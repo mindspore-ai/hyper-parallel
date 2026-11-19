@@ -57,6 +57,16 @@ if TYPE_CHECKING:
         register_materialized_state_hook,
         register_rebuildable_buffer,
     )
+    from hyper_parallel.models.preparation_manifest import (
+        NativeBindingRecord,
+        PartialRef,
+        PreparationManifest,
+        PreparedComponent,
+        ReplacementApplication,
+        SymbolRef,
+        WeightConversionRecord,
+        get_preparation_manifest,
+    )
     from hyper_parallel.models.validation_spec import (
         CheckpointValidationSpec,
         DataValidationSpec,
@@ -98,6 +108,17 @@ _LAZY_VALIDATION_EXPORTS = {
     "TopologyConstraint",
 }
 
+_LAZY_PREPARATION_EXPORTS = {
+    "NativeBindingRecord",
+    "PartialRef",
+    "PreparationManifest",
+    "PreparedComponent",
+    "ReplacementApplication",
+    "SymbolRef",
+    "WeightConversionRecord",
+    "get_preparation_manifest",
+}
+
 __all__ = [
     "CompileConfig",
     "CheckpointValidationSpec",
@@ -114,14 +135,22 @@ __all__ = [
     "ModelBuildOptions",
     "ModelValidationSpec",
     "ModuleParityCase",
+    "NativeBindingRecord",
     "ObservationSpec",
+    "PartialRef",
     "ParameterProbeSpec",
+    "PreparationManifest",
+    "PreparedComponent",
     "RebuildableBufferSpec",
     "RecomputePolicy",
+    "ReplacementApplication",
     "SharedStateValidationSpec",
     "StateInvariantSpec",
+    "SymbolRef",
     "TopologyConstraint",
+    "WeightConversionRecord",
     "get_model_adapter",
+    "get_preparation_manifest",
     "normalize_build_options",
     "rebuild_materialized_state",
     "register_materialized_state_hook",
@@ -147,6 +176,11 @@ def __getattr__(name):  # pylint: disable=invalid-name
         value = getattr(module, name)
         globals()[name] = value
         return value
+    if name in _LAZY_PREPARATION_EXPORTS:
+        module = importlib.import_module(".preparation_manifest", __name__)
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
     if name == "ModelAdapterSpec":
         return importlib.import_module(".adapter_spec", __name__).ModelAdapterSpec
     if name == "RecomputePolicy":
@@ -162,5 +196,6 @@ def __dir__():  # pylint: disable=invalid-name
         set(globals())
         | set(_LAZY_FACADE_EXPORTS)
         | _LAZY_MATERIALIZATION_EXPORTS
+        | _LAZY_PREPARATION_EXPORTS
         | _LAZY_VALIDATION_EXPORTS
     )

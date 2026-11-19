@@ -31,7 +31,7 @@ from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.definition_edits import drop_shadowed_definitions
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.framework_spec import (
-    replacement_spec_for as replacement_spec,
+    replacement_spec_for_observation,
     strategy_spec_for as strategy_spec,
 )
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
@@ -373,7 +373,7 @@ def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = No
     for rule in rules:
         if (
             rule.replace_target is not None
-            and replacement_spec(rule.replace_target, model_type, module_type=rule.module_type) is None
+            and replacement_spec_for_observation(rule, model_type) is None
         ):
             uncovered.append(rule.replace_target)
         for target in (rule.local_compute_target, rule.inner_wrapper_target):

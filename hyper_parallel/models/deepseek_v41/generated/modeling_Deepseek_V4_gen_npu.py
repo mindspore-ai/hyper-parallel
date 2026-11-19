@@ -61,7 +61,6 @@ from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
-from hyper_multicore import MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
@@ -138,6 +137,14 @@ class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
         outputs = self._hp_boundary.redistribute_outputs(outputs)
         return outputs
 from hyper_parallel.models.materialization import register_rebuildable_buffer
+
+# Native model replacements are optional; an installed package's own failures propagate.
+try:
+    from hyper_multicore import MegaGate
+except ModuleNotFoundError as error:
+    if error.name != "hyper_multicore":
+        raise
+    MegaGate = None
 
 _FULL_MODEL_MODE = "full"
 _VALIDATION_CROP_MODE = "validation_crop"
@@ -686,7 +693,7 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
     if isinstance(module, (DeepseekV41Engram, EngramModule)):
         module.q_weight.fill_(1.0)
         module.k_weight.fill_(1.0)
-    elif isinstance(module, (DeepseekV41TopKRouter, MegaGate)):
+    elif isinstance(module, DeepseekV41TopKRouter) or (MegaGate is not None and isinstance(module, MegaGate)):
         nn.init.normal_(module.weight, mean=0.0, std=std)
         tokens_per_expert = getattr(module, "tokens_per_expert", None)
         if tokens_per_expert is not None:
@@ -922,9 +929,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
-            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={})
-            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={})
-            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={})
+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={}, token_tile=32)
+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={}, token_tile=32)
+            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={}, indexer_balance_block_size=None, indexer_load_balance='none', indexer_zigzag_min_length=None, main_kv_comm='all_gather', use_fused_ops=True)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
             layer.mlp.gate = DeepseekV41MegaGate(module=DeepseekV41TopKRouter(config), module_fqn='', context={})
             bind_shared_expert_forward(layer.mlp.shared_experts)
@@ -1442,7 +1449,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             _hp_key = id(_hp_source)
             if _hp_key not in _hp_replacement_cache:
                 _hp_replacement_cache[_hp_key] = DeepseekV41MegaMoeExperts(
-                    module=_hp_source, module_fqn=_hp_fqn, context={})
+                    module=_hp_source, module_fqn=_hp_fqn, context={}, capacity_growth_factor=None, dispatch_mode='push', initial_capacity_factor=None, initializer_range=0.02)
             setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
     @torch.no_grad()

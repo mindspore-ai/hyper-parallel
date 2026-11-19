@@ -16,7 +16,20 @@
 
 from typing import Any
 
+from torch import nn
+
+from hyper_parallel.components.modules.module_family import FamilyShardingContext
+from hyper_parallel.distributed._builder.family_layout import replicated_subtree_layout
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
+
+
+def build_vision_layout(
+    *, model: nn.Module, context: FamilyShardingContext,
+) -> dict[str, ModuleShardingSpec]:
+    """Declare the vision tower's parameters replicated without a forward wrapper."""
+    vision = getattr(getattr(model, "model", None), "visual", None)
+    return {} if vision is None else {"model.visual": replicated_subtree_layout(vision, context)}
 
 
 def build_parameter_sharding_rules() -> list[tuple[Any, Any]]:
@@ -24,4 +37,4 @@ def build_parameter_sharding_rules() -> list[tuple[Any, Any]]:
     return [("model.visual.", ParamRole.REPLICATED)]
 
 
-__all__ = ["build_parameter_sharding_rules"]
+__all__ = ["build_parameter_sharding_rules", "build_vision_layout"]

@@ -27,7 +27,7 @@
  #
  # Unless required by applicable law or agreed to in writing, software
  # distributed under the License is distributed on an "AS IS" BASIS,
-@@ -26,22 +40,35 @@
+@@ -26,22 +40,33 @@
  import torch.nn as nn
  import torch.nn.functional as F
 
@@ -73,22 +73,11 @@
 +
 +# Codegen replacement: DeepseekV32DSAAttention wraps DeepseekV32Attention; the original class is kept as the wrapper input.
 +
-+# Codegen replacement: GroupedExperts wraps DeepseekV32Experts; the original class is kept as the wrapper input.
-+
 +from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 
 
  @use_kernel_forward_from_hub("RMSNorm")
-@@ -580,7 +607,7 @@
-     def __init__(self, config: DeepseekV32Config):
-         super().__init__()
-         self.config = config
--        self.experts = DeepseekV32Experts(config)
-+        self.experts = GroupedExperts(module=DeepseekV32Experts(config), module_fqn='', context=None)
-         self.gate = DeepseekV32TopkRouter(config)
-         self.shared_experts = DeepseekV32MLP(
-             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
-@@ -600,15 +627,15 @@
+@@ -600,15 +625,15 @@
      def __init__(self, config: DeepseekV32Config, layer_idx: int):
          super().__init__()
          self.hidden_size = config.hidden_size
@@ -107,7 +96,7 @@
 
      def forward(
          self,
-@@ -685,7 +712,7 @@
+@@ -685,7 +710,7 @@
          self.layers = nn.ModuleList(
              [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -116,7 +105,24 @@
          self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
          self.gradient_checkpointing = False
 
-@@ -826,3 +853,4 @@
+@@ -765,6 +790,16 @@
+
+         # Initialize weights and apply final processing
+         self.post_init()
++        _hp_replacement_cache = {}
++        for _hp_fqn in ('model.layers.3.mlp.experts',):
++            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
++            _hp_parent = self.get_submodule(_hp_parent_fqn)
++            _hp_source = getattr(_hp_parent, _hp_name)
++            _hp_key = id(_hp_source)
++            if _hp_key not in _hp_replacement_cache:
++                _hp_replacement_cache[_hp_key] = GroupedExperts(
++                    module=_hp_source, module_fqn=_hp_fqn, context=None)
++            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
+
+     @can_return_tuple
+     @auto_docstring
+@@ -826,3 +861,4 @@
 
 
  __all__ = ["DeepseekV32PreTrainedModel", "DeepseekV32Model", "DeepseekV32ForCausalLM"]

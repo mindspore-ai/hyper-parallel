@@ -17,6 +17,7 @@
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.qwen3_vl_moe.adapter.policies.sharding import (
     build_parameter_sharding_rules,
+    build_vision_layout,
 )
 from hyper_parallel.models.registry import register_model_adapter
 
@@ -43,6 +44,7 @@ QWEN3_VL_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
     sharding_rules=build_parameter_sharding_rules,
+    sharding=build_vision_layout,
 )
 
 register_model_adapter(QWEN3_VL_MOE_ADAPTER_SPEC)

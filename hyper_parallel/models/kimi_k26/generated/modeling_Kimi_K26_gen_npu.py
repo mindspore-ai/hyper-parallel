@@ -1274,10 +1274,10 @@ class DeepseekV3Attention(nn.Module):
             self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-            self.q_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.q_lora_rank), module_fqn='', context={})
+            self.q_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.q_lora_rank), module_fqn='', context={}, eps=1e-05, hidden_size=None)
             self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=config.attention_bias)
-        self.kv_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(self.kv_lora_rank), module_fqn='', context={})
+        self.kv_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(self.kv_lora_rank), module_fqn='', context={}, eps=1e-05, hidden_size=None)
         self.kv_b_proj = nn.Linear(self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias)
         self.scaling = self.qk_head_dim ** (-0.5)
@@ -1333,8 +1333,8 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
             self.mlp = DeepseekV3MoE(config)
         else:
             self.mlp = DeepseekV3MLP(config)
-        self.input_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
-        self.post_attention_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
+        self.input_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={}, eps=1e-05, hidden_size=None)
+        self.post_attention_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={}, eps=1e-05, hidden_size=None)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None=None, position_ids: torch.LongTensor | None=None, past_key_values: Cache | None=None, use_cache: bool | None=False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None=None, **kwargs: Unpack[TransformersKwargs]) -> torch.Tensor:
         residual = hidden_states
@@ -1382,7 +1382,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
+        self.norm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={}, eps=1e-05, hidden_size=None)
         self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()

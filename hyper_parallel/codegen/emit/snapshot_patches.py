@@ -21,6 +21,7 @@ import importlib
 import os
 from typing import Any, Optional
 
+from hyper_parallel.codegen.emit.replacement import replacement_factory
 from hyper_parallel.codegen.inline.targets import import_target_path
 from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
 
@@ -34,18 +35,17 @@ def emission_patches_from_snapshot_payload(
         payload: Serialized native observations and selected strategy records.
     """
     applications = payload["replacements"]["applications"]
-    replacements = [
-        {
+    replacements = []
+    for item in applications:
+        replacement = {
             "module_fqn": item["primary_fqn"],
             "source_type": item["source_type"],
             "replacement_type": item["replacement_type"],
-            **({"factory": item["family_request"]["factory"],
-                "factory_kwargs": {**item["family_request"]["kwargs"],
-                                   "context": item["family_request"]["context"]}}
-               if item.get("family_request") else {}),
         }
-        for item in applications
-    ]
+        family = item.get("family_request")
+        if family is not None:
+            replacement["factory"], replacement["factory_kwargs"] = replacement_factory(family)
+        replacements.append(replacement)
     replacement_types = {
         module_fqn: item["replacement_type"]
         for item in applications

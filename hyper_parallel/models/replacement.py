@@ -38,6 +38,14 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightRenaming,
     get_model_conversion_mapping,
 )
+from hyper_parallel.models.preparation_manifest import (
+    ReplacementApplication,
+    SymbolRef,
+    WeightConversionRecord,
+    _family_identity,
+    is_replacement_application_collection_active,
+    record_replacement_applications,
+)
 
 
 ModuleReplacementFactory = Callable[..., nn.Module]
@@ -765,6 +773,36 @@ def _prepare_replacement_batches(plan, context, weights_mapping):
             yield [candidate]
 
 
+def _apply_replacement_batches(
+    model: nn.Module,
+    plan: ModuleReplacementPlan,
+    context: Mapping[str, Any],
+    weights_mapping: list[WeightRenaming | WeightConverter] | None,
+    capture_checkpoint_metadata: bool,
+) -> tuple[nn.Module, dict[str, tuple[int, ...]] | None, list[WeightRenaming | WeightConverter]]:
+    """Prepare and install every batch while committing capture records after success."""
+    spec_indexes = {id(spec): index for index, spec in enumerate(plan.specs)}
+    for target in plan.targets:
+        spec_indexes.setdefault(id(target.spec), len(spec_indexes))
+    source_shapes = None
+    extra_transforms: list[WeightRenaming | WeightConverter] = []
+    for prepared in _prepare_replacement_batches(plan, context, weights_mapping):
+        captured_applications = (
+            _describe_prepared_applications(prepared, spec_indexes, context)
+            if is_replacement_application_collection_active()
+            else ()
+        )
+        if capture_checkpoint_metadata and source_shapes is None and any(transforms for _, _, transforms in prepared):
+            source_shapes = _named_tensor_shapes(model)
+        model = _install_module_candidates(
+            model, ((target.module_fqns, target.source, candidate) for target, candidate, _ in prepared),
+        )
+        record_replacement_applications(captured_applications)
+        for _, _, transforms in prepared:
+            extra_transforms.extend(transforms)
+    return model, source_shapes, extra_transforms
+
+
 def apply_module_replacements(
     model: nn.Module,
     plan: ModuleReplacementPlan,
@@ -788,16 +826,13 @@ def apply_module_replacements(
     """
 
     context = MappingProxyType(dict(context or {}))
-    source_shapes = None
-    extra_transforms: list[WeightRenaming | WeightConverter] = []
-    for prepared in _prepare_replacement_batches(plan, context, weights_mapping):
-        if capture_checkpoint_metadata and source_shapes is None and any(transforms for _, _, transforms in prepared):
-            source_shapes = _named_tensor_shapes(model)
-        model = _install_module_candidates(
-            model, ((target.module_fqns, target.source, candidate) for target, candidate, _ in prepared),
-        )
-        for _, _, transforms in prepared:
-            extra_transforms.extend(transforms)
+    model, source_shapes, extra_transforms = _apply_replacement_batches(
+        model,
+        plan,
+        context,
+        weights_mapping,
+        capture_checkpoint_metadata,
+    )
     if extra_transforms:
         if capture_checkpoint_metadata:
             model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access
@@ -813,6 +848,60 @@ def apply_module_replacements(
         dict.fromkeys((*previous_replacements, *current_replacements))
     )
     return model, weights_mapping
+
+
+def _describe_prepared_applications(
+    prepared: Iterable[tuple[ModuleReplacementTarget, nn.Module, list]],
+    spec_indexes: Mapping[int, int],
+    context: Mapping[str, Any],
+) -> tuple[ReplacementApplication, ...]:
+    """Describe one candidate batch before successful installation releases its sources."""
+    records = []
+    for target, candidate, transforms in prepared:
+        declaration_id = _replacement_rule_id(target.spec, spec_indexes[id(target.spec)])
+        family = get_family_build_info(candidate)
+        family_id = family_version = request_target = resolved_member = resolved_variant = None
+        selectors = request_arguments = resolved_arguments = axis_sizes = construction_context = {}
+        if family is not None and family.origin == "replacement":
+            family_id, family_version = _family_identity(family.resolved.family)
+            request_target = SymbolRef.from_object(family.request.target, path=f"replacement {declaration_id} request")
+            resolved_member = SymbolRef.from_object(
+                family.resolved.constructor,
+                path=f"replacement {declaration_id} member",
+            )
+            selectors = family.resolved.selectors
+            request_arguments = family.request.kwargs
+            resolved_variant = family.resolved.variant
+            resolved_arguments = family.resolved.arguments
+            axis_sizes = {
+                f"{axis}_size": size for axis, size in family.resolved.axis_sizes.items()
+            }
+            construction_context = {
+                **axis_sizes,
+                **{axis: size > 1 for axis, size in family.resolved.axis_sizes.items()},
+                **{name: context[name] for name in (
+                    "sequence_parallel", "loss_parallel", "mesh_dim_names", "device_type", "dtype",
+                ) if name in context},
+            }
+        records.append(ReplacementApplication(
+            boundary_id=f"replacement:{declaration_id}:{target.module_fqns[0] or '<root>'}",
+            declaration_id=declaration_id,
+            aliases=target.module_fqns,
+            source_type=SymbolRef.from_object(type(target.source), path=f"replacement {declaration_id} source"),
+            replacement_type=SymbolRef.from_object(type(candidate), path=f"replacement {declaration_id} candidate"),
+            family_id=family_id,
+            family_version=family_version,
+            request_target=request_target,
+            resolved_member=resolved_member,
+            selectors=selectors,
+            request_arguments=request_arguments,
+            axis_sizes=axis_sizes,
+            weight_conversions=tuple(WeightConversionRecord.from_transform(item) for item in transforms),
+            resolved_variant=resolved_variant,
+            resolved_arguments=resolved_arguments,
+            construction_context=construction_context,
+        ))
+    return tuple(records)
 
 
 def _factory_for_request(request: ModuleReplacementRequest) -> ModuleReplacementFactory:

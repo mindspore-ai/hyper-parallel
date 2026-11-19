@@ -70,6 +70,22 @@ class TestDeferredPretrained(unittest.TestCase):
         self.assertIs(result, model)
         parent.assert_called_once_with(config, trust_remote_code=True)
 
+    def test_config_first_build_preserves_explicit_remote_code_policy(self):
+        """The common builder forwards the caller's trust decision to HF."""
+        model = torch.nn.Linear(2, 2)
+        for trust in (False, True):
+            with self.subTest(trust=trust), \
+                    patch(_TARGET + "._init_model", return_value=(False, model)) as initialize, \
+                    patch(_TARGET + ".apply_model_infrastructure", return_value=model):
+                HyperAutoModelForCausalLM._build_model(
+                    "/weights", is_hf_model=True, hf_config=None, mesh=None,
+                    sharding_planner=None, fsdp2_manager=None, peft_config=None,
+                    torch_dtype=torch.float32, attn_implementation="eager", validate_placement=False,
+                    load_base_model=True, trust_remote_code=trust,
+                )
+            self.assertIsNone(initialize.call_args.args[1])
+            self.assertIs(initialize.call_args.kwargs["trust_remote_code"], trust)
+
     def test_loader_selects_initial_construction_and_preserves_final_load(self):
         """Feature: automatic deferred HF loading.
 

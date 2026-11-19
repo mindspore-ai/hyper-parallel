@@ -17,9 +17,11 @@
 from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import ArtifactLayout
-from hyper_parallel.codegen.model_build_overlay import use_codegen_model_build_overlay
-from hyper_parallel.codegen.planner_overlay import use_codegen_planner_overlay
-from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.codegen.project import (
+    prepare_model_source_compat,
+    project_model_build,
+    publish_codegen_ir,
+)
 from hyper_parallel.distributed.mesh import (
     DistributedSetup,
     LogicalDeviceMesh,
@@ -28,6 +30,7 @@ from hyper_parallel.distributed.mesh import (
     infer_minimum_world_size,
     resolve_parallel_layout,
 )
+from hyper_parallel.models.build_capture import capture_model_build_plan
 from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
 
 
@@ -57,8 +60,7 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
     distributed_setup = create_offline_distributed_setup(config)
     normalize_distributed_setup_overrides(distributed_setup, config)
 
-    session = CodegenBuildSession()
-    with use_codegen_model_build_overlay(session, artifact_dir) as result, use_codegen_planner_overlay():
+    with capture_model_build_plan(prepare_model_spec=prepare_model_source_compat) as capture:
         config.model.build(
             distributed_setup=distributed_setup,
             peft_config=config.peft,
@@ -74,6 +76,8 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
             compile_config=config.compile,
             model_init_dtype=config.model_init_dtype,
         )
+    build_ir = project_model_build(capture)
+    result = publish_codegen_ir(build_ir, artifact_dir)
 
     if result.artifact_layout is None:
         failure = getattr(result.snapshot, "failure", None)

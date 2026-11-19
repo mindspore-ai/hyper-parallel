@@ -14,21 +14,14 @@
 # ============================================================================
 """Generality contracts for codegen topology, replacements, and isolation."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 import unittest
-from unittest import mock
-
-from torch import nn
 
 from tests.ut.codegen.helpers import SourceMLP, _replace_mlp
 
-from hyper_parallel.codegen.model_build_overlay import use_codegen_model_build_overlay
-from hyper_parallel.codegen import model_build_overlay
 from hyper_parallel.codegen.build import create_offline_distributed_setup
-from hyper_parallel.codegen.planner_overlay import use_codegen_planner_overlay
-from hyper_parallel.codegen.session import CodegenBuildSession
-from hyper_parallel.models._transformers import auto_model, model_builder
+from hyper_parallel.models._transformers import auto_model
+from hyper_parallel.models.build_capture import capture_model_build_plan, is_model_build_capture_active
 from hyper_parallel.trainer.config import (
     PlanOverride,
     ReplaceAction,
@@ -194,68 +187,23 @@ class TestStrategyReplacementMatrix(unittest.TestCase):
 
 
 class TestGenerationFailureIsolation(unittest.TestCase):
-    """Scoped codegen overlays restore native symbols on every failure path."""
+    """Codegen keeps native entry points intact during capture."""
 
-    def test_method_replacements_run_before_planning(self):
-        """Offline construction uses native method rules and mesh context."""
-        model = nn.Module()
-        mesh = object()
-        rules = (object(),)
-        setup = SimpleNamespace(mesh_context=mesh, method_replacements=rules)
-        events = []
-
-        def apply_methods(received_model, specs, *, context):
-            self.assertIs(received_model, model)
-            self.assertEqual(specs, rules)
-            self.assertIs(context["mesh_context"], mesh)
-            events.append("methods")
-
-        with mock.patch.multiple(
-            model_build_overlay,
-            _prepare_model_source_compat=mock.Mock(),
-            _codegen_model_init_context=nullcontext,
-            _record_source=mock.Mock(),
-            _observe_replacements=mock.Mock(return_value=model),
-            _observe_plan=mock.Mock(side_effect=lambda *_args: events.append("plan")),
-            _publish_session=mock.Mock(),
-        ), mock.patch.object(auto_model, "_init_model", return_value=(False, model)), \
-                mock.patch.object(auto_model, "_current_device", return_value="cpu"), \
-                mock.patch.object(model_builder, "_apply_pre_sharding_features"), \
-                mock.patch.object(model_builder, "apply_method_replacements", side_effect=apply_methods):
-            build_model = model_build_overlay._codegen_build_model(
-                CodegenBuildSession(), None, SimpleNamespace(),
-            )
-            build_model(
-                object(), None, is_hf_model=True, hf_config=SimpleNamespace(),
-                mesh=mesh, sharding_planner=None, fsdp2_manager=None,
-                peft_config=None, torch_dtype=None, attn_implementation="eager",
-                validate_placement=False, load_base_model=False, distributed_setup=setup,
-            )
-        self.assertEqual(events, ["methods", "plan"])
-
-    def test_nested_overlays_restore_native_symbols_after_exception(self):
-        """Restore AutoModel build and planner factories when generation raises."""
+    def test_capture_failure_leaves_native_symbols_intact(self):
+        """The same AutoModel build and planner method remain installed throughout."""
         model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
         original_build = model_class.__dict__["_build_model"]
         original_factory = auto_model.instantiate_infrastructure
 
-        with self.assertRaisesRegex(RuntimeError, "injected emitter failure"):
-            with use_codegen_model_build_overlay(CodegenBuildSession()), use_codegen_planner_overlay():
-                raise RuntimeError("injected emitter failure")
+        with self.assertRaisesRegex(RuntimeError, "injected build failure"):
+            with capture_model_build_plan():
+                self.assertIs(model_class.__dict__["_build_model"], original_build)
+                self.assertIs(auto_model.instantiate_infrastructure, original_factory)
+                raise RuntimeError("injected build failure")
 
+        self.assertFalse(is_model_build_capture_active())
         self.assertIs(model_class.__dict__["_build_model"], original_build)
         self.assertIs(auto_model.instantiate_infrastructure, original_factory)
-
-    def test_failure_does_not_prevent_a_subsequent_native_factory_call(self):
-        """Call the restored native factory after an isolated codegen failure."""
-        native_result = (object(), object())
-        native_factory = mock.Mock(return_value=native_result)
-        with mock.patch.object(auto_model, "instantiate_infrastructure", native_factory):
-            with self.assertRaisesRegex(ValueError, "invalid replacement"):
-                with use_codegen_planner_overlay():
-                    raise ValueError("invalid replacement")
-            self.assertEqual(auto_model.instantiate_infrastructure(), native_result)
-            native_factory.assert_called_once_with()
 
 
 if __name__ == "__main__":

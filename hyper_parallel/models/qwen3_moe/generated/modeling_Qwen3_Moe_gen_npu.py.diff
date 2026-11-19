@@ -9,7 +9,7 @@
 +#   source       : transformers.models.qwen3_moe.modeling_qwen3_moe
 +#   architecture : Qwen3MoeForCausalLM
 +#   parallel_dims: tp=2 cp=2 ep=2 pp=1 sp=True loss_parallel=True
-+#   injections   : 2 rule(s)
++#   injections   : 4 rule(s)
 +#   runtime      : mesh / FSDP2 / PP / AC / compile still handled by runtime
 +#
 +# [HYPER PLAN] training derives a live plan from its YAML and this model;
@@ -75,7 +75,7 @@
 +
 +
 +from hyper_parallel.components.modules import GroupedExperts, RMSNorm
-+from hyper_parallel.components.modules.attention.grouped_query_attention.grouped_query_attention_family import GroupedQueryAttention
++from hyper_parallel.components.modules.module_family import build_prepared_family_replacement
 +
 +
 +
@@ -141,17 +141,17 @@
          # Initialize weights and apply final processing
          self.post_init()
 +        _hp_replacement_cache = {}
-+        for _hp_fqn in ('model.layers.0.self_attn', 'model.layers.1.self_attn'):
++        for _hp_fqn in ('model.layers.0.self_attn', 'model.layers.1.self_attn', 'model.layers.2.self_attn', 'model.layers.3.self_attn'):
 +            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
 +            _hp_parent = self.get_submodule(_hp_parent_fqn)
 +            _hp_source = getattr(_hp_parent, _hp_name)
 +            _hp_key = id(_hp_source)
 +            if _hp_key not in _hp_replacement_cache:
-+                _hp_replacement_cache[_hp_key] = GroupedQueryAttention(
-+                    module=_hp_source, module_fqn=_hp_fqn, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1}, overlap=False, ulysses_degree=1)
++                _hp_replacement_cache[_hp_key] = build_prepared_family_replacement(
++                    module=_hp_source, module_fqn=_hp_fqn, prepared={'target': 'hyper_parallel.components.modules.attention.grouped_query_attention.grouped_query_attention_family:GroupedQueryAttention', 'version': 1, 'variant': 'cp', 'member': 'hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention:CPGroupedQueryAttentionModule', 'selectors': {'parallel': True}, 'request_arguments': {'mapping': {'ulysses_degree': 1, 'fuse_qkv': True, 'overlap': False}}, 'resolved_arguments': {'mapping': {'ulysses_degree': 1, 'fuse_qkv': True, 'overlap': False}}, 'construction_context': {'mapping': {'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}})
 +            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 +        _hp_replacement_cache = {}
-+        for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts'):
++        for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts', 'model.layers.2.mlp.experts', 'model.layers.3.mlp.experts'):
 +            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
 +            _hp_parent = self.get_submodule(_hp_parent_fqn)
 +            _hp_source = getattr(_hp_parent, _hp_name)

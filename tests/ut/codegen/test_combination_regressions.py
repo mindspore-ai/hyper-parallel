@@ -15,104 +15,27 @@
 """Regression tests for codegen parallel-strategy combination boundaries."""
 
 import unittest
-from unittest import mock
 
 from torch import nn
 
-from hyper_parallel.codegen.planner_overlay import (
-    CodegenShardingPlanner,
-    use_codegen_planner_overlay,
-)
-from hyper_parallel.distributed._builder.planner import _LEAF_SEGMENT_GUARD, ShardingPlanner
+from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
 from hyper_parallel.models.kimi_k3.adapter.policies.sharding import (
     build_parameter_sharding_rules as kimi_rules,
 )
-from hyper_parallel.models._transformers import auto_model, model_builder
-
-
-class TestPlannerCombinationBoundaries(unittest.TestCase):
-    """Codegen additions remain outside the native planner."""
-
-    def test_fsdp_execution_is_disabled_and_restored_on_failure(self):
-        """Logical setup retains policy without creating a runtime manager."""
-        original = model_builder._instantiate_fsdp2
-        with self.assertRaisesRegex(RuntimeError, "stop"):
-            with use_codegen_planner_overlay():
-                self.assertIsNone(model_builder._instantiate_fsdp2(config=object()))
-                raise RuntimeError("stop")
-        self.assertIs(model_builder._instantiate_fsdp2, original)
-
-    def test_root_backtrack_scatters_to_each_parameter_owner(self):
-        """Keep unknown owners explicit in the codegen overlay.
-
-        Feature: codegen planner isolation
-        Description: Group replicated parameters owned by two unknown visual modules.
-        Expectation: Codegen preserves both owners without patching the native class.
-        """
-        roles = {
-            "visual.stem.weight": ParamRole.REPLICATED,
-            "visual.neck.weight": ParamRole.REPLICATED,
-        }
-        groups = CodegenShardingPlanner()._group_by_boundary(roles)
-        self.assertEqual(groups["visual.stem"], [("visual.stem.weight", ParamRole.REPLICATED)])
-        self.assertEqual(groups["visual.neck"], [("visual.neck.weight", ParamRole.REPLICATED)])
-
-    def test_replicated_fallback_uses_relative_paths_and_yields_to_override(self):
-        """Keep replicated fallback codegen-only and respect overrides.
-
-        Feature: codegen replicated metadata
-        Description: Build fallback metadata for a replicated weight and overridden bias.
-        Expectation: Only the relative weight path appears in the generated specification.
-        """
-        model = nn.Module()
-        model.visual = nn.Linear(4, 4)
-        parameters = dict(model.named_parameters())
-        group = [
-            ("visual.weight", ParamRole.REPLICATED),
-            ("visual.bias", ParamRole.BIAS),
-        ]
-        self.assertFalse(hasattr(ShardingPlanner, "_build_replicated_fallback_spec"))
-        spec = CodegenShardingPlanner._build_replicated_fallback_spec(
-            "visual", group, parameters, {"visual.bias"},
-        )
-        self.assertEqual(set(spec.params), {"weight"})
-        self.assertFalse(spec.is_boundary)
-        self.assertTrue(all(value.is_replicate() for value in spec.params["weight"].values()))
-
-    def test_megatron_swiglu_leaves_merge_upward(self):
-        """Interpret Megatron SwiGLU leaves only in codegen.
-
-        Feature: codegen boundary discovery
-        Description: Inspect linear_fc1 and linear_fc2 boundary inference.
-        Expectation: Native guards stay unchanged and the overlay merges both upward.
-        """
-        self.assertNotIn("linear_fc1", _LEAF_SEGMENT_GUARD)
-        self.assertNotIn("linear_fc2", _LEAF_SEGMENT_GUARD)
-        planner = CodegenShardingPlanner()
-        fc1 = [("model.mlp.linear_fc1.weight", ParamRole.FUSED_GATE_UP)]
-        fc2 = [("model.mlp.linear_fc2.weight", ParamRole.ROWWISE)]
-        self.assertEqual(planner._infer_boundary_type("model.mlp.linear_fc1", fc1), "unknown")
-        self.assertEqual(planner._infer_boundary_type("model.mlp.linear_fc2", fc2), "unknown")
-
-    def test_overlay_upgrades_and_restores_only_the_codegen_build(self):
-        """Scope the planner factory override to codegen.
-
-        Feature: codegen planner isolation
-        Description: Create a planner inside the overlay and inspect the factory afterward.
-        Expectation: The planner is upgraded temporarily and the original factory is restored.
-        """
-        native_planner = ShardingPlanner()
-        factory = mock.Mock(return_value=(native_planner, None))
-        with mock.patch.object(auto_model, "instantiate_infrastructure", factory):
-            with use_codegen_planner_overlay():
-                planner, _ = auto_model.instantiate_infrastructure()
-                self.assertIsInstance(planner, CodegenShardingPlanner)
-            self.assertIs(auto_model.instantiate_infrastructure, factory)
 
 
 class TestModelShardingRules(unittest.TestCase):
     """Model-owned policies cover multimodal and Kimi-specific parameters."""
+
+    def test_fused_swiglu_projections_share_native_boundary(self):
+        """The shared planner keeps the fused MLP output reduction at its owner."""
+        roles = {
+            "block.mlp.linear_fc1.weight": ParamRole.FUSED_GATE_UP,
+            "block.mlp.linear_fc2.weight": ParamRole.ROWWISE,
+        }
+        groups = ShardingPlanner()._group_by_boundary(roles)  # pylint: disable=protected-access
+        self.assertEqual({name: dict(params) for name, params in groups.items()}, {"block.mlp": roles})
 
     def test_kimi_special_parameters_are_replicated(self):
         """Cover Kimi special parameters in its model adapter.
@@ -133,16 +56,16 @@ class TestModelShardingRules(unittest.TestCase):
         }.issubset(replicated))
 
     def test_kimi_sparse_gate_classifies_as_router(self):
-        """Assign Kimi sparse gates their codegen-only router role.
+        """Assign Kimi sparse gates their adapter-declared router role.
 
         Feature: codegen parameter classification
-        Description: Classify a minimal block_sparse_moe gate with the overlay planner.
+        Description: Classify a minimal block_sparse_moe gate with the shared native planner.
         Expectation: Its weight is classified as ``MOE_GATE``.
         """
         model = nn.Module()
         model.block_sparse_moe = nn.Module()
         model.block_sparse_moe.gate = nn.Linear(4, 4, bias=False)
-        roles = CodegenShardingPlanner()._classify_all_params(model, "kimi_k3")
+        roles = ShardingPlanner()._classify_all_params(model, "kimi_k3")
         self.assertEqual(
             roles["block_sparse_moe.gate.weight"], ParamRole.MOE_GATE,
         )

@@ -55,6 +55,7 @@ from hyper_parallel.codegen.inline.ir import (
     ImportPatch,
     ModuleSnippetPatch,
     ReplacementSpec,
+    SourceObservation,
     StrategySpec,
 )
 from hyper_parallel.codegen.inline.recognition import (
@@ -355,8 +356,37 @@ def replacement_spec_for(
 
 
 
+def _family_wrap_spec(target: str, module_type: str | None) -> ReplacementSpec:
+    """Lower an authoritative family request to the existing source wrapper form."""
+    module_name, _, name = target.replace(":", ".", 1).rpartition(".")
+    old_ctor = class_name_of(module_type)
+    if not module_name or not name or not old_ctor:
+        raise ValueError(f"Invalid prepared family replacement {target!r} for {module_type!r}")
+    return ReplacementSpec(
+        old_ctor=old_ctor, new_ctor=name,
+        imports=(ImportPatch(module_name, (name,)),), mode="wrap_source",
+        keyword_args=("module_fqn=''",), remove_class=False, defer_to_fqns=True,
+    )
+
+
+def replacement_spec_for_observation(
+    rule: SourceObservation, model_type: str | None,
+) -> ReplacementSpec | None:
+    """Render a prepared family directly or lower a supported legacy replacement."""
+    if rule.prepared_family:
+        if rule.replace_target is None:
+            raise ValueError("Prepared family replacement has no construction target")
+        return _family_wrap_spec(rule.replace_target, rule.module_type)
+    spec = replacement_spec_for(rule.replace_target, model_type, module_type=rule.module_type)
+    if spec is None and rule.opaque_legacy:
+        raise RuntimeError(
+            f"Opaque legacy replacement {rule.replace_target!r} at {rule.match!r} has no inline declaration"
+        )
+    return spec
+
+
 def _module_family_replacement_spec(target: str, module_type: str | None) -> ReplacementSpec | None:
-    """Retain registered module-family construction instead of freezing its concrete class."""
+    """Recognize a registered family in a legacy replacement observation."""
     module_name, _, name = target.replace(":", ".", 1).rpartition(".")
     if not module_name or not name:
         return None
@@ -366,11 +396,7 @@ def _module_family_replacement_spec(target: str, module_type: str | None) -> Rep
         return None
     if get_module_family(factory) is None or not class_name_of(module_type):
         return None
-    return ReplacementSpec(
-        old_ctor=class_name_of(module_type), new_ctor=name,
-        imports=(ImportPatch(module_name, (name,)),), mode="wrap_source",
-        keyword_args=("module_fqn=''",), remove_class=False, defer_to_fqns=True,
-    )
+    return _family_wrap_spec(target, module_type)
 
 
 def _resolve_replacement_spec(
@@ -499,5 +525,6 @@ __all__ = [
     "CP_ATTENTION_KIND",
     "cp_dispatch_shell_body",
     "replacement_spec_for",
+    "replacement_spec_for_observation",
     "strategy_spec_for",
 ]

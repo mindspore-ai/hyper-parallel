@@ -30,6 +30,8 @@ class SourceObservation:
     construction_kwargs: tuple[str, ...] = ()
     inner_wrapper_target: Optional[str] = None
     local_compute_target: Optional[str] = None
+    prepared_family: bool = False
+    opaque_legacy: bool = False
 
 
 @dataclass(frozen=True)

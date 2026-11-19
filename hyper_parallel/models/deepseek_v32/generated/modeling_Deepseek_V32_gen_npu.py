@@ -66,8 +66,6 @@ from hyper_parallel.components.modules import DeepseekV32DSAAttention, GroupedEx
 
 # Codegen replacement: DeepseekV32DSAAttention wraps DeepseekV32Attention; the original class is kept as the wrapper input.
 
-# Codegen replacement: GroupedExperts wraps DeepseekV32Experts; the original class is kept as the wrapper input.
-
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 
 
@@ -607,7 +605,7 @@ class DeepseekV32MoE(nn.Module):
     def __init__(self, config: DeepseekV32Config):
         super().__init__()
         self.config = config
-        self.experts = GroupedExperts(module=DeepseekV32Experts(config), module_fqn='', context=None)
+        self.experts = DeepseekV32Experts(config)
         self.gate = DeepseekV32TopkRouter(config)
         self.shared_experts = DeepseekV32MLP(
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
@@ -792,6 +790,16 @@ class DeepseekV32ForCausalLM(DeepseekV32PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+        _hp_replacement_cache = {}
+        for _hp_fqn in ('model.layers.3.mlp.experts',):
+            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
+            _hp_parent = self.get_submodule(_hp_parent_fqn)
+            _hp_source = getattr(_hp_parent, _hp_name)
+            _hp_key = id(_hp_source)
+            if _hp_key not in _hp_replacement_cache:
+                _hp_replacement_cache[_hp_key] = GroupedExperts(
+                    module=_hp_source, module_fqn=_hp_fqn, context=None)
+            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
     @can_return_tuple
     @auto_docstring

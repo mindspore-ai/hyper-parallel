@@ -18,6 +18,19 @@ from __future__ import annotations
 from typing import Any
 
 
+PREPARED_FAMILY_CONSTRUCTOR = (
+    "hyper_parallel.components.modules.module_family:build_prepared_family_replacement"
+)
+
+
+def replacement_factory(family: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Translate one prepared factory record into a source constructor and arguments."""
+    selection = family.get("selection")
+    if selection is not None:
+        return PREPARED_FAMILY_CONSTRUCTOR, {"prepared": selection}
+    return family["factory"], {**family["kwargs"], "context": family["context"]}
+
+
 def replacement_records_from_snapshot(snapshot: Any) -> tuple[dict[str, Any], ...]:
     """Translate native replacement observations into emission records.
 
@@ -61,13 +74,17 @@ def replacement_records_from_snapshot(snapshot: Any) -> tuple[dict[str, Any], ..
         }
         if declaration.get("static_arguments"):
             record["target_config"] = dict(declaration["static_arguments"])
+        if application.get("opaque_legacy"):
+            record["opaque_legacy"] = True
         family = application.get("family_request")
         if family is not None:
-            record["factory"] = family["factory"].replace(":", ".", 1)
+            factory, arguments = replacement_factory(family)
+            record["prepared_family"] = True
+            record["factory"] = factory.replace(":", ".", 1)
             record["replacement_target"] = record["factory"]
-            record["target_config"] = {**family["kwargs"], "context": family["context"]}
+            record["target_config"] = arguments
         records.append(record)
     return tuple(records)
 
 
-__all__ = ["replacement_records_from_snapshot"]
+__all__ = ["replacement_factory", "replacement_records_from_snapshot"]

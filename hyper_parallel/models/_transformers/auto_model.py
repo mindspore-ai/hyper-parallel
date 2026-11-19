@@ -47,6 +47,10 @@ from hyper_parallel.models.build_options import (  # pylint: disable=syntax-erro
     get_device_id,
     get_device_type,
 )
+from hyper_parallel.models.build_capture import (
+    is_model_build_capture_active,
+    prepare_model_spec_for_capture,
+)
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
 
 logger = logging.getLogger(__name__)
@@ -79,15 +83,20 @@ def _model_init_kwargs(
     kwargs: dict[str, Any],
     *,
     load_base_model: bool,
+    is_hf_model: bool,
 ) -> dict[str, Any]:
-    """Drop config/download-only kwargs when constructing directly from config."""
+    """Filter download options while preserving HF's explicit model import policy."""
     if load_base_model:
         return dict(kwargs)
-    return {
+    filtered = {
         key: value
         for key, value in kwargs.items()
         if key not in _CONFIG_ONLY_KWARGS
     }
+    # HF AutoModel.from_config checks trust before importing a custom class.
+    if is_hf_model and "trust_remote_code" in kwargs:
+        filtered["trust_remote_code"] = kwargs["trust_remote_code"]
+    return filtered
 
 
 def _requires_quantized_initialization(
@@ -181,6 +190,7 @@ def _resolve_module_construction(kwargs, hf_config, distributed_setup, dtype):
     context = build_module_context(
         distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec,
     )
+    prepare_model_spec_for_capture(spec)
     return factory, context
 
 
@@ -415,7 +425,9 @@ class _BaseHyperAutoModelClass:
             hf_config, kwargs.get("quantization_config"), load_base_model=load_base_model,
         )
         defer_hf_load = load_base_model and not quantized_init
-        is_meta_device = (
+        if is_model_build_capture_active() and quantized_init:
+            raise ValueError("offline model build capture does not support quantized initialization")
+        is_meta_device = is_model_build_capture_active() or (
             world_size > 1 or not is_hf_model or defer_hf_load
         ) and not quantized_init
 
@@ -431,6 +443,7 @@ class _BaseHyperAutoModelClass:
         init_kwargs = _model_init_kwargs(
             dict(kwargs),
             load_base_model=init_pretrained_path is not None,
+            is_hf_model=is_hf_model,
         )
         with init_ctx:
             if model_factory is not None:

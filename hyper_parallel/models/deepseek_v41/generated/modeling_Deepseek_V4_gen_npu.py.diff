@@ -26,16 +26,7 @@
  #
  # Unless required by applicable law or agreed to in writing, software
  # distributed under the License is distributed on an "AS IS" BASIS,
-@@ -47,7 +61,7 @@
- from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
- from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
- from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
--from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
-+from hyper_multicore import MegaGate
- from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
-     accumulate_router_load,
-     sequence_load_balancing_loss,
-@@ -76,6 +90,53 @@
+@@ -75,6 +89,53 @@
      DeepseekV41VisionAligner,
      DeepseekV41VisionTower,
  )
@@ -88,8 +79,8 @@
 +        return outputs
  from hyper_parallel.models.materialization import register_rebuildable_buffer
 
- _FULL_MODEL_MODE = "full"
-@@ -395,7 +456,7 @@
+ # Native model replacements are optional; an installed package's own failures propagate.
+@@ -402,7 +463,7 @@
      shared_expert.forward = MethodType(_v41_shared_expert_forward, shared_expert)
 
 
@@ -98,7 +89,7 @@
          self: nn.Module,
          hidden_states: torch.Tensor,
          input_ids: torch.Tensor | None = None,
-@@ -414,6 +475,37 @@
+@@ -421,6 +482,37 @@
      routed = self.experts(hidden_states.view(-1, hidden_size), indices, weights)
      return routed.view(batch_size, sequence_length, hidden_size) + self.shared_experts(hidden_states)
 
@@ -136,16 +127,16 @@
 
  class DeepseekV41Compressor(nn.Module):
      """Non-overlapping V4.1 compressed-KV producer."""
-@@ -830,15 +922,16 @@
+@@ -837,15 +929,16 @@
          )
          for layer_idx in range(config.num_hidden_layers):
              layer = self.layers[layer_idx]
 -            layer.attn_hc = DeepseekV41PipelinedHyperConnection(layer.attn_hc)
 -            layer.ffn_hc = DeepseekV41PipelinedHyperConnection(layer.ffn_hc)
 -            layer.self_attn = DeepseekV41Attention(config, layer_idx)
-+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={})
-+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={})
-+            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={})
++            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={}, token_tile=32)
++            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={}, token_tile=32)
++            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={}, indexer_balance_block_size=None, indexer_load_balance='none', indexer_zigzag_min_length=None, main_kv_comm='all_gather', use_fused_ops=True)
              layer.forward = MethodType(_v41_decoder_layer_forward, layer)
 -            layer.mlp.gate = DeepseekV41TopKRouter(config)
 +            layer.mlp.gate = DeepseekV41MegaGate(module=DeepseekV41TopKRouter(config), module_fqn='', context={})
@@ -158,7 +149,7 @@
          self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.rotary_emb = DeepseekV4RotaryEmbedding(config)
          self.vision = None
-@@ -1313,7 +1406,7 @@
+@@ -1320,7 +1413,7 @@
      dspark_config.num_local_experts = experts
      dspark_config.num_experts_per_tok = int(getattr(config, "v41_dspark_top_k", config.num_experts_per_tok))
      mlp = DeepseekV4DecoderLayer(dspark_config, 0).mlp
@@ -167,7 +158,7 @@
      mlp.forward = MethodType(_dspark_sparse_moe_forward, mlp)
      return mlp
 
-@@ -1341,6 +1434,16 @@
+@@ -1348,6 +1441,16 @@
              self.dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _build_dspark_mlp(config))
              self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
          self.post_init()
@@ -179,12 +170,12 @@
 +            _hp_key = id(_hp_source)
 +            if _hp_key not in _hp_replacement_cache:
 +                _hp_replacement_cache[_hp_key] = DeepseekV41MegaMoeExperts(
-+                    module=_hp_source, module_fqn=_hp_fqn, context={})
++                    module=_hp_source, module_fqn=_hp_fqn, context={}, capacity_growth_factor=None, dispatch_mode='push', initial_capacity_factor=None, initializer_range=0.02)
 +            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
      @torch.no_grad()
      def _init_weights(self, module: nn.Module) -> None:
-@@ -1418,3 +1521,4 @@
+@@ -1425,3 +1528,4 @@
      "SharedAttentionCPContext",
      "SharedAttentionState",
  ]

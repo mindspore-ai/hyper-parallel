@@ -39,6 +39,8 @@ def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
                     module_type=record.get("module_type"),
                     replace_target=target,
                     construction_kwargs=_construction_kwargs(record),
+                    prepared_family=record.get("prepared_family", False),
+                    opaque_legacy=record.get("opaque_legacy", False),
                 )
             )
     for record in getattr(meta, "injections", None) or []:
@@ -69,6 +71,8 @@ def _construction_kwargs(record: dict[str, Any]) -> tuple[str, ...]:
 
 def _replacement_target(record: dict[str, Any]) -> Any:
     """Prefer model-owned declarations and otherwise use the observed factory."""
+    if record.get("prepared_family"):
+        return record["factory"]
     declared = record.get("replacement_target")
     parts = str(declared or "").split(".")
     if len(parts) >= 4 and parts[:2] == ["hyper_parallel", "models"] and parts[3] == "adapter":

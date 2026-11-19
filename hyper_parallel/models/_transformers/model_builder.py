@@ -38,10 +38,16 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.build_capture import (
+    is_model_build_capture_active,
+    record_model_plan_for_capture,
+    record_model_source_for_capture,
+)
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
 )
+from hyper_parallel.models.preparation_manifest import record_native_bindings
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
@@ -59,7 +65,7 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
     _instantiate_fsdp2,
 )
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
-from hyper_parallel.distributed.apply import apply_sharding_plan
+from hyper_parallel.distributed.apply import apply_sharding_plan, preflight_sharding_plan
 from hyper_parallel.distributed.module_binding import validate_materialized_modules
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.models.registry import _resolve_custom_model_cls, resolve_model_adapter
@@ -124,6 +130,8 @@ def instantiate_infrastructure(
     fsdp2_manager = None
     mesh = distributed_setup.mesh_context if distributed_setup is not None else None
     strategy_cfg = distributed_setup.strategy_config if distributed_setup is not None else None
+    if is_model_build_capture_active():
+        strategy_cfg = None
     if graph_mode_requested:
         strategy_cfg = None
     if strategy_cfg is not None:
@@ -259,13 +267,17 @@ def _plan_and_apply_sharding(
         mesh is not None
         and any(size > 1 for size in (mesh.tp_size, mesh.cp_size, mesh.ep_size))
     )
-    if (
-        sharding_planner is None
-        or mesh is None
-        or (is_hf_model and not model_sharding_requested and not _has_module_owned_layouts(model))
-    ):
+    if sharding_planner is None:
+        record_model_plan_for_capture(model, None, mesh, reason="planner_unavailable")
+        return model, None
+    if mesh is None:
+        record_model_plan_for_capture(model, None, mesh, reason="mesh_unavailable")
+        return model, None
+    if is_hf_model and not model_sharding_requested and not _has_module_owned_layouts(model):
+        record_model_plan_for_capture(model, None, mesh, reason="pure_data_parallel")
         return model, None
     if mesh.device_mesh is None:
+        record_model_plan_for_capture(model, None, mesh, reason="device_mesh_unavailable")
         logger.warning("MeshContext has no device_mesh; skipping sharding")
         return model, None
 
@@ -287,12 +299,20 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
+    if is_model_build_capture_active():
+        preflight_sharding_plan(model, plan, mesh)
+        if getattr(model, "_hp_preparation_manifest", None) is not None:
+            record_native_bindings(model, plan)
+        record_model_plan_for_capture(model, plan, mesh)
+        return model, None
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
         mesh,
         validate_mode=validate_placement,
     )
+    if getattr(model, "_hp_preparation_manifest", None) is not None:
+        record_native_bindings(model, plan)
     logger.info("Sharding plan applied; source_shard_info keys=%d", len(source_shard_info or {}))
     return model, source_shard_info
 
@@ -708,18 +728,27 @@ def apply_model_infrastructure(
     """
 
     distributed_setup = kwargs.get("distributed_setup")
-    compile_config, compile_for_execution = _resolve_compile_config(
-        compile_config, validate_placement, fsdp2_manager
-    )
+    capture_active = is_model_build_capture_active()
+    if capture_active:
+        compile_config, compile_for_execution = None, False
+    else:
+        compile_config, compile_for_execution = _resolve_compile_config(
+            compile_config, validate_placement, fsdp2_manager
+        )
     graph_mode_requested = bool(
         compile_config is not None and compile_config.selects_graph_compiler()
     )
     _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
+    record_model_source_for_capture(
+        model,
+        pretrained_model_name_or_path=pretrained_path,
+        is_hf_model=is_hf_model,
+    )
 
     model, weights_mapping = _maybe_apply_module_replacements(
         model, distributed_setup, low_precision_config, load_base_model,
     )
-    if is_meta_device:
+    if is_meta_device and not capture_active:
         _apply_materialization_adapter(model)
 
     _tie_model_weights_before_parallelism(model)
@@ -733,6 +762,8 @@ def apply_model_infrastructure(
     model, source_shard_info = _plan_and_apply_sharding(
         model, mesh, sharding_planner, is_hf_model, validate_placement,
     )
+    if capture_active:
+        return model
 
     model = _apply_activation_features(
         model, activation_checkpoint, activation_swap, compile_for_execution, mesh,

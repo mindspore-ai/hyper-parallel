@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Family preparation and codegen observation share the native installation contract."""
+"""Shared family preparation and capture replace the former build overlay."""
 
 from types import SimpleNamespace
 import unittest
@@ -22,29 +22,42 @@ import weakref
 import torch
 from torch import nn
 
-from hyper_parallel.codegen.model_build_overlay import (
-    _observe_plan, _observe_replacement_installations, _observe_replacements, use_codegen_model_build_overlay,
-)
-from hyper_parallel.codegen.session import CodegenBuildSession
-from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
 from hyper_parallel.components.modules import family as registry
-from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
-from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.models import HyperAutoModelForCausalLM, module_build
 from hyper_parallel.models._transformers import auto_model, model_builder
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
-from hyper_parallel.models.module_build import attach_build_context, build_module_context
+from hyper_parallel.models.build_capture import capture_model_build_plan
+from hyper_parallel.models.module_build import (
+    attach_build_context,
+    build_module_context,
+    prepare_model_components,
+)
+from hyper_parallel.models.preparation_manifest import (
+    collect_replacement_applications,
+    get_preparation_manifest,
+)
 from hyper_parallel.models.replacement import (
-    MethodReplacementSpec, ModuleReplacementRequest, ModuleReplacementSpec, apply_module_replacements,
-    compile_module_replacements, method_replacement, module_replacement,
+    MethodReplacementSpec,
+    ModuleReplacementRequest,
+    ModuleReplacementSpec,
+    apply_module_replacements,
+    compile_module_replacements,
+    method_replacement,
+    module_replacement,
 )
 from tests.common.module_family_fixtures import (
-    FamilyModelConfig, LinearFamily, LocalLinear, ParallelLinear, create_family_model, register_linear_family,
+    FamilyModelConfig,
+    LinearFamily,
+    LocalLinear,
+    ParallelLinear,
+    create_family_model,
+    register_linear_family,
 )
 
 
 class _MethodModel(nn.Module):
-    """A real model with an explicit non-forward stage for shared policy acceptance."""
+    """Minimal model with a replaceable non-forward stage."""
 
     def __init__(self, config, *, context):
         super().__init__()
@@ -59,8 +72,8 @@ class _MethodModel(nn.Module):
         return self.stage(inputs)
 
 
-class TestModelBuildOverlay(unittest.TestCase):
-    """Exercise real module identities, meta construction and snapshot contents."""
+class TestSharedModelBuild(unittest.TestCase):
+    """Exercise shared preparation without codegen-owned execution paths."""
 
     def setUp(self):
         handle = patch.dict(registry._FAMILIES, clear=True)
@@ -68,71 +81,87 @@ class TestModelBuildOverlay(unittest.TestCase):
         self.addCleanup(handle.stop)
         register_linear_family()
 
-    def test_defaults_and_legacy_rules_share_one_plan_and_snapshot_order(self):
-        """Default and legacy requests share compilation and preserve observed installation order."""
+    def test_defaults_and_legacy_rules_share_manifest_order(self):
+        """Default and legacy requests compile once and retain installation order."""
         model = nn.Sequential(nn.Linear(4, 3), nn.Linear(4, 3))
         request = ModuleReplacementRequest(("0",), LinearFamily)
         legacy = ModuleReplacementSpec(("1",), LinearFamily)
         spec = ModelAdapterSpec("Sequential", "toy", replacements=lambda: (request,))
         setup = SimpleNamespace(module_replacements=(legacy,), mesh_context=None)
-        attach_build_context(model, build_module_context(setup, model_spec=spec))
-        session = CodegenBuildSession()
-        session.record_source({"model_type": "toy"})
+        context = build_module_context(setup, model_spec=spec)
+        attach_build_context(model, context)
 
-        with patch.object(module_build, "compile_module_replacements",
-                          wraps=compile_module_replacements) as compile_plan:
-            result = _observe_replacements(model, setup, None, False, session)
+        with patch.object(
+            module_build,
+            "compile_module_replacements",
+            wraps=compile_module_replacements,
+        ) as compile_plan:
+            prepared, _ = prepare_model_components(model, context)
 
-        self.assertIs(result, model)
+        self.assertIs(prepared, model)
         self.assertEqual(compile_plan.call_count, 1)
         self.assertIs(type(model[0]), LocalLinear)
         self.assertIs(type(model[1]), LocalLinear)
-        session.mark_not_required("snapshot_test")
-        replacements = session.finish().to_dict()["replacements"]
-        declarations, applications = replacements["declarations"], replacements["applications"]
-        self.assertEqual([item["rule_id"] for item in declarations],
-                         [item["rule_id"] for item in applications])
-        self.assertEqual(declarations[0]["replacement_target"],
-                         f"{LinearFamily.__module__}:{LinearFamily.__qualname__}")
-        self.assertEqual([item["primary_fqn"] for item in applications], ["0", "1"])
+        manifest = get_preparation_manifest(model)
+        self.assertEqual(
+            [item["rule_id"] for item in manifest.declarations],
+            [item.declaration_id for item in manifest.replacements],
+        )
+        self.assertEqual(
+            [item.primary_fqn for item in manifest.replacements],
+            ["0", "1"],
+        )
 
-    def test_factory_build_uses_shared_meta_preparation_without_replacement(self):
-        """Direct factory builds finalize meta members once without synthetic replacement records."""
-        setup = DistributedSetup(mesh_context=MeshContext(dp_size=2, dp_shard_size=2, ep_size=2))
-        session = CodegenBuildSession()
+    def test_factory_capture_uses_shared_meta_preparation(self):
+        """Direct factory capture resolves the same family once on meta."""
+        setup = DistributedSetup(
+            mesh_context=MeshContext(dp_size=2, dp_shard_size=2, ep_size=2)
+        )
         with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
-                patch.object(module_build, "_finalize_family_modules",
-                             wraps=module_build._finalize_family_modules) as finalize, \
-                use_codegen_model_build_overlay(session) as result:
+                patch.object(
+                    module_build,
+                    "_finalize_family_modules",
+                    wraps=module_build._finalize_family_modules,
+                ) as finalize, capture_model_build_plan() as capture:
             model = HyperAutoModelForCausalLM.from_config(
-                FamilyModelConfig(), model_factory=create_family_model, distributed_setup=setup,
+                FamilyModelConfig(),
+                model_factory=create_family_model,
+                distributed_setup=setup,
                 torch_dtype=torch.float32,
             )
+
         self.assertEqual(finalize.call_count, 1)
+        self.assertTrue(capture.complete)
         self.assertTrue(model._hp_components_prepared)
         self.assertIs(type(model.projection), ParallelLinear)
         self.assertEqual(model.projection.weight.device.type, "meta")
-        self.assertEqual(result.snapshot.to_dict()["replacements"]["applications"], [])
+        self.assertEqual(capture.manifest.replacements, ())
 
-    def test_failed_atomic_batch_records_no_installations(self):
-        """A failed candidate batch preserves the original model and publishes no installations."""
+    def test_failed_atomic_batch_records_no_applications(self):
+        """A failed candidate batch preserves the model and commits no application."""
         @module_replacement
         def fail(*, module, module_fqn, context):
+            del module, module_fqn, context
             raise ValueError("candidate failed")
 
         model = nn.Sequential(nn.Linear(4, 3), nn.Linear(4, 3))
         original = tuple(model)
-        plan = compile_module_replacements(model, defaults=(
-            ModuleReplacementRequest(("0",), LinearFamily), ModuleReplacementRequest(("1",), fail),
-        ))
-        with _observe_replacement_installations(plan.specs) as applications:
+        plan = compile_module_replacements(
+            model,
+            defaults=(
+                ModuleReplacementRequest(("0",), LinearFamily),
+                ModuleReplacementRequest(("1",), fail),
+            ),
+        )
+        with collect_replacement_applications() as applications:
             with self.assertRaisesRegex(ValueError, "candidate failed"):
                 apply_module_replacements(model, plan)
+
         self.assertEqual(applications, [])
         self.assertEqual(tuple(model), original)
 
-    def test_observation_does_not_keep_replaced_sources_alive(self):
-        """Codegen observation releases source modules after the shared installer replaces them."""
+    def test_application_records_do_not_keep_replaced_sources_alive(self):
+        """Stable application records retain no source module references."""
         references = []
 
         @module_replacement
@@ -142,40 +171,18 @@ class TestModelBuildOverlay(unittest.TestCase):
             return LocalLinear(module=module, module_fqn=module_fqn, context=context)
 
         model = nn.Sequential(nn.Linear(4, 3), nn.Linear(4, 3))
-        plan = compile_module_replacements(model, (ModuleReplacementSpec(("*",), replace),))
-        with _observe_replacement_installations(plan.specs) as applications:
+        plan = compile_module_replacements(
+            model,
+            (ModuleReplacementSpec(("*",), replace),),
+        )
+        with collect_replacement_applications() as applications:
             apply_module_replacements(model, plan)
+
         self.assertEqual(len(applications), 2)
         self.assertTrue(all(reference() is None for reference in references))
 
-    def test_wildcard_user_request_has_distinct_effective_declarations(self):
-        model = nn.Sequential(nn.Linear(4, 3), nn.Linear(4, 3))
-        request = ModuleReplacementRequest(("*",), LinearFamily, declaration_id="user-rule")
-        setup = SimpleNamespace(module_replacement_requests=(request,), mesh_context=None)
-        session = CodegenBuildSession()
-        session.record_source({"model_type": "toy"})
-        _observe_replacements(model, setup, None, False, session)
-        session.mark_not_required("snapshot_test")
-        records = replacement_records_from_snapshot(session.finish())
-        self.assertEqual([record["fqn"] for record in records], ["0", "1"])
-
-    def test_size_one_owned_layout_is_planned_during_observation(self):
-        """A module-owned layout is planned even when every parallel axis has size one."""
-        model = nn.Module()
-        model._hp_model_adapter_spec = ModelAdapterSpec("Module", "toy", sharding=lambda **_: {})
-        mesh = MeshContext()
-        mesh.device_mesh = LogicalDeviceMesh(mesh_dim_names=("dp",), mesh_shape=(1,))
-        planner = SimpleNamespace(plan=lambda *_args, **_kwargs: ShardingPlan())
-        session = CodegenBuildSession()
-        session.record_source({"model_type": "toy"})
-        session.record_replacements()
-        with patch.object(planner, "plan", wraps=planner.plan) as plan:
-            _observe_plan(model, mesh, planner, True, session)
-        self.assertEqual(plan.call_count, 1)
-        self.assertEqual(session.finish().to_dict()["status"], "derived")
-
-    def test_native_and_observation_share_method_policy_and_prepared_context(self):
-        """Native and offline builds reuse the prepared context for identical method replacement policy."""
+    def test_native_and_capture_share_method_replacement_order(self):
+        """Both builds run method replacement from the same prepared context."""
         events = []
 
         @method_replacement
@@ -190,57 +197,68 @@ class TestModelBuildOverlay(unittest.TestCase):
 
             return scaled
 
-        setup = DistributedSetup(method_replacements=(MethodReplacementSpec("0.stage", replace_stage),))
+        setup = DistributedSetup(
+            method_replacements=(MethodReplacementSpec("0.stage", replace_stage),)
+        )
+
         def factory(config, *, context):
             parent = nn.Sequential(_MethodModel(config, context=context))
             parent.config = config
             return parent
 
         with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
-                patch.object(model_builder, "build_module_context",
-                             side_effect=AssertionError("prepared context must be reused")):
+                patch.object(
+                    model_builder,
+                    "build_module_context",
+                    side_effect=AssertionError("prepared context must be reused"),
+                ):
             model = HyperAutoModelForCausalLM.from_config(
-                FamilyModelConfig(), model_factory=factory, distributed_setup=setup, torch_dtype=torch.float32,
+                FamilyModelConfig(),
+                model_factory=factory,
+                distributed_setup=setup,
+                torch_dtype=torch.float32,
             )
-            torch.testing.assert_close(model(torch.tensor([3.])), torch.tensor([6.]))
-            with use_codegen_model_build_overlay(CodegenBuildSession()):
+            torch.testing.assert_close(model(torch.tensor([3.0])), torch.tensor([6.0]))
+            with capture_model_build_plan() as capture:
                 observed = HyperAutoModelForCausalLM.from_config(
-                    FamilyModelConfig(), model_factory=factory, distributed_setup=setup, torch_dtype=torch.float32,
+                    FamilyModelConfig(),
+                    model_factory=factory,
+                    distributed_setup=setup,
+                    torch_dtype=torch.float32,
                 )
+
+        self.assertTrue(capture.complete)
         self.assertEqual(len(events), 2)
         self.assertIs(events[0]["model_spec"], model._hp_model_adapter_spec)
         self.assertIs(events[1]["model_spec"], observed._hp_model_adapter_spec)
         self.assertEqual(observed[0].weight.device.type, "meta")
 
-    def test_replacement_only_observation_uses_empty_native_plan_projection(self):
-        """Replacement-only builds publish an empty layout plan together with installation metadata."""
-        model = nn.Sequential(nn.Linear(4, 3))
-        setup = SimpleNamespace(module_replacement_requests=(ModuleReplacementRequest(("0",), LinearFamily),),
-                                mesh_context=None)
-        session = CodegenBuildSession()
-        session.record_source({"model_type": "toy"})
-        model = _observe_replacements(model, setup, None, False, session)
-        mesh = MeshContext()
-        mesh.device_mesh = LogicalDeviceMesh(mesh_dim_names=("dp",), mesh_shape=(1,))
-        planner = SimpleNamespace(plan=Mock(side_effect=AssertionError("pure DP needs no layout plan")))
-        _observe_plan(model, mesh, planner, True, session)
-        result = session.finish().to_dict()
-        self.assertEqual(result["status"], "derived")
-        self.assertEqual(result["plan"]["param_plan"], {})
-        self.assertEqual(result["plan"]["injections"], [])
-        self.assertEqual(result["plan"]["parallel_dims"]["dp_size"], 1)
-        self.assertEqual(len(result["replacements"]["applications"]), 1)
-
-    def test_source_compat_uses_the_effective_per_build_spec(self):
-        """An explicit model spec supplies its import policy without a second registry lookup."""
+    def test_source_compat_uses_effective_build_spec(self):
+        """Capture invokes the source hook of the exact model spec once."""
         prepare = Mock()
         provider = Mock(return_value=SimpleNamespace(prepare_model_import=prepare))
-        spec = ModelAdapterSpec("FamilyModel", "test_family_model", codegen=provider)
+        spec = ModelAdapterSpec(
+            "FamilyModel",
+            "test_family_model",
+            codegen=provider,
+        )
+
+        def prepare_spec(model_spec):
+            model_spec.codegen().prepare_model_import()
+
         with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
-                use_codegen_model_build_overlay(CodegenBuildSession()):
+                capture_model_build_plan(prepare_model_spec=prepare_spec):
             model = HyperAutoModelForCausalLM.from_config(
-                FamilyModelConfig(), model_factory=create_family_model, model_spec=spec, torch_dtype=torch.float32,
+                FamilyModelConfig(),
+                model_factory=create_family_model,
+                model_spec=spec,
+                torch_dtype=torch.float32,
             )
+
         provider.assert_called_once_with()
         prepare.assert_called_once_with()
         self.assertIs(model._hp_model_adapter_spec, spec)
+
+
+if __name__ == "__main__":
+    unittest.main()

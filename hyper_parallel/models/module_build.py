@@ -31,10 +31,14 @@ from hyper_parallel.components.modules.module_family import (
     validate_family_context,
 )
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.preparation_manifest import (
+    build_preparation_manifest,
+    collect_replacement_applications,
+)
 from hyper_parallel.models.registry import _normalize_family_key, get_model_adapter
 from hyper_parallel.models.replacement import (
     ModuleReplacementPlan, _apply_module_replacement_actions, _install_module_candidates,
-    _validate_replacement, compile_module_replacements,
+    _validate_replacement, compile_module_replacements, describe_replacement_declarations,
 )
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
 
@@ -284,15 +288,24 @@ def prepare_model_components(
     overrides = context.get("module_replacement_requests")
     legacy = () if overrides is not None else (context.get("module_replacements") or ())
     plan = compile_module_replacements(model, legacy, defaults=defaults, overrides=overrides or ())
+    declarations = describe_replacement_declarations(plan.specs)
     weights = model_weight_mapping(model)
     _validate_low_precision_targets(model, plan, context)
-    if plan.targets:
-        model, weights = _apply_module_replacement_actions(
-            model, plan, weights_mapping=weights, context=context,
-            capture_checkpoint_metadata=capture_checkpoint_metadata,
-        )
+    with collect_replacement_applications() as applications:
+        if plan.targets:
+            model, weights = _apply_module_replacement_actions(
+                model, plan, weights_mapping=weights, context=context,
+                capture_checkpoint_metadata=capture_checkpoint_metadata,
+            )
     model._hp_components_prepared = True  # pylint: disable=protected-access
     model._hp_family_weight_mapping = weights  # pylint: disable=protected-access
+    build_preparation_manifest(
+        model,
+        model_spec=spec,
+        declarations=declarations,
+        replacements=applications,
+        weight_conversions=weights,
+    )
     return model, weights
 
 

@@ -28,7 +28,7 @@ from hyper_parallel.codegen.inline.ir import (
     SourceObservation,
     ModuleSnippetPatch,
 )
-from hyper_parallel.codegen.inline.framework_spec import replacement_spec_for as replacement_spec
+from hyper_parallel.codegen.inline.framework_spec import replacement_spec_for_observation
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def build_replacement_patches(
         target = rule.replace_target
         if target is None:
             continue
-        spec = replacement_spec(target, model_type, module_type=rule.module_type)
+        spec = replacement_spec_for_observation(rule, model_type)
         if spec is None:
             continue
         # Different layer requests may use the same factory with different schedules.
