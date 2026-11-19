@@ -67,6 +67,7 @@ def _decode_construction_value(value: Any) -> Any:
 
 def build_prepared_family_replacement(
     *, module: nn.Module, module_fqn: str, prepared: Mapping[str, Any],
+    construct_member: Callable | None = None,
 ) -> nn.Module:
     """Build the exact source member recorded by shared model preparation.
 
@@ -74,6 +75,7 @@ def build_prepared_family_replacement(
         module: Original module constructed by the source model.
         module_fqn: Exact path of the source module.
         prepared: Serialized request and concrete selection from preparation.
+        construct_member: Optional source-emitted call to the same member.
 
     Returns:
         The prepared member with the same construction provenance as a native build.
@@ -96,4 +98,6 @@ def build_prepared_family_replacement(
         MappingProxyType(_decode_construction_value(prepared["resolved_arguments"])),
         MappingProxyType(dict(prepared["selectors"])), _axis_sizes(context),
     )
-    return _build_family_member(request, resolved, module=module, module_fqn=module_fqn, context=context)
+    return _build_family_member(
+        request, resolved, module=module, module_fqn=module_fqn, context=context, construct_member=construct_member,
+    )

@@ -250,13 +250,15 @@ def _build_family_member(
     module: nn.Module | None = None,
     module_fqn: str = "",
     context: Mapping[str, Any],
+    construct_member: Callable | None = None,
 ) -> nn.Module:
     """Construct an already resolved choice without parsing the same request again."""
     context = MappingProxyType(dict(context))
     if member.family.validate is not None:
         member.family.validate(config=config, module=module, context=context, member=member)
     config = deepcopy(config)
-    result = member.constructor(**_constructor_arguments(member, config, module, module_fqn, context))
+    constructor = member.constructor if construct_member is None else construct_member
+    result = constructor(**_constructor_arguments(member, config, module, module_fqn, context))
     if not isinstance(result, nn.Module):
         raise TypeError("a family constructor must return nn.Module")
     info = FamilyBuildInfo(request, member, deepcopy(config), "direct" if module is None else "replacement")

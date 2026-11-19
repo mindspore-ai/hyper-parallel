@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import replace
 from typing import Any
@@ -25,7 +25,11 @@ import weakref
 from torch import nn
 
 from hyper_parallel.components.modules.module_family import FamilyRequest, resolve_family
-from hyper_parallel.models.preparation_manifest import _encode_construction_value, _replacement_replay
+from hyper_parallel.models.preparation_manifest import (
+    _encode_construction_value,
+    _replacement_replay,
+    _replacement_replay_call,
+)
 from hyper_parallel.models.prepared_family import (
     PREPARED_FAMILY_RECORD_VERSION,
     _decode_construction_value,
@@ -67,7 +71,7 @@ def _source_constructor(record: Mapping[str, Any]):
     return request, factory
 
 
-def _prepare_factory(record, factory, source_type, expected_type, generated_type):
+def _prepare_factory(record, factory, source_type, expected_type, generated_type, emitted=None):
     """Retain the recorded concrete member and optional emitted forward subclass."""
     selection = record.get("family_request", {}).get("selection")
 
@@ -78,13 +82,19 @@ def _prepare_factory(record, factory, source_type, expected_type, generated_type
             # A shallow view preserves its tensors and the native type checks.
             module = copy(module)
             module.__class__ = source_type
-        if selection is None:
-            candidate = factory(module=module, module_fqn=module_fqn, context=context)
+        if selection is not None:
+            candidate = build_prepared_family_replacement(
+                module=module, module_fqn=module_fqn, prepared=selection, construct_member=emitted,
+            )
+        elif emitted is not None:
+            arguments = _decode_construction_value(record["replay"]["constructor_arguments"])
+            candidate = emitted(module=module, module_fqn=module_fqn, context=context, **arguments)
         else:
-            candidate = build_prepared_family_replacement(module=module, module_fqn=module_fqn, prepared=selection)
-        if type(candidate) is not expected_type:  # pylint: disable=unidiomatic-typecheck
+            candidate = factory(module=module, module_fqn=module_fqn, context=context)
+        actual_type = type(candidate)
+        if actual_type not in (expected_type, generated_type):
             raise _mismatch(f"{module_fqn!r} installed {type(candidate)!r}, expected {expected_type!r}")
-        if generated_type is not expected_type:
+        if actual_type is not generated_type:
             # The emitted subclass supplies forwards only. The recorded native
             # constructor owns parameters, state and checkpoint conversion.
             candidate.__class__ = generated_type
@@ -93,7 +103,7 @@ def _prepare_factory(record, factory, source_type, expected_type, generated_type
     return build
 
 
-def _recorded_target(model, record, aliases, namespace):
+def _recorded_target(model, record, aliases, namespace, emitted=None):
     paths = tuple(record["module_fqns"])
     if not paths or len(set(paths)) != len(paths):
         raise _mismatch("invalid replacement aliases")
@@ -117,7 +127,7 @@ def _recorded_target(model, record, aliases, namespace):
         generated = expected
     request, factory = _source_constructor(record)
     spec = ModuleReplacementSpec(
-        paths, _prepare_factory(record, factory, source_type, expected, generated),
+        paths, _prepare_factory(record, factory, source_type, expected, generated, emitted),
         declaration_id=record["rule_id"], request=request,
     )
     return ModuleReplacementTarget(paths, weakref.ref(source), spec), source_type, generated
@@ -125,10 +135,17 @@ def _recorded_target(model, record, aliases, namespace):
 
 def install_prepared_components(
     model: nn.Module, records: Sequence[Mapping[str, Any]], topology: Mapping[str, Any], namespace: Mapping[str, Any],
+    *, constructors: Mapping[str, Callable] | None = None,
 ) -> None:
     """Replay a bundle against its original tree using the shared atomic installer."""
     inventory = _module_aliases(model)
-    staged = [_recorded_target(model, record, inventory, namespace) for record in records]
+    if constructors is not None and set(constructors) != {record["primary_fqn"] for record in records}:
+        raise _mismatch("emitted constructors must match all recorded replacement paths")
+    emitted = constructors or {}
+    staged = [
+        _recorded_target(model, record, inventory, namespace, emitted.get(record["primary_fqn"]))
+        for record in records
+    ]
     targets = tuple(item[0] for item in staged)
     if len({id(target.source) for target in targets}) != len(targets):
         raise _mismatch("duplicate prepared replacement boundary")
@@ -183,6 +200,11 @@ def _validate_installed_target(target, module, record, rule_id, context):
     replay = _replacement_replay(target.spec, context)
     if any(replay.get(name) != record["replay"][name] for name in ("target", "arguments", "request")):
         raise _mismatch(f"replacement target or arguments changed at {path!r}")
+    if not record.get("family_request") and "constructor" in record["replay"]:
+        current = _replacement_replay_call(target.spec, context, None)
+        if current != {**replay, "constructor": record["replay"]["constructor"],
+                       "constructor_arguments": record["replay"]["constructor_arguments"]}:
+            raise _mismatch(f"replacement constructor changed at {path!r}")
     _validate_family_selection(record, target.spec.request, context, path)
 
 

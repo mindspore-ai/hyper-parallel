@@ -27,7 +27,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from torch import Tensor, nn
 
-from hyper_parallel.components.modules.module_family import collect_family_modules, get_family_build_info
+from hyper_parallel.components.modules.module_family import (
+    collect_family_modules,
+    get_family_build_info,
+    resolve_module_family_target,
+)
 from hyper_parallel.models.prepared_family import PREPARED_FAMILY_RECORD_VERSION
 
 if TYPE_CHECKING:
@@ -516,9 +520,25 @@ def _describe_prepared_applications(
             resolved_variant=resolved_variant,
             resolved_arguments=resolved_arguments,
             construction_context=construction_context,
-            replay=_replacement_replay(target.spec, context),
+            replay=_replacement_replay_call(target.spec, context, resolved_member),
         ))
     return tuple(records)
+
+
+def _replacement_replay_call(spec, context, member: SymbolRef | None) -> dict[str, Any]:
+    """Add the executable constructor and arguments to the captured recipe."""
+    replay = _replacement_replay(spec, context)
+    if not replay:
+        return replay
+    arguments = {}
+    if member is not None:
+        constructor = member.legacy_path()
+    elif spec.request is not None:
+        factory, arguments = resolve_module_family_target(spec.request.target, spec.request.kwargs)
+        constructor = SymbolRef.from_object(factory).legacy_path()
+    else:
+        constructor = replay["target"]
+    return {**replay, "constructor": constructor, "constructor_arguments": _encode_construction_value(arguments)}
 
 
 def _replacement_replay(spec: ModuleReplacementSpec, context: Mapping[str, Any]) -> dict[str, Any]:

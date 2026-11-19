@@ -38,6 +38,10 @@ from typing import Any
 
 from hyper_parallel.codegen.source.composition import compose_nested_model_sources
 from hyper_parallel.codegen.source.compat import sanitize_source_compat
+from hyper_parallel.codegen.emit.family_forwards import (
+    materialize_parallel_family_forwards,
+    verify_parallel_family_forwards,
+)
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_plan
@@ -352,6 +356,7 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
             None if getattr(emission_meta, "nested_components", None) else source_path
         ),
     )
+    text = materialize_parallel_family_forwards(text, getattr(meta, "parallel_forwards", {}))
     text = _lower_forward_boundaries(text, emission_meta, module_name)
     text = _emit_preinstalled_components(text, meta)
     _verify_recorded_patch_materialization(
@@ -380,16 +385,37 @@ def _emit_preinstalled_components(text: str, meta: Any) -> str:
     body = lines[constructor.body[0].lineno - 1]
     indent = body[:len(body) - len(body.lstrip())]
     entries = "".join(f"{indent}    {record!r},\n" for record in records)
+    imports, constructors_by_fqn = _emitted_constructors(records, getattr(meta, "parallel_forwards", {}), indent)
     lines[constructor.end_lineno:constructor.end_lineno] = [
         f"{indent}from hyper_parallel.models._generated.phase_c import apply_generated_phase_c\n",
         f"{indent}self._hp_bind_materialized_forwards = apply_generated_phase_c\n",
         f"{indent}from hyper_parallel.models.preinstalled import install_prepared_components\n",
+        *imports,
         f"{indent}self.__hp_prepared_components__ = (\n{entries}{indent})\n",
         f"{indent}install_prepared_components(\n",
         f"{indent}    self, self.__hp_prepared_components__, {meta.parallel_dims!r}, globals(),\n",
+        f"{indent}    constructors={{\n{constructors_by_fqn}{indent}    }},\n",
         f"{indent})\n",
     ]
     return "".join(lines)
+
+
+def _emitted_constructors(records, parallel_forwards, indent):
+    """Emit a direct executable factory call for every prepared module path."""
+    imports = {}
+    calls = []
+    for record in records:
+        fqn = record["primary_fqn"]
+        symbol = record["replay"]["constructor"]
+        module, name = symbol.split(":", 1)
+        if parallel_forwards.get(fqn, {}).get("type") == symbol:
+            callee = name
+        else:
+            alias = imports.setdefault(module, f"_hp_constructor_module_{len(imports)}")
+            callee = f"{alias}.{name}"
+        calls.append(f"{indent}        {fqn!r}: lambda **kwargs: {callee}(**kwargs),\n")
+    statements = [f"{indent}import {module} as {alias}\n" for module, alias in imports.items()]
+    return statements, "".join(calls)
 
 
 def _verify_recorded_patch_materialization(
@@ -409,9 +435,11 @@ def _verify_recorded_patch_materialization(
     wrapper_records = (
         getattr(patches, "inner_wrappers", ()) if patches is not None else ()
     )
-    if not local_records and not replacement_records and not wrapper_records:
+    parallel_forwards = getattr(meta, "parallel_forwards", {})
+    if not local_records and not replacement_records and not wrapper_records and not parallel_forwards:
         return
     tree = ast.parse(text)
+    verify_parallel_family_forwards(tree, parallel_forwards)
     classes = _class_index(tree)
     materialized = getattr(meta, "materialized_patches", None)
     if isinstance(materialized, list):
@@ -515,12 +543,17 @@ def _verify_replacement_records(
     bound_names = {
         node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
     } | set(classes)
+    prepared, emitted = _preinstalled_calls(tree)
     missing = []
     for record in records:
         constructor = getattr(record, "factory", None) or record.replacement_type
         name = constructor.__name__
-        if _has_preinstalled_record(tree, record.module_fqn):
-            _record_materialized(materialized, record.module_fqn, name, "module_replacement", "constructor")
+        if record.module_fqn in prepared:
+            expected = prepared[record.module_fqn]
+            if not expected or emitted.get(record.module_fqn) != expected:
+                missing.append(f"{record.module_fqn} (missing executable constructor {expected!r})")
+            else:
+                _record_materialized(materialized, record.module_fqn, expected, "module_replacement", "constructor")
             continue
         visible = name in bound_names and any(
             isinstance(node, ast.Call) and _call_name(node.func) == name
@@ -539,15 +572,34 @@ def _verify_replacement_records(
     return missing
 
 
-def _has_preinstalled_record(tree: ast.AST, fqn: str) -> bool:
-    """Use literal FQN records as source evidence for shared installations."""
+def _preinstalled_calls(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
+    """Retrieve prepared identities and the executable constructor map separately."""
+    prepared = {}
+    emitted = {}
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if any(isinstance(target, ast.Attribute) and target.attr == "__hp_prepared_components__"
-               for target in node.targets):
-            return any(fqn in item["module_fqns"] for item in ast.literal_eval(node.value))
-    return False
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Attribute) and target.attr == "__hp_prepared_components__"
+            for target in node.targets
+        ):
+            prepared.update({
+                item["primary_fqn"]: item["replay"].get("constructor", "").split(":")[-1].split(".")[-1]
+                for item in ast.literal_eval(node.value)
+            })
+        elif isinstance(node, ast.Call) and _call_name(node.func) == "install_prepared_components":
+            emitted.update(_constructor_call_map(node))
+    return prepared, emitted
+
+
+def _constructor_call_map(node: ast.Call) -> dict[str, str]:
+    """Read direct calls keyed by FQN from a shared installer invocation."""
+    mapping = next((keyword.value for keyword in node.keywords if keyword.arg == "constructors"), None)
+    if not isinstance(mapping, ast.Dict):
+        return {}
+    return {
+        key.value: _call_name(value.body.func)
+        for key, value in zip(mapping.keys, mapping.values)
+        if isinstance(key, ast.Constant) and isinstance(value, ast.Lambda) and isinstance(value.body, ast.Call)
+    }
 
 
 def _wrapper_identity(record: Any) -> tuple[Any, str, str]:
