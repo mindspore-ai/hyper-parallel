@@ -83,20 +83,15 @@ def _model_init_kwargs(
     kwargs: dict[str, Any],
     *,
     load_base_model: bool,
-    is_hf_model: bool,
 ) -> dict[str, Any]:
-    """Filter download options while preserving HF's explicit model import policy."""
+    """Drop config/download-only kwargs when constructing directly from config."""
     if load_base_model:
         return dict(kwargs)
-    filtered = {
+    return {
         key: value
         for key, value in kwargs.items()
         if key not in _CONFIG_ONLY_KWARGS
     }
-    # HF AutoModel.from_config checks trust before importing a custom class.
-    if is_hf_model and "trust_remote_code" in kwargs:
-        filtered["trust_remote_code"] = kwargs["trust_remote_code"]
-    return filtered
 
 
 def _requires_quantized_initialization(
@@ -443,7 +438,6 @@ class _BaseHyperAutoModelClass:
         init_kwargs = _model_init_kwargs(
             dict(kwargs),
             load_base_model=init_pretrained_path is not None,
-            is_hf_model=is_hf_model,
         )
         with init_ctx:
             if model_factory is not None:

@@ -101,7 +101,7 @@ def test_codegen_observation_rejects_missing_ep_compute_source():
     with pytest.raises(ValueError, match=error) as native:
         model_builder._plan_and_apply_sharding(model, mesh, Planner(), True, False)
     with capture_model_build_plan():
-        record_model_source_for_capture(model, pretrained_model_name_or_path=None, is_hf_model=True)
+        record_model_source_for_capture(model, pretrained_model_name_or_path=None)
         with pytest.raises(ValueError, match=error) as captured:
             model_builder._plan_and_apply_sharding(model, mesh, Planner(), True, False)
     assert str(captured.value) == str(native.value), f"Capture: {captured.value}; native: {native.value}"
@@ -125,7 +125,7 @@ def test_codegen_plan_guards_record_reason(planner, mesh, is_hf_model, reason):
     """
     model = nn.Module()
     with capture_model_build_plan() as capture:
-        record_model_source_for_capture(model, pretrained_model_name_or_path=None, is_hf_model=is_hf_model)
+        record_model_source_for_capture(model, pretrained_model_name_or_path=None)
         model, _ = prepare_model_components(model, build_module_context(None))
         model_builder._plan_and_apply_sharding(model, mesh, planner, is_hf_model, False)
     assert capture.planning_finished, "The capture must finish without invoking the planner"

@@ -729,7 +729,6 @@ def apply_model_infrastructure(
     record_model_source_for_capture(
         model,
         pretrained_model_name_or_path=pretrained_path,
-        is_hf_model=is_hf_model,
     )
 
     model, weights_mapping = _maybe_apply_module_replacements(

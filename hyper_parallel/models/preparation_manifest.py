@@ -16,19 +16,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import partial
 from importlib import import_module
-import re
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from torch import Tensor, nn
 
-from hyper_parallel.components.modules.module_family import collect_family_modules
+from hyper_parallel.components.modules.module_family import collect_family_modules, get_family_build_info
+from hyper_parallel.models.prepared_family import PREPARED_FAMILY_RECORD_VERSION
+
+if TYPE_CHECKING:
+    from hyper_parallel.models.replacement import ModuleReplacementPlan, ModuleReplacementSpec, ModuleReplacementTarget
 
 
 _JSON_SCALARS = (type(None), bool, int, float, str)
@@ -217,8 +220,6 @@ class ReplacementApplication:
     aliases: tuple[str, ...]
     source_type: SymbolRef
     replacement_type: SymbolRef
-    family_id: str | None = None
-    family_version: int | None = None
     request_target: SymbolRef | None = None
     resolved_member: SymbolRef | None = None
     selectors: Mapping[str, Any] = field(default_factory=dict)
@@ -265,7 +266,7 @@ class ReplacementApplication:
             if self.resolved_variant is not None:
                 record["family_request"]["selection"] = {
                     "target": self.request_target.legacy_path(),
-                    "version": self.family_version,
+                    "version": PREPARED_FAMILY_RECORD_VERSION,
                     "variant": self.resolved_variant,
                     "member": self.resolved_member.legacy_path(),
                     "selectors": _stable_value_to_data(self.selectors),
@@ -281,8 +282,6 @@ class ReplacementApplication:
             "aliases": list(self.aliases),
             "source_type": self.source_type.to_dict(),
             "replacement_type": self.replacement_type.to_dict(),
-            "family_id": self.family_id,
-            "family_version": self.family_version,
             "request_target": None if self.request_target is None else self.request_target.to_dict(),
             "resolved_member": None if self.resolved_member is None else self.resolved_member.to_dict(),
             "resolved_variant": self.resolved_variant,
@@ -304,14 +303,11 @@ class PreparedComponent:
     emission_owner_boundary_id: str
     origin: Literal["direct", "replacement", "native"]
     aliases: tuple[str, ...]
-    family_id: str | None = None
-    family_version: int | None = None
     request_target: SymbolRef | None = None
     resolved_member: SymbolRef | None = None
     selectors: Mapping[str, Any] = field(default_factory=dict)
     declaration_id: str | None = None
     source_type: SymbolRef | None = None
-    state_contract_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "selectors", _freeze_stable_value(self.selectors, path="component.selectors"))
@@ -329,14 +325,11 @@ class PreparedComponent:
             "emission_owner_boundary_id": self.emission_owner_boundary_id,
             "origin": self.origin,
             "aliases": list(self.aliases),
-            "family_id": self.family_id,
-            "family_version": self.family_version,
             "request_target": None if self.request_target is None else self.request_target.to_dict(),
             "resolved_member": None if self.resolved_member is None else self.resolved_member.to_dict(),
             "selectors": _stable_value_to_data(self.selectors),
             "declaration_id": self.declaration_id,
             "source_type": None if self.source_type is None else self.source_type.to_dict(),
-            "state_contract_id": self.state_contract_id,
         }
 
 
@@ -450,16 +443,77 @@ def record_replacement_applications(applications: Sequence[ReplacementApplicatio
         target.extend(applications)
 
 
-def is_replacement_application_collection_active() -> bool:
-    """Return whether shared preparation is currently collecting applications."""
-    return _ACTIVE_APPLICATIONS.get() is not None
+def replacement_application_capture(
+    plan: ModuleReplacementPlan,
+    context: Mapping[str, Any],
+    resolve_rule_id: Callable[[ModuleReplacementSpec, int], str],
+) -> Callable[[Iterable[tuple[ModuleReplacementTarget, nn.Module, list]]], tuple[ReplacementApplication, ...]] | None:
+    """Set up batch observation only within the opt-in preparation capture."""
+    if _ACTIVE_APPLICATIONS.get() is None:
+        return None
+    rule_ids = {id(spec): resolve_rule_id(spec, index) for index, spec in enumerate(plan.specs)}
+    for target in plan.targets:
+        identity = id(target.spec)
+        if identity not in rule_ids:
+            rule_ids[identity] = resolve_rule_id(target.spec, len(rule_ids))
+
+    def describe_batch(
+        prepared: Iterable[tuple[ModuleReplacementTarget, nn.Module, list]],
+    ) -> tuple[ReplacementApplication, ...]:
+        return _describe_prepared_applications(prepared, rule_ids, context)
+
+    return describe_batch
 
 
-def _family_identity(family: Any) -> tuple[str, int]:
-    family_id = getattr(family, "family_id", None)
-    if family_id is None:
-        family_id = re.sub(r"[^a-z0-9]+", "_", family.name.strip().lower()).strip("_")
-    return family_id, family.schema_version
+def _describe_prepared_applications(
+    prepared: Iterable[tuple[ModuleReplacementTarget, nn.Module, list]],
+    rule_ids: Mapping[int, str],
+    context: Mapping[str, Any],
+) -> tuple[ReplacementApplication, ...]:
+    """Describe one candidate batch before successful installation releases its sources."""
+    records = []
+    for target, candidate, transforms in prepared:
+        declaration_id = rule_ids[id(target.spec)]
+        family = get_family_build_info(candidate)
+        request_target = resolved_member = resolved_variant = None
+        selectors = request_arguments = resolved_arguments = axis_sizes = construction_context = {}
+        if family is not None and family.origin == "replacement":
+            request_target = SymbolRef.from_object(family.request.target, path=f"replacement {declaration_id} request")
+            resolved_member = SymbolRef.from_object(
+                family.resolved.constructor,
+                path=f"replacement {declaration_id} member",
+            )
+            selectors = family.resolved.selectors
+            request_arguments = family.request.kwargs
+            resolved_variant = family.resolved.variant
+            resolved_arguments = family.resolved.arguments
+            axis_sizes = {
+                f"{axis}_size": size for axis, size in family.resolved.axis_sizes.items()
+            }
+            construction_context = {
+                **axis_sizes,
+                **{axis: size > 1 for axis, size in family.resolved.axis_sizes.items()},
+                **{name: context[name] for name in (
+                    "sequence_parallel", "loss_parallel", "mesh_dim_names", "device_type", "dtype",
+                ) if name in context},
+            }
+        records.append(ReplacementApplication(
+            boundary_id=f"replacement:{declaration_id}:{target.module_fqns[0] or '<root>'}",
+            declaration_id=declaration_id,
+            aliases=target.module_fqns,
+            source_type=SymbolRef.from_object(type(target.source), path=f"replacement {declaration_id} source"),
+            replacement_type=SymbolRef.from_object(type(candidate), path=f"replacement {declaration_id} candidate"),
+            request_target=request_target,
+            resolved_member=resolved_member,
+            selectors=selectors,
+            request_arguments=request_arguments,
+            axis_sizes=axis_sizes,
+            weight_conversions=tuple(WeightConversionRecord.from_transform(item) for item in transforms),
+            resolved_variant=resolved_variant,
+            resolved_arguments=resolved_arguments,
+            construction_context=construction_context,
+        ))
+    return tuple(records)
 
 
 def _boundary_id(kind: str, primary_fqn: str, identity: str) -> str:
@@ -517,14 +571,14 @@ def build_preparation_manifest(
     family_aliases = set()
     for boundary in collect_family_modules(model):
         info = boundary.info
-        family_id, family_version = _family_identity(info.resolved.family)
+        request_target = SymbolRef.from_object(info.request.target, path="prepared family request")
         aliases = tuple(sorted(boundary.fqns))
         family_aliases.update(aliases)
         application = next((application_by_alias[alias] for alias in aliases if alias in application_by_alias), None)
         declaration_id = None if application is None else application.declaration_id
         source_type = None if application is None else application.source_type
         boundary_id = (
-            _boundary_id("family", aliases[0], family_id)
+            _boundary_id("family", aliases[0], request_target.legacy_path())
             if application is None
             else application.boundary_id
         )
@@ -534,10 +588,8 @@ def build_preparation_manifest(
             emission_owner_boundary_id=boundary_id,
             origin=info.origin if application is None else "replacement",
             aliases=aliases,
-            family_id=family_id,
-            family_version=family_version,
-            request_target=SymbolRef.from_object(info.request.target, path=f"family {family_id} request"),
-            resolved_member=SymbolRef.from_object(info.resolved.constructor, path=f"family {family_id} member"),
+            request_target=request_target,
+            resolved_member=SymbolRef.from_object(info.resolved.constructor, path="prepared family member"),
             selectors=info.resolved.selectors,
             declaration_id=declaration_id,
             source_type=source_type,

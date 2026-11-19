@@ -70,8 +70,8 @@ class TestDeferredPretrained(unittest.TestCase):
         self.assertIs(result, model)
         parent.assert_called_once_with(config, trust_remote_code=True)
 
-    def test_config_first_build_preserves_explicit_remote_code_policy(self):
-        """The common builder forwards the caller's trust decision to HF."""
+    def test_config_first_build_filters_download_options(self):
+        """The native model constructor receives only model initialization options."""
         model = torch.nn.Linear(2, 2)
         for trust in (False, True):
             with self.subTest(trust=trust), \
@@ -84,7 +84,7 @@ class TestDeferredPretrained(unittest.TestCase):
                     load_base_model=True, trust_remote_code=trust,
                 )
             self.assertIsNone(initialize.call_args.args[1])
-            self.assertIs(initialize.call_args.kwargs["trust_remote_code"], trust)
+            self.assertNotIn("trust_remote_code", initialize.call_args.kwargs)
 
     def test_loader_selects_initial_construction_and_preserves_final_load(self):
         """Feature: automatic deferred HF loading.

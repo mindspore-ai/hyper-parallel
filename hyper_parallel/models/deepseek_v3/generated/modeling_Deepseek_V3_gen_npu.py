@@ -47,7 +47,7 @@ from transformers.utils.generic import is_flash_attention_requested, maybe_autoc
 from transformers.utils.output_capturing import capture_outputs
 
 
-from hyper_parallel.components.modules.module_family import build_prepared_family_replacement
+from hyper_parallel.models.prepared_family import build_prepared_family_replacement
 
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 

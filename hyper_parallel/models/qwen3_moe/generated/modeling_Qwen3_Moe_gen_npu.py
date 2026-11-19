@@ -67,7 +67,7 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 
 from hyper_parallel.components.modules import GroupedExperts, RMSNorm
-from hyper_parallel.components.modules.module_family import build_prepared_family_replacement
+from hyper_parallel.models.prepared_family import build_prepared_family_replacement
 
 
 

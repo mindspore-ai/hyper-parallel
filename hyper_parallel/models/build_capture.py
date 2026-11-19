@@ -100,7 +100,6 @@ def record_model_source_for_capture(
     model: Any,
     *,
     pretrained_model_name_or_path: Any,
-    is_hf_model: bool,
 ) -> None:
     """Record deterministic source identity before shared preparation mutates the tree."""
     capture = _ACTIVE_CAPTURE.get()
@@ -122,7 +121,6 @@ def record_model_source_for_capture(
         "pretrained_model_name_or_path": (
             None if pretrained_model_name_or_path is None else str(pretrained_model_name_or_path)
         ),
-        "is_hf_model": bool(is_hf_model),
     }
 
 

@@ -79,8 +79,6 @@ class ComponentBoundaryIR:
     emission_owner_boundary_id: str
     origin: str
     aliases: tuple[str, ...]
-    family_id: Optional[str] = None
-    family_version: Optional[int] = None
     declaration_id: Optional[str] = None
     values: Mapping[str, Any] = field(default_factory=dict)
     replacement: Optional[Mapping[str, Any]] = None
@@ -140,7 +138,6 @@ class EmissionPlanIR:
 class CodegenBuildIR:
     """Complete immutable projection of one shared Trainer model build."""
 
-    schema_version: int
     source: ModelSourceIR
     declarations: tuple[Mapping[str, Any], ...]
     components: tuple[ComponentBoundaryIR, ...]
@@ -151,8 +148,6 @@ class CodegenBuildIR:
     reason: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.schema_version < 1:
-            raise ValueError("codegen IR schema_version must be positive")
         object.__setattr__(
             self,
             "declarations",

@@ -149,8 +149,6 @@ def project_model_build(capture: ModelBuildCapture) -> CodegenBuildIR:
             emission_owner_boundary_id=component.emission_owner_boundary_id,
             origin=component.origin,
             aliases=component.aliases,
-            family_id=component.family_id,
-            family_version=component.family_version,
             declaration_id=component.declaration_id,
             values=component.to_dict(),
             replacement=(
@@ -187,7 +185,6 @@ def project_model_build(capture: ModelBuildCapture) -> CodegenBuildIR:
         for binding in manifest.native_bindings
     )
     return CodegenBuildIR(
-        schema_version=1,
         source=ModelSourceIR(capture.source or {}),
         declarations=manifest.declarations,
         components=components,

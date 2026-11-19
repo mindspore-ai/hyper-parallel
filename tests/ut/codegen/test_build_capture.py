@@ -57,12 +57,10 @@ class TestModelBuildCapture(unittest.TestCase):
                 build_capture.record_model_source_for_capture(
                     inner_model,
                     pretrained_model_name_or_path=None,
-                    is_hf_model=True,
                 )
             build_capture.record_model_source_for_capture(
                 outer_model,
                 pretrained_model_name_or_path=None,
-                is_hf_model=True,
             )
 
         self.assertEqual(inner.source["model_type"], "inner")
@@ -88,7 +86,6 @@ class TestModelBuildCapture(unittest.TestCase):
                 build_capture.record_model_source_for_capture(
                     model,
                     pretrained_model_name_or_path=None,
-                    is_hf_model=True,
                 )
             captures.append(capture)
 
@@ -105,7 +102,6 @@ class TestModelBuildCapture(unittest.TestCase):
                 build_capture.record_model_source_for_capture(
                     model,
                     pretrained_model_name_or_path=model_type,
-                    is_hf_model=True,
                 )
                 self.assertTrue(build_capture.is_model_build_capture_active())
             self.assertFalse(build_capture.is_model_build_capture_active())
@@ -137,7 +133,6 @@ class TestModelBuildCapture(unittest.TestCase):
             build_capture.record_model_source_for_capture(
                 model,
                 pretrained_model_name_or_path=None,
-                is_hf_model=True,
             )
             prepared, _ = prepare_model_components(model, context)
             build_capture.record_model_plan_for_capture(prepared, None, None)
@@ -170,7 +165,6 @@ class TestModelBuildCapture(unittest.TestCase):
             build_capture.record_model_source_for_capture(
                 model,
                 pretrained_model_name_or_path=None,
-                is_hf_model=True,
             )
             prepared, _ = prepare_model_components(model, build_module_context(None))
             with patch.object(build_capture, "_prepare_sharding_meshes") as preflight, patch.object(

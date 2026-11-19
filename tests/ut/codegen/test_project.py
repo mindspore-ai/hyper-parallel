@@ -41,8 +41,6 @@ def _component() -> PreparedComponent:
         emission_owner_boundary_id="family:linear:block",
         origin="direct",
         aliases=("block",),
-        family_id="linear",
-        family_version=1,
         resolved_member=SymbolRef.from_object(nn.Linear),
     )
 

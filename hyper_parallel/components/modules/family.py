@@ -56,8 +56,6 @@ class ModuleFamily:
     validate: Callable | None = None
     # Optional declaration for members whose math has no distributed protocol methods.
     parallel_spec: Callable | None = None
-    family_id: str | None = None
-    schema_version: int = 1
 
 
 # Keep the baseline in the value so its identity cannot be reused while registered.
@@ -109,40 +107,12 @@ def _validate_variant_paths(family: ModuleFamily) -> None:
             raise ValueError(f"ModuleFamily {family.name}: invalid variant import path {path!r}")
 
 
-def _validate_family_metadata(family: ModuleFamily) -> None:
-    """Check fields that identify a family and its parallel dimension."""
-    if family.parallel_axis not in (None, "cp", "ep"):
-        raise ValueError("parallel_axis must be cp, ep or None")
-    if family.family_id is not None and (
-        not isinstance(family.family_id, str) or not family.family_id.strip()
-    ):
-        raise ValueError("family_id must be a non-empty string or None")
-    if (not isinstance(family.schema_version, int)
-            or isinstance(family.schema_version, bool) or family.schema_version < 1):
-        raise ValueError("schema_version must be a positive integer")
-
-
-def _validate_rule_condition(family: ModuleFamily, rule: VariantRule, defaults: Mapping[str, Any]) -> None:
-    """Check that a rule names a declared member and a complete selector combination."""
-    if not isinstance(rule, VariantRule) or not isinstance(rule.when, Mapping):
-        raise TypeError(f"ModuleFamily {family.name}: expected VariantRule with a mapping condition")
-    if set(rule.when) != set(defaults):
-        raise ValueError(f"ModuleFamily {family.name}: each rule must contain exactly {sorted(defaults)}")
-    for name, value in rule.when.items():
-        if name == "parallel" and family.default_variant is not None:
-            if not isinstance(value, bool):
-                raise TypeError("derived parallel conditions must be bool")
-        else:
-            _validate_selector_value(family, name, value)
-    if rule.variant not in family.variants:
-        raise ValueError(f"ModuleFamily {family.name}: undeclared variant {rule.variant!r}")
-
-
 def _validate_family_rules(family: ModuleFamily) -> None:
     """Check complete, unique whitelist entries before registration."""
     defaults = _validate_selector_specs(family)
     _validate_variant_paths(family)
-    _validate_family_metadata(family)
+    if family.parallel_axis not in (None, "cp", "ep"):
+        raise ValueError("parallel_axis must be cp, ep or None")
     if family.default_variant is not None:
         if family.default_variant not in family.variants:
             raise ValueError("default_variant must name a declared concrete variant")
@@ -151,7 +121,19 @@ def _validate_family_rules(family: ModuleFamily) -> None:
         defaults = {**defaults, "parallel": False}
     conditions = [defaults]  # The default combination is an explicit baseline allowance.
     for rule in family.variant_rules:
-        _validate_rule_condition(family, rule, defaults)
+        if not isinstance(rule, VariantRule) or not isinstance(rule.when, Mapping):
+            raise TypeError(f"ModuleFamily {family.name}: expected VariantRule with a mapping condition")
+        if set(rule.when) != set(defaults):
+            raise ValueError(f"ModuleFamily {family.name}: each rule must contain exactly {sorted(defaults)}")
+        for name, value in rule.when.items():
+            if name == "parallel" and family.default_variant is not None:
+                actual_type = type(value)
+                if actual_type is not bool:
+                    raise TypeError("derived parallel conditions must be bool")
+            else:
+                _validate_selector_value(family, name, value)
+        if rule.variant not in family.variants:
+            raise ValueError(f"ModuleFamily {family.name}: undeclared variant {rule.variant!r}")
         condition = dict(rule.when)
         if condition in conditions:
             raise ValueError(f"ModuleFamily {family.name}: duplicate or baseline-default rule {condition!r}")

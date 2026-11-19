@@ -18,9 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 
-PREPARED_FAMILY_CONSTRUCTOR = (
-    "hyper_parallel.components.modules.module_family:build_prepared_family_replacement"
-)
+PREPARED_FAMILY_CONSTRUCTOR = "hyper_parallel.models.prepared_family:build_prepared_family_replacement"
 
 
 def replacement_factory(family: dict[str, Any]) -> tuple[str, dict[str, Any]]:
