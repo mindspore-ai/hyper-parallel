@@ -52,16 +52,7 @@ from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_p
 
 
 def copy_original_modeling(source: Any) -> str:
-    """Read the original modeling source text from a ``ResolvedSource``-like.
-
-    ``source`` is ``meta.source`` — the ``ResolvedSource.to_dict()`` form with
-    a ``file_path`` key.  Accepts either a dict or a ``ResolvedSource`` (the
-    dict form is what the manager records, but the helper tolerates the live
-    dataclass so it stays usable outside the meta path).
-
-    Args:
-        source: Resolved source metadata containing the original modeling file.
-    """
+    """Read the modeling source selected by the native build."""
     if isinstance(source, dict):
         path = source.get("file_path")
     else:
