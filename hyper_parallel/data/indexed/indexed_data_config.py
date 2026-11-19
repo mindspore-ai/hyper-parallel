@@ -272,7 +272,7 @@ def build_gpt_dataset_config(
 
         config = GPTDatasetConfig(
             random_seed=data_config["random_seed"],
-            sequence_length=data_config["seq_length"],
+            sequence_length=data_config["max_seq_len"],
             tokenizer=tokenizer,
             mock=mock_data,
             blend=None if has_independent_blends else list(data_paths),

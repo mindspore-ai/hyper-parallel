@@ -24,6 +24,7 @@ from contextlib import ExitStack
 from typing import Any
 
 import numpy as np
+from numpy.random import RandomState
 
 from hyper_parallel.data.constants import ONLINE_SOURCE_PATH_KEY, ONLINE_SPLIT_COUNT, ONLINE_SPLIT_NAMES
 from hyper_parallel.data.dataset_logging import get_dataset_logger
@@ -109,17 +110,21 @@ class MappingTransformDataset:
     def get_item(self, index: int) -> list[Any]:
         """Transform one source index into zero, one, or many output samples."""
         dataset_length = len(self.source_dataset)
+
         if index < 0:
             index += dataset_length
+
         if index < 0 or index >= dataset_length:
             raise IndexError("Online Mapping Dataset index out of range")
 
+        # One raw record may expand into zero, one, or several model samples.
         raw_sample = self.source_dataset[index]
         transformed_samples = self.transform(raw_sample)
         logger.debug(
             "Online sample source_index=%s sample_id=%s", index, raw_sample.get("id"),
             enabled=True,
         )
+
         if not isinstance(transformed_samples, list):
             raise TypeError("Online Mapping sample transform must return a list")
 
@@ -128,10 +133,12 @@ class MappingTransformDataset:
     def __getitem__(self, index: int) -> Any:
         """Return exactly one sample for fixed-size DataLoader consumers."""
         transformed_samples = self.get_item(index)
+
         if not transformed_samples:
             raise ValueError(
                 "An empty transform result requires source filtering or TokenBatchLoader"
             )
+
         if len(transformed_samples) != 1:
             raise ValueError("A multi-sample transform result requires TokenBatchLoader")
 
@@ -167,8 +174,10 @@ class _JsonlMappingSource:
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Deserialize one record and attach its source file context."""
         record_count = len(self)
+
         if index < 0:
             index += record_count
+
         if index < 0 or index >= record_count:
             raise IndexError("Online JSONL source index out of range")
 
@@ -272,8 +281,10 @@ class _JsonlMappingSource:
             source_record = json.loads(raw_record)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"Invalid JSONL record in {data_file}") from error
+
         if not isinstance(source_record, dict):
             raise ValueError(f"Online JSONL records must be objects: {data_file}")
+
         return source_record
 
 
@@ -289,18 +300,23 @@ class _OnlineBlendedMappingDataset:
         shuffle: bool = True,
     ) -> None:
         """Build the source schedule and source-local shuffle indices."""
+
         if not source_datasets or len(source_datasets) != len(weights):
             raise ValueError("Mapping blend sources and weights must be non-empty and aligned")
+
         if len(source_datasets) >= np.iinfo(np.int16).max:
             raise ValueError("Mapping blend supports fewer than 32767 sources")
+
         if size <= 0:
             raise ValueError("Mapping blend size must be positive")
 
         source_lengths = []
         for source_dataset in source_datasets:
             source_length = len(source_dataset)
+
             if source_length <= 0:
                 raise ValueError("Mapping blend sources must not be empty")
+
             source_lengths.append(source_length)
 
         self.source_datasets = tuple(source_datasets)
@@ -373,7 +389,7 @@ class _OnlineBlendedMappingDataset:
             self.source_index,
             minlength=len(self.source_datasets),
         )
-        source_random = np.random.RandomState(random_seed)
+        source_random = RandomState(random_seed)
         source_shuffle_indices = []
         for source_length, requested_samples in zip(source_lengths, source_sample_counts):
             repeated_epochs = int(np.ceil(int(requested_samples) / source_length))
@@ -381,8 +397,10 @@ class _OnlineBlendedMappingDataset:
                 np.arange(source_length, dtype=np.int64),
                 repeated_epochs,
             )
+
             if shuffle:
                 source_random.shuffle(source_sample_index)
+
             source_shuffle_indices.append(source_sample_index[:requested_samples])
         return tuple(source_shuffle_indices)
 
@@ -399,8 +417,10 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
     ) -> None:
         """Store source configuration and optional training sample targets."""
         super().__init__(data_path, data_config)
+
         if sampler_type not in ("single", "cyclic"):
             raise ValueError(f"Unsupported Mapping sampler_type: {sampler_type!r}")
+
         self.sampler_type = sampler_type
         self.train_valid_test_num_samples = self._validate_split_sizes(train_valid_test_num_samples)
 
@@ -419,8 +439,10 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         # Cyclic sampling owns epoch shuffle and repetition, including explicit single sources.
         if self.sampler_type == "cyclic" and len(source_results) == 1:
             source = source_results[0]
+
             if isinstance(source, tuple):
                 return tuple(split if split is not None and len(split) else None for split in source)
+
             return source if len(source) else None
 
         # Example: source A returns Dataset, while source B returns (train, valid, test).
@@ -474,23 +496,28 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         """Build one leaf through native JSONL indexing or the general loader."""
         data_path = source_loader.data_path
         split_config = source_loader.data_config.get("split")
+
         if isinstance(data_path, Mapping) and split_config is None:
             jsonl_split_sources = cls._try_build_presplit_jsonl_sources(
                 data_path,
                 sample_filter,
             )
+
             if jsonl_split_sources is not None:
                 return jsonl_split_sources
 
         if not isinstance(data_path, Mapping):
             jsonl_files = cls._resolve_native_jsonl_files(data_path)
             logger.debug("Resolved native JSONL files: %s", jsonl_files)
+
             if jsonl_files is not None:
                 jsonl_source = _JsonlMappingSource(jsonl_files, sample_filter)
+
                 if split_config is not None:
                     split_percentages = source_loader.parse_split_percentages(split_config)
                     jsonl_splits = jsonl_source.split_by_percentages(split_percentages)
                     return jsonl_splits
+
                 return jsonl_source
 
         mapping_source = source_loader.load(
@@ -506,6 +533,7 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         sample_filter: Callable[[Mapping[str, Any]], bool] | None,
     ) -> tuple[Any, Any, Any] | None:
         """Try to preserve configured splits with native JSONL sources."""
+
         if not data_path:
             return None
 
@@ -513,17 +541,22 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         for split_name, split_path in data_path.items():
             if split_name not in ONLINE_SPLIT_NAMES:
                 return None
+
             jsonl_files = cls._resolve_native_jsonl_files(split_path)
+
             if jsonl_files is None:
                 return None
+
             resolved_split_files[split_name] = jsonl_files
 
         split_sources = []
         for split_name in ONLINE_SPLIT_NAMES:
             split_source = None
             jsonl_files = resolved_split_files.get(split_name)
+
             if jsonl_files is not None:
                 split_source = _JsonlMappingSource(jsonl_files, sample_filter)
+
             split_sources.append(split_source)
         jsonl_split_sources = (split_sources[0], split_sources[1], split_sources[2])
         return jsonl_split_sources
@@ -535,24 +568,27 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         data_files = []
         for configured_path in configured_paths:
             matched_paths = sorted(glob.glob(configured_path))
+
             if os.path.isdir(configured_path):
                 matched_paths = sorted(glob.glob(os.path.join(configured_path, "*.jsonl")))
+
             if not matched_paths:
                 return None
+
             data_files.extend(matched_paths)
 
         if not data_files:
             return None
+
         for data_file in data_files:
             if not os.path.isfile(data_file) or os.path.splitext(data_file)[1].lower() != ".jsonl":
                 return None
+
         return data_files
 
     def _get_target_size(self, split_index: int, source_datasets: Sequence[Any]) -> int:
-        """Return the configured sample target or one natural blended epoch."""
-        if self.sampler_type != "cyclic" and self.train_valid_test_num_samples is not None:
-            return self.train_valid_test_num_samples[split_index]
-
+        """Size raw documents independently of the packed optimizer-step budget."""
+        del split_index
         natural_size = 0
         for source_dataset in source_datasets:
             natural_size += len(source_dataset)
@@ -588,14 +624,18 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
     @staticmethod
     def _validate_split_sizes(split_sizes: Sequence[int] | None) -> tuple[int, int, int] | None:
         """Validate optional train, validation, and test sample targets."""
+
         if split_sizes is None:
             return None
+
         if len(split_sizes) != ONLINE_SPLIT_COUNT:
             raise ValueError("Online Mapping sample targets must contain train, validation, and test sizes")
 
         normalized_sizes = (int(split_sizes[0]), int(split_sizes[1]), int(split_sizes[2]))
+
         if any(size < 0 for size in normalized_sizes):
             raise ValueError("Online Mapping sample targets must be non-negative")
+
         return normalized_sizes
 
 

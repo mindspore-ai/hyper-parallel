@@ -16,9 +16,6 @@ data:
   chat_template_kwargs: {enable_thinking: false}
   max_train_samples: null
   shuffle: true
-  num_workers: 0
-  prefetch_factor: null
-  pin_memory: false
 
 rollout:
   engine: vllm

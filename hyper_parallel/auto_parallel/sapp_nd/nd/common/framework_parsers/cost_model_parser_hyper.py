@@ -450,23 +450,16 @@ class CostModelParserHyperV2(_CostModelParser):
     def _dataset_seq_len(self) -> int:
         """The sequence length the dataset states, the legacy ``data.max_seq_len`` too, else 0.
 
-        The Online path states ``dataset.data_transform.max_seq_len`` and an
-        Indexed Dataset ``dataset.data_config.seq_length``; both describe the
-        dataset that runs, so they outrank the deprecated ``data.max_seq_len``.
+        Online and Indexed datasets state ``dataset.data_config.max_seq_len``;
+        it outranks the deprecated ``data.max_seq_len``.
         """
         data_raw = self._get_cfg_attr(self.config, "data", Config({}))
         legacy_seq_len = self._get_cfg_attr(data_raw, "max_seq_len", 0)
 
         dataset_raw = self._get_cfg_attr(self.config, "dataset", Config({}))
-        transform_raw = self._get_cfg_attr(
-            dataset_raw, "data_transform", Config({}),
-        )
-        trainer_seq_len = self._get_cfg_attr(transform_raw, "max_seq_len", 0)
-        # Only the Online path carries data_transform.max_seq_len; an Indexed
-        # Dataset states its length as data_config.seq_length.
         data_config_raw = self._get_cfg_attr(dataset_raw, "data_config", Config({}))
-        indexed_seq_len = self._get_cfg_attr(data_config_raw, "seq_length", 0)
-        return int(trainer_seq_len or indexed_seq_len or legacy_seq_len or 0)
+        dataset_seq_len = self._get_cfg_attr(data_config_raw, "max_seq_len", 0)
+        return int(dataset_seq_len or legacy_seq_len or 0)
 
     def _resolve_sequence_length(self) -> int:
         """The training sequence length: the dataset's, else the model's limit.
@@ -486,8 +479,7 @@ class CostModelParserHyperV2(_CostModelParser):
             # makes the quadratic attention term meaningless.
             logger.warning(
                 "no training sequence length in the config; costing the model "
-                "context limit of %d. Set dataset.data_transform.max_seq_len "
-                "(Online) or dataset.data_config.seq_length (Indexed).",
+                "context limit of %d. Set dataset.data_config.max_seq_len.",
                 int(model_seq_len or 4096),
             )
         return int(stated or model_seq_len or 4096)

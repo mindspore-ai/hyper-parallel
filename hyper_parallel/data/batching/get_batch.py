@@ -105,9 +105,11 @@ class OmniParallelBatch:
         """Read on source owners, slice for CP, and distribute only if needed."""
         self._batch_index += 1
         local_batch = None
+
         if self.parallel_context.build_on_rank():
             logger.debug("Omni get_batch: batch=%d source_read_begin", self._batch_index, enabled=True)
             source_batch = external_batch if external_batch is not None else next(data_iterator)
+
             if not isinstance(source_batch, Mapping):
                 raise TypeError("Omni DataLoader must yield a mapping batch")
 
@@ -121,14 +123,18 @@ class OmniParallelBatch:
             )
 
         transport_inputs = {}
+
         if self.batch_transport is None:
             device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
         else:
             device_batch, transport_inputs = self.batch_transport(local_batch, self.tp_broadcaster)
+
         runtime_inputs = self._build_runtime_inputs(device_batch)
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(device_batch)
+
         if set(transport_inputs).intersection((*device_batch, *runtime_inputs)):
             raise ValueError("batch transport cannot replace Omni model or runtime inputs")
+
         model_inputs.update(runtime_inputs)
         model_inputs.update(transport_inputs)
         # Shapes are host metadata; inspecting device tensor values here can stall collectives.
@@ -224,7 +230,7 @@ class TextParallelBatch:
             tokenizer: Tokenizer providing EOD and padding token semantics.
             data_config: Dataset options used to build runtime LTR fields.
             pp_shared_data: Whether pipeline stages share the prepared batch.
-            source_type: ``online``, ``indexed``, or ``packed_text`` batch contract.
+            source_type: ``online``, ``offline``, or ``packed_text`` batch contract.
                 Packed text provides input_ids, shifted labels, and explicit cu_seq_lens.
             attention_mode: ``dense`` or ``compressed`` attention representation.
             causal: Whether attention uses left-to-right causal semantics.
@@ -247,10 +253,11 @@ class TextParallelBatch:
         self.data_config = dict(data_config)
         self.source_type = source_type
         dataset_spec = data_config.get("low_level_dataset")
-        self.is_sft_dataset = (source_type == "indexed" and dataset_spec is not None
+        self.is_sft_dataset = (source_type == "offline" and dataset_spec is not None
                                and issubclass(resolve_dataset_type(dataset_spec), SFTFromMRDataset))
         self.causal = causal
         self.sliding_window = sliding_window
+
         if runtime_input_adapter is not None and not isinstance(
                 runtime_input_adapter, RuntimeInputAdapter
         ):
@@ -291,14 +298,20 @@ class TextParallelBatch:
     @staticmethod
     def _build_boundary_resolver(source_type: str, tokenizer: Any) -> OnlineBoundaryResolver | IndexedBoundaryResolver:
         """Select sequence-boundary handling for the source's input_ids batch."""
+
         if source_type in {"online", "packed_text"}:
-            return OnlineBoundaryResolver()
-        if source_type == "indexed":
-            return IndexedBoundaryResolver(getattr(tokenizer, "eod", None))
+            boundary_resolver = OnlineBoundaryResolver()
+            return boundary_resolver
+
+        if source_type == "offline":
+            boundary_resolver = IndexedBoundaryResolver(getattr(tokenizer, "eod", None))
+            return boundary_resolver
+
         raise ValueError(f"Unsupported batch source type: {source_type!r}")
 
     def _validate_attention_inputs(self, attention_mode: str, create_attention_mask: bool) -> None:
         """Require shifted labels and document isolation for prepared text records."""
+
         if self.source_type == "packed_text":
             if not self.labels_are_shifted:
                 raise ValueError("Packed text batches require shifted labels; labels_are_shifted must be True")
@@ -307,9 +320,11 @@ class TextParallelBatch:
                     "Packed text batches require document-boundary attention: enable "
                     "create_attention_mask_in_dataloader and supply a runtime_input_adapter for compressed attention"
                 )
+
         if self.is_sft_dataset:
             if not self.labels_are_shifted or self.eod_mask_loss or not self.causal:
                 raise ValueError("Prepared records require shifted labels, causal attention and eod_mask_loss=False")
+
             if (attention_mode == "compressed" or not create_attention_mask) and self.runtime_input_adapter is None:
                 raise ValueError("Prepared records without a dense mask require a boundary-aware runtime adapter")
 

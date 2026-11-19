@@ -102,11 +102,12 @@ dataset:
   _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
   data_path: /path/to/offline_text_document
   data_config:
-    seq_length: 4096
+    max_seq_len: 4096
     split: "1, 0, 0"
     mock_data: false
     distributed_walk: true
-    is_dataset_from_mr: false
+    low_level_dataset:
+      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
     simple_blend: "no"
     data_lazy_load: true
     skip_data_check: true
@@ -120,16 +121,9 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_indexed_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
-    source_type: indexed
+    source_type: offline
     attention_mode: dense
   sampler_type: single
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 
 optimizer:
   _target_: hyper_parallel.components.optim.Muon

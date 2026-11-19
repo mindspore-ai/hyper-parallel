@@ -1,5 +1,8 @@
 # SFT 数据处理特性
 
+模板省略默认参数，默认值见 [Dataset 默认值表](../../../hyper_parallel/data/README.zh.md#默认值不写入最小模板)。
+需要改变行为时再覆盖对应可选项；Trainer 注入项不要写入 YAML。
+
 本文介绍纯文本和图文 SFT 的数据格式、模板编码、监督标签、采样及组批配置。
 完整训练配置可参考 [Qwen Dense 文本 recipe](../../../hyper_parallel/models/qwen3_8/recipes/train_online.yaml)
 和 [Qwen MoE 图文 recipe](../../../hyper_parallel/models/qwen3_6_moe/recipes/train_online_vlm.yaml)。
@@ -33,7 +36,7 @@ flowchart TD
 | tools/thinking 配置 | tokenizer 模板路径支持，具体语义由模板决定 | 不自动继承纯文本模板配置 |
 | 图片路径、bytes | 不适用 | 支持路径和外部 images 中的 bytes/path |
 | 长度限制 | 模板编码保留尾部，再构建 shifted 输入与标签 | 超长报错，不截断媒体序列 |
-| Packing | 由 loader/collator 配置决定 | 设置 `dataloader._target_` 为 `OmniPackingLoader`，并配置 `token_budget` |
+| Packing | 由 loader/collator 配置决定 | 设置 `dataloader._target_` 为 `OmniPackingLoader`，由 `data_config.max_seq_len` 限定每条 packed 长度 |
 
 ## 2. 纯文本样本与配置
 
@@ -59,18 +62,16 @@ dataset:
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: /data/train.jsonl
   data_config:
-    labels_are_shifted: true
+    max_seq_len: 32768
   model_assets:
     chat_template: tokenizer
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /models/model
-      local_files_only: true
   data_transform:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: sharegpt
     text_keys: messages
-    max_seq_len: 32768
 ```
 
 ShareGPT 示例设置 `data_type: sharegpt`、`text_keys: conversations`。省略 text_keys 时，
@@ -86,6 +87,8 @@ plaintext/sharegpt 分别默认读取 text/conversations 列；role/content 消�
 替换上面配置中的 `data_transform`：
 
 ```yaml
+data_config:
+  max_seq_len: 32768
 data_transform:
   _target_: hyper_parallel.data.text.text_transform.build_text_transform
   data_type: alpaca
@@ -93,8 +96,6 @@ data_transform:
     instruction: prompt
     input: context
     output: answer
-  input_separator: "\n\n"
-  max_seq_len: 32768
 ```
 
 `InstructionMessages` 读取映射列，组成 user/assistant 消息，然后复用 `TextConversationTransform` 编码。
@@ -196,14 +197,14 @@ dataset:
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   training_mode: sft
   data_path: /data/train.parquet
-  data_config: {}
+  data_config:
+    max_seq_len: 8192
   model_assets:
     _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
     pretrained_model_name_or_path: /models/model
   data_transform:
     _target_: hyper_parallel.data.omni.omni_transform.AutoProcessorTransform
     sample_format: messages
-    max_seq_len: 8192
 ```
 
 ShareGPT 图文数据使用 `sample_format: sharegpt` 和 `conversations` 列。
@@ -236,7 +237,7 @@ data_config:
 `single` 模式可以根据训练目标样本数构建索引，不能假定两种模式顺序相同。
 数值对比除 seed 外，还需固定 source、采样模式、batch 与并行参数。
 
-通用 Omni 数据链路通过以下配置开启 packing：
+通用 Omni 数据链路通过以下配置开启 packing，长度由 `dataset.data_config.max_seq_len` 统一设置：
 
 ```yaml
 dataloader:
@@ -245,15 +246,10 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
-    encoder_dp: false
-  sampler_type: single
-  token_budget: 8192
-  min_buffered_samples: 1
-  num_workers: 0
 ```
 
-`token_budget` 设置每次选择样本的 token 预算，`min_buffered_samples` 设置候选缓冲的最少样本数。
-`token_budget` 不截断单个样本。配置与输入字段说明见 [Omni Online 数据接入指南](omni_online_data_guide.md)。
+`max_seq_len` 限制每条 packed 序列长度，B 条序列再组成 batch；`min_buffered_samples` 设置候选缓冲的最少样本数。
+超长样本跳过，当前序列放不下的样本留到后续序列；默认每条 padding 到 `max_seq_len`。配置与输入字段说明见 [Omni Online 数据接入指南](omni_online_data_guide.md)。
 此配置使用通用 `OmniParallelBatch`；Qwen 专用的 `QwenVLMParallelBatch` 当前不接受 packed sequence。
 
 模型相关的 CP 输入由 runtime adapter 完成。Qwen 图文适配需要先计算全局 mRoPE、完成全局 labels shift，

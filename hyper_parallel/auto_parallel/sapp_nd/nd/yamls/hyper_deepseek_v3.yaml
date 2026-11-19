@@ -46,8 +46,6 @@ data:
   train_path: /path/to/dataset
   max_seq_len: 4096
   shuffle: false
-  num_workers: 0
-  pin_memory: true
 
 train:
   max_steps: 20

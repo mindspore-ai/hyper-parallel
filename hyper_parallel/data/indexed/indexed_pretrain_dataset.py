@@ -104,8 +104,14 @@ class _IndexedPretrainDataset(ABC):
 
         # Handle pad token id provided by the tokenizer.
         try:
-            pad_token_id = self.config.tokenizer.pad
-            self._pad_token_id = PAD_TOKEN_ID if pad_token_id is None else int(pad_token_id)
+            pad_token_id = getattr(self.config.tokenizer, "pad_token_id", None)
+
+            if pad_token_id is None:
+                pad_token_id = self.config.tokenizer.pad
+
+            self._pad_token_id = (
+                PAD_TOKEN_ID if pad_token_id is None or callable(pad_token_id) else int(pad_token_id)
+            )
         except (AttributeError, NotImplementedError):
             self._pad_token_id = PAD_TOKEN_ID
 
@@ -124,7 +130,7 @@ class _IndexedPretrainDataset(ABC):
                 except (AttributeError, NotImplementedError):
                     pass
 
-        if not self.config.mock and self._pad_token_id in special_token_ids:
+        if self._pad_token_id in special_token_ids:
             if self.config.allow_ambiguous_pad_tokens:
                 logger.warning(
                     "The tokenizer PAD ID collides with another special token ID; matching tokens will also be "
@@ -279,7 +285,7 @@ class MockGPTDataset(_MockDataset):
     def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Generate a deterministic mock sample for one split and index."""
         token = 1
-        pad = 2
+        pad = self._pad_token_id
         eod = self.config.tokenizer.eod
 
         if index >= self.num_samples:
@@ -292,14 +298,17 @@ class MockGPTDataset(_MockDataset):
         sample_tokens = np.zeros(length) + token
         sample_pads = np.zeros(self.config.sequence_length - length - 1) + pad
         sample = np.int64(np.concatenate([[length], sample_tokens, [eod], sample_pads]))
-        tokens = sample[:-1]
-        labels = sample[1:]
+        tokens = sample[:-1].copy()
+        labels = sample[1:].copy()
+        ltor_fields = self._build_ltor_fields(tokens, labels)
+        tokens[tokens == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         raw_sample = {
             "input_ids": tokens,
             "labels": labels,
         }
-        raw_sample.update(self._build_ltor_fields(tokens, labels))
+        raw_sample.update(ltor_fields)
 
         return raw_sample
 
@@ -465,7 +474,7 @@ class GPTDataset(_IndexedPretrainDataset):
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         if np.any(tokens < 0) or np.any(tokens >= len(self.config.tokenizer)):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
@@ -625,13 +634,13 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
             labels = np.roll(text, shift=-1)
             labels[-1] = self._pad_token_id
 
-        if np.any(tokens < 0) or np.any(tokens >= self.config.tokenizer.vocab_size):
+        if np.any(tokens < 0) or np.any(tokens >= len(self.config.tokenizer)):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
 
         ltor_fields = self._build_ltor_fields(tokens, labels)
 
         tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         raw_sample = {
             "input_ids": tokens,

@@ -32,17 +32,20 @@ from hyper_parallel.data.constants import (
     OMNI_CP_TOKEN_FIELDS,
 )
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.data.batching.packing import SamplePacker
 
 logger = get_dataset_logger(__name__)
 
 
 def _get_token_alignment_size(mesh_context: Any | None) -> int:
     """Return TP X CP, the required final batch token alignment."""
+
     if mesh_context is None:
         return 1
 
     cp_size = int(getattr(mesh_context, "cp_size", 1))
     tp_size = int(getattr(mesh_context, "tp_size", 1))
+
     if cp_size <= 0 or tp_size <= 0:
         raise ValueError("mesh_context tp_size and cp_size must be positive")
 
@@ -52,6 +55,7 @@ def _get_token_alignment_size(mesh_context: Any | None) -> int:
 
 def _validate_padding_config(alignment_size: int, pad_to_length: int | None) -> None:
     """Check the shared text/Omni padding contract once at construction."""
+
     if alignment_size <= 0:
         raise ValueError("alignment_size must be positive")
 
@@ -67,60 +71,121 @@ def _validate_padding_config(alignment_size: int, pad_to_length: int | None) -> 
         )
 
 
-def _pad_batch_tokens(
-        batch: Mapping[str, Any],
+def _pad_packed_token_field(
+        name: str,
+        values: Sequence[torch.Tensor],
+        packed_samples: Sequence[Mapping[str, Any]],
+        sequence_lengths: Sequence[int],
+        target_length: int,
+) -> torch.Tensor:
+    """Validate one token field and pad every packed row to the target length."""
+    if len(values) != len(packed_samples) or any(value.shape != sample["input_ids"].shape
+                                                for sample, value in zip(packed_samples, values)):
+        raise ValueError(f"Packed token field {name!r} must match input_ids in every packed sample")
+
+    output = values[0].new_full((len(packed_samples), target_length), OMNI_CP_PAD_VALUES.get(name, 0))
+
+    for batch_index, (value, length) in enumerate(zip(values, sequence_lengths)):
+        output[batch_index, :length] = value
+
+    return output
+
+
+def _collate_packed_boundaries(
+        packed_samples: Sequence[Mapping[str, Any]],
+        sequence_lengths: Sequence[int],
+        target_length: int,
+) -> torch.Tensor:
+    """Flatten document coordinates and isolate each packed row's padding tail."""
+    reference = packed_samples[0]["input_ids"]
+    boundary_parts = [reference.new_zeros(1, dtype=torch.int32)]
+
+    for batch_index, (sample, length) in enumerate(zip(packed_samples, sequence_lengths)):
+        boundaries = sample.get("cu_seq_lens")
+
+        if boundaries is None:
+            boundaries = reference.new_tensor([0, length], dtype=torch.int32)
+
+        boundaries = boundaries.reshape(-1).to(torch.int32)
+
+        if (boundaries.numel() < 2 or int(boundaries[0]) != 0 or int(boundaries[-1]) != length
+                or bool(torch.any(boundaries[1:] <= boundaries[:-1]))):
+            raise ValueError("cu_seq_lens must cover each complete packed row with increasing boundaries")
+
+        boundary_parts.append(boundaries[1:] + batch_index * target_length)
+
+        if length < target_length:
+            boundary_parts.append(boundaries.new_tensor([(batch_index + 1) * target_length]))
+
+    return torch.cat(boundary_parts)
+
+
+def _collate_packed_samples(
+        packed_samples: Sequence[Mapping[str, Any]],
         alignment_size: int,
-        token_pad_values: Mapping[str, int],
-        pad_to_length: int | None = None,
+        pad_to_length: int | None,
+        max_seq_len: int | None,
 ) -> dict[str, Any]:
-    """Pad to a fixed length or alignment while preserving real boundaries and media.
+    """Pad packed samples into [B, T] token tensors and collate their metadata.
+
+    Args:
+        packed_samples: B packed sample mappings, each with one-dimensional
+            input_ids [L], matching token fields, and optional document/media metadata.
+        alignment_size: Required TP * CP sequence-length alignment.
+        pad_to_length: Fixed sequence length, or None to align the longest sample.
+        max_seq_len: Upper bound on the padded sequence length.
+
+    Returns:
+        Padded token tensors with combined document boundaries and media fields.
 
     Example:
-        Length 18, TP=4, CP=2: token fields grow to 24, labels pad with
-        -100, and cu_seq_lens [0, 10, 18] becomes [0, 10, 18, 24].
-        With pad_to_length=32, the same boundaries become [0, 10, 18, 32].
+        B=2, pad_to_length=4096: packed samples [1800+2000], [500+3000]
+        become input_ids/labels [2, 4096], with 296/596 padding tokens (0/-100).
+        cu_seq_lens = [0, 1800, 3800, 4096, 4596, 7596, 8192].
     """
-    padded_batch = dict(batch)
-    input_ids = padded_batch["input_ids"]
-    if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
-        raise ValueError("Batch alignment requires input_ids with shape [batch, sequence]")
 
-    sequence_length = input_ids.shape[-1]
-    if pad_to_length is None:
-        pad_length = (-sequence_length) % alignment_size
-    else:
-        if sequence_length > pad_to_length:
-            raise ValueError(
-                f"Packed sequence length {sequence_length} exceeds pad_to_length={pad_to_length}; "
-                "increase pad_to_length or reduce the packing token budget and sample lengths"
-            )
+    if any(sample["input_ids"].ndim != 1 or sample["input_ids"].shape[-1] == 0
+           for sample in packed_samples):
+        raise ValueError("Packed samples must contain nonempty one-dimensional input_ids")
 
-        pad_length = pad_to_length - sequence_length
+    sequence_lengths = [sample["input_ids"].shape[-1] for sample in packed_samples]
+    longest_length = max(sequence_lengths)
+    target_length = pad_to_length
 
-    if not pad_length:
-        return padded_batch
+    if target_length is None:
+        target_length = longest_length + (-longest_length) % alignment_size
 
-    for field, pad_value in token_pad_values.items():
-        if field not in padded_batch:
-            continue
+    if longest_length > target_length:
+        raise ValueError(f"Packed sequence length {longest_length} exceeds pad_to_length={target_length}")
 
-        value = padded_batch[field]
-        if not torch.is_tensor(value) or value.shape != input_ids.shape:
-            raise ValueError(f"Batch token field {field!r} must match input_ids shape")
+    if max_seq_len is not None and target_length > max_seq_len:
+        raise ValueError(f"Batch padding length {target_length} exceeds max_seq_len={max_seq_len}")
 
-        padded_batch[field] = torch.nn.functional.pad(value, (0, pad_length), value=pad_value)
+    # Token fields become [B, T]; media retain their modality-specific leading dimension.
+    batch = {}
+    fields = set().union(*(sample.keys() for sample in packed_samples)) - {"cu_seq_lens", "packing_length"}
+    image_fields = {"image_patch_lengths", "image_vit_grid_hw", "image_llm_grid_hw", "image_token_starts"}
 
-    if "cu_seq_lens" in padded_batch:
-        boundaries = padded_batch["cu_seq_lens"].reshape(-1)
-        if (input_ids.shape[0] != 1 or boundaries.numel() < 2
-                or int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length):
-            raise ValueError("cu_seq_lens must cover one complete packed input row")
+    for name in fields:
+        values = [sample[name] for sample in packed_samples if name in sample]
 
-        # A separate ignored sequence keeps attention metadata consistent with
-        # the physical tail without changing any real sample boundary.
-        padded_batch["cu_seq_lens"] = torch.cat((boundaries, boundaries[-1:] + pad_length))
+        if name in OMNI_CP_TOKEN_FIELDS:
+            batch[name] = _pad_packed_token_field(name, values, packed_samples, sequence_lengths, target_length)
 
-    return padded_batch
+        elif name in OMNI_CONCAT_FIELDS or name in image_fields:
+            batch[name] = torch.cat(values, dim=0)
+        else:
+            batch[name] = default_collate(values)
+
+    batch["cu_seq_lens"] = _collate_packed_boundaries(packed_samples, sequence_lengths, target_length)
+
+    if "image_patch_lengths" in fields:
+        batch["image_batch_indices"] = torch.cat([
+            sample["image_patch_lengths"].new_full((sample["image_patch_lengths"].numel(),), batch_index)
+            for batch_index, sample in enumerate(packed_samples) if "image_patch_lengths" in sample
+        ])
+
+    return batch
 
 
 @dataclass
@@ -133,16 +198,19 @@ class TextPackingCollator:
 
     alignment_size: int = 1
     pad_to_length: int | None = None
+    max_seq_len: int | None = None
 
     def __post_init__(self) -> None:
         """Validate fixed padding before any samples are read."""
         _validate_padding_config(self.alignment_size, self.pad_to_length)
+        _validate_padding_config(self.alignment_size, self.max_seq_len)
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        """Pack samples into one ``[1, packed_length]`` forward-backward batch.
+        """Pad independently packed rows to one common ``[B, T]`` shape.
 
         Args:
-            model_samples: Online samples selected for one forward-backward step.
+            model_samples: Packed rows with cu_seq_lens. A flat group without
+                boundaries is accepted as one row for direct callers.
 
         Returns:
             Packed ``input_ids`` and ``labels`` plus int32 ``cu_seq_lens``.
@@ -150,27 +218,17 @@ class TextPackingCollator:
         Raises:
             ValueError: If no samples are provided.
         """
+
         if not model_samples:
             raise ValueError("model_samples must contain at least one Online sample")
 
-        packed_batch = {}
-        for field in ("input_ids", "labels"):
-            values = [model_sample[field] for model_sample in model_samples]
-            packed_batch[field] = torch.cat(values, dim=-1).unsqueeze(0)
+        if not any("cu_seq_lens" in sample for sample in model_samples):
+            model_samples = [SamplePacker().pack_selected_samples(model_samples)]
 
-        seq_lens = model_samples[0]["input_ids"].new_tensor(
-            [model_sample["input_ids"].shape[-1] for model_sample in model_samples]
+        padded_batch = _collate_packed_samples(
+            model_samples, self.alignment_size, self.pad_to_length, self.max_seq_len,
         )
-        zero = seq_lens.new_zeros(1)
-        seq_ends = seq_lens.cumsum(dim=0)
-        cu_seq_lens = torch.cat((zero, seq_ends))
-        cu_seq_lens = cu_seq_lens.to(torch.int32)
-        packed_batch["cu_seq_lens"] = cu_seq_lens
-
-        aligned_batch = _pad_batch_tokens(
-            packed_batch, self.alignment_size, {"input_ids": 0, "labels": IGNORE_INDEX}, self.pad_to_length,
-        )
-        return aligned_batch
+        return padded_batch
 
 
 @dataclass
@@ -179,10 +237,12 @@ class OmniCollator:
 
     alignment_size: int = 1
     pad_to_length: int | None = None
+    max_seq_len: int | None = None
 
     def __post_init__(self) -> None:
         """Validate fixed padding before any samples are read."""
         _validate_padding_config(self.alignment_size, self.pad_to_length)
+        _validate_padding_config(self.alignment_size, self.max_seq_len)
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Stack token fields, concatenate media, and pad only the final batch.
@@ -191,62 +251,37 @@ class OmniCollator:
             One packed sample of length 18, TP=4, CP=2 produces [1, 24]
             token fields. Image tensors and global image starts are unchanged.
         """
+
         if not model_samples:
             raise ValueError("model_samples must contain at least one Omni sample")
 
-        sample_fields = set()
-        for model_sample in model_samples:
-            sample_fields.update(model_sample)
+        aligned_batch = _collate_packed_samples(
+            model_samples, self.alignment_size, self.pad_to_length, self.max_seq_len,
+        )
 
-        batch = {}
-        for field in sample_fields:
-            values = []
-            for model_sample in model_samples:
-                if field in model_sample:
-                    values.append(model_sample[field])
+        if logger.isEnabledFor(logging.DEBUG) and aligned_batch["input_ids"].device.type == "cpu":
+            self._log_batch(aligned_batch, sum(sample["input_ids"].numel() for sample in model_samples))
 
-            if field in OMNI_CONCAT_FIELDS:
-                batch[field] = torch.cat(values, dim=0)
-            else:
-                batch[field] = default_collate(values)
-
-        token_pad_values = {field: OMNI_CP_PAD_VALUES.get(field, 0) for field in OMNI_CP_TOKEN_FIELDS}
-        aligned_batch = _pad_batch_tokens(batch, self.alignment_size, token_pad_values, self.pad_to_length)
-        if logger.isEnabledFor(logging.DEBUG) and batch["input_ids"].device.type == "cpu":
-            self._log_batch(aligned_batch, batch["input_ids"].shape[-1])
         return aligned_batch
 
-
-    def _log_batch(self, batch: Mapping[str, Any], real_length: int) -> None:
+    def _log_batch(self, batch: Mapping[str, Any], real_token_count: int) -> None:
         """Inspect CPU batches before transport without synchronizing accelerator streams."""
         input_ids = batch["input_ids"]
         labels = batch["labels"]
         boundaries = batch.get("cu_seq_lens")
         boundaries = [] if boundaries is None else boundaries.reshape(-1).tolist()
-        sequence_length = input_ids.shape[-1]
-        issues = []
-        if labels.shape != input_ids.shape:
-            issues.append("labels shape differs from input_ids")
-        if sequence_length == 0:
-            issues.append("empty input_ids")
-        if boundaries and (boundaries[0] != 0 or boundaries[-1] != sequence_length
-                           or any(end <= start for start, end in zip(boundaries[:-1], boundaries[1:]))):
-            issues.append("cu_seq_lens do not cover strictly increasing packed intervals")
-        padding = sequence_length - real_length
+        padding = input_ids.numel() - real_token_count
         supervised = int((labels >= 0).sum())
-        if not supervised:
-            issues.append("no supervised tokens")
-        if padding and bool(torch.any(labels[..., real_length:] != IGNORE_INDEX)):
-            issues.append("padding tail contains supervised labels")
         lengths = [end - start for start, end in zip(boundaries[:-1], boundaries[1:])]
         logger.debug(
             "Omni collate: input_shape=%s label_shape=%s real_tokens=%d padding_tokens=%d "
-            "alignment=%d cu_seq_lens=%s segment_lengths=%s supervised_tokens=%d issues=%s",
-            tuple(input_ids.shape), tuple(labels.shape), real_length, padding, self.alignment_size,
-            boundaries, lengths, supervised, issues, enabled=True,
+            "alignment=%d cu_seq_lens=%s segment_lengths=%s supervised_tokens=%d",
+            tuple(input_ids.shape), tuple(labels.shape), real_token_count, padding, self.alignment_size,
+            boundaries, lengths, supervised, enabled=True,
         )
-        if issues:
-            logger.warning("Omni collate data anomalies: %s", issues)
+
+        if not supervised:
+            logger.warning("Omni collate batch contains no supervised tokens")
 
 
 def build_default_collate_fn() -> Callable[[list[Any]], Any]:
@@ -267,12 +302,16 @@ build_indexed_collate_fn = build_default_collate_fn
 def _sft_row_boundaries(boundaries: Any, sequence_length: int) -> list[int]:
     """Remove boundary sentinels and validate one complete SFT row."""
     row = torch.as_tensor(boundaries)
+
     if row.ndim != 1 or row.dtype not in (torch.int32, torch.int64):
         raise ValueError("Each cu_seq_lens row must be a one-dimensional integer array")
+
     row = row[row != -1]
+
     if (row.numel() < 2 or row[0] != 0 or row[-1] != sequence_length
             or torch.any(row[1:] <= row[:-1])):
         raise ValueError("Document boundaries must strictly increase from zero to row length")
+
     return row.tolist()
 
 
@@ -282,19 +321,26 @@ def _collate_sft_samples(batch: list[Any], *, alignment_size: int) -> Any:
     Records from SFTFromMRDataset have 1D input_ids/labels; already grouped
     records may have [rows, S]. Variable-length rows are padded, never truncated.
     """
+
     if not isinstance(batch[0], Mapping) or "cu_seq_lens" not in batch[0]:
         return default_collate(batch)
 
     token_rows, label_rows, boundary_rows = [], [], []
+
     for sample in batch:
         tokens, labels = torch.as_tensor(sample["input_ids"]), torch.as_tensor(sample["labels"])
+
         if tokens.ndim not in (1, 2) or tokens.shape != labels.shape or not tokens.numel():
             raise ValueError("SFT tokens and labels must have matching nonempty [S] or [rows, S] shapes")
+
         boundaries = sample["cu_seq_lens"]
+
         if tokens.ndim == 1:
             tokens, labels, boundaries = tokens.unsqueeze(0), labels.unsqueeze(0), [boundaries]
+
         if len(boundaries) != len(tokens):
             raise ValueError("cu_seq_lens must have one boundary array per token row")
+
         for row in boundaries:
             boundary_rows.append(_sft_row_boundaries(row, tokens.shape[-1]))
         token_rows.extend(tokens.unbind(0))
@@ -306,14 +352,17 @@ def _collate_sft_samples(batch: list[Any], *, alignment_size: int) -> Any:
     result = default_collate([
         {key: value for key, value in sample.items() if key not in packed_keys} for sample in batch
     ])
+
     for key, rows, value in (("input_ids", token_rows, 0), ("labels", label_rows, IGNORE_INDEX)):
         result[key] = torch.stack([
             torch.nn.functional.pad(row, (0, sequence_length - row.numel()), value=value) for row in rows
         ])
+
     for row in boundary_rows:
         if row[-1] < sequence_length:
             # Isolate ignored tail padding from every real document.
             row.append(sequence_length)
+
     result["cu_seq_lens"] = boundary_rows
     return result
 
@@ -331,54 +380,77 @@ def build_sft_collate_fn(mesh_context: Any | None = None) -> Callable[[list[Any]
     return partial(_collate_sft_samples, alignment_size=_get_token_alignment_size(mesh_context))
 
 
+def _get_pad_length(
+        pad_to_length: bool,
+        max_seq_len: int | None = None,
+) -> int | None:
+    """Use the shared packing limit for fixed padding, or align actual lengths."""
+
+    if not isinstance(pad_to_length, bool):
+        raise ValueError("pad_to_length must be a bool")
+
+    if not pad_to_length:
+        return None
+
+    if max_seq_len is None:
+        raise ValueError("Fixed batch padding requires max_seq_len")
+
+    return max_seq_len
+
+
 def build_omni_collate_fn(
         mesh_context: Any | None = None,
-        pad_to_length: int | None = None,
+        pad_to_length: bool = True,
+        max_seq_len: int | None = None,
 ) -> OmniCollator:
     """Build Omni collation with optional fixed padding after packing.
 
     Args:
         mesh_context: Runtime TP/CP topology injected by the Trainer.
-        pad_to_length: Exact global token length, divisible by TP × CP. None
-            pads only for alignment. Longer packed sequences raise ValueError.
+        pad_to_length: True pads every row to max_seq_len; False pads to the
+            aligned maximum actual row length. Defaults to True.
+        max_seq_len: Maximum packed row length supplied by the Trainer.
 
     Returns:
         A collator that pads token lengths and preserves modality metadata.
 
     Raises:
-        ValueError: If pad_to_length is not a positive aligned integer or None.
+        ValueError: If pad_to_length is not a bool, fixed padding has no max_seq_len,
+            or the length is invalid or not divisible by TP × CP.
     """
     alignment_size = _get_token_alignment_size(mesh_context)
-    collate_fn = OmniCollator(alignment_size=alignment_size, pad_to_length=pad_to_length)
+    collate_fn = OmniCollator(alignment_size=alignment_size, max_seq_len=max_seq_len,
+                             pad_to_length=_get_pad_length(pad_to_length, max_seq_len))
+
     return collate_fn
 
 
 def build_online_text_collate_fn(
         mesh_context: Any | None = None,
-        pad_to_length: int | None = None,
+        pad_to_length: bool = True,
+        max_seq_len: int | None = None,
 ) -> TextPackingCollator:
     """Build Online text collation shared by fixed N and dynamic K batching.
 
-    Packing concatenates ``input_ids`` and ``labels`` and emits ``cu_seq_lens``.
-    Tail padding defaults to alignment from the runtime topology. A fixed
-    pad_to_length can instead specify the exact global packed token length.
-    The unified alignment size is ``cp_size * tp_size``, derived directly
-    from the topology without a separate SP switch. Real sample boundaries
-    remain unchanged and one synthetic final boundary covers the physical
-    padding segment.
+    The loader independently packs B rows. Collation pads them to max_seq_len
+    by default, preserving document boundaries and isolating every padding tail.
+    Dynamic padding uses the longest actual row rounded to ``cp_size * tp_size``.
 
     Args:
         mesh_context: Runtime TP/CP topology injected by the Trainer.
-        pad_to_length: Exact global token length, divisible by TP × CP. None
-            pads only for alignment. Longer packed sequences raise ValueError.
+        pad_to_length: True pads every row to max_seq_len; False pads to the
+            aligned maximum actual row length. Defaults to True.
+        max_seq_len: Maximum packed row length supplied by the Trainer.
 
     Returns:
         A collator producing one forward-backward batch.
 
     Raises:
-        ValueError: If pad_to_length is not a positive aligned integer or None.
+        ValueError: If pad_to_length is not a bool, fixed padding has no max_seq_len,
+            or the length is invalid or not divisible by TP × CP.
     """
     alignment_size = _get_token_alignment_size(mesh_context)
-    collate_fn = TextPackingCollator(alignment_size=alignment_size, pad_to_length=pad_to_length)
+    collate_fn = TextPackingCollator(alignment_size=alignment_size, max_seq_len=max_seq_len,
+                                    pad_to_length=_get_pad_length(pad_to_length, max_seq_len))
 
     return collate_fn

@@ -1584,7 +1584,7 @@ def _log_priced_caveats(priced: Any) -> None:
         # sits under the table it qualifies.
         logger.output(
             "Every number above is priced at %d tokens, the model's context limit: the config states no "
-            "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
+            "training sequence length (dataset.data_config.max_seq_len)",
             priced.s,
         )
     if getattr(priced, "mtp_unpriced", 0):

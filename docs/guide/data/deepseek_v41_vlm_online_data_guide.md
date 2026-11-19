@@ -69,7 +69,7 @@ placeholder and checks that the placeholder count matches the image count.
 
 ### 2.1 Data Source Routing FAQ
 
-#### Interface: How Are Empty Omni Samples Filtered?
+#### Interface: How Are Empty Omni Samples Filtered
 
 **FAQ: Which interface should callers use?**
 
@@ -145,7 +145,7 @@ pre-split paths, it returns:
 An unconfigured or ultimately empty split is `None`. Only afterward is the result wrapped with the lazy Omni transform; building the source index
 does not execute `encode_sample()`.
 
-#### General: How Is the Data Source Routed?
+#### General: How Is the Data Source Routed
 
 **FAQ: Which local file formats does Online Mapping currently support?**
 
@@ -188,7 +188,8 @@ configuration is:
 dataset:
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: /data/docvqa/train.jsonl
-  data_config: {}
+  data_config:
+    max_seq_len: 4096
 ```
 
 At startup, the native reader scans files and records the byte offsets of valid records, then reads them on demand by integer index. It does not require Arrow
@@ -367,7 +368,7 @@ Convert them to JSONL/JSON/Parquet/CSV/Arrow first, or extend the corresponding 
 
 ### 2.2 Multi-source Split, Blend, Shuffle, and DP Sharding FAQ
 
-#### Topic 1: How Does Each Source Determine Train, Valid, and Test?
+#### Topic 1: How Does Each Source Determine Train, Valid, and Test
 
 **FAQ: What structures can a source return?**
 
@@ -428,7 +429,7 @@ valid = [A_valid]
 test  = [A_test, C_test]
 ```
 
-#### Topic 2: How Are Matching Splits Globally Blended?
+#### Topic 2: How Are Matching Splits Globally Blended
 
 **FAQ: Are train, valid, and test blended together?**
 
@@ -462,7 +463,7 @@ source-local indices repeat across multiple epochs before deterministic shufflin
 it returns `None`. The current `build_online_omni_mapping_dataset()` does not pass this parameter to the lower layer, so the top-level Omni
 entry defaults to the sum of the natural lengths for each split.
 
-#### Topic 3: What Is the Actual Order of Shuffling and DP Sharding?
+#### Topic 3: What Is the Actual Order of Shuffling and DP Sharding
 
 **FAQ: After blending, does only train undergo global shuffling?**
 
@@ -724,10 +725,12 @@ If expanded `input_ids` exceeds `max_seq_len`, the transform raises an error ins
 the packed-sequence offset to each sample-local `image_token_starts`. `cu_seq_lens` stores sample boundaries to isolate
 packed attention.
 
-The collator can fix the global token length after packing to 1024 with
-`dataloader.collate_fn.pad_to_length: 1024`; the default `null` only aligns to TP × CP. The target must be a multiple of TP × CP; packed lengths exceeding it raise an error.
-Padding labels are `-100`, and padding is appended to `cu_seq_lens` as a separate final segment. Image patches, grids, and starting positions remain unchanged.
-`max_seq_len` controls per-sample filtering, while `token_budget` controls packing selection; all three are independent. For configuration and CP slicing examples, see
+`dataset.data_config.max_seq_len` sets S, the per-sequence packing limit.
+The loader packs B independent sequences. The default `pad_to_length: true` pads each to S,
+producing `[B,S]`; false pads to the longest actual sequence aligned to TP×CP.
+S must be divisible by TP×CP. Token padding is 0, labels are -100, and every sequence's
+padding is recorded as a separate `cu_seq_lens` segment. Image patches and grids are retained.
+For configuration and CP slicing examples, see
 [Fix the Input Length After Packing](omni_online_data_guide.md#fix-the-input-length-after-packing).
 
 `encode_batch()` then converts the generic image metadata into the fields required by DeepSeek-V4.1 forward:

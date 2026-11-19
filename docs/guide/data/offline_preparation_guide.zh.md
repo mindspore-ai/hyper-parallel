@@ -1,5 +1,8 @@
 # Offline Dataset Preparation Guide
 
+生成文件后的训练 YAML、`max_seq_len`、`GPTDataset/GPTFromMRDataset` 选择与 tokenizer 必填项见
+[Dataset 使用方法](../../../hyper_parallel/data/README.zh.md#offline-indexed-text)。
+
 本文档介绍如何将本地 JSON/JSONL 文件或 Hugging Face 数据集转换为训练可用的 Megatron Indexed Dataset。
 
 工具提供两个命令行入口：

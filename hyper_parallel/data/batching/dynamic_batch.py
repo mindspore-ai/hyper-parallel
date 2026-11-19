@@ -14,6 +14,8 @@
 # ============================================================================
 """Candidate buffering and finalization used by dynamic DataLoaders."""
 
+from __future__ import annotations
+
 import operator
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -36,6 +38,7 @@ class BaseCandidateBuffer(ABC):
     buffer: list[tuple[Mapping[str, Any], int]] = field(default_factory=list, init=False)
     buffer_output_indices: list[Any | None] = field(default_factory=list, init=False)
     buffer_token_count: int = field(default=0, init=False)
+    skipped_oversized_samples: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         """Validate the candidate-buffer limits."""
@@ -53,14 +56,19 @@ class BaseCandidateBuffer(ABC):
     def put_item(self, model_sample: Mapping[str, Any], output_index_entry: Any | None = None) -> None:
         """Append one candidate and its optional checkpoint replay index."""
         buffered_sample = self.build_buffer_entry(model_sample)
+
+        if buffered_sample[1] > self.token_budget:
+            self.skipped_oversized_samples += 1
+            return
+
         self.buffer.append(buffered_sample)
         self.buffer_output_indices.append(output_index_entry)
         self.buffer_token_count += buffered_sample[1]
 
-    def is_ready_for_micro_batch(self) -> bool:
-        """Return whether both configured candidate limits are reached."""
+    def is_ready_for_micro_batch(self, batch_size: int = 1) -> bool:
+        """Wait until the buffer can supply B bounded rows without a partial-batch checkpoint."""
         enough_samples = len(self.buffer) >= self.min_buffered_samples
-        enough_tokens = self.buffer_token_count >= self.token_budget
+        enough_tokens = self.buffer_token_count >= batch_size * self.token_budget
         is_ready = enough_samples and enough_tokens
         return is_ready
 
@@ -82,6 +90,7 @@ class TokenBudgetCandidateBuffer(BaseCandidateBuffer):
     def build_buffer_entry(self, model_sample: Mapping[str, Any]) -> tuple[Mapping[str, Any], int]:
         """Attach the encoded token length to one candidate."""
         sample_length = int(model_sample["input_ids"].shape[-1])
+
         if sample_length <= 0:
             raise ValueError("Dynamic batching samples must contain at least one token")
 
@@ -90,6 +99,7 @@ class TokenBudgetCandidateBuffer(BaseCandidateBuffer):
 
     def get_micro_batch(self) -> list[Mapping[str, Any]]:
         """Select fitting candidates and retain the remainder."""
+
         if not self.buffer:
             raise ValueError("Dynamic token buffer is empty")
 
@@ -97,11 +107,13 @@ class TokenBudgetCandidateBuffer(BaseCandidateBuffer):
         remaining_buffer = []
         remaining_output_indices = []
         selected_token_count = 0
+
         for (model_sample, sample_length), output_index_entry in zip(
                 self.buffer,
                 self.buffer_output_indices,
         ):
-            sample_fits = selected_token_count == 0 or selected_token_count + sample_length <= self.token_budget
+            sample_fits = selected_token_count + sample_length <= self.token_budget
+
             if sample_fits:
                 selected_samples.append(model_sample)
                 selected_token_count += sample_length
@@ -129,10 +141,12 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
 
     def get_micro_batch(self) -> list[Mapping[str, Any]]:
         """Select and remove the next candidate group."""
+
         if not self.buffer:
             raise ValueError("Packing candidate buffer is empty")
 
         candidates = []
+
         for model_sample, _ in self.buffer:
             candidates.append(model_sample)
 
@@ -141,10 +155,16 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
             self.token_budget,
         )
         resolved_indices = self._validate_selected_indices(selected_indices)
+
+        # Buffer entries are (model_sample, sample_cost); [1] is the packing token cost.
+        if sum(self.buffer[index][1] for index in resolved_indices) > self.token_budget:
+            raise ValueError("PackingSelector selected more tokens than the per-row token_budget")
+
         selected_index_set = set(resolved_indices)
 
         selected_samples = []
         selected_cost = 0
+
         for selected_index in resolved_indices:
             model_sample, sample_cost = self.buffer[selected_index]
             selected_samples.append(model_sample)
@@ -152,6 +172,7 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
 
         remaining_buffer = []
         remaining_output_indices = []
+
         for sample_index, (buffered_sample, output_index) in enumerate(
                 zip(self.buffer, self.buffer_output_indices)
         ):
@@ -167,9 +188,11 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
     def _validate_selected_indices(self, selected_indices: Sequence[int]) -> list[int]:
         """Validate selector output before mutating the candidate buffer."""
         resolved_indices = []
+
         for selected_index in selected_indices:
             if isinstance(selected_index, bool):
                 raise TypeError("PackingSelector indices must be integers")
+
             try:
                 resolved_index = operator.index(selected_index)
             except TypeError as exc:
@@ -177,10 +200,12 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
 
             if resolved_index < 0 or resolved_index >= len(self.buffer):
                 raise IndexError("PackingSelector returned an out-of-range candidate index")
+
             resolved_indices.append(resolved_index)
 
         if not resolved_indices:
             raise ValueError("PackingSelector must select at least one candidate")
+
         if len(set(resolved_indices)) != len(resolved_indices):
             raise ValueError("PackingSelector must not select a candidate more than once")
 
@@ -189,12 +214,14 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
 
 def _normalize_source_samples(source_item: Any) -> list[Mapping[str, Any]]:
     """Normalize one source output into its ordered model samples."""
+
     if isinstance(source_item, Mapping):
         model_samples = [source_item]
         return model_samples
 
     if isinstance(source_item, Sequence) and not isinstance(source_item, (str, bytes)):
         model_samples = []
+
         for model_sample in source_item:
             if not isinstance(model_sample, Mapping):
                 raise ValueError("Every dynamic source sample must be a mapping")
@@ -214,9 +241,11 @@ def _restore_index_buffer(
     restored_buffer = []
     cached_output_index: Any = object()
     cached_model_samples: list[Mapping[str, Any]] = []
+
     for output_index_entry in saved_buffer:
         output_index, sample_index = output_index_entry
         resolved_sample_index = operator.index(sample_index)
+
         if resolved_sample_index < 0:
             raise ValueError("Buffered sample index must be a non-negative integer")
 
@@ -224,6 +253,7 @@ def _restore_index_buffer(
             restored_item = source_dataset.get_item(output_index)
             cached_model_samples = _normalize_source_samples(restored_item)
             cached_output_index = output_index
+
         try:
             model_sample = cached_model_samples[resolved_sample_index]
         except IndexError as exc:
@@ -239,31 +269,37 @@ def _restore_index_buffer(
 
 
 class MappingReplayDataset:
-    """Attach a stable replay index to each mapping Dataset output."""
+    """Read expanded Mapping outputs and optionally attach their stable replay indices."""
 
-    def __init__(self, dataset: Any) -> None:
+    def __init__(self, dataset: Any, *, output_index_for_resume: bool = True) -> None:
         """Store the mapping Dataset used to reconstruct buffered samples."""
         self.dataset = dataset
+        self.output_index_for_resume = output_index_for_resume
+        self._read_item = dataset.get_item if hasattr(dataset, "get_item") else dataset.__getitem__
+
+        # Preserve optional source state hooks without forwarding vectorized reads that bypass expansion.
+        for name in ("set_epoch", "state_dict", "load_state_dict"):
+            if hasattr(dataset, name):
+                setattr(self, name, getattr(dataset, name))
 
     def __len__(self) -> int:
         """Return the wrapped Dataset length."""
         dataset_length = len(self.dataset)
         return dataset_length
 
-    def __getitem__(self, index: int) -> tuple[Any, int]:
-        """Return one source item and the index that can reproduce it."""
+    def __getitem__(self, index: int) -> Any:
+        """Return expanded samples, with a replay index only in index-checkpoint mode."""
         source_item = self.get_item(index)
-        indexed_source_item = (source_item, index)
-        return indexed_source_item
+
+        if self.output_index_for_resume:
+            source_item = (source_item, index)
+
+        return source_item
 
     def get_item(self, index: Any) -> Any:
         """Rebuild one source item without advancing the source iterator."""
         resolved_index = operator.index(index)
-        get_item = getattr(self.dataset, "get_item", None)
-        if callable(get_item):
-            source_item = get_item(resolved_index)
-        else:
-            source_item = self.dataset[resolved_index]
+        source_item = self._read_item(resolved_index)
 
         return source_item
 
@@ -289,6 +325,7 @@ class IndexReplayCheckpoint:
         """Append an indexed source item and retain each sample index."""
         model_samples_item, output_index = source_item
         model_samples = _normalize_source_samples(model_samples_item)
+
         for sample_index, model_sample in enumerate(model_samples):
             candidate_buffer.put_item(model_sample, (output_index, sample_index))
 
@@ -335,6 +372,7 @@ class FullSampleCheckpoint:
     def put_source_item(source_item: Any, candidate_buffer: BaseCandidateBuffer) -> None:
         """Append one streaming source item to the candidate buffer."""
         model_samples = _normalize_source_samples(source_item)
+
         for model_sample in model_samples:
             candidate_buffer.put_item(model_sample)
 
@@ -393,6 +431,10 @@ class _BatchPipeline(ABC):
 class _TokenBatchPipeline(_BatchPipeline):
     """Build batches directly from fully encoded token samples."""
 
+    def __init__(self) -> None:
+        """Reuse the packing policy across rows and batches."""
+        self.packer = SamplePacker()
+
     def build_candidate_buffer(
             self,
             *,
@@ -410,8 +452,10 @@ class _TokenBatchPipeline(_BatchPipeline):
             self,
             selected_samples: Sequence[Mapping[str, Any]],
     ) -> Sequence[Mapping[str, Any]]:
-        """Return fully encoded samples for final collation."""
-        return selected_samples
+        """Pack one row using the same field and boundary rules as Omni."""
+        packed_sample = self.packer.pack_selected_samples(selected_samples)
+        packed_samples = [packed_sample]
+        return packed_samples
 
 
 @dataclass(frozen=True)
@@ -426,31 +470,30 @@ class _OmniPackingPipeline(_BatchPipeline):
     @classmethod
     def from_dataset(cls, dataset: Any) -> "_OmniPackingPipeline":
         """Build the packing pipeline from one normalized Omni Dataset interface."""
-        selected_sample_encoder = getattr(dataset, "encode_selected_sample", None)
-        batch_encoder = getattr(dataset, "encode_batch", None)
-        if not callable(selected_sample_encoder) or not callable(batch_encoder):
-            raise TypeError("OmniPackingLoader requires encode_selected_sample() and encode_batch()")
-
         # Hook—a criterion used to select data objects; this criterion can be extended to support load balancing.
         selector = getattr(dataset, "packing_selector", None)
+
         if selector is None:
             selector = FirstFitPackingSelector()
+
         if not isinstance(selector, PackingSelector):
             raise TypeError("dataset.packing_selector must implement PackingSelector")
 
         # This is a hook function used to package data into different fields;
         # you need to verify that the keyword mappings match.
         packer = getattr(dataset, "sample_packer", None)
+
         if packer is None:
             packer = SamplePacker()
+
         if not isinstance(packer, SamplePacker):
             raise TypeError("dataset.sample_packer must implement SamplePacker")
 
         packing_pipeline = cls(
             selector=selector,
-            selected_sample_encoder=selected_sample_encoder,
+            selected_sample_encoder=dataset.encode_selected_sample,
             packer=packer,
-            batch_encoder=batch_encoder,
+            batch_encoder=dataset.encode_batch,
         )
         return packing_pipeline
 
@@ -474,13 +517,17 @@ class _OmniPackingPipeline(_BatchPipeline):
     ) -> Sequence[Mapping[str, Any]]:
         """Encode and pack one selected sample group."""
         encoded_samples = []
+
         for selected_sample in selected_samples:
             encoded_sample = self.selected_sample_encoder(selected_sample)
+
             if not isinstance(encoded_sample, Mapping):
                 raise TypeError("postencode_sample must return a mapping")
+
             encoded_samples.append(encoded_sample)
 
         packed_sample = self.packer.pack_selected_samples(encoded_samples)
+
         if not isinstance(packed_sample, Mapping):
             raise TypeError("SamplePacker must return one mapping")
 

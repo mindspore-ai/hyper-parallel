@@ -54,12 +54,14 @@ def _build_dataloader_context(
     return dataloader_context
 
 
-def _get_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, int]:
-    """Calculate train, validation, and test sizes from the training plan."""
+def _get_offline_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, int]:
+    """Calculate offline train, validation, and test sizes from the training plan."""
+
     if training_config is None:
         raise ValueError("Dataset sample planning requires a training configuration")
 
     global_batch_size = training_config.global_batch_size
+
     if training_config.train_iters is not None:
         train_iters = training_config.train_iters
     elif training_config.train_samples:
@@ -100,22 +102,19 @@ def build_online_text_mapping_dataset(
     Raises:
         ValueError: If no Online text transform is configured.
     """
+
     if transform is None:
         raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
 
     dataset_config = dict(data_config)
-    training_seed = getattr(training_config, "seed", None)
+    training_seed = training_config.seed if training_config is not None else None
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
-    train_valid_test_num_samples = None
-    if training_config is not None:
-        train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
     sample_filter = transform.is_valid_sample
     source_dataset = build_online_mapping_source(
         data_path=data_path,
         data_config=dataset_config,
         sample_filter=sample_filter,
         sampler_type=sampler_type,
-        train_valid_test_num_samples=train_valid_test_num_samples,
     )
     text_dataset = MappingTransformDataset.apply(source_dataset, transform)
     return text_dataset
@@ -147,13 +146,15 @@ def build_online_iterable_dataset(
     Raises:
         ValueError: If no Online text transform is configured.
     """
+
     if transform is None:
         raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
 
     dataset_config = dict(data_config)
-    training_seed = getattr(training_config, "seed", None)
+    training_seed = training_config.seed if training_config is not None else None
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
     sample_filter = transform.is_valid_sample
+
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
 
@@ -196,8 +197,9 @@ def build_indexed_text_dataset(
     """
     dataset_config = dict(data_config)
     dataset_config.setdefault("distributed_walk", True)
-    training_seed = getattr(training_config, "seed", None)
+    training_seed = training_config.seed if training_config is not None else None
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
+
     if tokenizer is not None:
         dataset_config["tokenizer"] = tokenizer
 
@@ -205,7 +207,7 @@ def build_indexed_text_dataset(
         raise ValueError("Indexed Dataset requires data_path")
 
     if train_valid_test_num_samples is None:
-        train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
+        train_valid_test_num_samples = _get_offline_train_valid_test_num_samples(training_config)
 
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
