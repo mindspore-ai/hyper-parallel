@@ -114,6 +114,37 @@ class DSparkConfidenceHead(nn.Module):
         return self.proj(joined.float()).squeeze(-1)
 
 
+class _GroupedWoAFunction(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Grouped linear projection using contiguous 2D ``torch.mm`` per group."""
+
+    @staticmethod
+    def forward(ctx, grouped: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
+        # grouped: [B, S, J, G, D], wo_a: [G, R, D]
+        batch, seq, block, groups, dim = grouped.shape
+        rank = wo_a.shape[1]
+        g_flat = grouped.permute(3, 0, 1, 2, 4).contiguous().view(groups, -1, dim)
+        w = wo_a.to(grouped.dtype)
+        out = torch.empty((groups, g_flat.shape[1], rank), dtype=grouped.dtype, device=grouped.device)
+        for g in range(groups):
+            torch.mm(g_flat[g], w[g].t(), out=out[g])
+        ctx.save_for_backward(g_flat, w)
+        ctx.shape_info = (batch, seq, block, groups, dim, rank, wo_a.dtype)
+        return out.view(groups, batch, seq, block, rank).permute(1, 2, 3, 0, 4).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        g_flat, w = ctx.saved_tensors
+        batch, seq, block, groups, dim, rank, w_orig_dtype = ctx.shape_info
+        go_flat = grad_out.permute(3, 0, 1, 2, 4).contiguous().view(groups, -1, rank)
+        grad_g = torch.empty_like(g_flat)
+        grad_w = torch.empty_like(w)
+        for g in range(groups):
+            torch.mm(go_flat[g], w[g], out=grad_g[g])
+            torch.mm(go_flat[g].t(), g_flat[g], out=grad_w[g])
+        grad_grouped = grad_g.view(groups, batch, seq, block, dim).permute(1, 2, 3, 0, 4).contiguous()
+        return grad_grouped, grad_w.to(w_orig_dtype)
+
+
 class DSparkDraftAttention(nn.Module):
     """Sliding-window MQA over backbone-projected KV for draft positions.
 
@@ -199,7 +230,7 @@ class DSparkDraftAttention(nn.Module):
         context = torch.einsum("bshjw,bswd->bsjhd", weights, gathered_value.to(query.dtype))
         grouped = context.reshape(batch, seq, block, self.o_groups, -1)
         wo_a = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, -1)
-        reduced = torch.einsum("bsjgd,grd->bsjgr", grouped, wo_a.to(context.dtype))
+        reduced = _GroupedWoAFunction.apply(grouped, wo_a)
         return self.wo_b(reduced.flatten(3))
 
 
@@ -532,11 +563,11 @@ class DeepseekV41DSpark(nn.Module):
                 reduction="sum",
             )
             with torch.no_grad():
-                hit_sum = ((logits.argmax(dim=-1) == target_chunk) & chunk_mask).sum()
+                chunk_hits = (logits.argmax(dim=-1) == target_chunk) & chunk_mask
+                hit_sum = chunk_hits.sum()
+            del logits
             confidence = self.confidence_head(hidden_chunk, markov_embed)
             if bool(chunk_mask.any()):
-                with torch.no_grad():
-                    chunk_hits = (logits.argmax(dim=-1) == target_chunk) & chunk_mask
                 bce_sum = functional.binary_cross_entropy_with_logits(
                     confidence[chunk_mask], chunk_hits[chunk_mask].float(), reduction="sum"
                 )
