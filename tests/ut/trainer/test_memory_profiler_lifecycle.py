@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for memory profiler integration with Trainer lifecycles."""
 
+import gc
 import types
 import unittest
 from functools import partial
@@ -21,6 +22,7 @@ from typing import Union
 from unittest.mock import MagicMock, patch
 
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer.callbacks.garbage_collection_callback import GarbageCollectionCallback
 from hyper_parallel.trainer.config.training import MemoryConfig
 from hyper_parallel.trainer.text_trainer import TextTrainer
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
@@ -187,6 +189,58 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
                 base.profiler_callback.close.assert_called_once_with()
                 stop_mock.assert_called_once_with()
                 abort_mock.assert_called_once_with()
+
+    def test_manual_gc_policy_is_restored_after_training(self) -> None:
+        """Feature: manual GC lifecycle. Description: finish or fail. Expectation: restore caller policy."""
+        previous = gc.isenabled()
+        try:
+            for trainer_class in (BaseTrainer, TextTrainer, VLMTrainer):
+                for initially_enabled in (True, False):
+                    for failure in (None, "collect", "train_end"):
+                        with self.subTest(trainer=trainer_class.__name__, enabled=initially_enabled, failure=failure):
+                            if initially_enabled:
+                                gc.enable()
+                            else:
+                                gc.disable()
+                            trainer, base = self._empty_trainer(trainer_class, [])
+                            base.mesh = None
+                            base.config.training = types.SimpleNamespace(
+                                manual_gc=True, gc_steps=50, empty_cache_steps=0,
+                            )
+                            callback = GarbageCollectionCallback(base)
+                            base.garbage_collection_callback = callback
+                            base._callbacks = [callback]  # pylint: disable=protected-access
+                            try:
+                                with (
+                                    patch("hyper_parallel.trainer.base.HyperIter", return_value=MagicMock()),
+                                    patch("hyper_parallel.trainer.base.memory_profiler.stop"),
+                                    patch("hyper_parallel.trainer.base.memory_profiler.abort"),
+                                    patch("hyper_parallel.trainer.base.synchronize"),
+                                    patch("hyper_parallel.trainer.text_trainer.synchronize"),
+                                    patch("hyper_parallel.trainer.vlm_trainer.synchronize"),
+                                    patch("gc.collect", side_effect=_ProbeError("collect") if failure == "collect"
+                                          else None),
+                                ):
+                                    if failure == "train_end":
+                                        # Fail before the GC callback can restore the policy normally.
+                                        with patch.object(
+                                            trainer, "on_train_end", side_effect=_ProbeError("train_end"),
+                                        ):
+                                            with self.assertRaisesRegex(_ProbeError, "train_end"):
+                                                trainer.train()
+                                    elif failure == "collect":
+                                        with self.assertRaisesRegex(_ProbeError, "collect"):
+                                            trainer.train()
+                                    else:
+                                        trainer.train()
+                                self.assertEqual(gc.isenabled(), initially_enabled)
+                            finally:
+                                callback.close()
+        finally:
+            if previous:
+                gc.enable()
+            else:
+                gc.disable()
 
     @staticmethod
     def _empty_trainer(

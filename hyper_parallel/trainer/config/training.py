@@ -39,6 +39,8 @@ class TrainingConfig:
     seed: Optional[int] = None
     enable_full_determinism: bool = False
     gc_steps: int = 0
+    manual_gc: bool = False
+    """Disable automatic Python GC during training and collect every positive ``gc_steps`` at step start."""
     empty_cache_steps: int = 0
     empty_cache_before_backward: bool = False
     eval_steps: int = 0

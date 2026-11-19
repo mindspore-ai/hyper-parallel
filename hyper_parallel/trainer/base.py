@@ -1155,7 +1155,13 @@ class BaseTrainer(Stateful, ABC):
         }
 
     def abort_profilers(self) -> None:
-        """Release process-local profiling resources while preserving a training error."""
+        """Restore GC and release profiling resources while preserving a training error."""
+        garbage_collection = getattr(self, "garbage_collection_callback", None)
+        if garbage_collection is not None:
+            try:
+                garbage_collection.close()
+            except BaseException:  # pylint: disable=broad-exception-caught
+                logger.exception("Failed to restore automatic garbage collection while aborting training.")
         try:
             memory_profiler.abort()
         # Cleanup must also preserve the training error if interrupted.

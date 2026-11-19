@@ -15,7 +15,8 @@
 """Periodic Python and accelerator garbage collection callback."""
 
 import gc
-from typing import Any
+from multiprocessing.util import register_after_fork
+from typing import Any, Optional
 
 from hyper_parallel.trainer.runtime.device import empty_cache, get_device_type
 
@@ -34,12 +35,33 @@ class GarbageCollectionCallback(Callback):
         super().__init__(trainer)
         training_config = trainer.config.training
         self.gc_steps = training_config.gc_steps
+        self.manual_gc = getattr(training_config, "manual_gc", False)
+        self._gc_was_enabled: Optional[bool] = None
+        if self.manual_gc and self.gc_steps <= 0:
+            raise ValueError("manual_gc requires a positive gc_steps cleanup interval")
+        if self.manual_gc:
+            # Forked DataLoader workers do not run the parent's step callbacks.
+            register_after_fork(self, type(self).close)
         self.empty_cache_steps = training_config.empty_cache_steps
+
+    def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
+        """Save the automatic GC policy and switch to explicit collections."""
+        del state, kwargs
+        if self.manual_gc and self._gc_was_enabled is None:
+            self._gc_was_enabled = gc.isenabled()
+            gc.disable()
+            gc.collect()
+
+    def on_step_begin(self, state: TrainerState, **kwargs: Any) -> None:
+        """Collect at step boundaries inside the step timing interval."""
+        del kwargs
+        if self.manual_gc and state.global_step > 0 and state.global_step % self.gc_steps == 0:
+            gc.collect()
 
     def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
         """Run configured cleanup operations after an optimizer step."""
         del kwargs
-        if self.gc_steps > 0 and state.global_step % self.gc_steps == 0:
+        if not self.manual_gc and self.gc_steps > 0 and state.global_step % self.gc_steps == 0:
             gc.collect()
         if (
             self.empty_cache_steps > 0
@@ -47,3 +69,17 @@ class GarbageCollectionCallback(Callback):
             and get_device_type() != "cpu"
         ):
             empty_cache()
+
+    def close(self) -> None:
+        """Restore the original process-local automatic GC policy once."""
+        if self._gc_was_enabled is not None:
+            if self._gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+            self._gc_was_enabled = None
+
+    def on_train_end(self, state: TrainerState, **kwargs: Any) -> None:
+        """Restore automatic GC when training finishes normally."""
+        del state, kwargs
+        self.close()
