@@ -83,18 +83,16 @@ def _prepare_factory(record, factory, source_type, expected_type, generated_type
             module = copy(module)
             module.__class__ = source_type
         if selection is not None:
-            candidate = build_prepared_family_replacement(
-                module=module, module_fqn=module_fqn, prepared=selection, construct_member=emitted,
-            )
+            builder = emitted if record.get("source_family_builder") else build_prepared_family_replacement
+            candidate = builder(module=module, module_fqn=module_fqn, prepared=selection)
         elif emitted is not None:
             arguments = _decode_construction_value(record["replay"]["constructor_arguments"])
             candidate = emitted(module=module, module_fqn=module_fqn, context=context, **arguments)
         else:
             candidate = factory(module=module, module_fqn=module_fqn, context=context)
-        actual_type = type(candidate)
-        if actual_type not in (expected_type, generated_type):
+        if type(candidate) is not expected_type:  # pylint: disable=unidiomatic-typecheck
             raise _mismatch(f"{module_fqn!r} installed {type(candidate)!r}, expected {expected_type!r}")
-        if actual_type is not generated_type:
+        if generated_type is not expected_type:
             # The emitted subclass supplies forwards only. The recorded native
             # constructor owns parameters, state and checkpoint conversion.
             candidate.__class__ = generated_type

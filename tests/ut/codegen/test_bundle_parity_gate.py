@@ -65,7 +65,8 @@ def test_cli_and_rank_zero_sidecar_publish_identical_bundles(tmp_path, monkeypat
     tree = ast.parse(modeling.read_text(encoding="utf-8"))
     prepared, emitted = _preinstalled_calls(tree)
     name = "CPMultiLatentAttentionModule"
-    assert prepared == emitted and name in emitted.values(), f"Expected {name} construction calls: {emitted}"
+    assert prepared == emitted
+    assert emitted["model.layers.0.self_attn"] == "build_prepared_family_replacement"
     verify_parallel_family_forwards(tree, {
         "model.layers.0.self_attn": {
             "type": name,

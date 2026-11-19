@@ -384,8 +384,7 @@ def _emit_preinstalled_components(text: str, meta: Any) -> str:
     # Use the constructor's original suite indentation for copied sources.
     body = lines[constructor.body[0].lineno - 1]
     indent = body[:len(body) - len(body.lstrip())]
-    entries = "".join(f"{indent}    {record!r},\n" for record in records)
-    imports, constructors_by_fqn = _emitted_constructors(records, getattr(meta, "parallel_forwards", {}), indent)
+    entries, imports, constructors_by_fqn = _emitted_constructors(records, indent)
     lines[constructor.end_lineno:constructor.end_lineno] = [
         f"{indent}from hyper_parallel.models._generated.phase_c import apply_generated_phase_c\n",
         f"{indent}self._hp_bind_materialized_forwards = apply_generated_phase_c\n",
@@ -400,22 +399,24 @@ def _emit_preinstalled_components(text: str, meta: Any) -> str:
     return "".join(lines)
 
 
-def _emitted_constructors(records, parallel_forwards, indent):
+def _emitted_constructors(records, indent):
     """Emit a direct executable factory call for every prepared module path."""
     imports = {}
+    entries = []
     calls = []
     for record in records:
         fqn = record["primary_fqn"]
         symbol = record["replay"]["constructor"]
         module, name = symbol.split(":", 1)
-        if parallel_forwards.get(fqn, {}).get("type") == symbol:
-            callee = name
-        else:
-            alias = imports.setdefault(module, f"_hp_constructor_module_{len(imports)}")
-            callee = f"{alias}.{name}"
+        if record.get("family_request", {}).get("selection"):
+            record = {**record, "source_family_builder": True}
+            module, name = "hyper_parallel.models.prepared_family", "build_prepared_family_replacement"
+        alias = imports.setdefault(module, f"_hp_constructor_module_{len(imports)}")
+        callee = f"{alias}.{name}"
+        entries.append(f"{indent}    {record!r},\n")
         calls.append(f"{indent}        {fqn!r}: lambda **kwargs: {callee}(**kwargs),\n")
     statements = [f"{indent}import {module} as {alias}\n" for module, alias in imports.items()]
-    return statements, "".join(calls)
+    return "".join(entries), statements, "".join(calls)
 
 
 def _verify_recorded_patch_materialization(
@@ -582,7 +583,10 @@ def _preinstalled_calls(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
             for target in node.targets
         ):
             prepared.update({
-                item["primary_fqn"]: item["replay"].get("constructor", "").split(":")[-1].split(".")[-1]
+                item["primary_fqn"]: (
+                    "build_prepared_family_replacement" if item.get("source_family_builder")
+                    else item["replay"].get("constructor", "").split(":")[-1].split(".")[-1]
+                )
                 for item in ast.literal_eval(node.value)
             })
         elif isinstance(node, ast.Call) and _call_name(node.func) == "install_prepared_components":
