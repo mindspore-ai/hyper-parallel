@@ -14,17 +14,11 @@
 # ============================================================================
 """Contracts for recording native module replacement decisions."""
 
-from types import SimpleNamespace
-from unittest.mock import patch
-
 import pytest
 import torch
 from torch import nn
 
-from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
-from hyper_parallel.codegen.inline.framework_spec import replacement_spec_for
-from hyper_parallel.codegen.inline.observations import collect_source_observations
-from hyper_parallel.codegen.inline.replacement_pass import build_replacement_patches
+from hyper_parallel.codegen.manager import _preinstalled_records
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.models import replacement as replacement_api
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
@@ -64,15 +58,6 @@ class _ReplacementBlock(nn.Module):
 
     def forward(self, inputs):
         return inputs * self.weight
-
-
-@module_replacement
-class _ObservedReplacementBlock(_ReplacementBlock):
-    """Model-owned replacement with required native executor arguments."""
-
-    def __init__(self, *, module, module_fqn, context):
-        del module_fqn, context
-        super().__init__(module)
 
 
 @module_replacement
@@ -136,19 +121,7 @@ def test_native_replacement_records_declaration_and_application_once():
     assert application["source_type"].endswith(":_SourceBlock")
     assert application["replacement_type"].endswith(":_ReplacementBlock")
     assert application["weight_transforms"] == []
-    assert replacement_records_from_snapshot(session.finish()) == (
-        {
-            "exact_type": True,
-            "factory": f"{_ReplacementBlock.__module__}.{_ReplacementBlock.__qualname__}",
-            "fqn": "alias",
-            "fqns": ["alias", "primary"],
-            "match": ["primary"],
-            "module_type": f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}",
-            "replacement_target": "tests.replace_block",
-            "target_config": {"mode": "pipelined"},
-            "opaque_legacy": True,
-        },
-    )
+    assert application.get("replay") is None
 
 
 def test_python_replacement_rule_gets_stable_order_fallback():
@@ -200,9 +173,8 @@ def test_inferred_source_type_is_recorded_from_native_application():
     assert replacements["applications"][0]["source_type"] == (
         f"{_SourceBlock.__module__}:{_SourceBlock.__qualname__}"
     )
-    assert replacement_records_from_snapshot(snapshot)[0]["module_type"] == (
-        f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}"
-    )
+    replay = replacements["applications"][0]["replay"]
+    assert replay["constructor"] == f"{_replace_source_block.__module__}:{_replace_source_block.__qualname__}"
 
 
 def test_yaml_replacement_preserves_declaration_order_and_static_arguments():
@@ -248,73 +220,11 @@ def test_unmatched_rule_fails_before_preparation_publishes_a_manifest():
         get_preparation_manifest(model)
 
 
-def test_family_replacement_uses_prepared_target_without_inference():
-    """Consume the recorded source type, member selection and exact aliases."""
-    selection = {
-        "target": "component.impl:AttentionFamily", "version": 1, "variant": "cp",
-        "member": "component.member:CPAttention", "selectors": {"parallel": True},
-        "request_arguments": {"mapping": {"overlap": False}}, "resolved_arguments": {"mapping": {}},
-        "construction_context": {"mapping": {"cp_size": 2}},
-    }
-    snapshot = {"replacements": {
-        "declarations": [{
-            "rule_id": "example", "match": ["*.attention"], "exact_type": True,
-            "replacement_target": "old.adapter.lookup",
-        }],
-        "applications": [{
-            "rule_id": "example", "primary_fqn": "layer.0.attention",
-            "module_fqns": ["layer.0.attention", "attention_alias"],
-            "source_type": "source.model:Attention", "replacement_type": "component.member:CPAttention",
-            "family_request": {
-                "factory": "component.impl:AttentionFamily", "kwargs": {"overlap": False},
-                "context": {"cp_size": 2}, "selection": selection,
-            },
-        }],
-    }}
-    records = replacement_records_from_snapshot(snapshot)
-    rules = collect_source_observations(SimpleNamespace(module_overrides=records))
-
-    with patch("hyper_parallel.codegen.inline.framework_spec.replacement_spec_for") as infer:
-        patches = build_replacement_patches(rules)
-
-    infer.assert_not_called()
-    assert len(patches.constructor_replaces) == 1, f"Expected one constructor replacement, got {patches}"
-    constructor = patches.constructor_replaces[0]
-    assert constructor.old_ctor == "Attention", f"Unexpected source constructor: {constructor}"
-    assert constructor.new_ctor == "build_prepared_family_replacement", (
-        f"Unexpected prepared constructor: {constructor}"
-    )
-    expected_aliases = ("attention_alias", "layer.0.attention")
-    assert constructor.scope_fqns == expected_aliases, f"Expected {expected_aliases}, got {constructor.scope_fqns}"
-    expected_args = ("module_fqn=''", f"prepared={selection!r}")
-    assert constructor.keyword_args == expected_args, f"Expected {expected_args}, got {constructor.keyword_args}"
-
-
-def test_opaque_replacement_requires_a_lowering():
-    """An unsupported installed legacy replacement fails with its exact FQN."""
-    records = ({
-        "factory": "legacy.external.convert", "fqns": ["layers.0.experts"],
-        "module_type": "source.model.Experts", "opaque_legacy": True,
-    },)
-    rules = collect_source_observations(SimpleNamespace(module_overrides=records))
-
-    with pytest.raises(RuntimeError, match=r"Opaque legacy replacement .*layers\.0\.experts.*no replay record"):
-        build_replacement_patches(rules)
-
-
-@pytest.mark.parametrize("separator", [".", ":"])
-def test_observed_replacement_class_needs_no_codegen_declaration(separator):
-    """Avoid duplicate declarations for an observed replacement class."""
-    replacement_type = (
-        f"{_ObservedReplacementBlock.__module__}{separator}"
-        f"{_ObservedReplacementBlock.__qualname__}"
-    )
-    source_type = f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}"
-
-    spec = replacement_spec_for(replacement_type, module_type=source_type)
-
-    assert spec is not None
-    assert spec.old_ctor == "_SourceBlock"
-    assert spec.new_ctor == "_ObservedReplacementBlock"
-    assert spec.mode == "wrap_source"
-    assert spec.keyword_args == ("module_fqn=''", "context={}")
+def test_missing_constructor_replay_is_rejected_at_exact_fqn():
+    """Do not infer a constructor when any recorded module cannot be replayed."""
+    payload = {"replacements": {"applications": [
+        {"primary_fqn": "layers.0.attention", "replay": {"constructor": "demo:Attention"}},
+        {"primary_fqn": "layers.0.experts"},
+    ]}}
+    with pytest.raises(ValueError, match=r"no importable replay record.*layers\.0\.experts"):
+        _preinstalled_records(payload)

@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Project native replacement and injection observations into source rules."""
+"""Project native forward injections into source rules."""
 
 from __future__ import annotations
 
-import ast
 from typing import Any, Iterable
 
 from hyper_parallel.codegen.inline.ir import SourceObservation
@@ -27,22 +26,9 @@ def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
     """Return normalized source rules from the already observed native plan.
 
     Args:
-        meta: Observed native plan and replacement records.
+        meta: Observed native sharding plan.
     """
     rules: list[SourceObservation] = []
-    for record in getattr(meta, "module_overrides", None) or []:
-        target = _replacement_target(record)
-        if target:
-            rules.append(
-                SourceObservation(
-                    match=_matches(record),
-                    module_type=record.get("module_type"),
-                    replace_target=target,
-                    construction_kwargs=_construction_kwargs(record),
-                    prepared_family=record.get("prepared_family", False),
-                    opaque_legacy=record.get("opaque_legacy", False),
-                )
-            )
     for record in getattr(meta, "injections", None) or []:
         local = projected_target_path(record.get("local_compute_fn"))
         inner = projected_target_path(record.get("inner_wrapper"))
@@ -56,22 +42,6 @@ def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
             )
     return tuple(rules)
 
-
-
-def _construction_kwargs(record: dict[str, Any]) -> tuple[str, ...]:
-    """Preserve static arguments; reject values that cannot round-trip as literals."""
-    arguments = []
-    for name, value in sorted((record.get("target_config") or {}).items()):
-        text = repr(value)
-        if not name.isidentifier() or ast.literal_eval(text) != value:
-            raise ValueError(f"codegen cannot preserve construction argument {name!r}")
-        arguments.append(f"{name}={text}")
-    return tuple(arguments)
-
-
-def _replacement_target(record: dict[str, Any]) -> Any:
-    """Read the callable identity observed by preparation."""
-    return record.get("factory")
 
 
 def _matches(record: dict[str, Any]) -> tuple[str, ...]:

@@ -438,7 +438,7 @@ def _verify_recorded_patch_materialization(
         materialized.clear()
     missing = _verify_local_records(tree, classes, local_records, materialized)
     missing += _verify_replacement_records(
-        tree, classes, replacement_records, materialized
+        tree, replacement_records, materialized
     )
     missing += _verify_wrapper_records(
         classes, wrapper_records, replacement_records, materialized
@@ -528,39 +528,16 @@ def _verify_local_records(
     return missing
 
 
-def _verify_replacement_records(
-    tree: ast.AST, classes: dict[str, ast.ClassDef], records: Any, materialized: Any
-) -> list[str]:
-    """Verify replacement constructors in one source unit."""
-    bound_names = {
-        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-    } | set(classes)
+def _verify_replacement_records(tree: ast.AST, records: Any, materialized: Any) -> list[str]:
+    """Require an executable constructor for each recorded replacement path."""
     prepared, emitted = _preinstalled_calls(tree)
     missing = []
     for record in records:
-        constructor = getattr(record, "factory", None) or record.replacement_type
-        name = constructor.__name__
-        if record.module_fqn in prepared:
-            expected = prepared[record.module_fqn]
-            if not expected or emitted.get(record.module_fqn) != expected:
-                missing.append(f"{record.module_fqn} (missing executable constructor {expected!r})")
-            else:
-                _record_materialized(materialized, record.module_fqn, expected, "module_replacement", "constructor")
-            continue
-        visible = name in bound_names and any(
-            isinstance(node, ast.Call) and _call_name(node.func) == name
-            for node in ast.walk(tree)
-        )
-        if visible:
-            _record_materialized(
-                materialized,
-                record.module_fqn,
-                name,
-                "module_replacement",
-                "constructor",
-            )
+        expected = prepared.get(record.module_fqn)
+        if not expected or emitted.get(record.module_fqn) != expected:
+            missing.append(f"{record.module_fqn} (missing executable constructor {expected!r})")
         else:
-            missing.append(f"{record.module_fqn} (replacement {name})")
+            _record_materialized(materialized, record.module_fqn, expected, "module_replacement", "constructor")
     return missing
 
 

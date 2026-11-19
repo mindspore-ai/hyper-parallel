@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import importlib
 import keyword
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Mapping, Optional
 
@@ -28,12 +28,7 @@ class ModuleReplacementPatch:
     """One already-resolved module replacement."""
 
     module_fqn: str
-    source_type: type
     replacement_type: type
-    factory: Any = None
-    factory_kwargs: Mapping[str, Any] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
 
 
 @dataclass(frozen=True)
@@ -85,10 +80,7 @@ def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
     replacements = tuple(
         ModuleReplacementPatch(
             module_fqn=item["module_fqn"],
-            source_type=_resolve_symbol(item["source_type"]),
             replacement_type=_resolve_symbol(item["replacement_type"]),
-            factory=_resolve_symbol(item["factory"]) if item.get("factory") else None,
-            factory_kwargs=MappingProxyType(item.get("factory_kwargs", {})),
         )
         for item in data.get("module_replacements", ())
     )

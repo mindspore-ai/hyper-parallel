@@ -12,10 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""YAML-driven inline source patches for generated modeling files."""
-
-from hyper_parallel.codegen.inline.pipeline import render_inline_modeling
-
-__all__ = [
-    "render_inline_modeling",
-]
+"""Source rewrites for observed parallel forwards."""

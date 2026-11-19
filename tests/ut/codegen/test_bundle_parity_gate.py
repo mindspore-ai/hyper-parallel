@@ -86,7 +86,7 @@ def constructor(self):
     install_prepared_components(self, self.__hp_prepared_components__, {}, globals())
 """)
     record = SimpleNamespace(module_fqn="layer.attention", replacement_type=object)
-    missing = _verify_replacement_records(tree, {}, (record,), [])
+    missing = _verify_replacement_records(tree, (record,), [])
     assert missing == ["layer.attention (missing executable constructor 'ParallelAttention')"], (
         f"Metadata-only replacement should be rejected, got {missing}"
     )

@@ -35,7 +35,6 @@ from hyper_parallel.codegen.artifact import (
     write_bundle_atomic,
 )
 from hyper_parallel.codegen.emit import emit_bundle
-from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
 from hyper_parallel.codegen.emit.snapshot_patches import (
     emission_patches_from_snapshot_payload,
 )
@@ -107,7 +106,7 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
     status = snapshot.status
     frozen_plan = dict(payload["plan"] or {})
     is_derived = status is CodegenStatus.DERIVED
-    module_overrides, preinstalled = _replacement_inputs(payload) if is_derived else ([], [])
+    preinstalled = _preinstalled_records(payload) if is_derived else []
     emission_patches = (
         emission_patches_from_snapshot_payload(payload) if is_derived else {}
     )
@@ -120,23 +119,19 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
         boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
         nested_components=list(frozen_plan.get("nested_components") or ()),
         mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
-        module_overrides=module_overrides,
         preinstalled_components=preinstalled,
         parallel_forwards=dict(frozen_plan.get("parallel_forwards") or {}),
         emission_patches=emission_patches,
     )
 
 
-def _replacement_inputs(payload: dict) -> tuple[list, list]:
-    """Select captured constructor records or the transitional snapshot format."""
+def _preinstalled_records(payload: dict) -> list:
+    """Use only replayable constructors captured by shared preparation."""
     applications = payload["replacements"]["applications"]
-    if applications and all(item.get("replay") for item in applications):
-        return [], list(applications)
-    unsupported = [item["primary_fqn"] for item in applications
-                   if "opaque_legacy" in item and not item.get("replay")]
+    unsupported = [item["primary_fqn"] for item in applications if not item.get("replay")]
     if unsupported:
         raise ValueError(f"Codegen replacement has no importable replay record at {unsupported!r}")
-    return list(replacement_records_from_snapshot(payload)), []
+    return list(applications)
 
 
 def _model_type_to_modeling_token(model_type: str) -> str:

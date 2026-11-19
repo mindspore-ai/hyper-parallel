@@ -12,15 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lower recorded construction and forward strategies to source edits."""
+"""Lower recorded forward strategies to source edits."""
 
 from __future__ import annotations
 
-import importlib
-import inspect
-
-from hyper_parallel.codegen.inline.ir import ImportPatch, ReplacementSpec, SourceObservation, StrategySpec
-from hyper_parallel.codegen.inline.recognition import class_name_of, inner_wrapper_target
+from hyper_parallel.codegen.inline.ir import ImportPatch, StrategySpec
+from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 
 
 _CP_DISPATCH_SHELL = '''if self.cp_enable:
@@ -42,88 +39,6 @@ def cp_dispatch_shell_body(helper_name: str) -> str:
 CP_ATTENTION_KIND = "cp_attention"
 
 _STRATEGY_CACHE: dict[tuple[str, bool], StrategySpec | None] = {}
-
-
-#: Generic components are valid direct targets without a decorator. Model-owned
-#: classes are accepted only when their native replacement decorator marks them.
-_COMPONENTS_PREFIX = "hyper_parallel.components."
-
-
-def _direct_component_class(target: str) -> type | None:
-    """Import a generic or natively decorated replacement class."""
-    module_name, _, attr = target.rpartition(".")
-    if not module_name or not attr:
-        return None
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError:
-        return None
-    component = getattr(module, attr, None)
-    if not isinstance(component, type):
-        return None
-    if (
-        target.startswith(_COMPONENTS_PREFIX)
-        or getattr(component, "_hp_module_replacement", False)
-    ):
-        return component
-    return None
-
-
-def replacement_spec_for(
-    target: str | None,
-    model_type: str | None = None,
-    *,
-    module_type: str | None = None,
-) -> ReplacementSpec | None:
-    """Lower an explicitly observed component class from an older snapshot."""
-    del model_type
-    if target is None:
-        return None
-    component = _direct_component_class(target.replace(":", ".", 1))
-    old_ctor = class_name_of(module_type)
-    if component is None or not old_ctor:
-        return None
-    params = inspect.signature(component).parameters
-    if "module" not in params:
-        return None
-    name = component.__name__
-    return ReplacementSpec(
-        old_ctor=old_ctor, new_ctor=name, mode="wrap_source", remove_class=False,
-        imports=(ImportPatch(component.__module__, (name,)),),
-        keyword_args=tuple(
-            f"{key}={value}" for key, value in (("module_fqn", "''"), ("context", "{}")) if key in params
-        ),
-    )
-
-
-def _family_wrap_spec(target: str, module_type: str | None) -> ReplacementSpec:
-    """Lower an authoritative family request to the existing source wrapper form."""
-    module_name, _, name = target.replace(":", ".", 1).rpartition(".")
-    old_ctor = class_name_of(module_type)
-    if not module_name or not name or not old_ctor:
-        raise ValueError(f"Invalid prepared family replacement {target!r} for {module_type!r}")
-    return ReplacementSpec(
-        old_ctor=old_ctor, new_ctor=name,
-        imports=(ImportPatch(module_name, (name,)),), mode="wrap_source",
-        keyword_args=("module_fqn=''",), remove_class=False, defer_to_fqns=True,
-    )
-
-
-def replacement_spec_for_observation(
-    rule: SourceObservation, model_type: str | None,
-) -> ReplacementSpec | None:
-    """Render a prepared family directly or lower a supported legacy replacement."""
-    if rule.prepared_family:
-        if rule.replace_target is None:
-            raise ValueError("Prepared family replacement has no construction target")
-        return _family_wrap_spec(rule.replace_target, rule.module_type)
-    spec = replacement_spec_for(rule.replace_target, model_type, module_type=rule.module_type)
-    if spec is None and rule.opaque_legacy:
-        raise RuntimeError(
-            f"Opaque legacy replacement {rule.replace_target!r} at {rule.match!r} "
-            "has no replay record or inline declaration"
-        )
-    return spec
 
 
 def strategy_spec_for(
@@ -199,7 +114,5 @@ def _cp_strategy_spec(target: str) -> StrategySpec:
 __all__ = [
     "CP_ATTENTION_KIND",
     "cp_dispatch_shell_body",
-    "replacement_spec_for",
-    "replacement_spec_for_observation",
     "strategy_spec_for",
 ]

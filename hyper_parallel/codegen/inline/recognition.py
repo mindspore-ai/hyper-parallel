@@ -34,13 +34,6 @@ class InnerWrapperTarget:
     inline_body: str | None = None
 
 
-def class_name_of(qualified_type: str | None) -> str | None:
-    """Return the bare class name of a dotted ``module_type`` path."""
-    if not qualified_type:
-        return None
-    return qualified_type.rsplit(".", 1)[-1] or None
-
-
 def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
     """Recover an inner wrapper's emitted helper contract from its source."""
     if not factory_path:
@@ -357,4 +350,4 @@ def _original_forward_binding(tree: ast.AST) -> str | None:
     return None
 
 
-__all__ = ["InnerWrapperTarget", "class_name_of", "inner_wrapper_target"]
+__all__ = ["InnerWrapperTarget", "inner_wrapper_target"]

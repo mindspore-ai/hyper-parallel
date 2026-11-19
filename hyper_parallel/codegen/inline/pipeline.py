@@ -31,44 +31,10 @@ from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.definition_edits import drop_shadowed_definitions
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.framework_spec import (
-    replacement_spec_for_observation,
     strategy_spec_for as strategy_spec,
 )
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.observations import collect_source_observations
-from hyper_parallel.codegen.inline.source_plan import build_source_patch_plan
-
-
-def render_inline_modeling(
-    source_text: str,
-    meta: Any,
-    model_type: str | None = None,
-    *,
-    patch_plan: Any = None,
-) -> str:
-    """Render the inline-patched modeling file for a frozen plan.
-
-    This is the only artifact route. A YAML target with no adapter declaration
-    is a hard error rather than a silent fallback, so an inline coverage gap
-    surfaces at generation time instead of degrading the artifact. A plan with
-    no inline rules needs no patch and the source is returned unchanged.
-
-    Args:
-        source_text: Modeling source the inline patches are applied to.
-        meta: Frozen plan metadata recorded by the generator.
-        model_type: Model family key used to resolve framework declarations.
-
-    Returns:
-        The rendered modeling source.
-    """
-
-    rendered, _ = render_inline_modeling_with_plan(
-        source_text,
-        meta,
-        model_type,
-        patch_plan=patch_plan,
-    )
-    return rendered
 
 
 def render_inline_modeling_with_plan(
@@ -92,8 +58,7 @@ def render_inline_modeling_with_plan(
         else rules
     )
     _require_inline_coverage(strategy_rules, model_type)
-    patch_set = build_source_patch_plan(
-        rules,
+    patch_set = build_strategy_patches(
         strategy_rules,
         model_type,
         _observed_boundary_classes(meta, patch_plan),
@@ -102,14 +67,7 @@ def render_inline_modeling_with_plan(
     _add_recorded_forward_host_imports(source_text, patch_set, patch_plan)
     _materialize_imported_forward_hosts(source_text, patch_set)
     rendered = apply_patch_set(source_text, patch_set)
-    # The copied modeling source brings its own decorated helpers that share
-    # names with the library functions the artifact imports, and a local
-    # definition wins over the import: the native path calls the library
-    # implementation (whose kernel binding is resolved in its own module), so a
-    # redefined copy makes the generated model run something else.  Only names
-    # the base source defines with a decorator are candidates, so the classes and
-    # snippets the inline passes render (which share names with library imports
-    # on purpose) keep their definitions.
+    # Prefer native helpers over decorated definitions copied from the model source.
     rendered = drop_shadowed_definitions(
         rendered, _library_import_names(rendered) & _decorated_names(source_text)
     )
@@ -279,8 +237,6 @@ def render_inline_strategies_for_source_unit(
     if not patches.forward_extracts:
         return source_text
     patches.module_snippets.clear()
-    patches.constructor_replaces.clear()
-    patches.class_removals.clear()
     return apply_patch_set(source_text, patches)
 
 
@@ -358,24 +314,9 @@ def _is_local_compute_factory(target: str) -> bool:
 
 
 def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = None) -> None:
-    """Fail when a YAML rule has no structural resolution behind it.
-
-    Covers both rule kinds: a replacement target needs a ``ReplacementSpec``,
-    and every strategy target needs a ``StrategySpec``.  One exception: a
-    ``local_compute_fn`` target that is itself a ``@local_compute`` factory
-    needs no inline strategy -- its region is runtime-bound (see
-    :func:`_is_local_compute_factory`), so the factory's injection discipline
-    is the coverage proof.  Reporting all gaps at once keeps one fix cycle
-    from hiding the next gap.
-    """
-
+    """Require a known inline strategy or a runtime local-compute factory."""
     uncovered: list[str] = []
     for rule in rules:
-        if (
-            rule.replace_target is not None
-            and replacement_spec_for_observation(rule, model_type) is None
-        ):
-            uncovered.append(rule.replace_target)
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
             if target is None:
                 continue
