@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -414,6 +414,22 @@ _ACTIVE_APPLICATIONS: ContextVar[list[ReplacementApplication] | None] = ContextV
     "hyper_parallel_preparation_applications",
     default=None,
 )
+_CAPTURE_MANIFEST: ContextVar[bool] = ContextVar("hyper_parallel_capture_preparation_manifest", default=False)
+
+
+@contextmanager
+def capture_preparation_manifest() -> Iterator[None]:
+    """Opt in to collecting stable preparation metadata for builds in this context."""
+    token = _CAPTURE_MANIFEST.set(True)
+    try:
+        yield
+    finally:
+        _CAPTURE_MANIFEST.reset(token)
+
+
+def preparation_application_capture() -> AbstractContextManager[list[ReplacementApplication] | None]:
+    """Use an isolated application collector when a manifest was requested."""
+    return collect_replacement_applications() if _CAPTURE_MANIFEST.get() else nullcontext()
 
 
 @contextmanager
@@ -599,7 +615,7 @@ def record_native_bindings(model: nn.Module, plan: Any) -> PreparationManifest:
 
 
 def get_preparation_manifest(model: nn.Module) -> PreparationManifest:
-    """Return the immutable preparation result attached by ``prepare_model_components``."""
+    """Return the immutable metadata attached by an opted-in preparation build."""
     manifest = getattr(model, "_hp_preparation_manifest", None)
     if not isinstance(manifest, PreparationManifest):
         raise RuntimeError("model components have not produced a PreparationManifest")
@@ -614,5 +630,6 @@ __all__ = [
     "ReplacementApplication",
     "SymbolRef",
     "WeightConversionRecord",
+    "capture_preparation_manifest",
     "get_preparation_manifest",
 ]

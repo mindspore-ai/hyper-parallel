@@ -73,7 +73,6 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
                 False,
             ),
             activation_swap=config.activation_swap,
-            compile_config=config.compile,
             model_init_dtype=config.model_init_dtype,
         )
     build_ir = project_model_build(capture)
@@ -117,7 +116,7 @@ def create_offline_distributed_setup(config: Any) -> DistributedSetup:
     return DistributedSetup.from_config(
         config,
         mesh_context=mesh_context,
-        strategy_enabled=True,
+        strategy_enabled=False,
     )
 
 

@@ -35,6 +35,7 @@ from hyper_parallel.models import PreparationManifest, get_preparation_manifest
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
 from hyper_parallel.models.preparation_manifest import (
     WeightConversionRecord,
+    capture_preparation_manifest,
     collect_replacement_applications,
     record_native_bindings,
 )
@@ -105,10 +106,11 @@ class TestPreparationManifest(unittest.TestCase):
             family_id="test.linear",
             schema_version=2,
         ))
-        model, _ = prepare_model_components(
-            FamilyModel(FamilyModelConfig()),
-            build_module_context(None),
-        )
+        with capture_preparation_manifest():
+            model, _ = prepare_model_components(
+                FamilyModel(FamilyModelConfig()),
+                build_module_context(None),
+            )
 
         manifest = get_preparation_manifest(model)
         component = next(item for item in manifest.components if "projection" in item.aliases)
@@ -133,7 +135,8 @@ class TestPreparationManifest(unittest.TestCase):
 
         model = nn.Sequential(nn.Linear(4, 3))
         context = build_module_context(SimpleNamespace(module_replacement_requests=(request,)))
-        model, _ = prepare_model_components(model, context)
+        with capture_preparation_manifest():
+            model, _ = prepare_model_components(model, context)
         manifest = get_preparation_manifest(model)
         application = manifest.replacements[0]
         component = next(item for item in manifest.components if item.boundary_id == application.boundary_id)
@@ -151,7 +154,8 @@ class TestPreparationManifest(unittest.TestCase):
                     mesh_context=SimpleNamespace(ep_size=ep_size),
                     module_replacement_requests=(request,),
                 ))
-                installed, _ = prepare_model_components(model, context)
+                with capture_preparation_manifest():
+                    installed, _ = prepare_model_components(model, context)
                 application = get_preparation_manifest(installed).replacements[0]
                 prepared = application.to_legacy_dict()["family_request"]["selection"]
                 source = nn.Linear(4, 3)
@@ -189,7 +193,8 @@ class TestPreparationManifest(unittest.TestCase):
         model.block = LinearBlockFamily(config=LinearConfig())
         model.external_alias = model.block.projection
         context = build_module_context(SimpleNamespace(mesh_context=SimpleNamespace(ep_size=2)))
-        model, _ = prepare_model_components(model, context)
+        with capture_preparation_manifest():
+            model, _ = prepare_model_components(model, context)
 
         components = get_preparation_manifest(model).components
         parent = next(item for item in components if item.family_id == "test.linear_block")
@@ -200,10 +205,11 @@ class TestPreparationManifest(unittest.TestCase):
 
     def test_native_binding_enriches_shared_manifest_without_resources(self) -> None:
         """The shared planner adds protocol facts while retaining family layout ownership."""
-        model, _ = prepare_model_components(
-            FamilyModel(FamilyModelConfig()),
-            build_module_context(None),
-        )
+        with capture_preparation_manifest():
+            model, _ = prepare_model_components(
+                FamilyModel(FamilyModelConfig()),
+                build_module_context(None),
+            )
         parallel = ParallelModuleSpec(
             protocol="test.linear.local",
             stages={"forward": ("input",)},
@@ -219,6 +225,19 @@ class TestPreparationManifest(unittest.TestCase):
         self.assertEqual(binding.layout_owner_boundary_id, component.boundary_id)
         self.assertEqual(binding.module_type.qualname, "LocalLinear")
         json.dumps(manifest.to_dict())
+
+    def test_normal_preparation_does_not_capture_manifest(self) -> None:
+        """Ordinary preparation installs modules without validating export metadata."""
+        model = nn.Sequential(nn.Linear(4, 3))
+        request = ModuleReplacementRequest(("0",), LinearFamily)
+        context = build_module_context(SimpleNamespace(module_replacement_requests=(request,)))
+        with patch("hyper_parallel.models.module_build.describe_replacement_declarations",
+                   side_effect=AssertionError("ordinary preparation captured declarations")):
+            prepared, _ = prepare_model_components(model, context)
+
+        self.assertEqual(get_family_build_info(prepared[0]).resolved.variant, "default")
+        with self.assertRaisesRegex(RuntimeError, "have not produced a PreparationManifest"):
+            get_preparation_manifest(prepared)
 
     def test_weight_conversion_records_stable_operation_types(self) -> None:
         """Checkpoint transforms retain patterns and operation identities without tensors."""

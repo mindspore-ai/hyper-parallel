@@ -65,44 +65,32 @@ def _prepare_sharding_meshes(
     mesh: Any,
 ) -> Tuple[Any, Any, Any, Any, Any]:
     """Resolve active and parameter source meshes before plan application."""
-    mesh, active_mesh, models = preflight_sharding_plan(model, plan, mesh)
     mesh_context = mesh if hasattr(mesh, "device_mesh") else None
-    device_mesh = mesh.device_mesh if hasattr(mesh, "device_mesh") else mesh
+    if mesh_context is None:
+        device_mesh = mesh
+    else:
+        device_mesh = mesh_context.device_mesh
+    if device_mesh is None:
+        raise ValueError("apply_sharding_plan requires a DeviceMesh")
+
     mesh_dim_names = plan.mesh_dim_names
+    # Active sub-mesh: the planner strips size=1 axes (plan.mesh_dim_names), but the
+    # passed-in mesh may still contain those axes -- placements are resolved against
+    # plan.mesh_dim_names, so the dimensionality must align with the mesh, otherwise
+    # distribute_tensor will silently shard along the wrong axis.
     full_mesh = device_mesh
+    active_mesh = _get_active_mesh(device_mesh, mesh_dim_names)
     tp_mesh = _get_tp_submesh(active_mesh, mesh_dim_names)
+    models = model if isinstance(model, list) else [model]
+
+    # Explicit-injection guard: CP/EP sharding without an explicit compute
+    # injection fails fast here, BEFORE any parameter is touched
+    _preflight_compute_injection(plan, active_mesh, model=models[0])
 
     expert_mesh, dense_source_mesh, expert_source_mesh = (
         _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh)
     )
     return active_mesh, models, expert_mesh, dense_source_mesh, expert_source_mesh
-
-
-def preflight_sharding_plan(
-    model: Any,
-    plan: ShardingPlan,
-    mesh: Any,
-) -> Tuple[Any, Any, list[Any]]:
-    """Validate a plan against its borrowed mesh before any parameter mutation.
-
-    Args:
-        model: One model or pipeline-part list.
-        plan: Shared planner output.
-        mesh: DeviceMesh or MeshContext owned by the current job.
-
-    Returns:
-        The normalized mesh, active sub-mesh, and model-part list.
-    """
-    original_mesh = mesh
-    for part in model if isinstance(model, list) else [model]:
-        original_mesh = _family_mesh(part, original_mesh)
-    device_mesh = original_mesh.device_mesh if hasattr(original_mesh, "device_mesh") else original_mesh
-    if device_mesh is None:
-        raise ValueError("apply_sharding_plan requires a DeviceMesh")
-    active_mesh = _get_active_mesh(device_mesh, plan.mesh_dim_names)
-    models = model if isinstance(model, list) else [model]
-    _preflight_compute_injection(plan, active_mesh, model=models[0])
-    return original_mesh, active_mesh, models
 
 
 def apply_sharding_plan(

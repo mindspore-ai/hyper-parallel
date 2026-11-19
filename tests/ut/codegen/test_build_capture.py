@@ -173,7 +173,7 @@ class TestModelBuildCapture(unittest.TestCase):
                 is_hf_model=True,
             )
             prepared, _ = prepare_model_components(model, build_module_context(None))
-            with patch.object(model_builder, "preflight_sharding_plan") as preflight, patch.object(
+            with patch.object(build_capture, "_prepare_sharding_meshes") as preflight, patch.object(
                 model_builder,
                 "apply_sharding_plan",
                 side_effect=AssertionError("capture applied a sharding plan"),
@@ -191,6 +191,14 @@ class TestModelBuildCapture(unittest.TestCase):
         self.assertIs(capture.plan, plan)
         self.assertTrue(capture.complete)
         preflight.assert_called_once_with(model, plan, mesh)
+
+        with patch.object(build_capture, "_prepare_sharding_meshes") as offline_preflight, patch.object(
+            model_builder, "apply_sharding_plan", return_value=(model, {}),
+        ) as apply_plan:
+            model_builder._plan_and_apply_sharding(model, mesh, planner, True, False)  # pylint: disable=protected-access
+
+        offline_preflight.assert_not_called()
+        apply_plan.assert_called_once_with(model, plan, mesh, validate_mode=False)
 
     def test_auto_model_uses_meta_and_stops_after_planning(self):
         """The normal AutoModel entry reaches capture without runtime materialization."""

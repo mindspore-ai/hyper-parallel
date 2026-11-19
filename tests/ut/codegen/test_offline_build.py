@@ -68,7 +68,7 @@ class TestOfflineBuild(unittest.TestCase):
                     topology.size(),
                     expected_shape[0] * expected_shape[1] * expected_shape[2],
                 )
-                self.assertIs(setup.strategy_config, config.fsdp_config)
+                self.assertIsNone(setup.strategy_config)
 
     def test_model_build_policies_match_runtime_setup(self):
         """Both entry points assemble the same non-runtime policy objects."""
@@ -87,6 +87,8 @@ class TestOfflineBuild(unittest.TestCase):
         runtime_fields = vars(runtime).copy()
         offline_fields.pop("mesh_context")
         runtime_fields.pop("mesh_context")
+        self.assertIsNone(offline_fields.pop("strategy_config"))
+        self.assertIs(runtime_fields.pop("strategy_config"), config.fsdp_config)
         self.assertEqual(offline_fields, runtime_fields)
         self.assertEqual(runtime.mesh_context.tp_size, offline.mesh_context.tp_size)
         self.assertIs(offline.low_precision_config, config.training.low_precision)

@@ -23,7 +23,14 @@ from dataclasses import dataclass, field
 import inspect
 from typing import Any, Optional
 
-from hyper_parallel.models.preparation_manifest import PreparationManifest, get_preparation_manifest
+from hyper_parallel.components.modules.module_family import _family_mesh
+from hyper_parallel.distributed.apply import _prepare_sharding_meshes
+from hyper_parallel.models.preparation_manifest import (
+    PreparationManifest,
+    capture_preparation_manifest,
+    get_preparation_manifest,
+    record_native_bindings,
+)
 
 
 @dataclass
@@ -68,7 +75,8 @@ def capture_model_build_plan(
     capture = ModelBuildCapture(prepare_model_spec=prepare_model_spec)
     token = _ACTIVE_CAPTURE.set(capture)
     try:
-        yield capture
+        with capture_preparation_manifest():
+            yield capture
     finally:
         _ACTIVE_CAPTURE.reset(token)
 
@@ -133,13 +141,32 @@ def record_model_plan_for_capture(
         raise RuntimeError("model build capture planning has already finished")
     if capture.source is None:
         raise RuntimeError("model source must be recorded before planning")
-    capture.manifest = get_preparation_manifest(model)
+    if plan is None:
+        capture.manifest = get_preparation_manifest(model)
+    else:
+        # MeshContext carries the logical expert mesh, so native preparation
+        # validates the same axes and injections without creating groups.
+        _prepare_sharding_meshes(model, plan, _family_mesh(model, mesh))
+        capture.manifest = record_native_bindings(model, plan)
     capture.model = model
     capture.plan = plan
     capture.mesh = mesh
     capture.reason = reason
     capture.planning_finished = True
     return True
+
+
+def record_model_without_plan_for_capture(model: Any, mesh: Any, sharding_planner: Any) -> None:
+    """Explain the shared planner's early exit only for capture consumers."""
+    if not is_model_build_capture_active():
+        return
+    if sharding_planner is None:
+        reason = "planner_unavailable"
+    elif mesh is None:
+        reason = "mesh_unavailable"
+    else:
+        reason = "pure_data_parallel"
+    record_model_plan_for_capture(model, None, mesh, reason=reason)
 
 
 __all__ = [

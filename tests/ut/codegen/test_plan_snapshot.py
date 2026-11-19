@@ -95,10 +95,16 @@ def test_codegen_observation_rejects_missing_ep_compute_source():
             return plan
 
     device_mesh = LogicalDeviceMesh(("tp",), (2,))
-    with capture_model_build_plan(), pytest.raises(ValueError, match="ep_size=8.*no EP-aware compute source"):
-        model_builder._plan_and_apply_sharding(
-            nn.Module(), _mesh(device_mesh=device_mesh), Planner(), True, False,
-        )
+    mesh = _mesh(device_mesh=device_mesh)
+    model = nn.Module()
+    error = "ep_size=8.*no EP-aware compute source"
+    with pytest.raises(ValueError, match=error) as native:
+        model_builder._plan_and_apply_sharding(model, mesh, Planner(), True, False)
+    with capture_model_build_plan():
+        record_model_source_for_capture(model, pretrained_model_name_or_path=None, is_hf_model=True)
+        with pytest.raises(ValueError, match=error) as captured:
+            model_builder._plan_and_apply_sharding(model, mesh, Planner(), True, False)
+    assert str(captured.value) == str(native.value), f"Capture: {captured.value}; native: {native.value}"
 
 
 @pytest.mark.parametrize(

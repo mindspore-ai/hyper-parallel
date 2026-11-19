@@ -34,6 +34,7 @@ from hyper_parallel.models.module_build import (
     prepare_model_components,
 )
 from hyper_parallel.models.preparation_manifest import (
+    capture_preparation_manifest,
     collect_replacement_applications,
     get_preparation_manifest,
 )
@@ -95,7 +96,7 @@ class TestSharedModelBuild(unittest.TestCase):
             module_build,
             "compile_module_replacements",
             wraps=compile_module_replacements,
-        ) as compile_plan:
+        ) as compile_plan, capture_preparation_manifest():
             prepared, _ = prepare_model_components(model, context)
 
         self.assertIs(prepared, model)
