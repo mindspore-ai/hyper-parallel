@@ -463,9 +463,11 @@ class GPTDataset(_IndexedPretrainDataset):
 
         ltor_fields = self._build_ltor_fields(tokens, labels)
 
-        # For padded sequences, ensure the embedding layer can map the token ID
+        # Padding needs a valid embedding ID but must never become a target, even
+        # without LTR masks (e.g. partial [5, 6, 7, pad] or final position when
+        # add_extra_token_to_sequence=False -> input_ids=0, labels=IGNORE_INDEX).
         tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         if np.any(tokens < 0) or np.any(tokens >= len(self.config.tokenizer)):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
@@ -630,8 +632,10 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
 
         ltor_fields = self._build_ltor_fields(tokens, labels)
 
+        # With add_extra_token_to_sequence=False, the final position has no next token
+        # (labels[-1] = _pad_token_id) and must become IGNORE_INDEX, not token 0.
         tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         raw_sample = {
             "input_ids": tokens,

@@ -60,16 +60,20 @@ class TestOmniCollator(unittest.TestCase):
         Description: Split one batch containing an unknown modality route.
         Expectation: The route reaches model inputs while loss metadata stays separate.
         """
+        stream_mask = torch.tensor([[0.25, 0.75]])
         model_inputs, loss_inputs = OmniParallelBatch._split_model_and_loss_inputs({
             "input_ids": torch.tensor([[1, 2]]),
             "labels": torch.tensor([[-100, 2]]),
             "loss_mask": torch.tensor([[False, True]]),
+            "stream_loss_mask": stream_mask,
             "custom_modality_route": torch.tensor([[3, 4]]),
         })
 
         self.assertIn("custom_modality_route", model_inputs)
         self.assertNotIn("loss_mask", model_inputs)
-        self.assertEqual(set(loss_inputs), {"labels", "loss_mask"})
+        self.assertNotIn("stream_loss_mask", model_inputs)
+        self.assertIs(loss_inputs["stream_loss_mask"], stream_mask)
+        self.assertEqual(set(loss_inputs), {"labels", "loss_mask", "stream_loss_mask"})
 
 
 if __name__ == "__main__":

@@ -107,6 +107,61 @@ class TestIndexedDataset(unittest.TestCase):
                         if lazy:
                             self.assertIsInstance(train._dataset, expected_type)
 
+    def test_unavailable_next_token_is_ignored_without_extra_token(self) -> None:
+        """Feature: Indexed next-token targets.
+        Description: Read GPT and pre-cut records with and without an extra target token.
+        Expectation: A missing final target is ignored even when no LTR mask is generated.
+        """
+        with TemporaryDirectory() as directory:
+            for dataset_type in (GPTDataset, GPTFromMRDataset):
+                for extra_token in (False, True):
+                    records = [list(range(1, 5 + extra_token))] * 2
+                    prefix = _write_records(directory, f"text-{dataset_type.__name__}-{extra_token}", records)
+                    for ltor_fields in (False, True):
+                        with self.subTest(dataset=dataset_type.__name__, extra=extra_token, ltor=ltor_fields):
+                            train, _, _ = build_indexed_dataset(
+                                data_path=prefix,
+                                data_config=_config(
+                                    directory, low_level_dataset=dataset_type,
+                                    simple_blend="intra" if dataset_type is GPTFromMRDataset else "no",
+                                    add_extra_token_to_sequence=extra_token,
+                                    create_ltor_fields_in_dataloader=ltor_fields,
+                                ),
+                                train_valid_test_num_samples=(1, 0, 0),
+                            )
+                            row = train[0]
+                            np.testing.assert_array_equal(row["labels"][:-1], row["input_ids"][1:])
+                            self.assertEqual(row["labels"][-1] == -100, not extra_token)
+                            self.assertEqual("loss_mask" in row, ltor_fields)
+                            if ltor_fields:
+                                np.testing.assert_array_equal(row["loss_mask"] != 0, row["labels"] != -100)
+
+    def test_retained_validation_padding_is_not_a_target(self) -> None:
+        """Feature: Partial indexed validation samples.
+        Description: Retain a short final sample with optional LTR field generation.
+        Expectation: Padding inputs remain embedding-safe and padding targets stay ignored.
+        """
+        with TemporaryDirectory() as directory:
+            prefix = _write_records(directory, "partial", [[1, 2, 3, 4, 5, 6, 7]])
+            for ltor_fields in (False, True):
+                with self.subTest(ltor=ltor_fields):
+                    _, valid, _ = build_indexed_dataset(
+                        data_path=prefix,
+                        data_config=_config(
+                            directory, split="0,1,0", drop_last_partial_validation_sequence=False,
+                            create_ltor_fields_in_dataloader=ltor_fields,
+                        ),
+                        train_valid_test_num_samples=(0, 1, 0),
+                    )
+                    rows = [valid[index] for index in range(len(valid))]
+                    padded_rows = [row for row in rows if (row["input_ids"] == 0).any()]
+                    self.assertEqual(len(padded_rows), 1)
+                    row = padded_rows[0]
+                    np.testing.assert_array_equal(row["input_ids"], [5, 6, 7, 0])
+                    np.testing.assert_array_equal(row["labels"], [6, 7, -100, -100])
+                    if ltor_fields:
+                        np.testing.assert_array_equal(row["loss_mask"], [1, 1, 0, 0])
+
     def test_weighted_blend_preserves_requested_counts_without_repeating_sources(self) -> None:
         """Feature: Weighted indexed Dataset blending.
         Description: Select a short training plan from two larger corpora.
