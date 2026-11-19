@@ -36,27 +36,34 @@ def gather_sparse_along_axis(coo_cpu: torch.Tensor, axis_mesh: Any, width: int) 
     if axis_mesh is None or axis_mesh.size() == 1:
         return coo_cpu
     group = axis_mesh.get_group()
+    world = axis_mesh.size()
     device = _communication_device(axis_mesh)
     coo_cpu = coo_cpu.coalesce()
     nnz = coo_cpu._nnz()  # pylint: disable=protected-access
     local_count = torch.tensor([nnz], dtype=torch.long, device=device)
-    count_parts = [torch.empty_like(local_count) for _ in range(axis_mesh.size())]
-    dist.all_gather(count_parts, local_count, group=group)
-    counts = [int(part.item()) for part in count_parts]
+    count_buf = torch.empty(world, dtype=torch.long, device=device)
+    dist.all_gather_into_tensor(count_buf, local_count, group=group)
+    counts = count_buf.cpu().tolist()
     max_count = max(counts)
     if max_count == 0:
         return coo_cpu
     ids = torch.zeros(max_count, dtype=torch.long, device=device)
     values = torch.zeros((max_count, width), dtype=torch.float32, device=device)
     if nnz:
-        ids[:nnz] = coo_cpu.indices()[0].to(device)
-        values[:nnz] = coo_cpu.values().to(device)
-    id_parts = [torch.empty_like(ids) for _ in counts]
-    value_parts = [torch.empty_like(values) for _ in counts]
-    dist.all_gather(id_parts, ids, group=group)
-    dist.all_gather(value_parts, values, group=group)
-    gathered_ids = torch.cat([part[:count].cpu() for part, count in zip(id_parts, counts)])
-    gathered_values = torch.cat([part[:count].cpu() for part, count in zip(value_parts, counts)])
+        ids[:nnz].copy_(coo_cpu.indices()[0].to(device, non_blocking=True))
+        values[:nnz].copy_(coo_cpu.values().to(device, non_blocking=True))
+    id_buf = torch.empty((world, max_count), dtype=torch.long, device=device)
+    val_buf = torch.empty((world, max_count, width), dtype=torch.float32, device=device)
+    dist.all_gather_into_tensor(id_buf, ids, group=group)
+    dist.all_gather_into_tensor(val_buf, values, group=group)
+    if all(c == max_count for c in counts):
+        gathered_ids = id_buf.reshape(-1).cpu()
+        gathered_values = val_buf.reshape(-1, width).cpu()
+    else:
+        id_slices = [id_buf[i, :c] for i, c in enumerate(counts) if c > 0]
+        val_slices = [val_buf[i, :c] for i, c in enumerate(counts) if c > 0]
+        gathered_ids = torch.cat(id_slices, dim=0).cpu()
+        gathered_values = torch.cat(val_slices, dim=0).cpu()
     return torch.sparse_coo_tensor(
         gathered_ids.unsqueeze(0), gathered_values, coo_cpu.shape,
     ).coalesce()

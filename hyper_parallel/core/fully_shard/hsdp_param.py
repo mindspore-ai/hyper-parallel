@@ -478,6 +478,26 @@ class HSDPParamV2:
             if not hasattr(self.sharded_param, "main_grad"):
                 self.sharded_param.main_grad = None
             sharded_grad = self.sharded_param.main_grad
+        if (
+            reduced_grad.dim() == 1
+            and reduced_grad.is_contiguous()
+            and reduced_grad.numel() == self.sharded_size.numel()
+            and not self.offload_to_cpu
+            and getattr(self.sharded_param, "_hp_staged_main_grad", None) is None
+            and sharded_grad is None
+            and (self.apply_grad_on_fp32_main_grad or reduced_grad.dtype == self.orig_dtype)
+        ):
+            view = self.to_sharded_dtensor(reduced_grad.view(self.sharded_size))
+            if not self.apply_grad_on_fp32_main_grad:
+                self.sharded_param.grad = view
+            else:
+                self.sharded_param.main_grad = view
+                self.sharded_param.grad = None
+            if self.unsharded_accumulated_grad_data is not None:
+                self.unsharded_accumulated_grad = None
+            elif self.unsharded_param.grad is not None:
+                self.unsharded_param.grad = None
+            return False
         reduced_grad = (
             reduced_grad.reshape(-1)
             .narrow(0, 0, self.sharded_size.numel())
