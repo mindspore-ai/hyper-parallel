@@ -55,17 +55,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
-
-
-from hyper_parallel.components.modules import DeepseekV32DSAAttention, GroupedExperts, RMSNorm
-
-
-
-
-# Codegen replacement: RMSNorm wraps DeepseekV32RMSNorm; the original class is kept as the wrapper input.
-
-# Codegen replacement: DeepseekV32DSAAttention wraps DeepseekV32Attention; the original class is kept as the wrapper input.
-
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 
 
@@ -625,15 +614,15 @@ class DeepseekV32DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: DeepseekV32Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = DeepseekV32DSAAttention(module=DeepseekV32Attention(config, layer_idx), module_fqn='', context=None)
+        self.self_attn = DeepseekV32Attention(config, layer_idx)
 
         if config.mlp_layer_types[layer_idx] == "sparse":
             self.mlp = DeepseekV32MoE(config)
         else:
             self.mlp = DeepseekV32MLP(config)
 
-        self.input_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
-        self.post_attention_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
+        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
@@ -710,7 +699,7 @@ class DeepseekV32Model(DeepseekV32PreTrainedModel):
         self.layers = nn.ModuleList(
             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context=None)
+        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -790,16 +779,26 @@ class DeepseekV32ForCausalLM(DeepseekV32PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
-        _hp_replacement_cache = {}
-        for _hp_fqn in ('model.layers.3.mlp.experts',):
-            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
-            _hp_parent = self.get_submodule(_hp_parent_fqn)
-            _hp_source = getattr(_hp_parent, _hp_name)
-            _hp_key = id(_hp_source)
-            if _hp_key not in _hp_replacement_cache:
-                _hp_replacement_cache[_hp_key] = GroupedExperts(
-                    module=_hp_source, module_fqn=_hp_fqn, context=None)
-            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
+        from hyper_parallel.models.preinstalled import install_prepared_components
+        self.__hp_prepared_components__ = (
+            {'rule_id': 'plan_override:0:replace:model.layers.0.input_layernorm', 'module_fqns': ['model.layers.0.input_layernorm'], 'primary_fqn': 'model.layers.0.input_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.layers.0.post_attention_layernorm', 'module_fqns': ['model.layers.0.post_attention_layernorm'], 'primary_fqn': 'model.layers.0.post_attention_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.layers.1.input_layernorm', 'module_fqns': ['model.layers.1.input_layernorm'], 'primary_fqn': 'model.layers.1.input_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.layers.1.post_attention_layernorm', 'module_fqns': ['model.layers.1.post_attention_layernorm'], 'primary_fqn': 'model.layers.1.post_attention_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.layers.2.input_layernorm', 'module_fqns': ['model.layers.2.input_layernorm'], 'primary_fqn': 'model.layers.2.input_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.layers.2.post_attention_layernorm', 'module_fqns': ['model.layers.2.post_attention_layernorm'], 'primary_fqn': 'model.layers.2.post_attention_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.layers.3.input_layernorm', 'module_fqns': ['model.layers.3.input_layernorm'], 'primary_fqn': 'model.layers.3.input_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.layers.3.post_attention_layernorm', 'module_fqns': ['model.layers.3.post_attention_layernorm'], 'primary_fqn': 'model.layers.3.post_attention_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:0:replace:model.norm', 'module_fqns': ['model.norm'], 'primary_fqn': 'model.norm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:1:replace:model.layers.0.self_attn', 'module_fqns': ['model.layers.0.self_attn'], 'primary_fqn': 'model.layers.0.self_attn', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32Attention', 'replacement_type': 'hyper_parallel.components.modules.dsa_attention:DeepseekV32DSAAttention', 'weight_transforms': ['transformers.core_model_loading:WeightConverter'], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_dsa_attention', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:1:replace:model.layers.1.self_attn', 'module_fqns': ['model.layers.1.self_attn'], 'primary_fqn': 'model.layers.1.self_attn', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32Attention', 'replacement_type': 'hyper_parallel.components.modules.dsa_attention:DeepseekV32DSAAttention', 'weight_transforms': ['transformers.core_model_loading:WeightConverter'], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_dsa_attention', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:1:replace:model.layers.2.self_attn', 'module_fqns': ['model.layers.2.self_attn'], 'primary_fqn': 'model.layers.2.self_attn', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32Attention', 'replacement_type': 'hyper_parallel.components.modules.dsa_attention:DeepseekV32DSAAttention', 'weight_transforms': ['transformers.core_model_loading:WeightConverter'], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_dsa_attention', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:1:replace:model.layers.3.self_attn', 'module_fqns': ['model.layers.3.self_attn'], 'primary_fqn': 'model.layers.3.self_attn', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32Attention', 'replacement_type': 'hyper_parallel.components.modules.dsa_attention:DeepseekV32DSAAttention', 'weight_transforms': ['transformers.core_model_loading:WeightConverter'], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_dsa_attention', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+            {'rule_id': 'plan_override:2:replace', 'module_fqns': ['model.layers.3.mlp.experts'], 'primary_fqn': 'model.layers.3.mlp.experts', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32Experts', 'replacement_type': 'hyper_parallel.components.modules.grouped_experts:GroupedExperts', 'weight_transforms': ['transformers.core_model_loading:WeightConverter', 'transformers.core_model_loading:WeightConverter'], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_grouped_experts', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},
+        )
+        install_prepared_components(
+            self, self.__hp_prepared_components__, {'dp_size': 1, 'tp_size': 1, 'cp_size': 1, 'pp_size': 1, 'ep_size': 1, 'sequence_parallel': False, 'loss_parallel': False}, globals(),
+        )
 
     @can_return_tuple
     @auto_docstring

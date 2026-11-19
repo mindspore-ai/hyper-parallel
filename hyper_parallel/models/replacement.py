@@ -312,6 +312,9 @@ def _matches_module_type(module: nn.Module, rule: ModuleReplacementSpec | Module
     """Share source type checks while leaving error policy to each rule consumer."""
     if rule.module_type is None:
         return True
+    source_type = getattr(module, "_hp_preinstalled_source_type", None)
+    if source_type is not None:
+        return source_type is rule.module_type if rule.exact_type else issubclass(source_type, rule.module_type)
     return (type(module) is rule.module_type  # pylint: disable=unidiomatic-typecheck
             if rule.exact_type else isinstance(module, rule.module_type))
 
@@ -826,8 +829,12 @@ def apply_module_replacements(
     )
     if extra_transforms:
         if capture_checkpoint_metadata:
+            if hasattr(model, "_hp_preinstalled_topology"):
+                source_shapes.update(getattr(model, "_hp_checkpoint_source_shapes", {}))
             model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access
-            model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
+            model._hp_replacement_weight_conversions = [  # pylint: disable=protected-access
+                *extra_transforms, *getattr(model, "_hp_preinstalled_conversions", ()),
+            ]
         weights_mapping[:0] = extra_transforms
     previous_replacements = tuple(getattr(model, "_hp_replaced_module_fqns", ()) or ())
     current_replacements = tuple(

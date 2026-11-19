@@ -229,6 +229,7 @@ class ReplacementApplication:
     resolved_variant: str | None = None
     resolved_arguments: Mapping[str, Any] = field(default_factory=dict)
     construction_context: Mapping[str, Any] = field(default_factory=dict)
+    replay: Mapping[str, Any] = field(default_factory=dict)
     _prepared_arguments: Mapping[str, Any] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -237,6 +238,7 @@ class ReplacementApplication:
             for name in ("request_arguments", "resolved_arguments", "construction_context")
         } if self.resolved_variant is not None else {}
         object.__setattr__(self, "_prepared_arguments", _freeze_stable_value(prepared, path="prepared_arguments"))
+        object.__setattr__(self, "replay", _freeze_stable_value(self.replay, path="replacement.replay"))
         for name in ("selectors", "request_arguments", "axis_sizes", "resolved_arguments", "construction_context"):
             value = _freeze_stable_value(getattr(self, name), path=f"replacement.{name}")
             object.__setattr__(self, name, value)
@@ -272,6 +274,8 @@ class ReplacementApplication:
                     "selectors": _stable_value_to_data(self.selectors),
                     **_stable_value_to_data(self._prepared_arguments),
                 }
+        if self.replay:
+            record["replay"] = _stable_value_to_data(self.replay)
         return record
 
     def to_dict(self) -> dict[str, Any]:
@@ -512,8 +516,36 @@ def _describe_prepared_applications(
             resolved_variant=resolved_variant,
             resolved_arguments=resolved_arguments,
             construction_context=construction_context,
+            replay=_replacement_replay(target.spec, context),
         ))
     return tuple(records)
+
+
+def _replacement_replay(spec: ModuleReplacementSpec, context: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture the actual configured call for a preinstalled constructor."""
+    request = spec.request
+    if request is not None:
+        target = SymbolRef.from_object(request.target).legacy_path()
+        arguments = request.kwargs
+    else:
+        try:
+            target = SymbolRef.from_object(spec.factory).legacy_path()
+        except (TypeError, ValueError):
+            return {}
+        arguments = {}
+    logical_context = {
+        name: context[name]
+        for name in ("tp", "cp", "ep", "pp", "tp_size", "cp_size", "ep_size", "pp_size",
+                     "sequence_parallel", "loss_parallel", "mesh_dim_names", "device_type", "dtype")
+        if name in context
+    }
+    return {
+        "version": PREPARED_FAMILY_RECORD_VERSION,
+        "target": target,
+        "arguments": _encode_construction_value(arguments),
+        "context": _encode_construction_value(logical_context),
+        "request": request is not None,
+    }
 
 
 def _boundary_id(kind: str, primary_fqn: str, identity: str) -> str:

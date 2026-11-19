@@ -22,20 +22,8 @@ from typing import Any, Iterator
 
 from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
 from hyper_parallel.models._transformers import auto_model, model_builder
-from hyper_parallel.models.module_build import model_weight_mapping
 
 distributed_apply = importlib.import_module("hyper_parallel.distributed.apply")
-
-
-def _skip_materialized_replacements(
-    model: Any,
-    distributed_setup: Any,
-    low_precision_config: Any,
-    load_base_model: bool,
-) -> tuple[Any, Any]:
-    """Keep generated constructor replacements and their conversion mapping."""
-    del distributed_setup, low_precision_config, load_base_model
-    return model, model_weight_mapping(model)
 
 
 @contextmanager
@@ -53,7 +41,6 @@ def generated_model_build(
         Control while the generated model build overlay is active.
     """
     original_resolver = model_builder._resolve_custom_model_cls  # pylint: disable=protected-access
-    original_replacements = model_builder._maybe_apply_module_replacements  # pylint: disable=protected-access
     original_phase_c = distributed_apply._apply_phase_c  # pylint: disable=protected-access
     auto_model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
     original_from_config = auto_model_class.__dict__["_from_config_parent_class"]
@@ -79,7 +66,6 @@ def generated_model_build(
         return model_class.from_pretrained(path, *args, **kwargs)
 
     model_builder._resolve_custom_model_cls = _resolve_model_class  # pylint: disable=protected-access
-    model_builder._maybe_apply_module_replacements = _skip_materialized_replacements  # pylint: disable=protected-access
     distributed_apply._apply_phase_c = apply_generated_phase_c  # pylint: disable=protected-access
     setattr(auto_model_class, "_from_config_parent_class", classmethod(_from_config))
     setattr(auto_model_class, "_from_pretrained_parent_class", classmethod(_from_pretrained))
@@ -87,7 +73,6 @@ def generated_model_build(
         yield
     finally:
         model_builder._resolve_custom_model_cls = original_resolver  # pylint: disable=protected-access
-        model_builder._maybe_apply_module_replacements = original_replacements  # pylint: disable=protected-access
         distributed_apply._apply_phase_c = original_phase_c  # pylint: disable=protected-access
         setattr(auto_model_class, "_from_config_parent_class", original_from_config)
         setattr(auto_model_class, "_from_pretrained_parent_class", original_from_pretrained)

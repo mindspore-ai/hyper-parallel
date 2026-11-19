@@ -148,6 +148,23 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
                 spec.loader.exec_module(generated_module)
                 with torch.device("meta"):
                     generated = getattr(generated_module, "DeepseekV3ForCausalLM")(config)
+        before_reentry = dict(generated.named_parameters())
+        changed = DistributedSetup(
+            mesh_context=mesh,
+            module_replacement_requests=(
+                ModuleReplacementRequest(("model.layers.0.self_attn",), MultiLatentAttention,
+                                         kwargs={"strategy": "expanded_ulysses", "overlap": True}),
+                requests[1],
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "arguments changed.*Regenerate"):
+            prepare_model_components(generated, build_module_context(changed))
+        context = build_module_context(setup)
+        prepared, weights = prepare_model_components(generated, context)
+        self.assertIs(prepared, generated)
+        self.assertTrue(weights)
+        self.assertTrue(all(before_reentry[name] is parameter for name, parameter in generated.named_parameters()))
+        self.assertIs(prepare_model_components(generated, context)[1], weights)
         self.assertEqual(set(generated.state_dict()), set(native.state_dict()))
         for index, (expected, actual) in enumerate(zip(native.model.layers, generated.model.layers)):
             expected, actual = expected.self_attn, actual.self_attn
@@ -184,7 +201,17 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
             self.assertEqual(resolved.axis_sizes["cp"], 4)
             self.assertEqual(resolved.axis_sizes["tp"], 1)
 
-        bundled, _ = prepare_model_components(bundled, build_module_context(DistributedSetup(mesh_context=mesh)))
+        tracked_request = ModuleReplacementRequest(
+            ("model.layers.*.self_attn",), MultiLatentAttention,
+            kwargs={"strategy": "expanded_ulysses", "overlap": False, "config": None,
+                    "ulysses_degree": None, "kv_exchange": "all_gather"},
+            declaration_id="plan_override:0:replace",
+        )
+        tracked_setup = DistributedSetup(
+            mesh_context=mesh,
+            module_replacement_requests=(tracked_request,) if hasattr(bundled, "__hp_prepared_components__") else (),
+        )
+        bundled, _ = prepare_model_components(bundled, build_module_context(tracked_setup))
         planner = ShardingPlanner()
         expected = planner.plan(native, mesh.device_mesh, tp_size=1, cp_size=4)
         actual = planner.plan(bundled, mesh.device_mesh, tp_size=1, cp_size=4)

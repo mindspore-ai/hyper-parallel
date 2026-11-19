@@ -35,6 +35,7 @@ from hyper_parallel.models.preparation_manifest import (
     build_preparation_manifest,
     preparation_application_capture,
 )
+from hyper_parallel.models.preinstalled import reconcile_preinstalled_components, validate_preinstalled_topology
 from hyper_parallel.models.registry import _normalize_family_key, get_model_adapter
 from hyper_parallel.models.replacement import (
     ModuleReplacementPlan, _apply_module_replacement_actions, _install_module_candidates,
@@ -209,7 +210,8 @@ def _prepare_family_member(
 
 def _finalize_family_modules(model: nn.Module, context: Mapping[str, Any]) -> nn.Module:
     """Finalize family requests atomically before layout, keeping all module aliases."""
-    boundaries = collect_family_modules(model)
+    boundaries = tuple(boundary for boundary in collect_family_modules(model)
+                       if not hasattr(boundary.module, "_hp_preinstalled_record"))
     if not boundaries:
         return model
     prepared = [(boundary, *_prepare_family_member(boundary, context)) for boundary in boundaries]
@@ -281,6 +283,7 @@ def prepare_model_components(
         if getattr(model, "_hp_module_build_context", None) is not context:
             raise ValueError("prepared model components cannot be reused with another build context")
         return model, model._hp_family_weight_mapping  # pylint: disable=protected-access
+    validate_preinstalled_topology(model, context)
     model = _finalize_family_modules(model, context)
     attach_build_context(model, context)
     spec = context.get("model_spec")
@@ -290,6 +293,8 @@ def prepare_model_components(
     plan = compile_module_replacements(model, legacy, defaults=defaults, overrides=overrides or ())
     weights = model_weight_mapping(model)
     _validate_low_precision_targets(model, plan, context)
+    plan = reconcile_preinstalled_components(model, plan, context)
+    weights[:0] = getattr(model, "_hp_preinstalled_conversions", ())
     with preparation_application_capture() as applications:
         declarations = describe_replacement_declarations(plan.specs) if applications is not None else ()
         if plan.targets:

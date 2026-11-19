@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import torch
 from torch import nn
 
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
@@ -42,6 +43,7 @@ from hyper_parallel.models.preparation_manifest import (
     record_native_bindings,
 )
 from hyper_parallel.models.prepared_family import build_prepared_family_replacement
+from hyper_parallel.models.preinstalled import install_prepared_components
 from hyper_parallel.models.replacement import (
     ModuleReplacementRequest,
     apply_module_replacements,
@@ -242,6 +244,45 @@ class TestPreparationManifest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "have not produced a PreparationManifest"):
             get_preparation_manifest(prepared)
 
+    def test_preinstalled_replacement_reenters_and_trains(self) -> None:
+        """Share native matching and retain the installed parameter through an optimizer step."""
+        request = ModuleReplacementRequest(("0",), LinearFamily, module_type=nn.Linear, exact_type=True)
+        context = build_module_context(SimpleNamespace(module_replacement_requests=(request,)))
+        with capture_preparation_manifest():
+            native, _ = prepare_model_components(nn.Sequential(nn.Linear(4, 3)), context)
+        records = get_preparation_manifest(native).to_legacy_records()["applications"]
+
+        generated = nn.Sequential(nn.Linear(4, 3))
+        weight = generated[0].weight
+        install_prepared_components(generated, records, {"ep_size": 1}, globals())
+        generated, _ = prepare_model_components(generated, context)
+
+        optimizer = torch.optim.SGD(generated.parameters(), lr=0.1)
+        generated(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        self.assertIs(generated[0].weight, weight)
+        self.assertIsNotNone(weight.grad)
+
+    def test_preinstalled_replacement_rejects_stale_tree(self) -> None:
+        """Missing, unrequested and re-aliased installations fail before wrapping."""
+        request = ModuleReplacementRequest(("0",), LinearFamily)
+        context = build_module_context(SimpleNamespace(module_replacement_requests=(request,)))
+        with capture_preparation_manifest():
+            native, _ = prepare_model_components(nn.Sequential(nn.Linear(4, 3)), context)
+        records = get_preparation_manifest(native).to_legacy_records()["applications"]
+        for change in ("missing", "unrequested", "alias"):
+            with self.subTest(change=change):
+                model = nn.Sequential(nn.Linear(4, 3))
+                install_prepared_components(model, records, {"ep_size": 1}, globals())
+                effective = context
+                if change == "missing":
+                    model[0] = nn.Linear(4, 3)
+                elif change == "unrequested":
+                    effective = build_module_context(None)
+                else:
+                    model.add_module("same", model[0])
+                with self.assertRaisesRegex(ValueError, "Regenerate the bundle"):
+                    prepare_model_components(model, effective)
     def test_weight_conversion_records_stable_operation_types(self) -> None:
         """Checkpoint transforms retain patterns and operation identities without tensors."""
         transform = WeightConverter(

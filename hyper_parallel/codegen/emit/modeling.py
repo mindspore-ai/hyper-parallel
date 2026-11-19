@@ -353,10 +353,41 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
         ),
     )
     text = _lower_forward_boundaries(text, emission_meta, module_name)
+    text = _emit_preinstalled_components(text, meta)
     _verify_recorded_patch_materialization(
         text, emission_meta, patch_plan=patch_plan
     )
     return _banner(meta) + text
+
+
+def _emit_preinstalled_components(text: str, meta: Any) -> str:
+    """Attach the verified replacement records to the generated source constructor."""
+    records = getattr(meta, "preinstalled_components", ())
+    if not records:
+        return text
+    source = _source_dict(meta.source)
+    model_class = (source.get("model_class") or source["architecture"]).rsplit(":", 1)[-1]
+    owners = [node for node in ast.parse(text).body if isinstance(node, ast.ClassDef) and node.name == model_class]
+    constructors = [
+        method for owner in owners for method in owner.body
+        if isinstance(method, ast.FunctionDef) and method.name == "__init__"
+    ]
+    if len(constructors) != 1:
+        raise RuntimeError(f"Cannot attach prepared replacement records to {model_class!r}")
+    constructor = constructors[0]
+    lines = text.splitlines(keepends=True)
+    # Use the constructor's original suite indentation for copied sources.
+    body = lines[constructor.body[0].lineno - 1]
+    indent = body[:len(body) - len(body.lstrip())]
+    entries = "".join(f"{indent}    {record!r},\n" for record in records)
+    lines[constructor.end_lineno:constructor.end_lineno] = [
+        f"{indent}from hyper_parallel.models.preinstalled import install_prepared_components\n",
+        f"{indent}self.__hp_prepared_components__ = (\n{entries}{indent})\n",
+        f"{indent}install_prepared_components(\n",
+        f"{indent}    self, self.__hp_prepared_components__, {meta.parallel_dims!r}, globals(),\n",
+        f"{indent})\n",
+    ]
+    return "".join(lines)
 
 
 def _verify_recorded_patch_materialization(
@@ -486,6 +517,9 @@ def _verify_replacement_records(
     for record in records:
         constructor = getattr(record, "factory", None) or record.replacement_type
         name = constructor.__name__
+        if _has_preinstalled_record(tree, record.module_fqn):
+            _record_materialized(materialized, record.module_fqn, name, "module_replacement", "constructor")
+            continue
         visible = name in bound_names and any(
             isinstance(node, ast.Call) and _call_name(node.func) == name
             for node in ast.walk(tree)
@@ -501,6 +535,17 @@ def _verify_replacement_records(
         else:
             missing.append(f"{record.module_fqn} (replacement {name})")
     return missing
+
+
+def _has_preinstalled_record(tree: ast.AST, fqn: str) -> bool:
+    """Use literal FQN records as source evidence for shared installations."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Attribute) and target.attr == "__hp_prepared_components__"
+               for target in node.targets):
+            return any(fqn in item["module_fqns"] for item in ast.literal_eval(node.value))
+    return False
 
 
 def _wrapper_identity(record: Any) -> tuple[Any, str, str]:

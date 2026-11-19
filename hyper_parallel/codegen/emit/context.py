@@ -32,6 +32,7 @@ class EmissionContext:
     boundary_classes: dict[str, str] = field(default_factory=dict)
     nested_components: list[dict[str, str]] = field(default_factory=list)
     module_overrides: list[dict[str, Any]] = field(default_factory=list)
+    preinstalled_components: list[dict[str, Any]] = field(default_factory=list)
     materialized_patches: list[dict[str, str]] = field(default_factory=list)
     emission_patches: dict[str, Any] = field(default_factory=dict)
     external_state_classes: list[str] = field(default_factory=list)

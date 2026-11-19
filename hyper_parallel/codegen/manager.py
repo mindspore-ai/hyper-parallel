@@ -106,8 +106,8 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
     source = dict(payload["source"])
     status = snapshot.status
     frozen_plan = dict(payload["plan"] or {})
-    module_overrides = list(replacement_records_from_snapshot(payload))
     is_derived = status is CodegenStatus.DERIVED
+    module_overrides, preinstalled = _replacement_inputs(payload) if is_derived else ([], [])
     emission_patches = (
         emission_patches_from_snapshot_payload(payload) if is_derived else {}
     )
@@ -120,9 +120,18 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
         boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
         nested_components=list(frozen_plan.get("nested_components") or ()),
         mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
-        module_overrides=(module_overrides if is_derived else []),
+        module_overrides=module_overrides,
+        preinstalled_components=preinstalled,
         emission_patches=emission_patches,
     )
+
+
+def _replacement_inputs(payload: dict) -> tuple[list, list]:
+    """Select captured constructor records or the transitional snapshot format."""
+    applications = payload["replacements"]["applications"]
+    if applications and all(item.get("replay") for item in applications):
+        return [], list(applications)
+    return list(replacement_records_from_snapshot(payload)), []
 
 
 def _model_type_to_modeling_token(model_type: str) -> str:
