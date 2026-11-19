@@ -44,6 +44,7 @@ import torch.nn.functional as F
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
+from hyper_parallel.components.functional.token_histogram import token_histogram
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
 )
@@ -197,8 +198,8 @@ def _expert_token_counts(indices: torch.Tensor, num_experts: int) -> torch.Tenso
     (input validation and output sizing), so every call drains the device queue
     and blocks the host. The counts here are consumed either fully on device
     (grouped GEMM group list) or -- where the ragged all-to-all genuinely needs
-    them -- as a single host list, so accumulating them with ``scatter_add_``
-    keeps the same values at one device kernel and no host stall.
+    them -- as a single host list. A shape-bounded histogram avoids both host
+    reads and high-contention INT64 atomic accumulation for small expert sets.
 
     Args:
         indices: Expert indices, any shape; values must be in ``[0, num_experts)``.
@@ -207,9 +208,7 @@ def _expert_token_counts(indices: torch.Tensor, num_experts: int) -> torch.Tenso
     Returns:
         int64 counts of shape ``[num_experts]`` on ``indices.device``.
     """
-    flat = indices.to(torch.int64).reshape(-1)
-    counts = torch.zeros(num_experts, dtype=torch.int64, device=flat.device)
-    return counts.scatter_add_(0, flat, torch.ones_like(flat))
+    return token_histogram(indices, num_experts)
 
 
 def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):

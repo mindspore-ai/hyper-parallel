@@ -21,6 +21,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.components.functional.token_histogram import token_histogram
 from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch, distribute_tensor
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
 
@@ -129,11 +130,9 @@ def accumulate_router_load(
     """
     num_tokens, top_k = selected_experts.shape
     modalities = selected_experts.new_zeros(num_tokens) if image_mask is None else image_mask.reshape(-1).long()
-    valid = selected_experts.new_ones(num_tokens) if token_mask is None else token_mask.reshape(-1).long()
     indices = modalities.unsqueeze(-1) * accumulator.shape[-1] + selected_experts
-    counts = torch.zeros_like(accumulator).view(-1).scatter_add(
-        0, indices.reshape(-1), valid.unsqueeze(-1).expand(-1, top_k).reshape(-1),
-    ).view_as(accumulator)
+    valid = None if token_mask is None else token_mask.reshape(-1, 1).expand(-1, top_k)
+    counts = token_histogram(indices, accumulator.numel(), valid).view_as(accumulator)
     if torch.is_grad_enabled() and not weights.requires_grad:
         weights = weights.detach().requires_grad_()
     return _AccumulateRouterLoad.apply(weights, counts, accumulator)

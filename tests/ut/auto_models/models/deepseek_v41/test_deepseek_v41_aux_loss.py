@@ -28,7 +28,11 @@ from hyper_parallel.components.functional.aux_loss import (
     bind_aux_loss_scale,
 )
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import shared_compressed_indexer_kl_loss
-from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss, update_modality_bias
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
+    accumulate_router_load,
+    sequence_load_balancing_loss,
+    update_modality_bias,
+)
 
 
 def reference_loss(
@@ -166,6 +170,21 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
 
 class TestModalityBias(unittest.TestCase):
     """Preserve exact load comparisons when updating expert biases."""
+
+    def test_masked_loads_accumulate_only_on_backward(self) -> None:
+        """Keep routing gradients unchanged while counting valid text/image assignments once."""
+        indices = torch.tensor([[0, 1], [1, 1], [2, 0]])
+        image_mask = torch.tensor([False, True, True])
+        valid = torch.tensor([True, False, True])
+        counts = torch.zeros(2, 3, dtype=torch.int64)
+        weights = torch.ones(3, 2, requires_grad=True)
+        upstream = torch.arange(6).reshape(3, 2).float()
+        output = accumulate_router_load(weights, indices, image_mask, valid, counts)
+        torch.testing.assert_close(output, weights)
+        torch.testing.assert_close(counts, torch.zeros_like(counts))
+        (output * upstream).sum().backward()
+        torch.testing.assert_close(weights.grad, upstream)
+        torch.testing.assert_close(counts, torch.tensor([[1, 1, 0], [1, 0, 1]]), rtol=0, atol=0)
 
     def test_adjacent_large_counts_preserve_update_direction(self) -> None:
         """
