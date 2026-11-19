@@ -46,7 +46,12 @@ plan_overrides:
 
 Ulysses 在 U 张卡之间用 AllToAll 将序列分片转换为头分片；KV AllGather 再沿 A 维补齐 KV 序列，
 Q 仍按 query 区间分工。例如 U2×AG2 中，每个 rank 负责一半头、一半 query 序列，并取得对应头的完整 KV。
-这样可以扩展 CP 规模，而无需把 KV 复制到 Q 的头数；头数整除约束作用于 TP×U，不是 TP×CP。
+这样可以扩展 CP 规模，Q 头数整除约束作用于 TP×U，不是 TP×CP。
+
+当 TP 分片后的 KV 头数 `K` 不能被 U 整除时，CP 在通信前将每个 KV 头连续复制 `U/gcd(K,U)` 份，
+这是等分头布局需要的最小统一复制倍数；可整除时不复制。例如 Q32/KV8、TP1/U16 每个 KV 头只复制两份，
+每张卡的 FA 接收 Q2/KV1，无需展开到 KV32。反向将副本的梯度求和回原 KV；投影参数和 checkpoint 不变。
+这会增加 KV 通信和驻留，是否优于减小 U、增加 AG 度数需要按形状实测。
 
 `overlap: true` 让已完成投影、Norm/RoPE 的输入立即通信，直到 FA 消费前才等待：
 
@@ -76,7 +81,8 @@ TP/SP 由框架原有的布局重分布处理。
 
 ## 支持范围
 
-- 输入及输出 hidden 均为本地 `[B,S,D]`。Q、KV 头数都须能被 `TP×U` 整除；当前不隐式复制 KV 头。
+- 输入及输出 hidden 均为本地 `[B,S,D]`。Q 头数须能被 `TP×U` 整除，KV 头数须能被 TP 整除。
+  CP 按需最小复制 KV，沿用 `ulysses_degree` 配置，不增加开关；TP 的 KV 复制仍不支持。
 - packed 需要模型/数据入口传入全局文档累计边界和正确的位置表，不能同时使用显式 mask。
   TND 长度描述文档隔离；RoPE 仍使用模型提供的 cos/sin，在 FA 前执行。
 - 非 packed 支持全局 `[B,Sglobal]` padding mask（True/1 为有效 token），以及 Q/K 可见性 mask。
