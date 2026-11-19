@@ -32,25 +32,33 @@ class ModelOutputLoss(torch.nn.Module):
         *,
         model_output: Any,
         labels: Optional[torch.Tensor],
+        valid_token_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """Read the model-computed loss.
 
         Args:
             model_output: Model output exposing a ``loss`` attribute.
-            labels: Labels associated with the output. This default loss keeps
-                the argument only to share the trainer-facing call signature
-                with replaceable loss modules.
+            labels: Unshifted labels used by legacy callers that do not supply
+                an aligned token count.
+            valid_token_count: Trainer count after target alignment and masking.
+                When omitted, preserve the legacy unshifted-label convention.
 
         Returns:
             The loss tensor or named loss mapping from ``model_output.loss``.
         """
         local_loss = model_output.loss
-        if labels is None or not isinstance(local_loss, torch.Tensor):
+        if not isinstance(local_loss, torch.Tensor):
             return local_loss
 
-        # Causal LM loss shifts labels by one position. A CP-local slice may
-        # therefore contain no trainable target even when other CP ranks do.
-        has_valid_labels = labels[..., 1:].ne(IGNORE_INDEX).any()
+        # Packed inputs may already be shifted: dropping their first target
+        # again can erase the only supervised token on a CP shard. Trainer owns
+        # target alignment, so use its count whenever it is available.
+        if valid_token_count is not None:
+            has_valid_labels = valid_token_count > 0
+        elif labels is not None:
+            has_valid_labels = labels[..., 1:].ne(IGNORE_INDEX).any()
+        else:
+            return local_loss
         local_loss = torch.where(has_valid_labels, local_loss, torch.zeros_like(local_loss))
 
         return local_loss

@@ -23,6 +23,9 @@ def replacement_records_from_snapshot(snapshot: Any) -> tuple[dict[str, Any], ..
 
     The conversion consumes immutable observation data and never recompiles
     rules or inspects a live model.
+
+    Args:
+        snapshot: Resolved native build snapshot containing replacement observations.
     """
     payload = snapshot._emission_view() if hasattr(snapshot, "_emission_view") else snapshot  # pylint: disable=protected-access
     if not isinstance(payload, dict):
@@ -58,6 +61,11 @@ def replacement_records_from_snapshot(snapshot: Any) -> tuple[dict[str, Any], ..
         }
         if declaration.get("static_arguments"):
             record["target_config"] = dict(declaration["static_arguments"])
+        family = application.get("family_request")
+        if family is not None:
+            record["factory"] = family["factory"].replace(":", ".", 1)
+            record["replacement_target"] = record["factory"]
+            record["target_config"] = {**family["kwargs"], "context": family["context"]}
         records.append(record)
     return tuple(records)
 

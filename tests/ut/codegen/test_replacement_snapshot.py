@@ -277,10 +277,11 @@ def test_replacement_observer_restores_native_installer_after_error():
     assert replacement_api._install_module_candidates is original_install
 
 
-def test_observed_replacement_class_needs_no_codegen_declaration():
+@pytest.mark.parametrize("separator", [".", ":"])
+def test_observed_replacement_class_needs_no_codegen_declaration(separator):
     """Avoid duplicate declarations for an observed replacement class."""
     replacement_type = (
-        f"{_ObservedReplacementBlock.__module__}."
+        f"{_ObservedReplacementBlock.__module__}{separator}"
         f"{_ObservedReplacementBlock.__qualname__}"
     )
     source_type = f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}"

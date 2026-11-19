@@ -210,3 +210,15 @@ plan_overrides:
 | [MXFP8 单设备测试](../../../tests/torch/expert_parallel/test_family_mxfp8_local.py) | 非融合与融合的设备计算验证 |
 
 通用高性能模块的安装与替换说明见 [modules README](README.md)。
+
+### Layout validation without coupling standalone math to distributed resources
+
+A family may supply `parallel_spec(module=..., member=...)` when its local math class does not define
+`parallel_module_spec()`. This optional callback returns a `ParallelModuleSpec` for final layout validation.
+Class declarations take precedence for CP/EP members. Existing families without the callback are unchanged.
+
+MLA and GQA use this callback to validate their final parameter and token layouts. The existing
+planner/apply boundary performs TP input/output redistribution around the member's local computation;
+CP classes retain their own internal communication. The resource binder only supplies CP/EP contexts.
+There is no additional TP input hook, output-projection replacement, or YAML selector. See the
+[module usage guide](README.md) for supported layouts and configuration examples.

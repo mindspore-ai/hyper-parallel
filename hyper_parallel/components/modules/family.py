@@ -54,6 +54,8 @@ class ModuleFamily:
     parallel_axis: str | None = None
     sharding: Callable | None = None
     validate: Callable | None = None
+    # Optional declaration for members whose math has no distributed protocol methods.
+    parallel_spec: Callable | None = None
 
 
 # Keep the baseline in the value so its identity cannot be reused while registered.
@@ -151,6 +153,8 @@ def register_module_family(family: ModuleFamily) -> None:
     if id(family.baseline) in _FAMILIES:
         raise ValueError(f"Module family already registered: {family.name}")
     _validate_family_rules(family)
+    if family.parallel_spec is not None and not callable(family.parallel_spec):
+        raise TypeError("ModuleFamily parallel_spec must be callable")
     snapshot = replace(
         family,
         variants=MappingProxyType(dict(family.variants)),

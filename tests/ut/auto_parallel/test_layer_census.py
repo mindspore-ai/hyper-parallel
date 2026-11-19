@@ -715,16 +715,16 @@ class TestModuleReplacements(unittest.TestCase):
     def test_the_entries_that_replace_a_module(self):
         """
         Feature: replacement_specs.
-        Description: The shipped Qwen3-MoE recipe, whose plan_overrides state
-            three replacements and two entries that shard alone, under
-            ``when: cp`` and ``when: ep``.
-        Expectation: One rule per replacement, in the order stated, each with
-            its patterns, its factory and the source type it replaces; the
-            sharding entries are left out.
+        Description: The shipped Qwen3-MoE recipe declares three module
+            replacements, including the GQA family, and a conditional EP
+            method replacement.
+        Expectation: One rule per module replacement, in the order stated,
+            with its patterns, factory and source type; method replacements
+            are left out.
         """
         specs = _recipe_specs()
         self.assertEqual([spec.factory.__name__ for spec in specs],
-                         ["replace_qwen3_moe_rms_norm", "replace_qwen3_moe_flash_attention",
+                         ["replace_qwen3_moe_rms_norm", "GroupedQueryAttention",
                           "replace_qwen3_moe_grouped_experts"])
         self.assertEqual(specs[0].match, ("*.input_layernorm", "*.post_attention_layernorm", "model.norm"))
         self.assertEqual([spec.module_type.__name__ for spec in specs],
@@ -788,18 +788,25 @@ class TestModuleReplacements(unittest.TestCase):
         self.assertGreater(fused["attBMM"], 0)
         self.assertAlmostEqual(sum(fused.values()) * 256, census_layer(config, 0, 256, replacements=specs)[0])
 
-    def test_a_census_leaves_the_runtimes_caches_as_it_found_them(self):
+    def test_contracts_remove_fake_runtime_cache_entries(self):
         """
-        Feature: the caches HyperParallel's fused modules fill, after a census.
-        Description: The Qwen3-MoE attention caches the compressed causal mask
-            its sparse mode takes, one per device, the first time it runs.
-        Expectation: A census of the fused layer leaves no fake tensor in that
-            cache, so a real call in the same process builds its own mask.
+        Feature: npu_contracts cleans fake tensors from runtime caches.
+        Description: A temporary model module holds a real cached tensor and
+            adds a fake tensor while the census's kernel contracts are active.
+        Expectation: Leaving the contracts removes only the fake entry and
+            preserves the original real tensor by identity.
         """
-        from hyper_parallel.models.qwen3_moe.adapter.runtime import attention  # pylint: disable=C0415
-        census_layer(_qwen3_moe(), 0, 256, replacements=_recipe_specs())
-        cached = attention._COMPRESSED_CAUSAL_MASKS  # pylint: disable=protected-access
-        self.assertEqual([mask for mask in cached.values() if isinstance(mask, FakeTensor)], [])
+        runtime_name = "hyper_parallel.models.census_cache_fixture"
+        runtime = types.ModuleType(runtime_name)
+        real_mask = torch.ones(1, dtype=torch.bool)
+        cached = {"real": real_mask}
+        runtime.masks = cached
+        with patch.dict(sys.modules, {runtime_name: runtime}):
+            with npu_contracts(), FakeTensorMode():
+                cached["fake"] = torch.ones(1, dtype=torch.bool)
+                self.assertIsInstance(cached["fake"], FakeTensor)
+            self.assertEqual(set(cached), {"real"})
+            self.assertIs(cached["real"], real_mask)
 
     def test_a_replacement_this_host_cannot_build_is_refused(self):
         """

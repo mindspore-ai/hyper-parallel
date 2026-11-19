@@ -24,7 +24,6 @@ from hyper_parallel.components.checkpoint.weight_conversion import WeightConvert
 
 from hyper_parallel.components.checkpoint.conversion_ops import AddScalar
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import rms_norm
 
 
 @module_replacement
@@ -76,6 +75,9 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply NPU-accelerated RMS normalization."""
+        # Parameter/meta construction does not require the optional NPU backend.
+        from hyper_parallel.components.functional.rms_norm import rms_norm  # pylint: disable=C0415
+
         return rms_norm(hidden_states, self.weight, self.eps)
 
 
@@ -125,4 +127,7 @@ class OffsetRMSNorm(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply unit-offset RMSNorm with the NPU operator."""
+        # Resolve the callable directly; a same-named package attribute may be a submodule.
+        from hyper_parallel.components.functional.rms_norm import rms_norm  # pylint: disable=C0415
+
         return rms_norm(x, self.weight, self.eps)

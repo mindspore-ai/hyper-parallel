@@ -16,6 +16,7 @@
 # pylint: disable=protected-access
 
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -24,20 +25,19 @@ import torch_npu
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
-import rl.workers.adapters.qwen3 as qwen3
-from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
-from rl.workers.adapters.qwen3 import Qwen3ShardingPlanner as ShardingPlanner
-from pathlib import Path
 import yaml
-import rl
-from hyper_parallel.trainer.config import PlanOverride, normalize_distributed_setup_overrides
-from hyper_parallel.trainer.config.resolver import resolve_component
-from rl.workers.adapters.qwen3 import restore_tied_parameter as _replicate_tied_weights
-from rl.weight_sync import packed_weight
-from rl.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
-from rl.weight_sync.packed_weight import build_packed_weight_buckets, materialize_packed_weight_bucket, unpack_packed_weights
 
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+import rl
+from rl.workers.adapters import qwen3
+from rl.workers.adapters.qwen3 import Qwen3ShardingPlanner as ShardingPlanner
+from rl.workers.adapters.qwen3 import restore_tied_parameter as _replicate_tied_weights
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
+from rl.weight_sync import packed_weight
+from rl.weight_sync.model_adapter import ModelWeightAdapter
+from rl.weight_sync.packed_weight import (
+    build_packed_weight_buckets, materialize_packed_weight_bucket, unpack_packed_weights,
+)
+
 from hyper_parallel.distributed import ShardingPlanner as SharedPlanner
 from hyper_parallel.distributed._builder import parameter_sharding
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
@@ -47,6 +47,8 @@ from hyper_parallel.models._transformers.checkpoint_loader import CheckpointMana
 from hyper_parallel.models._transformers.model_builder import _move_model_to_device
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
+from hyper_parallel.trainer.config import PlanOverride, normalize_distributed_setup_overrides
+from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
@@ -82,7 +84,9 @@ def _cpu_kernels(monkeypatch):
         first, second = x.chunk(2, dim=-1)
         return x * cos + torch.cat((-second, first), dim=-1) * sin
 
-    def attention(q, k, v, *, atten_mask, sparse_mode, keep_prob, scale, **_kwargs):
+    def attention(q, k, v, head_num, input_layout, *, atten_mask, sparse_mode, keep_prob, scale, **_kwargs):
+        assert input_layout == "BNSD"
+        assert head_num == q.shape[1]
         allowed = None if sparse_mode == 2 else ~atten_mask
         ratio = q.shape[1] // k.shape[1]
         out = torch.nn.functional.scaled_dot_product_attention(
@@ -117,7 +121,8 @@ def test_shared_loader_preserves_checkpoint_logits_and_gradients(tmp_path, monke
     ).eval()
     assert isinstance(model.model.layers[0].mlp, Qwen3MLP)
     assert setup.module_replacements
-    assert setup.plan_overrides
+    # Attention now owns its execution layout; the recipe needs no legacy region override.
+    assert not setup.plan_overrides
     assert model.lm_head.weight is model.model.embed_tokens.weight
     tokens = torch.tensor([[1, 2, 3, 4, 5], [5, 4, 3, 0, 0]])
     mask = tokens.ne(0)
@@ -202,7 +207,9 @@ def test_shared_model_hf_export_round_trip(tmp_path, monkeypatch, cpu_kernels):
     source_dir = tmp_path / "source"
     reference.save_pretrained(source_dir)
     monkeypatch.setattr(auto_model, "_current_device", lambda: torch.device("cpu"))
-    model = qwen3.from_pretrained(str(source_dir), distributed_setup=declared_setup(), torch_dtype="float32", local_files_only=True)
+    model = qwen3.from_pretrained(
+        str(source_dir), distributed_setup=declared_setup(), torch_dtype="float32", local_files_only=True,
+    )
     destination = tmp_path / "export"
     assert CheckpointManager(model).save_pretrained(destination)
     restored = Qwen3ForCausalLM.from_pretrained(destination)

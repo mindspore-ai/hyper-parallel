@@ -18,11 +18,14 @@ import unittest
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.data.batching.get_batch import OmniParallelBatch
+from hyper_parallel.data.batching.get_batch import OmniParallelBatch, TextParallelBatch
 from hyper_parallel.data.batching.runtime_input import (
+    AttentionRuntime,
+    PackedAttentionRuntime,
     RuntimeInputAdapter,
     RuntimeInputContext,
 )
@@ -130,6 +133,27 @@ class TestRuntimeInputAdapter(unittest.TestCase):
             batch_runtime._build_runtime_inputs(  # pylint: disable=protected-access
                 parallel_batch
             )
+
+    def test_packed_text_keeps_global_bounds_without_a_dense_mask(self):
+        """Feature: Compressed Trainer inputs preserve B2/CP document coordinates.
+        Description: Build the real text runtime fields and reject malformed bounds.
+        Expectation: Q/K share one host tuple and no dense mask builder runs.
+        """
+        runtime = TextParallelBatch.__new__(TextParallelBatch)
+        runtime.parallel_context = self._parallel_context()
+        runtime.runtime_input_adapter = PackedAttentionRuntime()
+        runtime.attention_runtime = AttentionRuntime(mode="compressed", create_mask=True,
+                                                     reset_mask=True, sliding_window=None)
+        runtime.source_type, runtime.causal, runtime.sliding_window = "online", True, None
+        batch = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "cu_seq_lens": torch.tensor([0, 3, 8, 10, 16])}
+        with patch.object(AttentionRuntime, "_build_dense_attention_masks", side_effect=AssertionError("dense mask")):
+            inputs = runtime._build_runtime_inputs(batch)  # pylint: disable=protected-access
+        self.assertIsNone(inputs["attention_mask"])
+        self.assertEqual(inputs["cu_seq_lens_q"], (0, 3, 8, 10, 16))
+        self.assertIs(inputs["cu_seq_lens_q"], inputs["cu_seq_lens_k"])
+        for invalid in ([0, 3, 8], [0, 0, 16], [0.0, 16.0]):
+            with self.subTest(boundaries=invalid), self.assertRaises(ValueError):
+                runtime._build_runtime_inputs(dict(batch, cu_seq_lens=invalid))  # pylint: disable=protected-access
 
     def test_runtime_context_is_feature_neutral(self):
         """Keep model-specific options opaque to the generic context.

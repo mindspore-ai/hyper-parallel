@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 from typing import Any, Iterable
 
 from hyper_parallel.codegen.inline.ir import SourceObservation
@@ -23,7 +24,11 @@ from hyper_parallel.codegen.inline.targets import projected_target_path
 
 
 def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
-    """Return normalized source rules from the already observed native plan."""
+    """Return normalized source rules from the already observed native plan.
+
+    Args:
+        meta: Observed native plan and replacement records.
+    """
     rules: list[SourceObservation] = []
     for record in getattr(meta, "module_overrides", None) or []:
         target = _replacement_target(record)
@@ -33,6 +38,7 @@ def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
                     match=_matches(record),
                     module_type=record.get("module_type"),
                     replace_target=target,
+                    construction_kwargs=_construction_kwargs(record),
                 )
             )
     for record in getattr(meta, "injections", None) or []:
@@ -47,6 +53,18 @@ def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
                 )
             )
     return tuple(rules)
+
+
+
+def _construction_kwargs(record: dict[str, Any]) -> tuple[str, ...]:
+    """Preserve static arguments; reject values that cannot round-trip as literals."""
+    arguments = []
+    for name, value in sorted((record.get("target_config") or {}).items()):
+        text = repr(value)
+        if not name.isidentifier() or ast.literal_eval(text) != value:
+            raise ValueError(f"codegen cannot preserve construction argument {name!r}")
+        arguments.append(f"{name}={text}")
+    return tuple(arguments)
 
 
 def _replacement_target(record: dict[str, Any]) -> Any:

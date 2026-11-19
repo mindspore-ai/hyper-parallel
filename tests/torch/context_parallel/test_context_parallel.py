@@ -162,3 +162,14 @@ def test_context_parallel_group7():
         ("test_tp_cp_combination_npu", 13110, 4),
         ("test_tp_cp_dtensor_composed_mesh_npu", 13120, 4),
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_gqa_family():
+    """Feature: Model-family GQA integration beyond transport-only attention tests.
+    Description: Run one four-card worker covering packed GQA, gate, TP/SP and accumulated gradients.
+    Expectation: Family-owned sync and overlap schedules match the non-CP reference.
+    """
+    worker = str(Path(__file__).with_name("_test_gqa_family.py"))
+    parallel_run([TorchCase(worker, "test_gqa_family_npu", 13210, 4)])

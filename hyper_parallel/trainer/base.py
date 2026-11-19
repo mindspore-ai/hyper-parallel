@@ -785,7 +785,15 @@ class BaseTrainer(Stateful, ABC):
         Returns:
             Backward loss and named globally aggregated loss values.
         """
-        local_loss = self.loss_fn(model_output=outputs, labels=labels)
+        # The default empty-shard guard must use the same aligned supervision
+        # count as loss weighting, including already-shifted packed targets.
+        if isinstance(self.loss_fn, ModelOutputLoss):
+            local_loss = self.loss_fn(
+                model_output=outputs, labels=labels,
+                valid_token_count=current_token_counts.get("foundation_tokens"),
+            )
+        else:
+            local_loss = self.loss_fn(model_output=outputs, labels=labels)
         # Names are static graph metadata; diagnostics added below are not losses.
         self.loss_names = tuple(local_loss) if isinstance(local_loss, dict) else ("foundation_loss",)
         # Every foundation-family objective receives the same external token weight.
