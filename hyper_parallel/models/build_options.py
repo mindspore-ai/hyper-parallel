@@ -126,6 +126,8 @@ class CompileConfig:
     attention activation offload selected by the top-level ``activation_swap``
     field (they have no eager counterpart).
     Eager FSDP2 module prefetch depths do not configure these graph passes.
+    ``inductor_mode`` and ``inductor_configs`` select the terminal joint-graph
+    backend independently of decoder compilation; ``off`` executes FX directly.
     """
 
     enabled: bool = False
@@ -143,6 +145,9 @@ class CompileConfig:
     max_in_flight_gb: float = 0.25
     offload_budget_gb: float = 64.0
     offload_prefetch_n_layers: int = 1
+    # Joint-graph backend; backend/mode/options above configure decoder compilation.
+    inductor_mode: Literal["off", "regional", "full"] = "off"
+    inductor_configs: Optional[dict[str, Any]] = None
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -159,6 +164,7 @@ class CompileConfig:
                 raise TypeError(f"compile.{name} must be a bool")
         self._validate_max_in_flight_gb()
         self._validate_offload()
+        self._validate_joint_graph_backend()
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -208,6 +214,18 @@ class CompileConfig:
             raise ValueError(
                 "compile.offload_prefetch_n_layers must be a non-negative integer"
             )
+
+    def _validate_joint_graph_backend(self) -> None:
+        """Validate the terminal backend independently of decoder options."""
+        if self.inductor_mode not in ("off", "regional", "full"):
+            raise ValueError("compile.inductor_mode must be 'off', 'regional' or 'full'")
+        if self.inductor_configs is not None and (
+            not isinstance(self.inductor_configs, dict)
+            or any(not isinstance(key, str) for key in self.inductor_configs)
+        ):
+            raise ValueError("compile.inductor_configs must be a mapping with string keys or None")
+        if self.inductor_configs and self.inductor_mode == "off":
+            raise ValueError("compile.inductor_configs requires an enabled compile.inductor_mode")
 
 
 @dataclass

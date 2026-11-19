@@ -62,6 +62,8 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("max_in_flight_gb", "0.25"),
                 ("offload_budget_gb", "64.0"),
                 ("offload_prefetch_n_layers", "1"),
+                ("inductor_mode", "'off'"),
+                ("inductor_configs", "None"),
             ],
         )
 
@@ -113,6 +115,19 @@ class TestBuildOptionsFields(unittest.TestCase):
             CompileConfig(offload_budget_gb=-1)
         with self.assertRaisesRegex(ValueError, "offload_prefetch_n_layers"):
             CompileConfig(offload_prefetch_n_layers=-1)
+
+    def test_joint_backend_validation(self):
+        """Reject malformed backend options and configurations disabled by their mode."""
+        cases = (
+            {"inductor_mode": "eager"},
+            {"inductor_mode": "full", "inductor_configs": ["debug"]},
+            {"inductor_mode": "full", "inductor_configs": {1: True}},
+            {"inductor_configs": {"debug": True}},
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, "compile.inductor_"):
+                    CompileConfig(**options)
 
     def test_use_joint_graph_selects_graph_compiler(self):
         """Graph-mode trainer selection is driven by compile.enabled + flag."""

@@ -127,9 +127,10 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
     def test_reduce_comm_dtype_prefers_parameter_policy_and_falls_back_to_grad(self):
         """Effective reduction dtype should be resolved entirely by the parameter."""
         hsdp_param = _new_param()
-        grad = torch.ones(2, dtype=torch.bfloat16)
-
-        self.assertEqual(hsdp_param.reduce_comm_dtype(grad), torch.bfloat16)
+        for dtype in (torch.bfloat16, torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                grad = torch.ones(2, dtype=dtype)
+                self.assertEqual(hsdp_param.reduce_comm_dtype(grad), dtype)
 
         hsdp_param.reduce_dtype = torch.float16
         self.assertEqual(hsdp_param.reduce_comm_dtype(grad), torch.float16)

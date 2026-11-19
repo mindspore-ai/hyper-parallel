@@ -45,10 +45,12 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.external_state import get_model_external_state
 
 from .graph_parallel_plan import GraphParallelPlan
+from .mixed_precision import GraphMixedPrecision
 from .pass_config import (
     GradientReduction,
     PassConfig,
@@ -57,6 +59,7 @@ from .pass_config import (
 )
 from .passes.pipeline import PassPipeline
 from .passes.activation_checkpoint import prepare_activation_checkpoint
+from .passes.parallel.fsdp_pass import FSDPPass
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
@@ -124,6 +127,7 @@ class GraphCompiler:
         self.pass_config = self._resolve_pass_config(
             pass_config=pass_config,
             trainer_config=trainer_config,
+            mesh_context=mesh_context,
         )
         self._mesh_context = mesh_context
         self.source_shard_info = source_shard_info
@@ -132,9 +136,17 @@ class GraphCompiler:
         self._fsdp_config = getattr(trainer_config, 'fsdp_config', None)
         self._parameter_meshes = {}
         self._parameter_groups = {}
+        self._replicate_param_names = frozenset()
         self._parameter_shapes = {}
         self._parameter_layouts = None
         self._layout_signature = None
+        self._storage_ready = False
+        self._storage_failed = False
+        self._storage_signature = None
+        self._sharded_parameter_names = frozenset()
+        self._prepared_pass_kwargs = None
+        self._mixed_precision = None
+        self._fp32_main_params = getattr(getattr(trainer_config, "optimizer", None), "fp32_main_params", False)
         self.device = device or (
             torch.device("npu")
             if (hasattr(torch, "npu") and torch.npu.is_available())
@@ -155,12 +167,13 @@ class GraphCompiler:
         *,
         pass_config: Optional[PassConfig],
         trainer_config: Optional[Any],
+        mesh_context: Optional[Any] = None,
     ) -> PassConfig:
         """Resolve pass configuration from explicit or trainer-level input."""
         if pass_config is not None:
             return pass_config
         if trainer_config is not None:
-            return build_pass_config_from_trainer_config(trainer_config)
+            return build_pass_config_from_trainer_config(trainer_config, mesh_context=mesh_context)
         return PassConfig()
 
     @property
@@ -169,21 +182,94 @@ class GraphCompiler:
         return self._joint_graph is not None
 
     @property
+    def execution_backend(self) -> Optional[str]:
+        """Actual terminal backend, or None before the graph is ready."""
+        if self._joint_graph is None:
+            return None
+        return getattr(self._joint_graph.graph_module, "meta", {}).get("inductor_compiled", "fx")
+
+    @property
     def parameter_layouts(self) -> Optional[dict]:
-        """Final parameter-identity layouts, available after lazy compilation.
+        """Final parameter-identity layouts, available after storage preparation.
 
         Cache metadata only: gradients may be replaced on every optimizer step.
         Replacing a parameter invalidates the mapping, as does compiling again.
         """
-        if self._joint_graph is None:
+        if not self._storage_ready:
             return None
         parameters = dict(self.model.named_parameters())
         signature = tuple((id(param), tuple(param.shape), param.dtype, param.device) for param in parameters.values())
         if signature != self._layout_signature:
             self._parameter_layouts = self._build_parameter_layouts(parameters)
             self._layout_signature = signature
-            self._joint_graph.graph_module.parameter_layouts = self._parameter_layouts
+            if self._joint_graph is not None:
+                self._joint_graph.graph_module.parameter_layouts = self._parameter_layouts
         return self._parameter_layouts
+
+    @property
+    def parameter_shapes(self) -> dict:
+        """Source-local logical shapes before FSDP padding and slicing."""
+        return dict(self._parameter_shapes)
+
+    @property
+    def sharded_parameter_names(self) -> frozenset:
+        """Canonical names of parameters physically partitioned by FSDP."""
+        return self._sharded_parameter_names
+
+    def prepare_model(self) -> None:
+        """Prepare local parameter storage once, before optimizer construction.
+
+        Values may subsequently be loaded or updated in place. Changing a
+        parameter identity, shape, dtype or device requires a new model and
+        compiler. A failed preparation is terminal because storage may have
+        already been partitioned.
+        """
+        external = get_model_external_state(self.model)
+        if external is not None and external.parameters:
+            raise ValueError("GraphCompiler does not support externally managed parameters yet")
+        if self._storage_failed:
+            raise RuntimeError("Graph storage preparation failed; rebuild the model and compiler")
+        signature = self._model_storage_signature()
+        if self._storage_ready:
+            if signature != self._storage_signature:
+                raise ValueError("Prepared graph parameter storage changed; rebuild the model and compiler")
+            return
+        try:
+            self._prepare_model_storage()
+        except Exception:
+            self._storage_failed = True
+            raise
+        self._storage_signature = self._model_storage_signature()
+        self._storage_ready = True
+
+    def _model_storage_signature(self) -> tuple:
+        """Describe storage identity without retaining any parameter values."""
+        return tuple((name, id(param), tuple(param.shape), param.dtype, param.device, param.requires_grad)
+                     for name, param in self.model.named_parameters(remove_duplicate=False))
+
+    def _prepare_model_storage(self) -> None:
+        """Reuse FSDP ownership and slicing before creating optimizer state."""
+        self._validate_ep_topology()
+        tp_size = getattr(self._mesh_context, "tp_size", 1)
+        if isinstance(tp_size, int) and tp_size > 1 and not self.source_shard_info:
+            raise ValueError("Graph TP requires source_shard_info from the sharding plan")
+        if self.pass_config.fsdp_enabled and dist.is_initialized():
+            self._init_device_mesh(self._mesh_context)
+        self._bind_parameter_meshes()
+        precision = getattr(self._fsdp_config, "mix_precision", None)
+        if precision is not None and any((precision.param_dtype, precision.reduce_dtype, precision.output_dtype,
+                                          precision.custom_params, self._fp32_main_params)):
+            manager = FSDP2Manager(self._fsdp_config, self._mesh_context or MeshContext(), self._fp32_main_params)
+            policy, modules = manager.mixed_precision_bindings(self.model, self.source_shard_info)
+            self._mixed_precision = GraphMixedPrecision(self.model, policy, modules)
+        self._parameter_shapes = {
+            name: tuple(param.shape) for name, param in self.model.named_parameters(remove_duplicate=False)
+        }
+        self._prepared_pass_kwargs = self._build_pass_kwargs()
+        if self.pass_config.fsdp_enabled:
+            fsdp = FSDPPass(parallel_plan=self.parallel_plan)
+            self._sharded_parameter_names = fsdp.prepare_model(self.pass_config, **self._prepared_pass_kwargs)
+        self._layout_signature = None
 
     def compile(self, **inputs: Any) -> None:
         """
@@ -209,20 +295,7 @@ class GraphCompiler:
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
 
-        self._validate_ep_topology()
-        if (
-            isinstance(getattr(self._mesh_context, "tp_size", None), int)
-            and self._mesh_context.tp_size > 1
-            and not self.source_shard_info
-        ):
-            raise ValueError("Graph TP requires source_shard_info from the sharding plan")
-
-        if self.pass_config.fsdp_enabled and dist.is_initialized():
-            # Only build the FSDP mesh when distributed is actually up.
-            # ``FSDPPass`` early-returns when ``world_size == 1``, so a
-            # single-process run (no dist, or a single rank) compiles and
-            # runs as plain graph mode without sharding.
-            self._init_device_mesh(self._mesh_context)
+        self.prepare_model()
 
         # Activation checkpointing must resolve its scope and run the adapter's
         # runtime hook BEFORE tracing: the hook configures state the model's
@@ -231,32 +304,37 @@ class GraphCompiler:
         if self.pass_config.ac_mode != "off":
             ac_scope = prepare_activation_checkpoint(self.model, self.pass_config)
 
-        self._bind_parameter_meshes()
-        self._parameter_shapes = {name: tuple(param.shape) for name, param in self.model.named_parameters()}
-        self._layout_signature = None
-
-        trace_kwargs = {}
+        trace_kwargs = {"state_shapes": self._parameter_shapes, "mixed_precision": self._mixed_precision}
         if self.dynamic or self.dynamic_arg_dims is not None:
-            trace_kwargs = {
+            trace_kwargs.update({
                 "dynamic": self.dynamic,
                 "dynamic_arg_dims": self.dynamic_arg_dims,
-            }
+            })
         joint_graph = trace_model_graph(
             self.model, self.train_fn, inputs, **trace_kwargs
         )
 
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
-        pass_kwargs = self._build_pass_kwargs()
+        pass_kwargs = dict(self._prepared_pass_kwargs)
+        pass_kwargs["storage_prepared"] = True
         # Terminal backend compilation (InductorPass) sizes its regions from
         # the tracer's fake example inputs; every other pass ignores them.
         pass_kwargs["example_inputs"] = joint_graph.example_inputs
         if ac_scope is not None:
             pass_kwargs["ac_scope"] = ac_scope
 
-        # Passes mutate ``graph_module`` in place and return it, so the
-        # transformed graph lives on ``joint_graph`` for ``forward_backward``.
-        pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        # The terminal backend may return a wrapper around the transformed graph.
+        runtime_graph = pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        if getattr(runtime_graph, "meta", {}).get("inductor_compiled") == "unavailable":
+            raise RuntimeError("The requested joint-graph Inductor backend is unavailable in this torch build")
+        for name in (
+            "state_fqns", "state_is_param", "num_state_inputs", "user_inputs_spec",
+            "loss_dict_keys", "gradient_usage", "fsdp_sharded_param_names", "meta",
+        ):
+            if not hasattr(runtime_graph, name) and hasattr(joint_graph.graph_module, name):
+                setattr(runtime_graph, name, getattr(joint_graph.graph_module, name))
+        joint_graph.graph_module = runtime_graph
 
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()
@@ -334,7 +412,7 @@ class GraphCompiler:
         if self._fsdp_mesh is None and context is not None:
             # Plain graph mode still needs metadata, without creating collectives.
             self._init_mesh_from_context(context, self.pass_config.dp_mode, register_groups=False)
-        sharded = getattr(self._joint_graph.graph_module, "fsdp_sharded_param_names", frozenset())
+        sharded = self._sharded_parameter_names
         layouts = {}
         for name, parameter in parameters.items():
             if not parameter.requires_grad:
@@ -396,9 +474,13 @@ class GraphCompiler:
         """Reuse eager unit discovery and managed identities without eager hooks."""
         self._parameter_meshes = {}
         self._parameter_groups = {}
-        if not isinstance(self._fsdp_config, FSDP2Config) or self._mesh_context is None:
+        self._replicate_param_names = frozenset()
+        if not isinstance(self._fsdp_config, FSDP2Config):
             return
-        manager = FSDP2Manager(self._fsdp_config, self._mesh_context)
+        manager = FSDP2Manager(self._fsdp_config, self._mesh_context or MeshContext())
+        self._replicate_param_names = manager.replicate_parameter_names(self.model)
+        if self._mesh_context is None:
+            return
         bindings = manager.parameter_mesh_bindings(self.model, self.source_shard_info)
         registered = {}
         for name, parameter in self.model.named_parameters(remove_duplicate=False):
@@ -812,11 +894,17 @@ class GraphCompiler:
         """
         Build kwargs to pass to passes.
         """
-        kwargs = {}
+        kwargs = {
+            "storage_prepared": self._storage_ready,
+            "logical_parameter_shapes": self._parameter_shapes,
+            "replicate_param_names": self._replicate_param_names,
+        }
 
         # Live model: partitioning passes (FSDPPass) physically shard
         # parameters in place, keeping the compiler FSDP-agnostic.
         kwargs["model"] = self.model
+        if self._mixed_precision is not None:
+            kwargs["parameter_dtypes"] = self._mixed_precision.parameter_dtypes
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
@@ -896,17 +984,9 @@ class GraphCompiler:
     def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:
         """Accumulate graph-computed gradients into the live model's parameters.
 
-        The graph emits gradients in ``state_fqns`` order (trainable
-        parameters only, shared parameters included once per FQN), which
-        diverges from ``model.parameters()`` (deduplicated) when the model
-        ties weights. Mapping by FQN keeps every gradient on the right
-        parameter; the count check refuses to assign on mismatch instead of
-        letting ``zip`` silently truncate.
-
-        Accumulation (not overwrite) keeps ``forward_backward`` composable:
-        several micro-batch steps may run before the caller's optimizer step
-        (which ends with ``zero_grad``), so per-step grads must sum into
-        ``param.grad``.
+        Gradients follow the tracer's trainable state order, with tied
+        parameters deduplicated. Keep absent edges distinct from zero-valued
+        gradients and accumulate across calls until the optimizer clears them.
         """
         # ``state_is_param`` is attached to the traced GraphModule by
         # ``trace_model_graph``, not to the JointGraph dataclass itself.
@@ -923,14 +1003,28 @@ class GraphCompiler:
                 f"refusing to assign gradients to avoid silent misalignment."
             )
 
-        for param, grad in zip(trainable, grads):
-            if param.grad is None:
+        usage = getattr(self._joint_graph.graph_module, "gradient_usage", (True,) * len(grads))
+        if len(usage) != len(grads):
+            raise ValueError("Gradient usage does not match the traced gradient count")
+        main_grad = self._mixed_precision is not None and self._mixed_precision.policy.apply_grad_on_fp32_main_grad
+        for param, grad, used in zip(trainable, grads, usage):
+            if not used:
+                continue
+            attribute = "main_grad" if main_grad else "grad"
+            accumulated = getattr(param, attribute, None)
+            # Eager keeps reduction precision for main gradients and casts each
+            # ordinary gradient to storage precision before microbatch addition.
+            if not main_grad:
+                grad = grad.to(param.dtype)
+            if accumulated is None:
                 # Match eager's gradient layout so optimizer kernels see the
                 # parameter's strides rather than a backward matmul's view.
-                param.grad = torch.empty_like(param)
-                param.grad.copy_(grad)
+                dtype = grad.dtype
+                accumulated = torch.empty_like(param, dtype=dtype)
+                accumulated.copy_(grad)
+                setattr(param, attribute, accumulated)
             else:
-                param.grad += grad
+                accumulated += grad
 
     @staticmethod
     def _trainable_params_in_state_order(

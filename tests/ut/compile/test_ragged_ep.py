@@ -76,6 +76,7 @@ class TestRaggedExperts(unittest.TestCase):
         with (
             patch("hyper_parallel.compile.compiler.dist.is_initialized", return_value=True),
             patch("hyper_parallel.compile.compiler._register_process_group") as register,
+            patch("hyper_parallel.compile.compiler.FSDPPass.prepare_model", return_value=frozenset()),
             patch("hyper_parallel.compile.compiler.trace_model_graph", return_value=joint),
             patch("hyper_parallel.compile.compiler.PassPipeline.from_config") as pipeline,
         ):

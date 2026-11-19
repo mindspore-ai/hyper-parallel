@@ -70,11 +70,11 @@ class TextTrainer:
         self.base.attach_model_integration_data_pipeline()
         self.base._compute_train_iters()
 
+        self.base._build_training_context()
+        self.base._build_graph_compiler()
         self.base._build_optimizer()
         self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._build_graph_compiler()
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:

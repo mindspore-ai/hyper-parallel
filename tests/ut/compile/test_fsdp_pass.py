@@ -515,6 +515,92 @@ class TestFSDPPassRunSharding(unittest.TestCase):
             "the [3, 4] gradient must be padded back to [4, 4] before reduction",
         )
 
+    def test_shard_storage_preserves_padded_and_empty_tails(self):
+        """Every graph rank keeps uniform storage without changing parameter identity."""
+        degree = 4
+        for rows in (0, 2, 5):
+            source = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+            padded_rows = -(-rows // degree) * degree
+            padded = torch.cat((source, source.new_zeros(padded_rows - rows, 4)))
+            for rank in range(degree):
+                with self.subTest(rows=rows, rank=rank):
+                    model = _OddParam()
+                    model.odd = nn.Parameter(source.clone())
+                    param = model.odd
+                    gm = _odd_joint_graph()
+                    with _patch_dist(world_size=degree, rank=rank):
+                        FSDPPass().run(gm, PassConfig(fsdp_degree=degree), model=model)
+                    expected = padded.chunk(degree)[rank]
+                    self.assertIs(model.odd, param)
+                    torch.testing.assert_close(model.odd, expected, atol=0, rtol=0)
+                    gm.graph.lint()
+
+    def test_configured_replica_preserves_storage_and_uses_all_reduce(self):
+        """Explicit replicas bypass padding and gathers while retaining DP synchronization."""
+        for mode in ("fsdp", "hsdp"):
+            with self.subTest(mode=mode):
+                model = _OddParam()
+                original = model.odd
+                gm = _odd_joint_graph()
+                with _patch_dist(world_size=4):
+                    FSDPPass().run(gm, PassConfig(dp_mode=mode, fsdp_degree=2, dp_replicate_degree=2),
+                                   model=model, replicate_param_names={"odd"})
+                self.assertIs(model.odd, original)
+                self.assertEqual(tuple(model.odd.shape), (3, 4))
+                self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
+                self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 0)
+                self.assertEqual(_count_targets(gm, "all_reduce"), 2 if mode == "hsdp" else 1)
+                self.assertFalse(gm.fsdp_sharded_param_names)
+        with _patch_dist(world_size=2), self.assertRaisesRegex(ValueError, "unknown parameter FQNs"):
+            FSDPPass().run(_odd_joint_graph(), PassConfig(fsdp_degree=2),
+                           model=_OddParam(), replicate_param_names={"missing"})
+
+    def test_unused_gradient_usage_uses_edp_and_source_groups_without_world_or(self):
+        """All-false ranks still participate, without mixing different expert shards."""
+        gm = _linear_joint_graph()
+        gm.gradient_usage = (False, False)
+        calls = []
+
+        def reduce_usage(tensor, *, op, group):
+            self.assertEqual(op, mocked.ReduceOp.MAX)
+            calls.append((group, tensor.clone()))
+            if group == "dense":
+                tensor.fill_(1)
+
+        with _patch_dist(world_size=4) as mocked, patch(_RESOLVE_PG_PATH, side_effect=lambda name: name):
+            mocked.get_world_size.side_effect = lambda group=None: 4 if group is None else 2
+            mocked.all_reduce.side_effect = reduce_usage
+            FSDPPass().run(gm, PassConfig(fsdp_degree=2), model=nn.Linear(4, 4), fsdp_group_name="dense",
+                           expert_param_names={"weight"}, expert_fsdp_group_name="edp",
+                           gradient_reductions={"weight": GradientReduction("sum", 4)},
+                           source_gradient_groups={"bias": "tp"})
+        self.assertEqual([group for group, _ in calls], ["dense", "edp", "tp"])
+        self.assertEqual([tensor.tolist() for _, tensor in calls], [[0], [0], [1]])
+        self.assertEqual(gm.gradient_usage, (False, True))
+
+    def test_usage_propagates_in_hsdp_then_source_execution_order(self):
+        """Compile-time usage follows shard, replicate, and source reductions exactly once."""
+        gm = _linear_joint_graph()
+        gm.gradient_usage = (False, False)
+        calls = []
+
+        def reduce_usage(tensor, *, op, group):
+            self.assertEqual(op, mocked.ReduceOp.MAX)
+            calls.append((group, tensor.tolist()))
+            if group == "fsdp":
+                tensor[0] = 1
+            elif group == "replicas":
+                tensor[1] = 1
+
+        with _patch_dist(world_size=8) as mocked, patch(_RESOLVE_PG_PATH, side_effect=lambda name: name):
+            mocked.get_world_size.side_effect = lambda group=None: 8 if group is None else 2
+            mocked.all_reduce.side_effect = reduce_usage
+            FSDPPass().run(gm, PassConfig(dp_mode="hsdp", fsdp_degree=2, dp_replicate_degree=2),
+                           model=nn.Linear(4, 4), dp_replicate_group_name="replicas",
+                           source_gradient_groups={"bias": "tp"})
+        self.assertEqual(calls, [("fsdp", [0, 0]), ("replicas", [1, 0]), ("tp", [1])])
+        self.assertEqual(gm.gradient_usage, (True, True))
+
     def test_source_replicate_sum_follows_waited_fsdp_reduction(self):
         """TP-replicated gradients sum after DP shards, retaining both identities."""
         gm = _linear_joint_graph()

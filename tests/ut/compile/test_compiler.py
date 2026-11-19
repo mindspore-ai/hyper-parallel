@@ -33,6 +33,7 @@ Tracing uses a tiny ``nn.Linear`` model and the same joint-graph capture the
 tracer tests validate; only the compiler wiring is asserted here.
 """
 
+from copy import deepcopy
 import os
 from types import SimpleNamespace
 import unittest
@@ -69,6 +70,45 @@ def _fixed_batch():
 
 class TestGraphCompilerForwardBackward(unittest.TestCase):
     """``compile`` / lazy ``forward_backward`` without distributed."""
+
+    def test_terminal_wrapper_preserves_training_metadata(self) -> None:
+        """Execute the returned module while preserving loss and gradient output layout."""
+        model = _make_model()
+        x, y = _fixed_batch()
+        expected_loss = _mse_train_fn(model, x=x, y=y)
+        expected_grads = torch.autograd.grad(expected_loss, tuple(model.parameters()))
+        compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False))
+        wrappers = []
+
+        class RuntimeWrapper(nn.Module):
+            """Mirror the backend's positional state-and-input calling convention."""
+
+            def __init__(self, inner):
+                """Keep the executable without its tracer metadata."""
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, *args):
+                """Forward every flat state and user input positionally."""
+                return self.inner(*args)
+
+        def wrap(graph_module, **_kwargs):
+            """Return a terminal executable without copying tracer metadata."""
+            wrappers.append(RuntimeWrapper(graph_module))
+            return wrappers[-1]
+
+        self.assertIsNone(compiler.execution_backend)
+        with patch("hyper_parallel.compile.compiler.PassPipeline.run", side_effect=wrap):
+            loss, _ = compiler.forward_backward(x=x, y=y)
+
+        self.assertIs(compiler._joint_graph.graph_module, wrappers[0])
+        self.assertEqual(compiler.execution_backend, "fx")
+        self.assertEqual(wrappers[0].num_state_inputs, len(tuple(model.parameters())))
+        self.assertEqual(wrappers[0].state_fqns, compiler._joint_graph.state_fqns)
+        self.assertEqual(wrappers[0].gradient_usage, (True, True))
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        for parameter, expected in zip(model.parameters(), expected_grads):
+            torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
 
     def test_unit_bindings_reach_passes_with_tied_expert(self) -> None:
         """Claim nested experts before the root and keep every alias on EDP."""
@@ -277,6 +317,39 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
         comp._joint_graph.graph_module.state_is_param[0] = False
         with self.assertRaises(ValueError):
             comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
+
+    def test_unused_parameters_preserve_adamw_skip_semantics(self):
+        """An absent autograd edge must not create weight decay or optimizer state."""
+        model = _make_model()
+        model.register_parameter("unused", nn.Parameter(torch.ones(4)))
+        model.register_parameter("zero_gradient", nn.Parameter(torch.ones(4)))
+        reference = deepcopy(model)
+
+        def loss_with_zero_gradient(current, *, x, y):
+            """Keep a real zero gradient distinct from an absent autograd edge."""
+            return _mse_train_fn(current, x=x, y=y) + current.zero_gradient.sum() * 0
+
+        compiler = GraphCompiler(model, loss_with_zero_gradient, PassConfig(fsdp_enabled=False),
+                                 device=torch.device("cpu"))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.1, foreach=False)
+        reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.01, weight_decay=0.1, foreach=False)
+        x, y = _fixed_batch()
+        for _ in range(10):
+            expected_loss = loss_with_zero_gradient(reference, x=x, y=y)
+            expected_loss.backward()
+            loss, _ = compiler.forward_backward(x=x, y=y)
+            torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+            self.assertIsNone(model.unused.grad)
+            torch.testing.assert_close(model.zero_gradient.grad, torch.zeros(4), rtol=0, atol=0)
+            optimizer.step()
+            reference_optimizer.step()
+            for actual, expected in zip(model.parameters(), reference.parameters()):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertNotIn(model.unused, optimizer.state)
+            self.assertNotIn(reference.unused, reference_optimizer.state)
+            self.assertIn(model.zero_gradient, optimizer.state)
+            optimizer.zero_grad(set_to_none=True)
+            reference_optimizer.zero_grad(set_to_none=True)
 
 
 class TestGraphCompilerDevice(unittest.TestCase):
@@ -830,12 +903,12 @@ class TestParameterLayoutMeshFallback(unittest.TestCase):
                 model.experts.local_expert_count = 2
                 context = MeshContext(fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert,
                                       dp_size=8, dp_shard_size=8, ep_size=ep, edp_shard_size=8 // ep)
-                compiler = GraphCompiler(model, _mse_train_fn, mesh_context=context)
+                compiler = GraphCompiler(model, _mse_train_fn, PassConfig(enable_overlap=False), mesh_context=context)
                 with patch.object(compiler, "_register_mesh_group"):
                     compiler._init_device_mesh(context)
                 compiler._bind_parameter_meshes()
                 self.assertEqual(compiler._parameter_meshes, {})
-                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                compiler.prepare_model()
                 layouts = compiler.parameter_layouts
                 self.assertEqual(layouts[model.dense].mesh.mesh_dim_names, ("fsdp_shard",))
                 expert_layout = layouts[model.experts.weight]
@@ -853,7 +926,7 @@ class TestParameterLayoutMeshFallback(unittest.TestCase):
                 context = MeshContext(device_mesh=mesh, dp_replicate_size=replicate, dp_shard_size=2)
                 model = _make_model()
                 compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False), mesh_context=context)
-                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                compiler.prepare_model()
                 with patch.object(compiler, "_register_mesh_group") as register:
                     layout = compiler.parameter_layouts[model.weight]
                 register.assert_not_called()
@@ -876,7 +949,7 @@ class TestParameterLayoutMeshFallback(unittest.TestCase):
                     compiler._init_device_mesh(context)
                 expected = ("dp",) if world_only else ("fsdp_replicate", "fsdp_shard")
                 self.assertEqual(compiler._fsdp_mesh.mesh_dim_names, expected)
-                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                compiler.prepare_model()
                 layout_names = expected if world_only else (*expected, "tp")
                 self.assertEqual(compiler.parameter_layouts[model.weight].mesh.mesh_dim_names, layout_names)
 
