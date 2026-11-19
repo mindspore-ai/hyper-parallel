@@ -660,8 +660,7 @@ def build_sliding_window_indices(
         device=device,
     ).unsqueeze(-1)
     offsets = torch.arange(width - 1, -1, -1, device=device)
-    indices = query - offsets
-    indices = indices.masked_fill(indices < 0, -1)
+    indices = (query - offsets).clamp_min(-1)
     return indices.unsqueeze(0).expand(batch_size, -1, -1)
 
 

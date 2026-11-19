@@ -354,7 +354,7 @@ class DeepseekV41DSpark(nn.Module):
         # Sequence-chunk granularity of the draft objective: smaller chunks
         # lower the vocabulary-logits peak at the cost of more recompute
         # rounds; the loss value itself is chunking-invariant.
-        self.loss_chunk_size = int(getattr(config, "v41_dspark_loss_chunk_size", 64) or 64)
+        self.loss_chunk_size = int(getattr(config, "v41_dspark_loss_chunk_size", 512) or 512)
         if self.block_size <= 0 or self.num_targets == 0:
             raise ValueError("DSpark requires a positive block size and target layers")
         hidden = int(config.hidden_size)
@@ -485,12 +485,7 @@ class DeepseekV41DSpark(nn.Module):
             merged = merged.sum(dim=2).to(streams_in.dtype).view(batch, seq, block, -1)
             return self.norm(merged)
 
-        # The fp32 merge buffer otherwise stays resident for the norm
-        # backward; recomputing it is cheap and communication-free.
-        if gradient_active:
-            hidden_out = _checkpoint(_collapse, streams, pre_mix)
-        else:
-            hidden_out = _collapse(streams, pre_mix)
+        hidden_out = _collapse(streams, pre_mix)
 
         # Teacher-forced targets: draft offset j at position t predicts the
         # token at t + 1 + j; the Markov head is conditioned on t + j.  When
