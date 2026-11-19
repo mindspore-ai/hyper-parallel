@@ -48,14 +48,15 @@ class TestMhcPost(unittest.TestCase):
         h_res = torch.randn(B, S, N, N)
         mixed = torch.randn(B, S, N, C)
         ops = ModuleType("cann_ops_transformer.ops")
-        ops.mhc_post = Mock(return_value=mixed)
+        cann_post = Mock(return_value=mixed)
+        ops.mhc_post = cann_post
         package = ModuleType("cann_ops_transformer")
         package.ops = ops
         with patch.dict(sys.modules, {"cann_ops_transformer": package, "cann_ops_transformer.ops": ops}), \
                 _fake_npu_device():
             result = mhc_post(block_output, residual, h_post, h_res, N)
 
-        args = ops.mhc_post.call_args.args
+        args = cann_post.call_args.args
         self.assertEqual(args[0].shape, (B, S, N, C))
         self.assertIs(args[1], h_res)
         self.assertIs(args[2], block_output)
@@ -78,6 +79,34 @@ class TestMhcPost(unittest.TestCase):
             h_res.unsqueeze(-1) * residual.reshape(B, S, N, C).unsqueeze(-2), dim=2
         )
         torch.testing.assert_close(result, expected.flatten(2))
+
+    def test_cpu_eager_preserves_output_and_gradients(self):
+        """
+        Feature: Eager MHC post on CPU.
+        Description: Run the CPU fallback with either supported backend.
+        Expectation: Bypass vendor operators and match eager outputs and gradients.
+        """
+        for backend in ("cann", "omni"):
+            with self.subTest(backend=backend):
+                inputs = (
+                    torch.randn(B, S, C, requires_grad=True),
+                    torch.randn(B, S, N * C, requires_grad=True),
+                    torch.randn(B, S, N, requires_grad=True),
+                    torch.randn(B, S, N, N, requires_grad=True),
+                )
+                block_output, residual, h_post, h_res = inputs
+                expected = (
+                    torch.einsum("bsn,bsc->bsnc", h_post, block_output)
+                    + torch.einsum("bsij,bsic->bsjc", h_res, residual.reshape(B, S, N, C))
+                ).flatten(2)
+                with patch.dict(sys.modules, {"cann_ops_transformer": None, "omni_training_custom_ops": None}):
+                    result = mhc_post(*inputs, N, backend=backend)
+                torch.testing.assert_close(result, expected)
+                grad_output = torch.randn_like(result)
+                actual_grads = torch.autograd.grad(result, inputs, grad_output)
+                expected_grads = torch.autograd.grad(expected, inputs, grad_output)
+                for actual, reference in zip(actual_grads, expected_grads):
+                    torch.testing.assert_close(actual, reference)
 
     def test_omni_backend_is_deprecated(self):
         """

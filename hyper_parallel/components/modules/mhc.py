@@ -260,7 +260,17 @@ def pipelined_mhc_post(
     post: torch.Tensor,
     combine: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the shared high-performance mHC post path to 4-D streams."""
+    """Apply mHC post to 4-D streams using the device-specific implementation.
+
+    Args:
+        sublayer_output: Output of the preceding sublayer.
+        residual: Residual streams shaped as batch, sequence, streams, hidden.
+        post: Per-stream output mixing coefficients.
+        combine: Residual stream mixing matrices.
+
+    Returns:
+        Mixed residual streams with the original four-dimensional shape.
+    """
     num_stream = residual.shape[-2]
     flattened = mhc_post(
         sublayer_output,

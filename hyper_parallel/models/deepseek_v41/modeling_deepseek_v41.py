@@ -46,7 +46,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
-from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
+from hyper_parallel.components.modules.mhc import PipelinedMhcModule
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
@@ -630,8 +630,10 @@ def _hc_post(
         post: torch.Tensor,
         comb: torch.Tensor,
 ) -> torch.Tensor:
-    """Expand a sublayer result through the reusable high-performance path."""
-    return pipelined_mhc_post(sublayer_output, residual, post, comb)
+    """Expand a sublayer result without requiring optional NPU kernels."""
+    output = post.unsqueeze(-1) * sublayer_output.unsqueeze(-2)
+    output = output + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    return output.to(sublayer_output.dtype)
 
 
 def _identity_residual_mix(reference: torch.Tensor) -> torch.Tensor:

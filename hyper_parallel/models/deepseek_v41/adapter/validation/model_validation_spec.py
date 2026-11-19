@@ -45,6 +45,20 @@ from hyper_parallel.models.validation_spec import (
 )
 
 
+def _validate_retained_engram_parameters(model: Any, context: Any) -> dict[str, Any] | None:
+    """Require Engram parameters only at the layers declared by the model config."""
+    del context
+    layer_ids = getattr(getattr(model, "config", None), "v41_engram_layer_ids", ())
+    parameter_names = {name for name, _ in model.named_parameters()}
+    missing = [
+        f"model.layers.{layer_id}.engram.{suffix}"
+        for layer_id in layer_ids
+        for suffix in ("q_weight", "k_weight", "wkv.weight")
+        if f"model.layers.{layer_id}.engram.{suffix}" not in parameter_names
+    ]
+    return {"missing_engram_parameters": missing} if missing else None
+
+
 def _validate_engram_scratch_state(model: Any, context: Any) -> dict[str, Any] | None:
     """Require official q/k initialization on the final replaced scratch model."""
     if getattr(getattr(model, "config", None), "v41_model_mode", "full") != "validation_crop":
@@ -52,6 +66,8 @@ def _validate_engram_scratch_state(model: Any, context: Any) -> dict[str, Any] |
     trainer_config = context.get("trainer_config", {}) if isinstance(context, dict) else {}
     model_target = trainer_config.get("model", {}) if isinstance(trainer_config, dict) else {}
     if model_target.get("load_base_model"):
+        return None
+    if getattr(getattr(model, "config", None), "v41_engram_layer_ids", None) in ([], ()):
         return None
     failures = []
     engram_count = 0
@@ -73,11 +89,13 @@ def _validate_canonical_module_tree(model: Any, context: Any) -> dict[str, Any] 
     """Require executable V4.1 attention and Engram modules in the base model."""
     backbone = getattr(model, "model", None)
     layers = getattr(backbone, "layers", ())
+    # Activation wrappers expose their source modules under the canonical FQN.
+    canonical_modules = dict(model.named_modules())
     invalid_attention = [
         f"model.layers.{layer_index}.self_attn"
-        for layer_index, layer in enumerate(layers)
+        for layer_index in range(len(layers))
         if not isinstance(
-            getattr(layer, "self_attn", None),
+            canonical_modules.get(f"model.layers.{layer_index}.self_attn"),
             (DeepseekV41Attention, SharedCompressedDSAAttention),
         )
     ]
@@ -90,7 +108,7 @@ def _validate_canonical_module_tree(model: Any, context: Any) -> dict[str, Any] 
         for layer_id in engram_layer_ids
         if layer_id >= len(layers)
         or not isinstance(
-            getattr(layers[layer_id], "engram", None),
+            canonical_modules.get(f"model.layers.{layer_id}.engram"),
             (DeepseekV41Engram, EngramModule),
         )
     ]
@@ -180,15 +198,20 @@ def get_validation_spec() -> ModelValidationSpec:
             ),
         ),
         parameter_probes=(
-            ParameterProbeSpec("model.layers.*.engram.q_weight"),
-            ParameterProbeSpec("model.layers.*.engram.k_weight"),
-            ParameterProbeSpec("model.layers.*.engram.wkv.weight"),
+            ParameterProbeSpec("model.layers.*.engram.q_weight", required=False),
+            ParameterProbeSpec("model.layers.*.engram.k_weight", required=False),
+            ParameterProbeSpec("model.layers.*.engram.wkv.weight", required=False),
             ParameterProbeSpec("model.layers.*.self_attn.sinks"),
             ParameterProbeSpec("model.layers.*.mlp.gate.weight"),
             ParameterProbeSpec("model.layers.*.mlp.gate.bias"),
             ParameterProbeSpec("model.layers.*.mlp.gate.bias_vl", required=False),
         ),
         state_invariants=(
+            StateInvariantSpec(
+                name="deepseek_v41.retained_engram_parameters",
+                checker=_validate_retained_engram_parameters,
+                phase="structure",
+            ),
             StateInvariantSpec(
                 name="deepseek_v41.canonical_module_tree",
                 checker=_validate_canonical_module_tree,
