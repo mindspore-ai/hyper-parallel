@@ -91,9 +91,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from hyper_parallel.distributed.expert_parallel.routing import (
-    resolve_moe_router,
-)
+from hyper_parallel.distributed._builder.forward_rewriter import _install_bound_forward
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_dispatch,
@@ -101,10 +99,18 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     ep_routed_forward,
     require_attrs,
 )
+from hyper_parallel.distributed.expert_parallel.moonep_collective import (
+    collective_routed_forward,
+)
+from hyper_parallel.distributed.expert_parallel.moonep_collective_dedup import (
+    collective_token_forward,
+)
+from hyper_parallel.distributed.expert_parallel.routing import (
+    resolve_moe_router,
+)
 from hyper_parallel.distributed.recipe_spec import (
     local_compute,
 )
-
 
 # {canonical arch name (ShardingPlanner._get_architecture): archetype key} —
 # a SUGGESTION shown in preflight error messages and describe_moe_module
@@ -149,6 +155,7 @@ def build_ep_compute(
     fix_router: bool = False,
     capacity_factor: Optional[float] = None,
     overlap_fn: Optional[Callable] = None,
+    token_dispatcher: str = "all_to_all",
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -176,7 +183,15 @@ def build_ep_compute(
     around the given callable -- so a family gets the uniform-load comparison mode
     without carrying its own copy of the router.  See that factory for what it does and
     why its numbers must not be reported as an efficiency result.
+    ``token_dispatcher="moonep_collective"`` opts into synchronous capacity-based
+    redistribution and redundant expert execution using Torch collectives.
+    It currently requires packed SwiGLU weights; capacity dropping and overlap
+    are rejected. The default ``"all_to_all"`` retains the established path.
     """
+    if token_dispatcher not in ("all_to_all", "moonep_collective"):
+        raise ValueError(f"Unsupported EP token_dispatcher: {token_dispatcher!r}")
+    if token_dispatcher == "moonep_collective" and (capacity_factor is not None or overlap_fn is not None):
+        raise ValueError("MoonEP collective does not support capacity dropping or overlap_fn")
     router_fn = resolve_moe_router(router_fn, fix_router)
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
@@ -195,6 +210,17 @@ def build_ep_compute(
         # Read back by ``experts._resolve_capacity_factor``; bounds each expert's routed slots
         # so the busiest rank's buffers cannot blow up under a skewed real router.
         module.experts.capacity_factor = float(capacity_factor)
+
+    if token_dispatcher == "moonep_collective":
+        _install_bound_forward(module.experts, collective_token_forward)
+
+        def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+            """Keep parameter hooks around the entire collective expert call."""
+            routed = collective_routed_forward(
+                module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            return combine(module, hidden_states, routed)
+
+        return compute_fn
 
     if overlap_fn is None:
         def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:

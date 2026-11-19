@@ -49,9 +49,13 @@ def qwen3moe_ep_compute_fn(
     ep_mesh: Any,
     use_grouped_gemm: bool = False,
     fix_router: bool = False,
+    token_dispatcher: str = "all_to_all",
 ) -> Callable:
     """Archetype ``qwen3moe_topk_router``: TopKRouter module returning
     (logits, scores, indices), no shared expert (Qwen3-MoE).
+
+    ``token_dispatcher="moonep_collective"`` selects the experimental internal
+    collective backend without an external MoonEP dependency.
 
     Expected module interface: ``gate`` (TopKRouter module), ``experts``.
 
@@ -68,6 +72,7 @@ def qwen3moe_ep_compute_fn(
         combine=SHARED_MERGE_MODES["none"],
         use_grouped_gemm=use_grouped_gemm,
         fix_router=fix_router,
+        token_dispatcher=token_dispatcher,
     )
 
 
