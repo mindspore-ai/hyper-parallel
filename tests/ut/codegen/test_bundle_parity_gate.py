@@ -15,6 +15,7 @@
 """End-to-end CPU gate for the CLI and the real rank-zero sidecar."""
 
 import ast
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from types import SimpleNamespace
 from hyper_parallel.codegen.emit.family_forwards import verify_parallel_family_forwards
 from hyper_parallel.codegen.emit.modeling import _preinstalled_calls, _verify_replacement_records
 from hyper_parallel.codegen.train_sidecar import start_codegen_sidecar
+from hyper_parallel.models.preinstalled import COMPONENT_REPLAY_FILE
 from scripts.check_codegen_bundle_parity import bundle_hashes
 from tests.common.mla_cp_utils import make_deepseek_model
 
@@ -62,10 +64,14 @@ def test_cli_and_rank_zero_sidecar_publish_identical_bundles(tmp_path, monkeypat
     expected, actual = bundle_hashes(cli), bundle_hashes(sidecar)
     assert actual == expected, f"CLI bundle {expected}, sidecar bundle {actual}"
     modeling, = cli.glob("modeling_*_gen_npu.py")
-    tree = ast.parse(modeling.read_text(encoding="utf-8"))
-    prepared, emitted = _preinstalled_calls(tree)
+    source = modeling.read_text(encoding="utf-8")
+    assert "__hp_prepared_components__" not in source
+    tree = ast.parse(source)
+    emitted = _preinstalled_calls(tree)
+    replay = json.loads((cli / COMPONENT_REPLAY_FILE).read_text(encoding="utf-8"))
+    prepared_paths = {record["primary_fqn"] for record in replay["components"]}
     name = "CPMultiLatentAttentionModule"
-    assert prepared == emitted
+    assert prepared_paths == set(emitted)
     assert emitted["model.layers.0.self_attn"] == "build_prepared_family_replacement"
     verify_parallel_family_forwards(tree, {
         "model.layers.0.self_attn": {
@@ -80,13 +86,11 @@ def test_replacement_metadata_without_an_executable_call_is_rejected():
     """Record-only artifacts must not pass the replacement source gate."""
     tree = ast.parse("""
 def constructor(self):
-    self.__hp_prepared_components__ = (
-        {"primary_fqn": "layer.attention", "replay": {"constructor": "demo:ParallelAttention"}},
-    )
-    install_prepared_components(self, self.__hp_prepared_components__, {}, globals())
+    install_bundle_components(self, __file__, globals(), constructors={})
 """)
     record = SimpleNamespace(module_fqn="layer.attention", replacement_type=object)
-    missing = _verify_replacement_records(tree, (record,), [])
+    prepared = ({"primary_fqn": "layer.attention", "replay": {"constructor": "demo:ParallelAttention"}},)
+    missing = _verify_replacement_records(tree, (record,), prepared, [])
     assert missing == ["layer.attention (missing executable constructor 'ParallelAttention')"], (
         f"Metadata-only replacement should be rejected, got {missing}"
     )

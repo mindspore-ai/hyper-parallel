@@ -209,7 +209,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
         )
         tracked_setup = DistributedSetup(
             mesh_context=mesh,
-            module_replacement_requests=(tracked_request,) if hasattr(bundled, "__hp_prepared_components__") else (),
+            module_replacement_requests=(tracked_request,) if hasattr(bundled, "_hp_preinstalled_topology") else (),
         )
         bundled, _ = prepare_model_components(bundled, build_module_context(tracked_setup))
         planner = ShardingPlanner()

@@ -356,12 +356,19 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     return _banner(meta) + text
 
 
+def needs_component_install(meta: Any) -> bool:
+    """Return whether the generated constructor needs topology or replacement replay data."""
+    return bool(getattr(meta, "preinstalled_components", ()) or (
+        _source_dict(meta.source).get("model_class") and getattr(meta, "param_plan", None)
+    ))
+
+
 def _emit_preinstalled_components(text: str, meta: Any) -> str:
-    """Attach the verified replacement records to the generated source constructor."""
+    """Emit the prepared module replacements and forward binding in the constructor."""
+    if not needs_component_install(meta):
+        return text
     records = getattr(meta, "preinstalled_components", ())
     source = _source_dict(meta.source)
-    if not records and not (source.get("model_class") and getattr(meta, "param_plan", None)):
-        return text
     model_class = (source.get("model_class") or source["architecture"]).rsplit(":", 1)[-1]
     owners = [node for node in ast.parse(text).body if isinstance(node, ast.ClassDef) and node.name == model_class]
     constructors = [
@@ -375,39 +382,38 @@ def _emit_preinstalled_components(text: str, meta: Any) -> str:
     # Use the constructor's original suite indentation for copied sources.
     body = lines[constructor.body[0].lineno - 1]
     indent = body[:len(body) - len(body.lstrip())]
-    entries, imports, constructors_by_fqn = _emitted_constructors(records, indent)
+    imports, constructors_by_fqn = _emitted_constructors(records, indent)
     lines[constructor.end_lineno:constructor.end_lineno] = [
         f"{indent}from hyper_parallel.models._generated.phase_c import apply_generated_phase_c\n",
         f"{indent}self._hp_bind_materialized_forwards = apply_generated_phase_c\n",
-        f"{indent}from hyper_parallel.models.preinstalled import install_prepared_components\n",
+        f"{indent}from hyper_parallel.models.preinstalled import install_bundle_components\n",
         *imports,
-        f"{indent}self.__hp_prepared_components__ = (\n{entries}{indent})\n",
-        f"{indent}install_prepared_components(\n",
-        f"{indent}    self, self.__hp_prepared_components__, {meta.parallel_dims!r}, globals(),\n",
+        f"{indent}install_bundle_components(\n",
+        f"{indent}    self, __file__, globals(),\n",
         f"{indent}    constructors={{\n{constructors_by_fqn}{indent}    }},\n",
         f"{indent})\n",
     ]
     return "".join(lines)
 
 
+def _constructor_symbol(record: dict[str, Any]) -> str:
+    """Select the source-visible constructor for a captured replacement."""
+    if record.get("family_request", {}).get("selection"):
+        return "hyper_parallel.models.prepared_family:build_prepared_family_replacement"
+    return record["replay"]["constructor"]
+
+
 def _emitted_constructors(records, indent):
     """Emit a direct executable factory call for every prepared module path."""
     imports = {}
-    entries = []
     calls = []
     for record in records:
         fqn = record["primary_fqn"]
-        symbol = record["replay"]["constructor"]
-        module, name = symbol.split(":", 1)
-        if record.get("family_request", {}).get("selection"):
-            record = {**record, "source_family_builder": True}
-            module, name = "hyper_parallel.models.prepared_family", "build_prepared_family_replacement"
+        module, name = _constructor_symbol(record).split(":", 1)
         alias = imports.setdefault(module, f"_hp_constructor_module_{len(imports)}")
-        callee = f"{alias}.{name}"
-        entries.append(f"{indent}    {record!r},\n")
-        calls.append(f"{indent}        {fqn!r}: lambda **kwargs: {callee}(**kwargs),\n")
+        calls.append(f"{indent}        {fqn!r}: lambda **kwargs: {alias}.{name}(**kwargs),\n")
     statements = [f"{indent}import {module} as {alias}\n" for module, alias in imports.items()]
-    return "".join(entries), statements, "".join(calls)
+    return statements, "".join(calls)
 
 
 def _verify_recorded_patch_materialization(
@@ -438,7 +444,7 @@ def _verify_recorded_patch_materialization(
         materialized.clear()
     missing = _verify_local_records(tree, classes, local_records, materialized)
     missing += _verify_replacement_records(
-        tree, replacement_records, materialized
+        tree, replacement_records, getattr(meta, "preinstalled_components", ()), materialized
     )
     missing += _verify_wrapper_records(
         classes, wrapper_records, replacement_records, materialized
@@ -528,12 +534,16 @@ def _verify_local_records(
     return missing
 
 
-def _verify_replacement_records(tree: ast.AST, records: Any, materialized: Any) -> list[str]:
-    """Require an executable constructor for each recorded replacement path."""
-    prepared, emitted = _preinstalled_calls(tree)
+def _verify_replacement_records(tree: ast.AST, records: Any, prepared: Any, materialized: Any) -> list[str]:
+    """Require a source constructor matching each captured replacement path."""
+    expected_by_path = {
+        item["primary_fqn"]: _constructor_symbol(item).rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+        for item in prepared
+    }
+    emitted = _preinstalled_calls(tree)
     missing = []
     for record in records:
-        expected = prepared.get(record.module_fqn)
+        expected = expected_by_path.get(record.module_fqn)
         if not expected or emitted.get(record.module_fqn) != expected:
             missing.append(f"{record.module_fqn} (missing executable constructor {expected!r})")
         else:
@@ -541,25 +551,13 @@ def _verify_replacement_records(tree: ast.AST, records: Any, materialized: Any) 
     return missing
 
 
-def _preinstalled_calls(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
-    """Retrieve prepared identities and the executable constructor map separately."""
-    prepared = {}
+def _preinstalled_calls(tree: ast.AST) -> dict[str, str]:
+    """Read the constructors wired to the bundle installer in source."""
     emitted = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Attribute) and target.attr == "__hp_prepared_components__"
-            for target in node.targets
-        ):
-            prepared.update({
-                item["primary_fqn"]: (
-                    "build_prepared_family_replacement" if item.get("source_family_builder")
-                    else item["replay"].get("constructor", "").split(":")[-1].split(".")[-1]
-                )
-                for item in ast.literal_eval(node.value)
-            })
-        elif isinstance(node, ast.Call) and _call_name(node.func) == "install_prepared_components":
+        if isinstance(node, ast.Call) and _call_name(node.func) == "install_bundle_components":
             emitted.update(_constructor_call_map(node))
-    return prepared, emitted
+    return emitted
 
 
 def _constructor_call_map(node: ast.Call) -> dict[str, str]:

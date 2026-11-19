@@ -111,20 +111,21 @@ def _train(config, output, ranks, *, stop=True, bad_child=None, overrides=()):
 def _bundle(path):
     files = {file.relative_to(path).as_posix(): sha256(file.read_bytes()).hexdigest()
              for file in path.rglob("*") if file.is_file()}
-    assert len(files) == 3 and "__init__.py" in files, files
     source, = path.glob("modeling_*_gen_npu.py")
     diff, = path.glob("modeling_*_gen_npu.py.diff")
+    text = source.read_text(encoding="utf-8")
+    assert "__hp_prepared_components__" not in text
+    expected = {"__init__.py", source.name, diff.name}
+    if "install_bundle_components(" in text:
+        expected.add("_component_replay.json")
+    assert set(files) == expected, files
     assert diff.read_text(encoding="utf-8").strip(), diff
-    return files, ast.parse(source.read_text(encoding="utf-8"))
+    return files, ast.parse(text)
 
 
-def _prepared(tree):
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Attribute) and target.attr == "__hp_prepared_components__" for target in node.targets
-        ):
-            return ast.literal_eval(node.value)
-    return ()
+def _replay(path):
+    replay_file = path / "_component_replay.json"
+    return json.loads(replay_file.read_text(encoding="utf-8")) if replay_file.is_file() else {}
 
 
 def _assert_success(result):
@@ -137,11 +138,10 @@ def test_single_module_replacement_and_pipeline_topology(recipes, tmp_path):
     output = tmp_path / "cli"
     output.mkdir()
     _assert_success(_run(_cli(recipes["single"], output), tmp_path / "cli.log"))
-    _, tree = _bundle(output)
-    assert [record["primary_fqn"] for record in _prepared(tree)] == ["model.layers.0.self_attn"]
-    installer = next(node for node in ast.walk(tree)
-                     if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "install_prepared_components")
-    degrees = ast.literal_eval(installer.args[2])
+    _bundle(output)
+    replay = _replay(output)
+    assert [record["primary_fqn"] for record in replay["components"]] == ["model.layers.0.self_attn"]
+    degrees = replay["topology"]
     assert {key: degrees[key] for key in ("dp_size", "tp_size", "pp_size")} == {
         "dp_size": 2, "tp_size": 2, "pp_size": 2,
     }
@@ -151,8 +151,8 @@ def test_empty_patch_and_active_cp_contract(recipes, tmp_path):
     """Publish a source audit for a true empty patch and preserve the active-CP planner contract."""
     output = tmp_path / "audit"
     _assert_success(_run(_cli(recipes["audit"], output), tmp_path / "audit.log"))
-    _, tree = _bundle(output)
-    assert not _prepared(tree), "empty patch installed an unexpected component"
+    _bundle(output)
+    assert not _replay(output), "empty patch published unexpected replay data"
     status, log = _run(_cli(recipes["empty"], tmp_path / "empty"), tmp_path / "empty.log")
     assert status != 0 and "has no CP-aware forward replacement" in log, log[-4000:]
     assert not (tmp_path / "empty").exists(), "invalid CP config published an artifact"
@@ -180,11 +180,9 @@ def test_sidecar_forwards_explicit_override(recipes, tmp_path):
     sidecar = tmp_path / "sidecar"
     command, _ = _train(recipes["full"], sidecar, 1, overrides=(override,))
     _assert_success(_run(command, tmp_path / "sidecar.log"))
-    expected, tree = _bundle(cli)
+    expected, _ = _bundle(cli)
     assert expected == _bundle(sidecar)[0]
-    installer = next(node for node in ast.walk(tree)
-                     if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "install_prepared_components")
-    assert ast.literal_eval(installer.args[2])["sequence_parallel"] is False
+    assert _replay(cli)["topology"]["sequence_parallel"] is False
 
 
 def _wait_for_publishers(logs):
@@ -310,7 +308,7 @@ except Captured:
     _assert_success(result)
     native = json.loads(next(line.removeprefix("OBSERVED ") for line in result[1].splitlines()
                              if line.startswith("OBSERVED ")))
-    records = _prepared(tree)
+    records = _replay(output)["components"]
     assert sorted(record["primary_fqn"] for record in records) == native["replaced"]
     if recipe == "one_rule":
         assert len({record["rule_id"].split(":replace:", 1)[0] for record in records}) == 1

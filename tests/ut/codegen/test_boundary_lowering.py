@@ -637,7 +637,9 @@ def test_replacement_verifier_requires_constructor_call():
         module_replacements=(record,),
         inner_wrappers=(),
     )
-    meta = SimpleNamespace(materialized_patches=[])
+    meta = SimpleNamespace(materialized_patches=[], preinstalled_components=(
+        {"primary_fqn": "blocks.alpha", "replay": {"constructor": "demo:ReplacementBlock"}},
+    ))
     imported_only = "from demo import ReplacementBlock\n"
 
     with pytest.raises(RuntimeError, match="were not materialized"):
@@ -647,10 +649,7 @@ def test_replacement_verifier_requires_constructor_call():
 
     rendered = imported_only + """
 def init(self):
-    self.__hp_prepared_components__ = (
-        {"primary_fqn": "blocks.alpha", "replay": {"constructor": "demo:ReplacementBlock"}},
-    )
-    install_prepared_components(self, constructors={"blocks.alpha": lambda **kwargs: ReplacementBlock(**kwargs)})
+    install_bundle_components(self, constructors={"blocks.alpha": lambda **kwargs: ReplacementBlock(**kwargs)})
 """
     _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
 
