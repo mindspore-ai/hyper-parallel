@@ -12,9 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""FSDP execution policy for Qwen3.5-MoE and Qwen3.6 VLMs."""
+"""Vision parameter ownership and FSDP execution policy for Qwen VLMs."""
 
 from typing import Any
+
+from hyper_parallel.core.dtensor.placement_types import Replicate
+from hyper_parallel.distributed.recipe_spec import TP, ModuleShardingSpec
+
+
+def build_vision_sharding(*, model: Any, context: Any) -> dict[str, ModuleShardingSpec]:
+    """Declare native vision ownership independently of encoder parallelism.
+
+    Args:
+        model: Qwen model, optionally containing the native visual subtree.
+        context: Planner layout context; vision retains its native activation layout.
+
+    Returns:
+        Complete visual parameter layouts, replicated across decoder TP. FSDP
+        continues to manage storage sharding and gradient synchronization.
+        Text-only models have no visual parameter ownership.
+    """
+    del context
+    # Text-only loading can retain the checkpoint's VLM configuration identity.
+    visual = getattr(getattr(model, "model", None), "visual", None)
+    if visual is None:
+        return {}
+    return {
+        "model.visual": ModuleShardingSpec(
+            params={name: {TP: Replicate()} for name, _ in visual.named_parameters()},
+            in_src={}, in_dst={}, is_boundary=False,
+        ),
+    }
 
 
 def get_fsdp_execution_order(model: Any, module_fqns: tuple[str, ...]) -> tuple[str, ...]:
@@ -34,4 +62,4 @@ def get_fsdp_execution_order(model: Any, module_fqns: tuple[str, ...]) -> tuple[
     return (embedding_fqn,) + tuple(fqn for fqn in module_fqns if fqn != embedding_fqn)
 
 
-__all__ = ["get_fsdp_execution_order"]
+__all__ = ["build_vision_sharding", "get_fsdp_execution_order"]

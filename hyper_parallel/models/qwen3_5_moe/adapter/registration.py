@@ -18,7 +18,10 @@ from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.qwen3_5.adapter.checkpoint import export_text_checkpoint
 from hyper_parallel.models.qwen3_5.adapter.registration import _load_replacements
 from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
-from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import get_fsdp_execution_order
+from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import (
+    build_vision_sharding,
+    get_fsdp_execution_order,
+)
 from hyper_parallel.models.registry import register_model_adapter
 
 
@@ -49,21 +52,13 @@ def _load_vlm_loss():
     return vlm_chunk_loss
 
 
-def _load_encoder_parallel():
-    """Load the opt-in visual runtime without importing optional HF vision code."""
-    from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import (  # pylint: disable=C0415
-        get_encoder_parallel_spec,
-    )
-    return get_encoder_parallel_spec()
-
-
 QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     materialization=register_rotary_materialization,
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",
     loss=_load_vlm_loss,
-    encoder_parallel=_load_encoder_parallel,
     replacements=_load_replacements,
+    sharding=build_vision_sharding,
     sharding_rules=_load_sharding_rules,
     fsdp_execution_order=get_fsdp_execution_order,
 )

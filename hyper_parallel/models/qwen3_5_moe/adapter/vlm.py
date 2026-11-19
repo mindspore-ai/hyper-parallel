@@ -14,26 +14,90 @@
 # ============================================================================
 """Model-owned forward installation for Qwen dense and MoE VLM CP."""
 
+from dataclasses import dataclass
 from functools import partial, wraps
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch.nn import functional
 
-from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature
 from hyper_parallel.models import HyperAutoModelForImageTextToText
 from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMCPInputs
-from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import _chunk_loss_forward
 
 
-def select_local_image_features(records: list[EncoderFeature], geometry: QwenVLMCPInputs,
+@dataclass(frozen=True)
+class _ImageSpan:
+    """Image feature rows and their position in the global decoder sequence."""
+
+    decoder_token_start: int
+    output_rows: int
+
+
+class _QwenImageParser:
+    """Validate image payloads and locate decoder placeholders for VLM CP."""
+
+    input_fields = ("pixel_values", "image_grid_thw")
+
+    def __init__(self, model: Any) -> None:
+        """Read the native image layout and placeholder token configuration."""
+        self.merge_size = model.model.visual.spatial_merge_size
+        self.image_token_id = model.config.image_token_id
+
+    def parse_images(self, batch: Mapping[str, Any]) -> tuple[_ImageSpan, ...]:
+        """Validate image/token correspondence before native visual encoding."""
+        tokens = batch.get("vlm_global_input_ids", batch["input_ids"])
+        if tokens.ndim != 2 or tokens.shape[0] != 1:
+            raise ValueError("Qwen VLM CP requires a single unpacked sample")
+        self._validate_image_batch(batch)
+        positions = (tokens[0] == self.image_token_id).nonzero().flatten().tolist()
+        pixels, grids = (batch.get(name) for name in self.input_fields)
+        if pixels is None and grids is None:
+            if positions:
+                raise ValueError("Image tokens are present without image tensors")
+            return ()
+        self._validate_image_payload(pixels, grids)
+        items, offset, token_offset = [], 0, 0
+        for temporal, height, width in grids.tolist():
+            if temporal != 1 or min(height, width) <= 0 or height % self.merge_size or width % self.merge_size:
+                raise ValueError("Images require T=1 and positive H/W divisible by spatial_merge_size")
+            length = height * width
+            rows = length // self.merge_size ** 2
+            span = positions[token_offset:token_offset + rows]
+            if len(span) != rows or span != list(range(span[0], span[0] + rows)):
+                raise ValueError("Image token span is truncated or does not match image_grid_thw")
+            items.append(_ImageSpan(span[0], rows))
+            offset += length
+            token_offset += rows
+        if offset != pixels.shape[0] or token_offset != len(positions):
+            raise ValueError("Image payload/token count does not match image_grid_thw")
+        return tuple(items)
+
+    @staticmethod
+    def _validate_image_batch(batch: Mapping[str, Any]) -> None:
+        """Reject unsupported packed samples and video inputs."""
+        boundaries = batch.get("cu_seq_lens")
+        if boundaries is not None and boundaries.numel() > 2:
+            raise NotImplementedError("Qwen VLM CP does not support multi-sample packing")
+        if batch.get("pixel_values_videos") is not None or batch.get("video_grid_thw") is not None:
+            raise NotImplementedError("Qwen VLM CP currently supports images, not videos")
+
+    @staticmethod
+    def _validate_image_payload(pixels: torch.Tensor, grids: torch.Tensor) -> None:
+        """Check flattened image patches and integer grid metadata."""
+        if not torch.is_tensor(pixels) or not torch.is_tensor(grids) or pixels.ndim != 2:
+            raise ValueError("Qwen image tensors must contain flattened patches and grid_thw")
+        if grids.ndim != 2 or grids.shape[1] != 3 or grids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("image_grid_thw must be an integer [images, 3] tensor")
+
+
+def select_local_image_features(records: list[tuple[_ImageSpan, torch.Tensor]], geometry: QwenVLMCPInputs,
                                hidden: torch.Tensor, input_ids: torch.Tensor,
                                image_token_id: int) -> torch.Tensor:
     """Insert only image rows intersecting this rank's global token interval.
 
     Args:
-        records: Image work items paired with their encoded features.
+        records: Image token spans paired with their encoded features.
         geometry: Global token interval assigned to this CP rank.
         hidden: Local text embeddings receiving image features.
         input_ids: Local token IDs identifying image placeholders.
@@ -51,7 +115,7 @@ def select_local_image_features(records: list[EncoderFeature], geometry: QwenVLM
     mask = input_ids.eq(image_token_id).unsqueeze(-1).expand_as(hidden)
     features = torch.cat(rows).to(hidden.dtype) if rows else hidden.new_empty((0, hidden.shape[-1]))
     if int(mask[..., 0].sum()) != features.shape[0]:
-        raise ValueError("CP-local image placeholders do not match routed image features")
+        raise ValueError("CP-local image placeholders do not match image features")
     return hidden.masked_scatter(mask, features)
 
 
@@ -71,17 +135,16 @@ def _validate_cp_forward_inputs(model: Any, args: tuple[Any, ...], kwargs: dict[
         raise ValueError("Qwen VLM CP requires logits_to_keep=0")
 
 
-def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
+def install_qwen_vlm_cp_forward(model: Any) -> None:
     """Keep the HF decoder/head, replacing only image insertion and CP loss alignment.
 
     Args:
         model: Conditional-generation model receiving the batch forward adapter.
-        cp_enabled: Whether the decoder uses context parallelism.
     """
     if getattr(model, "_hp_qwen_vlm_forward_installed", False):
         raise ValueError("Qwen VLM CP forward is already installed")
     original_forward = model.forward
-    bridge = QwenVisionBridge(model)
+    image_parser = _QwenImageParser(model)
 
     @wraps(original_forward)
     def forward(*args: Any, **kwargs: Any) -> Any:
@@ -91,7 +154,7 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
             return original_forward(*args, **kwargs)
         if bool((geometry.input_ids[~geometry.attention_mask.bool()] == model.config.image_token_id).any()):
             raise ValueError("Qwen VLM CP padding must not contain image placeholders")
-        images = bridge.parse_images({**kwargs, "vlm_global_input_ids": geometry.input_ids})
+        images = image_parser.parse_images({**kwargs, "vlm_global_input_ids": geometry.input_ids})
         if geometry.cp_size == 1:
             if "chunk_loss_targets" in kwargs:
                 return _chunk_loss_forward(model, **kwargs)
@@ -109,11 +172,8 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
         kwargs.pop("labels", None)
         kwargs.pop("mm_token_type_ids", None)
         kwargs.pop("attention_mask", None)
-        plan = kwargs.pop("encoder_parallel_plan", None)
         hidden = model.get_input_embeddings()(input_ids)
-        if plan is not None:
-            records, anchor = plan.encode_and_route(kwargs)
-        elif images:
+        if images:
             visual = model.model.visual
             features = visual(kwargs["pixel_values"].to(visual.dtype),
                               grid_thw=kwargs["image_grid_thw"], return_dict=True).pooler_output
@@ -152,8 +212,6 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
         return output
 
     model.forward = forward
-    # Exercise the shared internal integration contract; no public equivalent exists.
-    model._hp_vlm_cp_enabled = cp_enabled  # pylint: disable=protected-access
     model._hp_qwen_vlm_forward_installed = True  # pylint: disable=protected-access
 
 
@@ -174,6 +232,5 @@ def build_qwen_vlm(pretrained_model_name_or_path: str, *, distributed_setup: Any
     )
     if model.config.model_type not in ("qwen3_5", "qwen3_5_moe"):
         raise ValueError("build_qwen_vlm requires a Qwen dense or MoE multimodal model")
-    cp_enabled = distributed_setup is not None and distributed_setup.mesh_context.cp_size > 1
-    install_qwen_vlm_cp_forward(model, cp_enabled=cp_enabled)
+    install_qwen_vlm_cp_forward(model)
     return model
