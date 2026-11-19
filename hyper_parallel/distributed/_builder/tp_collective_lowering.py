@@ -49,7 +49,8 @@ def classify_tp_transition(
         ``{"kind": "identity"}`` when no communication is needed;
         ``{"kind": "all_gather", "tensor_dim": d}`` for Shard -> Replicate on
         the tp axis; ``{"kind": "all_reduce", "reduce_op": "sum"}`` for
-        Partial -> Replicate; ``{"kind": "reduce_scatter", "tensor_dim": d,
+        Partial -> Replicate; ``{"kind": "local_shard", "tensor_dim": d}``
+        for Replicate -> Shard; ``{"kind": "reduce_scatter", "tensor_dim": d,
         "reduce_op": "sum"}`` for Partial -> Shard; ``None`` when the
         transition is not lowerable on this path (a non-tp axis differs, the
         placement pair is unsupported, or the reduce op is not ``sum``).
@@ -67,20 +68,21 @@ def classify_tp_transition(
 
     src_tp = src[tp_axis]
     dst_tp = dst[tp_axis]
+    if isinstance(src_tp, Replicate) and isinstance(dst_tp, Shard):
+        return {"kind": "local_shard", "tensor_dim": dst_tp.dim}
     if isinstance(src_tp, Shard) and isinstance(dst_tp, Replicate):
         return {"kind": "all_gather", "tensor_dim": src_tp.dim}
-    if isinstance(src_tp, Partial) and isinstance(dst_tp, Replicate):
+    if isinstance(src_tp, Partial):
         if src_tp.reduce_op != "sum":
             return None
-        return {"kind": "all_reduce", "reduce_op": "sum"}
-    if isinstance(src_tp, Partial) and isinstance(dst_tp, Shard):
-        if src_tp.reduce_op != "sum":
-            return None
-        return {
-            "kind": "reduce_scatter",
-            "tensor_dim": dst_tp.dim,
-            "reduce_op": "sum",
-        }
+        if isinstance(dst_tp, Replicate):
+            return {"kind": "all_reduce", "reduce_op": "sum"}
+        if isinstance(dst_tp, Shard):
+            return {
+                "kind": "reduce_scatter",
+                "tensor_dim": dst_tp.dim,
+                "reduce_op": "sum",
+            }
     return None
 
 
@@ -96,7 +98,17 @@ class TPExecutionOp:
     reduce_op: str = "sum"
 
     def execute(self, tensor: Any) -> Any:
-        """Execute the differentiable collective selected during lowering."""
+        """Execute the differentiable operation selected during lowering.
+
+        Args:
+            tensor: Local input tensor before the TP layout transition.
+
+        Returns:
+            Local tensor in the destination placement.
+        """
+        if self.kind == "local_shard":
+            # Preserve DTensor local slicing and its zero-padded backward.
+            return torch.chunk(tensor, self.group_size, dim=self.tensor_dim)[self.group_rank]
         if self.kind == "all_gather":
             return communication.differentiable_all_gather_concat(
                 tensor,
