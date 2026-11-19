@@ -116,16 +116,18 @@ def _bundle(path):
     text = source.read_text(encoding="utf-8")
     assert "__hp_prepared_components__" not in text
     expected = {"__init__.py", source.name, diff.name}
-    if "install_bundle_components(" in text:
-        expected.add("_component_replay.json")
     assert set(files) == expected, files
     assert diff.read_text(encoding="utf-8").strip(), diff
     return files, ast.parse(text)
 
 
-def _replay(path):
-    replay_file = path / "_component_replay.json"
-    return json.loads(replay_file.read_text(encoding="utf-8")) if replay_file.is_file() else {}
+def _constructor_paths(tree):
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_hp_module_constructors":
+            result = node.body[-1]
+            assert isinstance(result, ast.Return) and isinstance(result.value, ast.Dict)
+            return {ast.literal_eval(key) for key in result.value.keys}
+    return set()
 
 
 def _assert_success(result):
@@ -138,21 +140,16 @@ def test_single_module_replacement_and_pipeline_topology(recipes, tmp_path):
     output = tmp_path / "cli"
     output.mkdir()
     _assert_success(_run(_cli(recipes["single"], output), tmp_path / "cli.log"))
-    _bundle(output)
-    replay = _replay(output)
-    assert [record["primary_fqn"] for record in replay["components"]] == ["model.layers.0.self_attn"]
-    degrees = replay["topology"]
-    assert {key: degrees[key] for key in ("dp_size", "tp_size", "pp_size")} == {
-        "dp_size": 2, "tp_size": 2, "pp_size": 2,
-    }
+    _, tree = _bundle(output)
+    assert _constructor_paths(tree) == {"model.layers.0.self_attn"}
 
 
 def test_empty_patch_and_active_cp_contract(recipes, tmp_path):
     """Publish a source audit for a true empty patch and preserve the active-CP planner contract."""
     output = tmp_path / "audit"
     _assert_success(_run(_cli(recipes["audit"], output), tmp_path / "audit.log"))
-    _bundle(output)
-    assert not _replay(output), "empty patch published unexpected replay data"
+    _, tree = _bundle(output)
+    assert not _constructor_paths(tree), "empty patch contains a replacement"
     status, log = _run(_cli(recipes["empty"], tmp_path / "empty"), tmp_path / "empty.log")
     assert status != 0 and "has no CP-aware forward replacement" in log, log[-4000:]
     assert not (tmp_path / "empty").exists(), "invalid CP config published an artifact"
@@ -182,7 +179,9 @@ def test_sidecar_forwards_explicit_override(recipes, tmp_path):
     _assert_success(_run(command, tmp_path / "sidecar.log"))
     expected, _ = _bundle(cli)
     assert expected == _bundle(sidecar)[0]
-    assert _replay(cli)["topology"]["sequence_parallel"] is False
+    default = tmp_path / "default"
+    _assert_success(_run(_cli(recipes["full"], default), tmp_path / "default.log"))
+    assert _bundle(default)[0] != expected
 
 
 def _wait_for_publishers(logs):
@@ -308,10 +307,9 @@ except Captured:
     _assert_success(result)
     native = json.loads(next(line.removeprefix("OBSERVED ") for line in result[1].splitlines()
                              if line.startswith("OBSERVED ")))
-    records = _replay(output)["components"]
-    assert sorted(record["primary_fqn"] for record in records) == native["replaced"]
+    assert _constructor_paths(tree) == set(native["replaced"])
     if recipe == "one_rule":
-        assert len({record["rule_id"].split(":replace:", 1)[0] for record in records}) == 1
+        assert _constructor_paths(tree) == {f"model.layers.{layer}.self_attn" for layer in range(4)}
     assert native["dims"] == {"dp_size": 2, "tp_size": 2, "cp_size": 2, "ep_size": 2}
     assert len(native["compute"]) == 4 and all(name.endswith(".mlp") for name in native["compute"])
     cp_sites = {name for name, kind in native["parallel"].items() if kind == "cp"}

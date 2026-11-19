@@ -349,51 +349,23 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     )
     text = materialize_parallel_family_forwards(text, getattr(meta, "parallel_forwards", {}))
     text = _lower_forward_boundaries(text, emission_meta, module_name)
-    text = _emit_preinstalled_components(text, meta)
+    text = _emit_module_constructors(text, getattr(meta, "preinstalled_components", ()))
     _verify_recorded_patch_materialization(
         text, emission_meta, patch_plan=patch_plan
     )
     return _banner(meta) + text
 
 
-def needs_component_install(meta: Any) -> bool:
-    """Return whether the generated constructor needs topology or replacement replay data."""
-    return bool(getattr(meta, "preinstalled_components", ()) or (
-        _source_dict(meta.source).get("model_class") and getattr(meta, "param_plan", None)
-    ))
-
-
-def _emit_preinstalled_components(text: str, meta: Any) -> str:
-    """Emit the prepared module replacements and forward binding in the constructor."""
-    if not needs_component_install(meta):
+def _emit_module_constructors(text: str, records: Any) -> str:
+    """Show the applied replacement calls alongside the generated model."""
+    if not records:
         return text
-    records = getattr(meta, "preinstalled_components", ())
-    source = _source_dict(meta.source)
-    model_class = (source.get("model_class") or source["architecture"]).rsplit(":", 1)[-1]
-    owners = [node for node in ast.parse(text).body if isinstance(node, ast.ClassDef) and node.name == model_class]
-    constructors = [
-        method for owner in owners for method in owner.body
-        if isinstance(method, ast.FunctionDef) and method.name == "__init__"
-    ]
-    if len(constructors) != 1:
-        raise RuntimeError(f"Cannot attach prepared replacement records to {model_class!r}")
-    constructor = constructors[0]
-    lines = text.splitlines(keepends=True)
-    # Use the constructor's original suite indentation for copied sources.
-    body = lines[constructor.body[0].lineno - 1]
-    indent = body[:len(body) - len(body.lstrip())]
-    imports, constructors_by_fqn = _emitted_constructors(records, indent)
-    lines[constructor.end_lineno:constructor.end_lineno] = [
-        f"{indent}from hyper_parallel.models._generated.phase_c import apply_generated_phase_c\n",
-        f"{indent}self._hp_bind_materialized_forwards = apply_generated_phase_c\n",
-        f"{indent}from hyper_parallel.models.preinstalled import install_bundle_components\n",
-        *imports,
-        f"{indent}install_bundle_components(\n",
-        f"{indent}    self, __file__, globals(),\n",
-        f"{indent}    constructors={{\n{constructors_by_fqn}{indent}    }},\n",
-        f"{indent})\n",
-    ]
-    return "".join(lines)
+    imports, constructors = _emitted_constructors(records)
+    return (
+        text.rstrip() + "\n\n\ndef _hp_module_constructors():\n"
+        '    """Return the observed module replacement calls by module path."""\n'
+        f"{imports}    return {{\n{constructors}    }}\n"
+    )
 
 
 def _constructor_symbol(record: dict[str, Any]) -> str:
@@ -403,7 +375,7 @@ def _constructor_symbol(record: dict[str, Any]) -> str:
     return record["replay"]["constructor"]
 
 
-def _emitted_constructors(records, indent):
+def _emitted_constructors(records):
     """Emit a direct executable factory call for every prepared module path."""
     imports = {}
     calls = []
@@ -411,9 +383,9 @@ def _emitted_constructors(records, indent):
         fqn = record["primary_fqn"]
         module, name = _constructor_symbol(record).split(":", 1)
         alias = imports.setdefault(module, f"_hp_constructor_module_{len(imports)}")
-        calls.append(f"{indent}        {fqn!r}: lambda **kwargs: {alias}.{name}(**kwargs),\n")
-    statements = [f"{indent}import {module} as {alias}\n" for module, alias in imports.items()]
-    return statements, "".join(calls)
+        calls.append(f"        {fqn!r}: lambda **kwargs: {alias}.{name}(**kwargs),\n")
+    statements = [f"    import {module} as {alias}\n" for module, alias in imports.items()]
+    return "".join(statements), "".join(calls)
 
 
 def _verify_recorded_patch_materialization(
@@ -540,7 +512,7 @@ def _verify_replacement_records(tree: ast.AST, records: Any, prepared: Any, mate
         item["primary_fqn"]: _constructor_symbol(item).rsplit(":", 1)[-1].rsplit(".", 1)[-1]
         for item in prepared
     }
-    emitted = _preinstalled_calls(tree)
+    emitted = _module_constructor_calls(tree)
     missing = []
     for record in records:
         expected = expected_by_path.get(record.module_fqn)
@@ -551,20 +523,18 @@ def _verify_replacement_records(tree: ast.AST, records: Any, prepared: Any, mate
     return missing
 
 
-def _preinstalled_calls(tree: ast.AST) -> dict[str, str]:
-    """Read the constructors wired to the bundle installer in source."""
-    emitted = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and _call_name(node.func) == "install_bundle_components":
-            emitted.update(_constructor_call_map(node))
-    return emitted
+def _module_constructor_calls(tree: ast.Module) -> dict[str, str]:
+    """Read the executable replacement calls declared in the generated source."""
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_hp_module_constructors":
+            result = node.body[-1]
+            if isinstance(result, ast.Return) and isinstance(result.value, ast.Dict):
+                return _constructor_call_map(result.value)
+    return {}
 
 
-def _constructor_call_map(node: ast.Call) -> dict[str, str]:
-    """Read direct calls keyed by FQN from a shared installer invocation."""
-    mapping = next((keyword.value for keyword in node.keywords if keyword.arg == "constructors"), None)
-    if not isinstance(mapping, ast.Dict):
-        return {}
+def _constructor_call_map(mapping: ast.Dict) -> dict[str, str]:
+    """Read direct calls keyed by module path."""
     return {
         key.value: _call_name(value.body.func)
         for key, value in zip(mapping.keys, mapping.values)

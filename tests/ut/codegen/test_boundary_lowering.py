@@ -648,8 +648,8 @@ def test_replacement_verifier_requires_constructor_call():
         )
 
     rendered = imported_only + """
-def init(self):
-    install_bundle_components(self, constructors={"blocks.alpha": lambda **kwargs: ReplacementBlock(**kwargs)})
+def _hp_module_constructors():
+    return {"blocks.alpha": lambda **kwargs: ReplacementBlock(**kwargs)}
 """
     _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
 

@@ -32,7 +32,6 @@ passing separate copies would create a second source of truth.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -46,12 +45,10 @@ from hyper_parallel.codegen.emit.diff import unified_diff
 from hyper_parallel.codegen.emit.modeling import (
     copy_original_modeling,
     emit_modeling_file,
-    needs_component_install,
     verify_recorded_patch_bundle,
 )
 from hyper_parallel.codegen.inline.pipeline import render_inline_strategies_for_source_unit
 from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
-from hyper_parallel.models.preinstalled import COMPONENT_REPLAY_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +90,7 @@ def emit_bundle(
 
     Manager-facing entry point.  Returns a ``filename -> content`` dict
     holding the generated modeling file, the unified diff against the original
-    source, the package entry, and any required replay data. The manager atomically
+    source, and the package entry. The manager atomically
     swaps the complete bundle directory.
 
     """
@@ -132,8 +129,6 @@ def emit_bundle(
         os.path.basename(layout.diff_path): diff_text,
         "__init__.py": _strip_trailing_whitespace(emit_init_file(layout)),
     }
-    if needs_component_install(meta):
-        files[COMPONENT_REPLAY_FILE] = _component_replay_json(meta)
     # A ``<remote>`` source is
     # shipped inside the checkpoint and uses single-dot relative imports
     # (``from .configuration_deepseek import ...``) that resolve against its
@@ -160,24 +155,6 @@ def emit_bundle(
     verify_generated_source_structure(files)
     verify_recorded_patch_bundle(files, patch_plan=patch_plan)
     return files
-
-
-def _component_replay_json(meta: Any) -> str:
-    """Serialize only the fields needed to install and reconcile replacements."""
-    fields = ("primary_fqn", "module_fqns", "rule_id", "source_type", "replacement_type", "replay")
-    components = []
-    for record in getattr(meta, "preinstalled_components", ()):
-        entry = {key: record[key] for key in fields}
-        family = record.get("family_request")
-        if family:
-            selection = family.get("selection")
-            entry["family_request"] = {"selection": selection}
-            if selection is not None:
-                entry["source_family_builder"] = True
-        components.append(json.dumps(entry, separators=(",", ":")))
-    topology = json.dumps(meta.parallel_dims, separators=(",", ":"))
-    rows = ",\n".join(f"    {component}" for component in components)
-    return f'{{\n  "topology": {topology},\n  "components": [\n{rows}\n  ]\n}}\n'
 
 
 def _emit_remote_siblings(

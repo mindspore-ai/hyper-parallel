@@ -27,20 +27,35 @@ import torch
 from hyper_parallel.components.modules.attention.multi_latent_attention import (
     cp_multi_latent_attention as context_parallel,
 )
+from hyper_parallel.codegen.ir.construction import ir_value_to_data
 from hyper_parallel.codegen.project import project_model_build, publish_codegen_ir
 from hyper_parallel.components.modules import MultiLatentAttention
 from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.models import HyperAutoModelForCausalLM
+from hyper_parallel.models.deepseek_v3.generated import modeling_Deepseek_V3_gen_npu as tracked_modeling
 from hyper_parallel.models.deepseek_v3.generated.modeling_Deepseek_V3_gen_npu import (
     DeepseekV3ForCausalLM as BundledDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models._transformers import auto_model
 from hyper_parallel.models.build_capture import capture_model_build_plan
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
+from hyper_parallel.models.preinstalled import install_prepared_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest
 from tests.common.mla_cp_utils import make_deepseek_model, make_mla
+
+
+def _install_observed_replacements(model, module, capture):
+    """Exercise the visible constructors with records from the same native build."""
+    build = project_model_build(capture)
+    records = ir_value_to_data(build.replacements)
+    for record in records:
+        if record.get("family_request", {}).get("selection"):
+            record["source_family_builder"] = True
+    install_prepared_components(
+        model, records, build.plan["parallel_dims"], vars(module), constructors=module._hp_module_constructors(),
+    )
 
 
 class TestMLAContextParallelCompatibility(unittest.TestCase):
@@ -148,6 +163,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
                 spec.loader.exec_module(generated_module)
                 with torch.device("meta"):
                     generated = getattr(generated_module, "DeepseekV3ForCausalLM")(config)
+                _install_observed_replacements(generated, generated_module, capture)
         before_reentry = dict(generated.named_parameters())
         changed = DistributedSetup(
             mesh_context=mesh,
@@ -185,15 +201,21 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
         config.first_k_dense_replace = 4
         mesh = MeshContext(device_mesh=LogicalDeviceMesh(("dp", "cp", "tp"), (1, 4, 1)),
                            tp_size=1, cp_size=4, dp_size=1, dp_shard_size=4)
-        request = ModuleReplacementRequest(("model.layers.*.self_attn",), MultiLatentAttention)
+        request = ModuleReplacementRequest(
+            ("model.layers.*.self_attn",), MultiLatentAttention,
+            kwargs={"strategy": "expanded_ulysses", "overlap": False, "config": None,
+                    "ulysses_degree": None, "kv_exchange": "all_gather"},
+            declaration_id="plan_override:0:replace",
+        )
         setup = DistributedSetup(mesh_context=mesh, module_replacement_requests=(request,))
         with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
-                capture_model_build_plan():
+                capture_model_build_plan() as capture:
             native = HyperAutoModelForCausalLM.from_config(
                 config, distributed_setup=setup, torch_dtype=torch.float32,
             )
         with torch.device("meta"):
             bundled = BundledDeepseekV3ForCausalLM(config)
+        _install_observed_replacements(bundled, tracked_modeling, capture)
         self.assertEqual(set(bundled.state_dict()), set(native.state_dict()))
         for layer in bundled.model.layers:
             resolved = get_family_build_info(layer.self_attn).resolved
@@ -201,17 +223,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
             self.assertEqual(resolved.axis_sizes["cp"], 4)
             self.assertEqual(resolved.axis_sizes["tp"], 1)
 
-        tracked_request = ModuleReplacementRequest(
-            ("model.layers.*.self_attn",), MultiLatentAttention,
-            kwargs={"strategy": "expanded_ulysses", "overlap": False, "config": None,
-                    "ulysses_degree": None, "kv_exchange": "all_gather"},
-            declaration_id="plan_override:0:replace",
-        )
-        tracked_setup = DistributedSetup(
-            mesh_context=mesh,
-            module_replacement_requests=(tracked_request,) if hasattr(bundled, "_hp_preinstalled_topology") else (),
-        )
-        bundled, _ = prepare_model_components(bundled, build_module_context(tracked_setup))
+        bundled, _ = prepare_model_components(bundled, build_module_context(setup))
         planner = ShardingPlanner()
         expected = planner.plan(native, mesh.device_mesh, tp_size=1, cp_size=4)
         actual = planner.plan(bundled, mesh.device_mesh, tp_size=1, cp_size=4)

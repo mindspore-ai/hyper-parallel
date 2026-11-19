@@ -19,8 +19,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import replace
-import json
-from pathlib import Path
 from typing import Any
 import weakref
 
@@ -49,9 +47,6 @@ from hyper_parallel.models.replacement import (
     apply_module_replacements,
     module_replacement,
 )
-
-
-COMPONENT_REPLAY_FILE = "_component_replay.json"
 
 
 _TOPOLOGY_FIELDS = ("tp_size", "cp_size", "ep_size", "pp_size", "sequence_parallel", "loss_parallel")
@@ -168,18 +163,6 @@ def install_prepared_components(
     )
     model._hp_preinstalled_topology = {name: topology[name] for name in _TOPOLOGY_FIELDS if name in topology}
     model._hp_preinstalled_conversions = tuple(weights)
-
-
-def install_bundle_components(
-    model: nn.Module, modeling_file: str, namespace: Mapping[str, Any], *, constructors: Mapping[str, Callable],
-) -> None:
-    """Install visible constructor calls using the bundle's companion replay data."""
-    path = Path(modeling_file).with_name(COMPONENT_REPLAY_FILE)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        raise _mismatch(f"could not read component replay data at {path}") from error
-    install_prepared_components(model, data["components"], data["topology"], namespace, constructors=constructors)
 
 
 def validate_preinstalled_topology(model: nn.Module, context: Mapping[str, Any]) -> None:

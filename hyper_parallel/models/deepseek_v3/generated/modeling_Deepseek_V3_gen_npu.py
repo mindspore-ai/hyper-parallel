@@ -654,19 +654,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
-        from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
-        self._hp_bind_materialized_forwards = apply_generated_phase_c
-        from hyper_parallel.models.preinstalled import install_bundle_components
-        import hyper_parallel.models.prepared_family as _hp_constructor_module_0
-        install_bundle_components(
-            self, __file__, globals(),
-            constructors={
-                'model.layers.0.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-                'model.layers.1.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-                'model.layers.2.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-                'model.layers.3.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-            },
-        )
 
     @can_return_tuple
     @auto_docstring
@@ -760,4 +747,15 @@ class CPMultiLatentAttentionModule(_hp_parallel_base_0):
         del inputs
         output, output_state = self.restore_attention(output, hidden_states, output_state)
         return (self.project_output(output, hidden_states, output_state), weights)
+
+
+def _hp_module_constructors():
+    """Return the observed module replacement calls by module path."""
+    import hyper_parallel.models.prepared_family as _hp_constructor_module_0
+    return {
+        'model.layers.0.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
+        'model.layers.1.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
+        'model.layers.2.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
+        'model.layers.3.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
+    }
 # codespell:ignore-end

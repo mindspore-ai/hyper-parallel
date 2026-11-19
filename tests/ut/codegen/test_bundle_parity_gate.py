@@ -15,16 +15,14 @@
 """End-to-end CPU gate for the CLI and the real rank-zero sidecar."""
 
 import ast
-import json
 from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
 
 from hyper_parallel.codegen.emit.family_forwards import verify_parallel_family_forwards
-from hyper_parallel.codegen.emit.modeling import _preinstalled_calls, _verify_replacement_records
+from hyper_parallel.codegen.emit.modeling import _module_constructor_calls, _verify_replacement_records
 from hyper_parallel.codegen.train_sidecar import start_codegen_sidecar
-from hyper_parallel.models.preinstalled import COMPONENT_REPLAY_FILE
 from scripts.check_codegen_bundle_parity import bundle_hashes
 from tests.common.mla_cp_utils import make_deepseek_model
 
@@ -67,11 +65,10 @@ def test_cli_and_rank_zero_sidecar_publish_identical_bundles(tmp_path, monkeypat
     source = modeling.read_text(encoding="utf-8")
     assert "__hp_prepared_components__" not in source
     tree = ast.parse(source)
-    emitted = _preinstalled_calls(tree)
-    replay = json.loads((cli / COMPONENT_REPLAY_FILE).read_text(encoding="utf-8"))
-    prepared_paths = {record["primary_fqn"] for record in replay["components"]}
+    emitted = _module_constructor_calls(tree)
+    assert not list(cli.glob("*.json"))
+    assert "install_prepared_components" not in source
     name = "CPMultiLatentAttentionModule"
-    assert prepared_paths == set(emitted)
     assert emitted["model.layers.0.self_attn"] == "build_prepared_family_replacement"
     verify_parallel_family_forwards(tree, {
         "model.layers.0.self_attn": {
@@ -85,8 +82,8 @@ def test_cli_and_rank_zero_sidecar_publish_identical_bundles(tmp_path, monkeypat
 def test_replacement_metadata_without_an_executable_call_is_rejected():
     """Record-only artifacts must not pass the replacement source gate."""
     tree = ast.parse("""
-def constructor(self):
-    install_bundle_components(self, __file__, globals(), constructors={})
+def _hp_module_constructors():
+    return {}
 """)
     record = SimpleNamespace(module_fqn="layer.attention", replacement_type=object)
     prepared = ({"primary_fqn": "layer.attention", "replay": {"constructor": "demo:ParallelAttention"}},)
