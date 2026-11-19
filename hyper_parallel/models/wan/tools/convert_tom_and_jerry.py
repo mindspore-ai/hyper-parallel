@@ -45,6 +45,7 @@ def convert_tom_and_jerry(
     num_shards: int,
     num_proc: int,
 ) -> None:
+    """Convert the raw Tom-and-Jerry dataset into the training parquet layout."""
     if num_shards <= 0:
         raise ValueError("num_shards must be positive")
     dataset = _load_manifest(dataset_path)
@@ -97,4 +98,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

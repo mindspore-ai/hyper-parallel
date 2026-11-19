@@ -198,7 +198,7 @@ class DiffusersDiTModelProvider:
                 raise TypeError(
                     f"{model_class.__name__} must expose load_config() or use a config JSON file"
                 )
-            config = load_config(config_source)
+            config = load_config(config_source)  # pylint: disable=not-callable
         config = dict(config)
         config.update(overrides)
         return config

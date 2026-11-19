@@ -157,6 +157,7 @@ class DiTTrainer:
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:
+        """Resolve the DiT provider and build its condition model when one is provided."""
         config = self.base.config
         provider = resolve_dit_provider(
             getattr(config.model, "model_provider", None),
@@ -200,6 +201,7 @@ class DiTTrainer:
         self.base.data_transform = dataset_config.data_transform.build()
 
     def _build_collate_fn(self) -> None:
+        """Build the collate function and derive the micro-batch count."""
         dataloader_config = self.base.config.dataloader
         if dataloader_config is None or dataloader_config.collate_fn is None:
             raise ValueError("dataloader.collate_fn must define a build target")
@@ -251,6 +253,7 @@ class DiTTrainer:
         return scaled_loss, {"mse_loss": scaled_loss}
 
     def forward_backward_step(self, micro_batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run one conditioned forward-backward micro-batch and return the scaled loss."""
         micro_batch = self.preforward(micro_batch)
         condition_model = getattr(self.base, "condition_model", None)
         if condition_model is not None and _has_condition_inputs(condition_model, micro_batch):
@@ -276,6 +279,7 @@ class DiTTrainer:
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        """Consume micro-batches, accumulate gradients, and apply one optimizer update."""
         config = self.base.config
         num_micro_steps = self.base.num_micro_batches
         micro_batches = [self.base.get_batch(data_iterator)]
@@ -319,6 +323,7 @@ class DiTTrainer:
         return {"loss": total_loss, "grad_norm": grad_norm_value}
 
     def train(self) -> None:
+        """Run the full training loop across epochs."""
         config = self.base.config
         self.base.on_train_begin()
         logger.info(

@@ -38,6 +38,7 @@ def _load_json_config(config_path: str | Path) -> dict[str, Any]:
 
 
 def _convert_veomni_wan_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Convert a veomni-style Wan config into diffusers constructor arguments."""
     if "dim" not in config:
         return dict(config)
 

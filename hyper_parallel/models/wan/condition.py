@@ -61,6 +61,7 @@ class WanConditionConfig:
 
 
 def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
+    """Resolve a dtype name or object into a torch dtype."""
     if isinstance(dtype, torch.dtype):
         return dtype
     mapping = {
@@ -93,6 +94,7 @@ def _normalize_sample_values(values: Any) -> list[Any]:
 
 
 def _first_sample_image(images: Any, fallback_video: torch.Tensor | None = None) -> Any:
+    """Pick the conditioning image of one sample, falling back to the first video frame."""
     if images is None or (isinstance(images, dict) and not images):
         sample_images = []
     else:
@@ -110,6 +112,7 @@ def _first_sample_image(images: Any, fallback_video: torch.Tensor | None = None)
 
 
 def _tensor_frame_to_pil(frame: torch.Tensor) -> Image.Image:
+    """Convert one float frame tensor into a PIL RGB image."""
     if frame.ndim != 3:
         raise ValueError(f"Expected frame tensor with shape (C,H,W) or (H,W,C), got {tuple(frame.shape)}")
     if frame.shape[0] in (1, 3):
@@ -165,6 +168,7 @@ class WanConditionModel(torch.nn.Module):
         return int(getattr(self.vae.config, "scale_factor_spatial", 8))
 
     def _load_components(self) -> None:
+        """Load the frozen VAE, text encoder, tokenizer, and scheduler from the base repository."""
         base = self.config.base_model_path
         self.tokenizer = AutoTokenizer.from_pretrained(
             base,
@@ -207,7 +211,7 @@ class WanConditionModel(torch.nn.Module):
 
     @torch.no_grad()
     def _get_t5_prompt_embeds(self, **kwargs: Any) -> torch.Tensor:
-        return WanPipeline._get_t5_prompt_embeds(self, **kwargs)
+        return WanPipeline._get_t5_prompt_embeds(self, **kwargs)  # pylint: disable=protected-access
 
     @torch.no_grad()
     def _prepare_negative_prompt_embeds(self) -> None:
@@ -221,7 +225,7 @@ class WanConditionModel(torch.nn.Module):
 
     def _resize_video(self, video: torch.Tensor) -> torch.Tensor:
         height, width = video.shape[-2:]
-        size = min(self.config.video_max_size, min(width, height))
+        size = min(self.config.video_max_size, width, height)
         return functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float().clamp(0, 255)
 
     def _encode_video_to_latents(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -268,6 +272,7 @@ class WanConditionModel(torch.nn.Module):
         width: int,
         num_frames: int,
     ) -> torch.Tensor:
+        """Encode the reference image into the latent condition concatenated for i2v."""
         image = _image_for_processors(image)
         image = self.video_processor.preprocess(image, height=height, width=width).to(self.device, dtype=torch.float32)
         batch_size = latents.shape[0]
@@ -315,6 +320,7 @@ class WanConditionModel(torch.nn.Module):
         images: list[Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Encode prompts and videos into the intermediate per-sample condition fields."""
         del kwargs
         context_list = self._encode_prompt(inputs)
         latents_list = []
@@ -381,6 +387,7 @@ class WanConditionModel(torch.nn.Module):
         image_context: list[torch.Tensor] | None = None,
         latent_condition_inputs: list[tuple[Any, torch.Tensor]] | None = None,
     ) -> dict[str, Any]:
+        """Sample timesteps, build noisy latents, and pack the training condition targets."""
         if not self._timesteps_ready:
             self.scheduler.set_timesteps(self.config.num_train_timesteps, device=self.device)
             self._timesteps_ready = True

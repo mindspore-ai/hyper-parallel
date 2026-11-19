@@ -529,7 +529,7 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
     """
 
     @classmethod
-    def from_pretrained(
+    def from_pretrained(  # pylint: disable=arguments-differ
         cls,
         pretrained_model_name_or_path: Optional[str] = None,
         *,
@@ -571,13 +571,13 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
         )
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         is_meta_device = checkpoint_path is not None or world_size > 1
-        from contextlib import nullcontext
-        from transformers.modeling_utils import ContextManagers
+        from contextlib import nullcontext  # pylint: disable=import-outside-toplevel
+        from transformers.modeling_utils import ContextManagers  # pylint: disable=import-outside-toplevel
         try:
-            from transformers.modeling_utils import no_init_weights
+            from transformers.modeling_utils import no_init_weights  # pylint: disable=import-outside-toplevel
         except ImportError:
-            from transformers.initialization import no_init_weights
-        from hyper_parallel import init_empty_weights
+            from transformers.initialization import no_init_weights  # pylint: disable=import-outside-toplevel
+        from hyper_parallel import init_empty_weights  # pylint: disable=import-outside-toplevel
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
         with init_ctx:
             if checkpoint_path is not None:
@@ -608,7 +608,7 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
         return model
 
     @classmethod
-    def from_config(
+    def from_config(  # pylint: disable=arguments-differ
         cls,
         config: Any,
         *,
@@ -637,13 +637,13 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
         is_meta_device = (
             torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         ) > 1
-        from contextlib import nullcontext
-        from transformers.modeling_utils import ContextManagers
+        from contextlib import nullcontext  # pylint: disable=import-outside-toplevel
+        from transformers.modeling_utils import ContextManagers  # pylint: disable=import-outside-toplevel
         try:
-            from transformers.modeling_utils import no_init_weights
+            from transformers.modeling_utils import no_init_weights  # pylint: disable=import-outside-toplevel
         except ImportError:
-            from transformers.initialization import no_init_weights
-        from hyper_parallel import init_empty_weights
+            from transformers.initialization import no_init_weights  # pylint: disable=import-outside-toplevel
+        from hyper_parallel import init_empty_weights  # pylint: disable=import-outside-toplevel
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
         with init_ctx:
             build_from_config = getattr(provider, "build_from_config", provider.build_model)

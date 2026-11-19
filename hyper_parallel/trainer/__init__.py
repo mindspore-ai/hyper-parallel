@@ -20,6 +20,7 @@ package (e.g. for ``trainer.config`` or ``trainer.callbacks``) stays cheap
 and does not pull the model/data stack until a trainer class is touched.
 """
 
+# pylint: disable=undefined-all-variable
 __all__ = [
     "BaseTrainer",
     "TextTrainer",
@@ -37,7 +38,7 @@ _LAZY_EXPORTS = {
 }
 
 
-def __getattr__(name):
+def __getattr__(name):  # pylint: disable=invalid-name
     """Resolve trainer classes lazily on first attribute access."""
     if name in _LAZY_EXPORTS:
         import importlib  # pylint: disable=import-outside-toplevel
@@ -48,6 +49,6 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def __dir__():
+def __dir__():  # pylint: disable=invalid-name
     """List lazy exports for interactive discovery."""
     return sorted(__all__)

@@ -60,6 +60,7 @@ def _calculate_frame_indices(
     min_frames: int | None,
     max_frames: int | None,
 ) -> tuple[list[int], int]:
+    """Compute the source frame indices one clip samples under the fps/frame constraints."""
     if total_frames <= 0:
         raise ValueError("video must contain at least one frame")
     if frame_factor is not None and frame_factor <= 0:
@@ -86,6 +87,7 @@ def _calculate_frame_indices(
 
 
 def _normalize_video_tensor(video: Any) -> torch.Tensor:
+    """Normalize one decoded video array into a float CHW tensor scaled to [0, 255]."""
     if isinstance(video, np.ndarray):
         video = torch.from_numpy(video)
     if not torch.is_tensor(video):
@@ -120,6 +122,7 @@ def _sample_video(
     min_frames: int | None,
     max_frames: int | None,
 ) -> torch.Tensor:
+    """Decode one video input and sample the configured frames from it."""
     indices, pad_count = _calculate_frame_indices(
         total_frames=int(video.shape[0]),
         video_fps=video_fps,
@@ -144,6 +147,7 @@ def _smart_resize(
     max_ratio: int | None = None,
     **kwargs: Any,
 ) -> torch.Tensor:
+    """Pick output height and width that keep the aspect ratio within the model factor constraints."""
     del kwargs
     if video.ndim != 4:
         raise ValueError(f"video must be 4-dim, but got {video.ndim}")
@@ -188,6 +192,7 @@ def _smart_resize(
 
 
 def _apply_dynamic_video_max_pixels(frame_count: int, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Clamp the resize pixel budget against the per-frame cap for the requested frame count."""
     video_total_pixels = kwargs.get("video_total_pixels")
     if video_total_pixels is None or frame_count <= 0:
         return dict(kwargs)
@@ -206,6 +211,7 @@ def _apply_dynamic_video_max_pixels(frame_count: int, kwargs: Mapping[str, Any])
 
 
 def _load_video_with_torchcodec(video_input: Any, **kwargs: Any) -> tuple[torch.Tensor, float] | None:
+    """Decode one video through torchcodec; return the frame tensor and source fps."""
     try:
         from torchcodec.decoders import VideoDecoder  # pylint: disable=import-outside-toplevel
     except ImportError:
@@ -248,6 +254,7 @@ def _load_video_with_imageio(video_input: Any) -> tuple[torch.Tensor, float]:
 
 
 def _load_video(video_input: Any, *, data_dir: str | None = None, **kwargs: Any) -> torch.Tensor:
+    """Load one video input into a normalized frame tensor via torchcodec or imageio."""
     if torch.is_tensor(video_input) or isinstance(video_input, np.ndarray):
         video = _normalize_video_tensor(video_input)
         video_fps = float(kwargs.get("source_fps", kwargs.get("fps", 24.0)))
@@ -330,6 +337,7 @@ def _load_video(video_input: Any, *, data_dir: str | None = None, **kwargs: Any)
 
 
 def _load_image(image_input: Any, *, data_dir: str | None = None) -> Image.Image:
+    """Load one image input into a PIL image, resolving relative paths against data_dir."""
     if isinstance(image_input, Image.Image):
         return image_input.convert("RGB")
     if torch.is_tensor(image_input):
@@ -356,6 +364,7 @@ def _load_image(image_input: Any, *, data_dir: str | None = None) -> Image.Image
 
 
 def _first_available(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    """Return the first non-empty candidate-key value of one raw record."""
     for key in keys:
         value = mapping.get(key)
         if value is None:
@@ -391,7 +400,9 @@ class WanVideoTransform:
         use_first_video_frame_as_image: bool = True,
         prompt_keys: Sequence[str] = ("prompt", "text", "caption", "input", "inputs"),
         video_keys: Sequence[str] = ("video_bytes", "video", "video_path", "target_video", "target_video_path"),
-        image_keys: Sequence[str] = ("image", "image_bytes", "image_path", "input_image", "reference_image", "first_frame"),
+        image_keys: Sequence[str] = (
+            "image", "image_bytes", "image_path", "input_image", "reference_image", "first_frame",
+        ),
         **kwargs: Any,
     ) -> None:
         if task not in {"t2v", "i2v"}:
@@ -422,6 +433,7 @@ class WanVideoTransform:
         return _first_available(sample, self.video_keys) is not None
 
     def _preprocess(self, example: Mapping[str, Any]) -> tuple[str, list[Any], list[Any]]:
+        """Extract the prompt, optional image, and video entries from one raw record."""
         if (
             self.source_name == "Tom-and-Jerry-VideoGeneration-Dataset"
             and "prompt" in example

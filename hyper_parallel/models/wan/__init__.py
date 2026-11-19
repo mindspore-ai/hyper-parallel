@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Wan model-family public API with lazy Diffusers runtime imports."""
+# pylint: disable=undefined-all-variable
 
 from importlib import import_module
 from typing import Any

@@ -38,8 +38,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import torch_npu
-from torch_npu.contrib import transfer_to_npu
+import torch_npu  # pylint: disable=unused-import
+from torch_npu.contrib import transfer_to_npu  # pylint: disable=unused-import
 
 import torch
 
@@ -59,6 +59,7 @@ def build_pipeline(
     dtype: torch.dtype,
     offload: str,
 ):
+    """Load the Wan pipeline with the fine-tuned transformer swapped in."""
     from diffusers import AutoencoderKLWan, WanPipeline, WanTransformer3DModel  # pylint: disable=import-outside-toplevel
 
     # Diffusers recommends keeping the Wan VAE in fp32 for decode quality
@@ -97,6 +98,7 @@ def run_inference(
     seed: int | None,
     output_path: Path,
 ) -> None:
+    """Run one text-to-video generation and export the frames to a video file."""
     from diffusers.utils import export_to_video  # pylint: disable=import-outside-toplevel
 
     generator = None
@@ -121,6 +123,7 @@ def run_inference(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse the inference command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base_model", type=str, default="Wan-AI/Wan2.1-T2V-14B-Diffusers")
     parser.add_argument("--transformer_dir", type=Path, required=True,
