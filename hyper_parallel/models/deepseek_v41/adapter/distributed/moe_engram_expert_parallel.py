@@ -142,7 +142,15 @@ def _routed_and_shared_forward(
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
     def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route with statistics over the current token partitions."""
+        """Route with statistics over the current token partitions.
+
+        Args:
+            target: MoE block owning the learned router.
+            states: Local token activations.
+
+        Returns:
+            Selected expert indices and routing weights.
+        """
         return _router(
             target, states, image_mask, router_token_mask, router_sequence_ids,
             router_num_sequences, sequence_partition_groups=sequence_partition_groups,
@@ -395,7 +403,15 @@ def deepseek_v41_megamoe_compute_fn(
             local_image_mask = local_image_mask.contiguous()
 
         def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            """Keep training metadata attached to the learned gate before balancing."""
+            """Keep training metadata attached to the learned gate before balancing.
+
+            Args:
+                target: MoE block owning the learned router.
+                states: Local token activations.
+
+            Returns:
+                Selected expert indices and routing weights.
+            """
             return _router(
                 target, states, local_image_mask,
                 router_token_mask=_local_router_metadata(router_token_mask, states, tp_mesh),
@@ -479,10 +495,11 @@ def deepseek_v41_engram_compute_fn(
                 tp_rank=tp_rank, tp_size=tp_size,
             )
             fused = module._fuse(hidden_states, module.embed(ids))  # pylint: disable=protected-access
-            if token_mask is None:
+            mask = local_token_mask(token_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size)
+            if mask is None:
                 return fused
             return torch.where(
-                token_mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1),
+                mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1),
                 fused, hidden_states,
             )
         if ep_size > 1:

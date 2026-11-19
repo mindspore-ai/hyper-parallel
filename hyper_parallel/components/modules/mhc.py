@@ -26,6 +26,7 @@ from torch import nn
 from hyper_parallel.components.functional.mhc_post import mhc_post
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
 from hyper_parallel.components.functional.sinkhorn import sinkhorn, sinkhorn_knopps
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -260,7 +261,25 @@ def pipelined_mhc_post(
     post: torch.Tensor,
     combine: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the shared high-performance mHC post path to 4-D streams."""
+    """Apply the shared high-performance mHC post path to 4-D streams.
+
+    Args:
+        sublayer_output: Sublayer output with batch/sequence-local rows.
+        residual: Residual streams with replicated stream and feature dimensions.
+        post: Output mixing coefficients with the same batch/sequence layout.
+        combine: Residual mixing matrix with the same batch/sequence layout.
+
+    Returns:
+        Mixed streams retaining the input batch/sequence DTensor placements.
+    """
+    inputs = (sublayer_output, residual, post, combine)
+    reference = next((value for value in inputs if isinstance(value, DTensor)), None)
+    if reference is not None:
+        # Native fused bindings return local tensors, so preserve the distributed
+        # boundary explicitly instead of mixing global and local sequence sizes.
+        sublayer_output, residual, post, combine = (
+            value.to_local() if isinstance(value, DTensor) else value for value in inputs
+        )
     num_stream = residual.shape[-2]
     flattened = mhc_post(
         sublayer_output,
@@ -269,4 +288,7 @@ def pipelined_mhc_post(
         combine,
         num_stream,
     )
-    return flattened.unflatten(-1, (num_stream, residual.shape[-1]))
+    output = flattened.unflatten(-1, (num_stream, residual.shape[-1]))
+    if reference is not None:
+        return DTensor.from_local(output, reference.device_mesh, reference.placements)
+    return output
