@@ -22,6 +22,7 @@
 | [KDA 递归倍增与 Ulysses 混合 CP](./guide/kda_recursive_doubling.md) | RD 状态扫描、TND reset 剪枝与转移缓存 |
 | [线性注意力 TND 上下文并行](./guide/linear_attention_tnd_cp.md) | KDA / GDN 的文档边界、配置、状态交换与数值语义 |
 | [EP 专家并行](./guide/expert_parallel.zh.md) | ExpertParallel、MoE 构建模块、负载均衡 |
+| [Chunk MoE 分块训练](./guide/ChunkMoE分块训练.md) | 固定源 token 分块、完整反向、原参数与 EP 兼容及支持边界 |
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.zh.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.zh.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [Chunk Loss](./guide/chunk_loss.zh.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |
