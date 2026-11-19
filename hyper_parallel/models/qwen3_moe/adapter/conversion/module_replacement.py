@@ -57,7 +57,7 @@ def replace_qwen3_moe_rms_norm(
     # Lazy: the modules package wraps NPU-only functional backends.
     from hyper_parallel.components.modules import RMSNorm  # pylint: disable=C0415
 
-    return RMSNorm(module=module, module_fqn=module_fqn, context=context)
+    return RMSNorm(module=module, module_fqn=module_fqn, context=context, use_fused_ops=True)
 
 
 @register_module_replacement

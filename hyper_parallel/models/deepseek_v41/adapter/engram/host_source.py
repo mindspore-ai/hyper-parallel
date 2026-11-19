@@ -34,7 +34,7 @@ from hyper_parallel.components.checkpoint.load_groups import (
     build_load_targets,
     resolve_checkpoint_index,
 )
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.models.external_state import ExternalLoadContext
 

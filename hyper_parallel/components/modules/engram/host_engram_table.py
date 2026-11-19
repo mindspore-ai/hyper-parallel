@@ -16,15 +16,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 from torch import nn
 
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_lookup import host_lookup
+from .parallel_engram import ParallelHostTable, host_lookup
 
 
-class HostEngramTable(nn.Module):
+class HostEngramTable(ParallelHostTable, nn.Module):
     """Keep one EP owner's rows on CPU and stage only touched rows on device."""
 
     def __init__(self, *, source_weight: nn.Parameter, logical_rows: int,
@@ -47,12 +45,7 @@ class HostEngramTable(nn.Module):
         self.width = width
         self.max_pending_entries = max_pending_entries
         self.max_sparse_rows_per_step = max_sparse_rows_per_step
-        self.rows_per_owner: int | None = None
-        self.global_row_start: int | None = None
-        self.ep_rank = 0
-        self.ep_size = 1
-        self.ep_group = None
-        self.mesh_context = None
+        self._init_parallel_state()
         self.lookup_compute_dtype = torch.float32
         self.pending_chunks: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.pending: torch.Tensor | None = None
@@ -64,24 +57,6 @@ class HostEngramTable(nn.Module):
         self.max_synced_nnz = 0
         self.coalesce_seconds = 0.0
 
-    def bind_planned_shard(self, *, ep_rank: int, ep_size: int, ep_group: Any = None,
-                           compute_dtype: torch.dtype = torch.float32) -> None:
-        """Bind the planner's single EP row shard to its global row interval."""
-        if ep_size < 1 or not 0 <= ep_rank < ep_size or self.physical_rows % ep_size:
-            raise ValueError("Invalid EP row partition")
-        rows = self.physical_rows // ep_size
-        if not self.weight.is_meta or self.weight.dtype != torch.float32:
-            raise ValueError("Planner must leave a meta FP32 Host table")
-        if tuple(self.weight.shape) != (rows, self.width):
-            raise ValueError("Planner did not produce one EP row shard")
-        if ep_size > 1 and ep_group is None:
-            raise ValueError("EP routing requires an explicit process group")
-        self.rows_per_owner = rows
-        self.global_row_start = ep_rank * rows
-        self.ep_rank = ep_rank
-        self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.lookup_compute_dtype = compute_dtype
 
     def _apply(self, fn, recurse=True):
         """Keep the CPU parameter outside model-wide device and dtype changes."""

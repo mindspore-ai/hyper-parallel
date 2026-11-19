@@ -28,4 +28,4 @@ def replace_rms_norm(
     *, module: nn.Module, module_fqn: str, context: Mapping[str, Any],
 ) -> nn.Module:
     """Reuse one native RMSNorm's weight and epsilon in the generic RMSNorm."""
-    return RMSNorm(module=module, module_fqn=module_fqn, context=context)
+    return RMSNorm(module=module, module_fqn=module_fqn, context=context, use_fused_ops=True)

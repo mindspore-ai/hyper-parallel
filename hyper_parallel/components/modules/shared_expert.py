@@ -30,7 +30,10 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import swiglu
+from hyper_parallel.components.modules.swiglu_mlp import (
+    SwiGLUMLPModule, _validate_mlp_config, local_swiglu, _activation_settings,
+)
+from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 
 
 class LinearWithMatmul(nn.Linear):
@@ -76,8 +79,7 @@ class LinearWithMatmul(nn.Linear):
         return output, None
 
 
-@module_replacement
-class SharedExpert(nn.Module):
+class SharedExpertModule(nn.Module):
     """Transformers-compatible parameter-owning MoE shared expert.
 
     Args:
@@ -91,22 +93,23 @@ class SharedExpert(nn.Module):
         """Validate and return separate source projections."""
         source_linears = (module.gate_proj, module.up_proj, module.down_proj)
         if any(not isinstance(layer, nn.Linear) for layer in source_linears):
-            raise TypeError("SharedExpert source projections must be nn.Linear instances")
+            raise TypeError("SharedExpertModule source projections must be nn.Linear instances")
         gate_proj, up_proj, down_proj = source_linears
+        SwiGLUMLPModule._validate_projection_contract(gate_proj, up_proj, down_proj)  # pylint: disable=protected-access
         if gate_proj.in_features != up_proj.in_features:
-            raise ValueError("SharedExpert gate and up projections must have the same input size")
+            raise ValueError("SharedExpertModule gate and up projections must have the same input size")
         if gate_proj.out_features != up_proj.out_features:
-            raise ValueError("SharedExpert gate and up projections must have the same output size")
+            raise ValueError("SharedExpertModule gate and up projections must have the same output size")
         if down_proj.in_features != gate_proj.out_features:
-            raise ValueError("SharedExpert down projection input size is incompatible with gate/up")
+            raise ValueError("SharedExpertModule down projection input size is incompatible with gate/up")
         if down_proj.out_features != gate_proj.in_features:
-            raise ValueError("SharedExpert down projection output size is incompatible with gate/up")
+            raise ValueError("SharedExpertModule down projection output size is incompatible with gate/up")
         if gate_proj.weight.requires_grad != up_proj.weight.requires_grad:
-            raise ValueError("SharedExpert gate and up weights must use the same training policy")
+            raise ValueError("SharedExpertModule gate and up weights must use the same training policy")
         if (gate_proj.bias is None) != (up_proj.bias is None):
-            raise ValueError("SharedExpert gate and up projections must use the same bias policy")
+            raise ValueError("SharedExpertModule gate and up projections must use the same bias policy")
         if gate_proj.bias is not None and gate_proj.bias.requires_grad != up_proj.bias.requires_grad:
-            raise ValueError("SharedExpert gate and up biases must use the same training policy")
+            raise ValueError("SharedExpertModule gate and up biases must use the same training policy")
         return gate_proj, up_proj, down_proj
 
     def _initialize_fused_source(self, module: nn.Module) -> None:
@@ -114,11 +117,11 @@ class SharedExpert(nn.Module):
         self.linear_fc1 = module.linear_fc1
         self.linear_fc2 = module.linear_fc2
         if not all(hasattr(layer, "skip_bias_add") for layer in (self.linear_fc1, self.linear_fc2)):
-            raise TypeError("fused SharedExpert projections must return output and bias separately")
+            raise TypeError("fused SharedExpertModule projections must return output and bias separately")
         if not hasattr(module, "activation_func"):
-            raise TypeError("fused SharedExpert source module is missing activation_func")
+            raise TypeError("fused SharedExpertModule source module is missing activation_func")
         self.activation_func = module.activation_func
-        self._return_bias_tuple = True
+        self._return_bias_tuple = getattr(module, "_return_bias_tuple", True)
         self._gate_size = 0
         self._up_size = 0
         self.train(module.training)
@@ -152,6 +155,17 @@ class SharedExpert(nn.Module):
         self.linear_fc2.weight.requires_grad_(down_proj.weight.requires_grad)
         if down_proj.bias is not None:
             self.linear_fc2.bias.requires_grad_(down_proj.bias.requires_grad)
+        self.linear_fc1.weight = nn.Parameter(
+            torch.cat((gate_proj.weight.detach(), up_proj.weight.detach())),
+            requires_grad=gate_proj.weight.requires_grad,
+        )
+        if gate_proj.bias is not None:
+            self.linear_fc1.bias = nn.Parameter(
+                torch.cat((gate_proj.bias.detach(), up_proj.bias.detach())),
+                requires_grad=gate_proj.bias.requires_grad,
+            )
+        self.linear_fc2.weight = down_proj.weight
+        self.linear_fc2.bias = down_proj.bias
 
     def _initialize_activation(self, module: nn.Module, config: Any) -> None:
         """Select the source-compatible gated activation implementation."""
@@ -166,7 +180,7 @@ class SharedExpert(nn.Module):
                 hidden_act = "silu"
             activation_func = ACT2FN[hidden_act]
         if hidden_act == "silu" and bool(getattr(config, "use_fused_swiglu", True)):
-            self.activation_func = partial(swiglu, dim=-1)
+            self.activation_func = local_swiglu
             return
 
         def glu(x: torch.Tensor) -> torch.Tensor:
@@ -179,13 +193,48 @@ class SharedExpert(nn.Module):
     def __init__(
         self,
         *,
-        module: nn.Module,
+        module: nn.Module | None = None,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        config: Any = None,
+        activation_dtype: str | None = None,
+        swiglu_limit: float | None = None,
+        preserve_source_layout: bool = False,
     ) -> None:
         """Build the high-performance module from a Transformers shared expert."""
         super().__init__()
         del module_fqn, context
+        if not isinstance(preserve_source_layout, bool):
+            raise TypeError("preserve_source_layout must be bool")
+        self._preserve_source_layout = preserve_source_layout
+        self.swiglu_limit, self.activation_dtype = _activation_settings(
+            config if config is not None else module, limit=swiglu_limit, activation_dtype=activation_dtype)
+        self.limit = self.swiglu_limit
+        if config is None and module is None:
+            raise ValueError("provide exactly one of config or module")
+        if config is not None:
+            if module is not None:
+                raise ValueError("provide config or module, not both")
+            _validate_mlp_config(config)
+            if not isinstance(config.return_bias_tuple, bool):
+                raise TypeError("return_bias_tuple must be bool")
+            self.config = config
+            self._gate_size = self._up_size = config.intermediate_size
+            self._source_is_fused = False
+            self._source_is_separate = True
+            self._return_bias_tuple = config.return_bias_tuple
+            self.activation_func = partial(local_swiglu, limit=self.swiglu_limit,
+                                           activation_dtype=self.activation_dtype)
+            if self._preserve_source_layout:
+                if config.return_bias_tuple:
+                    raise ValueError("separate SharedExpert returns a tensor, not a bias tuple")
+                self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
+                self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
+                self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.bias)
+                return
+            self.linear_fc1 = LinearWithMatmul(config.hidden_size, 2 * config.intermediate_size, bias=config.bias)
+            self.linear_fc2 = LinearWithMatmul(config.intermediate_size, config.hidden_size, bias=config.bias)
+            return
         config = getattr(module, "config", None)
         self.config = config
         self._source_is_fused = all(
@@ -196,22 +245,40 @@ class SharedExpert(nn.Module):
         )
         if not self._source_is_fused and not self._source_is_separate:
             raise TypeError(
-                "SharedExpert requires linear_fc1/linear_fc2 or gate_proj/up_proj/down_proj"
+                "SharedExpertModule requires linear_fc1/linear_fc2 or gate_proj/up_proj/down_proj"
             )
 
         if self._source_is_fused:
+            if self._preserve_source_layout:
+                raise ValueError("preserve_source_layout requires separate gate/up/down source projections")
             self._initialize_fused_source(module)
             return
 
         gate_proj, up_proj, down_proj = self._separate_projections(module)
+        if self._preserve_source_layout:
+            self.gate_proj, self.up_proj, self.down_proj = gate_proj, up_proj, down_proj
+            self._initialize_activation(module, config)
+            self._set_clamped_activation(config)
+            self._return_bias_tuple = False
+            self.train(module.training)
+            return
         self._initialize_separate_linears(gate_proj, up_proj, down_proj)
         self._initialize_activation(module, config)
+        self._set_clamped_activation(config)
         self._return_bias_tuple = False
         self.train(module.training)
 
+    def _set_clamped_activation(self, config: Any) -> None:
+        if self.swiglu_limit > 0 or self.activation_dtype == "float32":
+            hidden_act = getattr(config, "hidden_act", getattr(config, "hidden_activation", None))
+            if hidden_act not in (None, "silu", "swiglu"):
+                raise ValueError("clamped/FP32 SharedExpert requires SwiGLU activation")
+            self.activation_func = partial(local_swiglu, limit=self.swiglu_limit,
+                                           activation_dtype=self.activation_dtype)
+
     def make_transforms(self) -> list[WeightRenaming | WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""
-        if self._source_is_fused:
+        if self._source_is_fused or self._preserve_source_layout:
             return []
         transforms: list[WeightRenaming | WeightConverter] = [
             WeightConverter(
@@ -254,9 +321,17 @@ class SharedExpert(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        *,
+        x: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply the shared-expert MLP while preserving the source return contract."""
+        if (hidden_states is None) == (x is None):
+            raise ValueError("provide exactly one of hidden_states or x")
+        hidden_states = x if hidden_states is None else hidden_states
+        if self._preserve_source_layout:
+            intermediate = torch.cat((self.gate_proj(hidden_states), self.up_proj(hidden_states)), dim=-1)
+            return self.down_proj(self.activation_func(intermediate).to(hidden_states.dtype))
         intermediate, bias = self.linear_fc1(hidden_states)
         if bias is not None:
             intermediate = intermediate + bias
@@ -267,3 +342,33 @@ class SharedExpert(nn.Module):
                 output = output + output_bias
             return output
         return output, output_bias
+
+    def reset_parameters(self) -> None:
+        """Initialize owned projections after meta materialization."""
+        if self._preserve_source_layout:
+            self.gate_proj.reset_parameters()
+            self.up_proj.reset_parameters()
+            self.down_proj.reset_parameters()
+            return
+        self.linear_fc1.reset_parameters()
+        self.linear_fc2.reset_parameters()
+
+
+@module_replacement
+def SharedExpert(  # pylint: disable=invalid-name
+    *, config: Any = None, module: nn.Module | None = None,
+    module_fqn: str = "", context: Mapping[str, Any] | None = None, mesh: Any = None,
+    activation_dtype: str | None = None, swiglu_limit: float | None = None,
+    preserve_source_layout: bool = False,
+) -> nn.Module:
+    """Construct a tracked shared expert preserving its source return protocol."""
+    return build_family(SharedExpert, config=config, module=module, module_fqn=module_fqn,
+                        context=context, mesh=mesh, activation_dtype=activation_dtype,
+                        swiglu_limit=swiglu_limit, preserve_source_layout=preserve_source_layout)
+
+
+register_module_family(ModuleFamily(
+    name="shared_expert", baseline=SharedExpert,
+    variants={"local": "hyper_parallel.components.modules.shared_expert.SharedExpertModule"},
+    default_variant="local",
+))

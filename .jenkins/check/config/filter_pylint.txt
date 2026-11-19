@@ -213,3 +213,7 @@
 # Linear replacements must preserve forward(input=...) for keyword calls and
 # the existing replacement executor's signature validation.
 "hyper-parallel/tests/ut/trainer/test_module_family_replacement.py" "redefined-builtin"
+
+# Gate subclasses and source fixtures intentionally expose different routing/input protocols.
+"hyper-parallel/hyper_parallel/components/modules/gate.py" "arguments-renamed"
+"hyper-parallel/tests/ut/components/modules/test_mlp_family.py" "arguments-renamed"

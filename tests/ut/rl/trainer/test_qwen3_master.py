@@ -15,6 +15,7 @@
 """Numerical and build-contract tests for the shared Qwen3 RL integration."""
 # pylint: disable=protected-access
 
+import importlib
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,9 +77,11 @@ def tiny_config() -> Qwen3Config:
 @pytest.fixture(name="cpu_kernels")
 def _cpu_kernels(monkeypatch):
     """Use independent CPU mathematical oracles for only the NPU primitives."""
-    def rms(x, weight, epsilon):
+    def rms(x, weight, epsilon, cast_order):
         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + epsilon)
-        return (normalized.to(x.dtype) * weight,)
+        if cast_order == "before_weight":
+            return normalized.to(x.dtype) * weight
+        return (normalized * weight.float()).to(x.dtype)
 
     def rotary(x, cos, sin, **_kwargs):
         first, second = x.chunk(2, dim=-1)
@@ -96,7 +99,9 @@ def _cpu_kernels(monkeypatch):
         )
         return (out,)
 
-    monkeypatch.setattr(torch_npu, "npu_rms_norm", rms)
+    # CPU oracles replace the family NPU boundary, including its device precondition.
+    norm_module = importlib.import_module("hyper_parallel.components.modules.rms_norm")
+    monkeypatch.setattr(norm_module, "_npu_rms_norm", rms)
     monkeypatch.setattr(torch_npu, "npu_rotary_mul", rotary)
     monkeypatch.setattr(torch_npu, "npu_fusion_attention", attention)
 

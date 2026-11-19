@@ -25,7 +25,7 @@ from safetensors.torch import save_file
 
 from hyper_parallel.components.checkpoint.quantized_hf_storage import QuantizedHuggingFaceStorageReader
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_source import materialize_owner_rows
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.external_state import ExternalLoadContext
 
 

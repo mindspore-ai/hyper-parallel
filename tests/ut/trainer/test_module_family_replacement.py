@@ -17,6 +17,7 @@
 import copy
 import unittest
 from typing import Any, Callable, Mapping, Optional
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -26,6 +27,8 @@ from torch import nn
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
+from hyper_parallel.components.modules.mhc.mhc import MHCPost, PipelinedMhc
+from hyper_parallel.components.modules.mhc import MhcPostModule, PipelinedMhcModule
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements, module_replacement
@@ -118,6 +121,35 @@ def _install(model, config):
     rules = entries_to_module_replacements(config.plan_overrides)
     plan = compile_module_replacements(model, rules)
     return apply_module_replacements(model, plan, context={"test_context": 7})[0]
+
+
+class TestDeferredFamilyReplacement(unittest.TestCase):
+    """Deferred factories keep runtime resources outside serialized user requests."""
+
+    def test_factory_yaml_roundtrip_and_install(self):
+        """Resolve actual factories, preserve their requests, and install concrete members."""
+        for factory in (MHCPost, PipelinedMhc):
+            with self.subTest(factory=factory.__name__):
+                raw = _raw_config()
+                action = raw["plan_overrides"][0]["replace"]
+                action.pop("source_type")
+                action.pop("exact_type")
+                action["implementation"] = {"_target_": f"{factory.__module__}.{factory.__name__}"}
+                resolved = resolve_config(raw)
+                serialized = resolved.plan_overrides[0].replace.implementation.to_dict()
+                self.assertTrue({"module", "module_fqn", "context", "mesh"}.isdisjoint(serialized))
+                action["implementation"] = serialized
+                restored = resolve_config(yaml.safe_load(yaml.safe_dump(raw)))
+                concrete = MhcPostModule if factory is MHCPost else PipelinedMhcModule
+                source = concrete(config=SimpleNamespace(num_stream=4, hidden_size=16,
+                                                         sinkhorn_iters=3, hc_eps=1e-6, norm_eps=1e-6))
+                result = _install(nn.Sequential(source), restored)
+                self.assertIs(type(result[0]), type(source))
+                for name, parameter in source.named_parameters():
+                    self.assertIs(result[0].get_parameter(name), parameter)
+                action["implementation"]["context"] = {}
+                with self.assertRaises(ConfigResolutionError):
+                    resolve_config(raw)
 
 
 class TestFamilyReplacement(unittest.TestCase):

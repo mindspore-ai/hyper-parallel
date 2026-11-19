@@ -68,7 +68,7 @@ def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
     Args:
         model: Model being built or inspected.
     """
-    from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import (  # pylint: disable=C0415
+    from hyper_parallel.components.modules.engram.host_engram_table import (  # pylint: disable=C0415
         HostEngramTable,
     )
     module_by_fqn = dict(model.named_modules())

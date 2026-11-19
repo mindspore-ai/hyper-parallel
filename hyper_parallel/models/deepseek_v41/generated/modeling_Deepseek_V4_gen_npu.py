@@ -85,7 +85,7 @@ from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE_START,
 )
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -95,7 +95,7 @@ from hyper_parallel.models.deepseek_v41.vision import (
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttention as _SharedCompressedDSAAttentionBase
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement import HostEngramModule
+from hyper_parallel.components.modules.engram.host_engram import HostEngramModule
 
 
 

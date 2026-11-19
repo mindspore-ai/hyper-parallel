@@ -39,7 +39,7 @@ def replace_qwen3_rms_norm(
     # Lazy: importing the implementation requires the optional NPU runtime.
     from hyper_parallel.components.modules import RMSNorm  # pylint: disable=C0415
 
-    return RMSNorm(module=module, module_fqn=module_fqn, context=context)
+    return RMSNorm(module=module, module_fqn=module_fqn, context=context, use_fused_ops=True)
 
 
 @module_replacement

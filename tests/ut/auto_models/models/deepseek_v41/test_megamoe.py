@@ -89,7 +89,7 @@ plan_overrides:
       kind: module
       source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
       implementation:
-        _target_: hyper_parallel.components.modules.engram.EngramModule
+        _target_: hyper_parallel.components.modules.engram.engram.Engram
   - match: model.layers.*.self_attn
     replace:
       kind: module

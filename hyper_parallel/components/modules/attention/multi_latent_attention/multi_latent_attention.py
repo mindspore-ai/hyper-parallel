@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import math
+from types import SimpleNamespace
 from typing import Any
 
 # This package provides PyTorch-specific high-performance modules.
@@ -301,8 +302,12 @@ class MultiLatentAttentionModule(nn.Module):
             hidden_size, self._q_latent_output_size + self._kv_latent_output_size, bias=bias, dtype=dtype,
         )
         eps = getattr(config, "rms_norm_eps", 1e-6)
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps).to(dtype=dtype)
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps).to(dtype=dtype)
+        self.q_a_layernorm = RMSNorm(
+            config=SimpleNamespace(hidden_size=self.q_lora_rank, eps=eps), use_fused_ops=True,
+        ).to(dtype=dtype)
+        self.kv_a_layernorm = RMSNorm(
+            config=SimpleNamespace(hidden_size=self.kv_lora_rank, eps=eps), use_fused_ops=True,
+        ).to(dtype=dtype)
         self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False, dtype=dtype)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False, dtype=dtype,
