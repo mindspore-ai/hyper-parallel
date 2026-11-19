@@ -87,11 +87,10 @@ class TestCodegenProjection(unittest.TestCase):
         capture.source["model_type"] = "mutated"
         plan.modules.clear()
 
-        self.assertEqual(build_ir.source.values["model_type"], "toy")
-        self.assertEqual(build_ir.plan.values["param_plan"], {"block": {"is_boundary": True}})
-        self.assertEqual(build_ir.layouts[0].owner_boundary_id, "family:linear:block")
+        self.assertEqual(build_ir.source["model_type"], "toy")
+        self.assertEqual(build_ir.plan["param_plan"], {"block": {"is_boundary": True}})
         with self.assertRaises(TypeError):
-            build_ir.source.values["model_type"] = "forbidden"
+            build_ir.source["model_type"] = "forbidden"
 
     def test_projection_observes_the_final_plan_once(self):
         """Projection must consume, not recompute, the Trainer-produced plan."""
@@ -111,7 +110,7 @@ class TestCodegenProjection(unittest.TestCase):
             build_ir = project_model_build(capture)
 
         project.assert_called_once_with(capture.plan, capture.model)
-        self.assertEqual(build_ir.plan.values["parallel_dims"]["tp_size"], 2)
+        self.assertEqual(build_ir.plan["parallel_dims"]["tp_size"], 2)
 
     def test_projection_rejects_unknown_component_owner(self):
         """Broken manifest links fail before the emission boundary."""
@@ -124,8 +123,8 @@ class TestCodegenProjection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown emission_owner_boundary_id"):
             project_model_build(_capture(manifest=manifest))
 
-    def test_nested_layout_keeps_own_boundary_under_parent_replacement(self):
-        """Layout ownership remains independent of the source constructor owner."""
+    def test_nested_replacement_has_exact_constructor_owner(self):
+        """A nested layout must not turn into an extra module replacement."""
         parent = replace(_component(), origin="replacement", declaration_id="install_block")
         child = replace(
             _component(), boundary_id="family:linear:experts", aliases=("block.experts",),
@@ -149,9 +148,8 @@ class TestCodegenProjection(unittest.TestCase):
 
         build_ir = project_model_build(capture)
 
-        owners = {layout.module_fqn: layout.owner_boundary_id for layout in build_ir.layouts}
-        self.assertEqual(owners, {"block": parent.boundary_id, "block.experts": child.boundary_id})
-        self.assertEqual([item["primary_fqn"] for item in build_ir.replacement_records()], ["block"])
+        self.assertEqual(set(build_ir.plan["param_plan"]), {"block", "block.experts"})
+        self.assertEqual([item["primary_fqn"] for item in build_ir.replacements], ["block"])
 
         invalid = replace(manifest, replacements=(replace(
             application, boundary_id=child.boundary_id, aliases=child.aliases,
@@ -185,8 +183,7 @@ class TestCodegenProjection(unittest.TestCase):
 
         build_ir = project_model_build(_capture(manifest=manifest))
 
-        self.assertEqual([item.boundary_id for item in build_ir.components], ["first", "second"])
-        self.assertEqual([item["primary_fqn"] for item in build_ir.replacement_records()], ["second", "first"])
+        self.assertEqual([item["primary_fqn"] for item in build_ir.replacements], ["second", "first"])
 
     def test_publication_restores_python_and_torch_rng(self):
         """The transitional emitter cannot advance host RNG state."""

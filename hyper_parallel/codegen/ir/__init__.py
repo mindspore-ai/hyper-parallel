@@ -14,20 +14,6 @@
 # ============================================================================
 """Immutable intermediate records consumed by codegen emission."""
 
-from hyper_parallel.codegen.ir.construction import (
-    CodegenBuildIR,
-    ComponentBoundaryIR,
-    EmissionPlanIR,
-    ModelSourceIR,
-    OwnedLayoutIR,
-    ParallelBindingIR,
-)
+from hyper_parallel.codegen.ir.construction import CodegenBuildIR
 
-__all__ = [
-    "CodegenBuildIR",
-    "ComponentBoundaryIR",
-    "EmissionPlanIR",
-    "ModelSourceIR",
-    "OwnedLayoutIR",
-    "ParallelBindingIR",
-]
+__all__ = ["CodegenBuildIR"]

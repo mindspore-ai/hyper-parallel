@@ -19,7 +19,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Optional
 
-from hyper_parallel.codegen.plan.observation import observe_emission_plan
 from hyper_parallel.codegen.snapshot import (
     CodegenSnapshot,
     CodegenStatus,
@@ -90,20 +89,6 @@ class CodegenBuildSession:
             raise RuntimeError("record_source() must run before record_plan()")
         self._plan = self._as_mapping(plan, "plan")
         self._status = CodegenStatus.DERIVED
-
-    def observe_plan(self, plan: Any, model: Any, mesh: Any) -> None:
-        """Observe a native planner result without exposing codegen to the builder."""
-        observed_plan = observe_emission_plan(plan, model).to_dict()
-        observed_plan["parallel_dims"] = {
-            "dp_size": getattr(mesh, "dp_size", 1),
-            "tp_size": mesh.tp_size,
-            "cp_size": mesh.cp_size,
-            "pp_size": getattr(mesh, "pp_size", 1),
-            "ep_size": mesh.ep_size,
-            "sequence_parallel": mesh.sequence_parallel,
-            "loss_parallel": mesh.loss_parallel,
-        }
-        self.record_plan(observed_plan)
 
     def record_diagnostics(self, diagnostics: Mapping[str, Any]) -> None:
         """Record optional counters and audit facts once."""

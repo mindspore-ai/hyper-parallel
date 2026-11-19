@@ -22,14 +22,7 @@ from typing import Any, Optional
 
 import torch
 
-from hyper_parallel.codegen.ir.construction import (
-    CodegenBuildIR,
-    ComponentBoundaryIR,
-    EmissionPlanIR,
-    ModelSourceIR,
-    OwnedLayoutIR,
-    ParallelBindingIR,
-)
+from hyper_parallel.codegen.ir.construction import CodegenBuildIR, ir_value_to_data
 from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.plan.observation import observe_emission_plan
 from hyper_parallel.codegen.session import CodegenBuildSession
@@ -39,7 +32,7 @@ from hyper_parallel.models.preparation_manifest import PreparationManifest, Prep
 
 @dataclass
 class CodegenProjectionResult:
-    """Artifact and sealed compatibility snapshot produced from one IR."""
+    """Result of publishing the observed native build."""
 
     artifact_layout: Optional[Any] = None
     snapshot: Optional[Any] = None
@@ -52,23 +45,6 @@ def prepare_model_source_compat(model_spec: Any) -> None:
     prepare = getattr(provider, "prepare_model_import", None)
     if prepare is not None:
         prepare()
-
-
-def _contains_fqn(alias: str, fqn: str) -> bool:
-    return alias == "" or alias == fqn or fqn.startswith(f"{alias}.")
-
-
-def _layout_owner(
-    module_fqn: str,
-    components: tuple[PreparedComponent, ...],
-) -> Optional[str]:
-    owners = (
-        (len(alias), component.boundary_id)
-        for component in components
-        for alias in component.aliases
-        if _contains_fqn(alias, module_fqn)
-    )
-    return max(owners, key=lambda item: item[0], default=(0, None))[1]
 
 
 def _parallel_dims(mesh: Any) -> dict[str, Any]:
@@ -141,57 +117,16 @@ def project_model_build(capture: ModelBuildCapture) -> CodegenBuildIR:
         raise RuntimeError("native model build completed without a preparation manifest")
     _validate_manifest_links(manifest)
 
-    applications = {item.boundary_id: item for item in manifest.replacements}
-    components = tuple(
-        ComponentBoundaryIR(
-            boundary_id=component.boundary_id,
-            parent_boundary_id=component.parent_boundary_id,
-            emission_owner_boundary_id=component.emission_owner_boundary_id,
-            origin=component.origin,
-            aliases=component.aliases,
-            declaration_id=component.declaration_id,
-            values=component.to_dict(),
-            replacement=(
-                applications[component.boundary_id].to_legacy_dict()
-                if component.boundary_id in applications
-                else None
-            ),
-        )
-        for component in manifest.components
-    )
-
-    plan_ir = None
-    layouts: tuple[OwnedLayoutIR, ...] = ()
+    plan = None
     if capture.plan is not None or manifest.replacements:
-        observed_plan = observe_emission_plan(capture.plan, capture.model).to_dict()
-        observed_plan["parallel_dims"] = _parallel_dims(capture.mesh)
-        plan_ir = EmissionPlanIR(observed_plan)
-        layouts = tuple(
-            OwnedLayoutIR(
-                module_fqn=fqn,
-                owner_boundary_id=_layout_owner(fqn, manifest.components),
-                values=values,
-            )
-            for fqn, values in observed_plan["param_plan"].items()
-        )
+        plan = observe_emission_plan(capture.plan, capture.model).to_dict()
+        plan["parallel_dims"] = _parallel_dims(capture.mesh)
 
-    bindings = tuple(
-        ParallelBindingIR(
-            boundary_id=binding.boundary_id,
-            layout_owner_boundary_id=binding.layout_owner_boundary_id,
-            aliases=binding.aliases,
-            values=binding.to_dict(),
-        )
-        for binding in manifest.native_bindings
-    )
     return CodegenBuildIR(
-        source=ModelSourceIR(capture.source or {}),
+        source=capture.source or {},
         declarations=manifest.declarations,
-        components=components,
-        layouts=layouts,
-        bindings=bindings,
-        plan=plan_ir,
-        replacement_order=tuple(applications),
+        replacements=tuple(item.to_legacy_dict() for item in manifest.replacements),
+        plan=plan,
         reason=capture.reason,
     )
 
@@ -202,15 +137,15 @@ def publish_codegen_ir(
 ) -> CodegenProjectionResult:
     """Adapt verified IR to the existing emitter while preserving host RNG."""
     session = CodegenBuildSession()
-    session.record_source(build_ir.source.to_dict())
+    session.record_source(ir_value_to_data(build_ir.source))
     session.record_replacements(
-        declarations=build_ir.declaration_records(),
-        applications=build_ir.replacement_records(),
+        declarations=ir_value_to_data(build_ir.declarations),
+        applications=ir_value_to_data(build_ir.replacements),
     )
     if build_ir.plan is None:
         session.mark_not_required(build_ir.reason or "sharding_not_required")
     else:
-        session.record_plan(build_ir.plan.to_dict())
+        session.record_plan(ir_value_to_data(build_ir.plan))
 
     result = CodegenProjectionResult()
     cpu_rng_state = torch.get_rng_state()
