@@ -113,6 +113,7 @@ class TestOfflineTopologyMatrix(unittest.TestCase):
                     "edp_shard": mesh.edp_shard_size,
                 }[argument]
                 self.assertEqual(normalized, 1)
+                self.assertEqual(mesh.device_mesh.shape, (1, 1, 1))
 
 
 class TestStrategyReplacementMatrix(unittest.TestCase):
@@ -190,7 +191,7 @@ class TestGenerationFailureIsolation(unittest.TestCase):
     """Codegen keeps native entry points intact during capture."""
 
     def test_capture_failure_leaves_native_symbols_intact(self):
-        """The same AutoModel build and planner method remain installed throughout."""
+        """Capture leaves the native AutoModel build and infrastructure factory intact."""
         model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
         original_build = model_class.__dict__["_build_model"]
         original_factory = auto_model.instantiate_infrastructure

@@ -141,6 +141,8 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
             "self_attn.q_conv1d.weight": ParamRole.COLWISE,
             "self_attn.A_log": ParamRole.REPLICATED,
             "self_attn.dt_bias": ParamRole.REPLICATED,
+            "self_attn.q_a_proj.weight": ParamRole.REPLICATED,
+            "output_attn_res_proj.weight": ParamRole.REPLICATED,
             "self_attn.f_a_proj.weight": ParamRole.REPLICATED,
             "self_attn.g_a_proj.weight": ParamRole.REPLICATED,
             "self_attn.f_b_proj.weight": ParamRole.COLWISE,
@@ -149,6 +151,21 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
         for name, role in expected.items():
             with self.subTest(parameter=name):
                 self.assertIs(classifier.classify_param(name, rules), role)
+
+    def test_kimi_sparse_gate_classifies_as_router(self):
+        """Assign Kimi sparse gates their adapter-declared router role.
+
+        Feature: Kimi-K3 parameter classification
+        Description: Classify a minimal block_sparse_moe gate with the shared native planner.
+        Expectation: Its weight is classified as ``MOE_GATE``.
+        """
+        model = nn.Module()
+        model.block_sparse_moe = nn.Module()
+        model.block_sparse_moe.gate = nn.Linear(4, 4, bias=False)
+        roles = ShardingPlanner()._classify_all_params(model, "kimi_k3")
+        self.assertEqual(
+            roles["block_sparse_moe.gate.weight"], ParamRole.MOE_GATE,
+        )
 
     def test_cp4_plan_retains_all_kda_params_and_injection(self):
         """Feature: Kimi KDA CP planner integration.

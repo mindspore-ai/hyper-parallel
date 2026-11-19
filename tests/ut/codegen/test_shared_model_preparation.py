@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared family preparation and capture replace the former build overlay."""
+"""Shared family preparation in native and captured builds."""
 
 from types import SimpleNamespace
 import unittest

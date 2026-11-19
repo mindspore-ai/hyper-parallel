@@ -186,7 +186,7 @@ class TestCodegenProjection(unittest.TestCase):
         self.assertEqual([item["primary_fqn"] for item in build_ir.replacements], ["second", "first"])
 
     def test_publication_restores_python_and_torch_rng(self):
-        """The transitional emitter cannot advance host RNG state."""
+        """Bundle publication preserves Python and Torch RNG state."""
         build_ir = project_model_build(_capture())
         cpu_state = torch.get_rng_state().clone()
         python_state = random.getstate()
