@@ -37,7 +37,9 @@ norm aggregation will require an additional manual all-reduce and is
 left for future work.
 """
 # pylint: disable=not-callable
+from collections import defaultdict
 import functools
+import weakref
 import math
 import warnings
 from collections import defaultdict, namedtuple
@@ -156,23 +158,39 @@ def build_norm_shard_plan(model: torch.nn.Module, excluded_params: Iterable[torc
     return NormShardPlan(representatives, replica_ranks)
 
 
+_DENSE_MESH_INFO_CACHE: "weakref.WeakKeyDictionary[torch.nn.Parameter, tuple]" = weakref.WeakKeyDictionary()
+
+
 def _effective_dense_grads(parameters: list[tuple[str, torch.nn.Parameter]]) -> tuple[list, dict]:
     """Collect local gradients and reduce partial placements once."""
     infos = []
     mesh_cache = {}
     for _, param in parameters:
-        mesh, shard_dims, partial_info = _get_param_mesh_info(param)
+        cached = _DENSE_MESH_INFO_CACHE.get(param)
+        if cached is None:
+            mesh, shard_dims, partial_info = _get_param_mesh_info(param)
+            mesh_key = id(mesh) if mesh is not None else None
+            cached = (mesh, partial_info, (mesh_key, shard_dims))
+            _DENSE_MESH_INFO_CACHE[param] = cached
+        mesh, partial_info, key = cached
         if mesh is not None:
             mesh_cache[id(mesh)] = mesh
-        infos.append((param, _get_local_grad(param), mesh, partial_info,
-                      (id(mesh) if mesh is not None else None, shard_dims)))
+        infos.append((param, _get_local_grad(param), mesh, partial_info, key))
     return infos, _coalesce_partial_reduce(infos, mesh_cache)
 
 
-def _check_dense_grad_presence(present: dict[str, bool], replica_ranks: dict[str, tuple[int, ...]]) -> None:
+def _check_dense_grad_presence(present: dict[str, bool], replica_ranks: dict[str, tuple[int, ...]],
+                               device: Optional[torch.device] = None) -> None:
     """Reject mismatched gradient presence on copies of the same shard."""
     if not dist.is_initialized():
         return
+    if replica_ranks:
+        all_present = 1 if all(present.get(fqn, False) for fqn in replica_ranks) else 0
+        flag_device = device if device is not None else torch.device("cpu")
+        flag = torch.tensor(all_present, dtype=torch.int64, device=flag_device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        if int(flag.item()) == 1:
+            return
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, present)
     for fqn, ranks in replica_ranks.items():
@@ -204,8 +222,8 @@ def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
         device = torch.device(getattr(mesh, "device_type", "cpu"))
     infos, reduced = _effective_dense_grads(parameters)
     refs = []
-    local_sq = torch.zeros((), device=device, dtype=torch.float32)
     present = {}
+    rep_groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = defaultdict(list)
     for index, (fqn, _) in enumerate(parameters):
         grad = infos[index][1]
         present[fqn] = grad is not None
@@ -214,8 +232,15 @@ def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
         refs.append(grad)
         if norm_shard_plan.representatives[fqn]:
             view = reduced.get(index, grad)
-            local_sq.add_(view.float().square().sum().to(device))
-    _check_dense_grad_presence(present, norm_shard_plan.replica_ranks)
+            rep_groups[(view.device, view.dtype)].append(view)
+
+    local_sq = torch.zeros((), device=device, dtype=torch.float32)
+    for (_, _), group in rep_groups.items():
+        norms = torch._foreach_norm(group, 2.0)  # pylint: disable=protected-access
+        sq_terms = torch.stack(norms).float().square().sum()
+        local_sq.add_(sq_terms.to(device))
+
+    _check_dense_grad_presence(present, norm_shard_plan.replica_ranks, device=device)
     for name in getattr(getattr(mesh_context, "device_mesh", None), "mesh_dim_names", ()) or ():
         axis = mesh_context.device_mesh[name]
         if axis.size() > 1:
@@ -230,8 +255,12 @@ def scale_grad_refs_(refs: Iterable[torch.Tensor], coefficient: torch.Tensor) ->
         refs: Mutable dense effective gradients.
         coefficient: Shared clipping coefficient.
     """
+    groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = defaultdict(list)
     for grad in refs:
-        grad.mul_(coefficient)
+        groups[(grad.device, grad.dtype)].append(grad)
+    for (dev, dt), group in groups.items():
+        coeff = coefficient.to(device=dev, dtype=dt)
+        torch._foreach_mul_(group, coeff)  # pylint: disable=protected-access
 
 
 # (id(mesh) or None, shard_dims) -> list of local grads for norm computation
