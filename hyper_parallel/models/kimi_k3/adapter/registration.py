@@ -18,7 +18,6 @@ from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.kimi_k3.adapter import load_context_parallel
 from hyper_parallel.models.kimi_k3.adapter.policies.sharding import (
     build_parameter_sharding_rules,
-    build_replicated_layouts,
 )
 from hyper_parallel.models.registry import register_model_adapter
 
@@ -35,7 +34,6 @@ KIMI_K3_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="kimi_k3",
     context_parallel=load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
-    sharding=build_replicated_layouts,
     codegen=_load_codegen,
 )
 

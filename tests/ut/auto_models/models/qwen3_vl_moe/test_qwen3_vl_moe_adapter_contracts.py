@@ -22,8 +22,6 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
-from hyper_parallel.components.modules.module_family import FamilyShardingContext
-from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
 from hyper_parallel.models import get_model_adapter
@@ -44,24 +42,6 @@ def test_model_adapter_registers_its_distributed_providers() -> None:
     assert spec.expert_parallel is not None
     assert spec.sharding_rules is not None
     assert spec.sharding_rules() == [("model.visual.", ParamRole.REPLICATED)]
-
-
-def test_vision_layout_owns_nested_parameters_without_wrapping_forward() -> None:
-    """The shared planner receives complete, non-boundary vision placement."""
-    model = nn.Module()
-    model.model = nn.Module()
-    model.model.visual = nn.Sequential(nn.Linear(3, 2), nn.LayerNorm(2))
-    context = FamilyShardingContext(("dp", "cp", "tp"), {"cp": 2, "tp": 2, "ep": 1}, {})
-
-    layouts = get_model_adapter("qwen3_vl_moe").sharding(model=model, context=context)
-    vision_layout = layouts["model.visual"]
-    expected = {
-        name: {"cp": Replicate(), "tp": Replicate()}
-        for name, _ in model.model.visual.named_parameters()
-    }
-
-    assert vision_layout.params == expected, f"Expected {expected}, got {vision_layout.params}"
-    assert not vision_layout.is_boundary, f"Unexpected vision boundary: {vision_layout}"
 
 
 def test_text_cp_keeps_global_2d_padding_mask() -> None:

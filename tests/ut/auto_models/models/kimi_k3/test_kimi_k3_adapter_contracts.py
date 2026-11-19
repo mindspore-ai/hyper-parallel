@@ -27,7 +27,6 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules import KimiDeltaAttention
-from hyper_parallel.components.modules.module_family import FamilyShardingContext
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
 )
@@ -116,24 +115,6 @@ class _TinyKimiModel(nn.Module):
 
 class TestKimiK3AdapterRegistration(unittest.TestCase):
     """Pin model-family discovery and KDA-specific parameter roles."""
-
-    def test_declared_replication_covers_vision_and_residual_projections(self):
-        """The Kimi adapter owns the replicas without adding compute boundaries."""
-        model = nn.Module()
-        model.vision_tower = nn.Sequential(nn.Linear(2, 2, bias=False))
-        model.mm_projector = nn.Linear(2, 2, bias=False)
-        model.language_model = nn.Module()
-        model.language_model.mlp_res_proj = nn.Linear(2, 2, bias=False)
-        model.language_model.mlp = nn.Linear(2, 2, bias=False)
-        context = FamilyShardingContext(("dp", "cp", "tp"), {"tp": 2, "cp": 1, "ep": 2}, {})
-
-        layouts = get_model_adapter("kimi_k3").sharding(model=model, context=context)
-
-        self.assertEqual(set(layouts), {"vision_tower", "mm_projector", "language_model.mlp_res_proj"})
-        for fqn, name in (("vision_tower", "0.weight"), ("mm_projector", "weight"),
-                          ("language_model.mlp_res_proj", "weight")):
-            self.assertFalse(layouts[fqn].is_boundary)
-            self.assertEqual(layouts[fqn].params, {name: {"tp": Replicate(), "cp": Replicate()}})
 
     def test_top_level_and_text_specs_share_kda_providers(self):
         """Both official Kimi config identities discover the same KDA rules."""

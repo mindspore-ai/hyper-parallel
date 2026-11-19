@@ -25,7 +25,7 @@ from typing import Any
 from torch import nn
 
 from hyper_parallel.components.modules.module_family import (
-    FamilyShardingContext, collect_family_modules, _family_parameter_shapes, get_family_build_info,
+    collect_family_modules, _family_parameter_shapes, get_family_build_info,
     _record_family_layouts, _validate_applied_layout,
 )
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
@@ -33,17 +33,6 @@ from hyper_parallel.distributed.module_binding import (
     NativeParallelBindingRequest, ParallelModuleSpec, validate_materialized_modules, validate_parallel_module,
 )
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, _normalize_out_fields
-
-
-def replicated_subtree_layout(module: nn.Module, context: FamilyShardingContext) -> ModuleShardingSpec:
-    """Assign a complete replicated parameter layout without a forward boundary."""
-    layout = {axis: Replicate() for axis in context.mesh_dim_names if axis in context.axis_sizes}
-    return ModuleShardingSpec(
-        params={name: dict(layout) for name, _ in module.named_parameters(remove_duplicate=False)},
-        in_src={},
-        in_dst={},
-        is_boundary=False,
-    )
 
 
 @dataclass

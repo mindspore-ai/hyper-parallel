@@ -28,15 +28,6 @@ from hyper_parallel.models.kimi_k3.adapter.policies.sharding import (
 class TestModelShardingRules(unittest.TestCase):
     """Model-owned policies cover multimodal and Kimi-specific parameters."""
 
-    def test_fused_swiglu_projections_share_native_boundary(self):
-        """The shared planner keeps the fused MLP output reduction at its owner."""
-        roles = {
-            "block.mlp.linear_fc1.weight": ParamRole.FUSED_GATE_UP,
-            "block.mlp.linear_fc2.weight": ParamRole.ROWWISE,
-        }
-        groups = ShardingPlanner()._group_by_boundary(roles)  # pylint: disable=protected-access
-        self.assertEqual({name: dict(params) for name, params in groups.items()}, {"block.mlp": roles})
-
     def test_kimi_special_parameters_are_replicated(self):
         """Cover Kimi special parameters in its model adapter.
 

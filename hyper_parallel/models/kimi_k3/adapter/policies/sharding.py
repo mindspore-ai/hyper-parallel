@@ -16,27 +16,6 @@
 
 from typing import Any
 
-from torch import nn
-
-from hyper_parallel.components.modules.module_family import FamilyShardingContext
-from hyper_parallel.distributed._builder.family_layout import replicated_subtree_layout
-from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
-
-
-_RESIDUAL_PROJECTIONS = ("self_attention_res_proj", "mlp_res_proj", "output_attn_res_proj")
-
-
-def build_replicated_layouts(
-    *, model: nn.Module, context: FamilyShardingContext,
-) -> dict[str, ModuleShardingSpec]:
-    """Declare visual subtrees and unsharded text residual projections."""
-    return {
-        name: replicated_subtree_layout(module, context)
-        for name, module in model.named_modules()
-        if name in {"vision_tower", "mm_projector"}
-        or (name.startswith("language_model.") and name.rpartition(".")[2] in _RESIDUAL_PROJECTIONS)
-    }
-
 
 def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
     """Return KDA parameter roles not covered by generic naming rules."""
@@ -49,11 +28,12 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
         (["A_log", "dt_bias"], ParamRole.REPLICATED),
         (["q_conv1d", "k_conv1d", "v_conv1d"], ParamRole.COLWISE),
         (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
-        (list(_RESIDUAL_PROJECTIONS), ParamRole.REPLICATED),
+        (["self_attention_res_proj", "mlp_res_proj", "output_attn_res_proj"],
+         ParamRole.REPLICATED),
         (["f_a_proj", "g_a_proj"], ParamRole.REPLICATED),
         (["f_b_proj", "b_proj", "g_proj", "g_b_proj"], ParamRole.COLWISE),
         (["vision_tower.", "mm_projector."], ParamRole.REPLICATED),
     ]
 
 
-__all__ = ["build_parameter_sharding_rules", "build_replicated_layouts"]
+__all__ = ["build_parameter_sharding_rules"]
