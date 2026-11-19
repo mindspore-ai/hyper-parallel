@@ -23,7 +23,7 @@ dispatch/collective primitives stay in the generic
 them through the now-public ``build_ep_compute``.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from hyper_parallel.distributed.expert_parallel.experts import (
     SHARED_MERGE_MODES,
@@ -49,6 +49,10 @@ def qwen3moe_ep_compute_fn(
     ep_mesh: Any,
     use_grouped_gemm: bool = False,
     fix_router: bool = False,
+    use_moonep: bool = False,
+    moonep_token_dedup: bool = True,
+    moonep_replica_capacity: Optional[int] = None,
+    moonep_prefetch_depth: int = 1,
 ) -> Callable:
     """Archetype ``qwen3moe_topk_router``: TopKRouter module returning
     (logits, scores, indices), no shared expert (Qwen3-MoE).
@@ -57,6 +61,10 @@ def qwen3moe_ep_compute_fn(
 
     ``fix_router`` selects the framework's benchmark-only balanced router
     (``routing.make_balanced_router``); correctness runs keep it ``False``.
+    ``moonep_token_dedup`` sends one vector per token/destination (default True).
+    ``moonep_replica_capacity`` bounds remote experts per rank (None means E/EP).
+    ``moonep_prefetch_depth`` prefetches earlier calls without FSDP (default 1; 0 disables it).
+    These options apply only when ``use_moonep`` is enabled.
     """
     del mesh, tp_mesh, cp_mesh
     return build_ep_compute(
@@ -68,6 +76,10 @@ def qwen3moe_ep_compute_fn(
         combine=SHARED_MERGE_MODES["none"],
         use_grouped_gemm=use_grouped_gemm,
         fix_router=fix_router,
+        use_moonep=use_moonep,
+        moonep_token_dedup=moonep_token_dedup,
+        moonep_replica_capacity=moonep_replica_capacity,
+        moonep_prefetch_depth=moonep_prefetch_depth,
     )
 
 

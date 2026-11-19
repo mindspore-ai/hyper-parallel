@@ -143,12 +143,16 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: list[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
     fix_router: bool = False,
     capacity_factor: Optional[float] = None,
     overlap_fn: Optional[Callable] = None,
+    use_moonep: bool = False,
+    moonep_token_dedup: bool = True,
+    moonep_replica_capacity: Optional[int] = None,
+    moonep_prefetch_depth: int = 1,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -176,11 +180,34 @@ def build_ep_compute(
     around the given callable -- so a family gets the uniform-load comparison mode
     without carrying its own copy of the router.  See that factory for what it does and
     why its numbers must not be reported as an efficiency result.
+
+    Args:
+        module: Model-owned MoE block.
+        ep_mesh: Expert mesh defining the dispatch process group.
+        router_fn: Return the selected expert indices and probabilities.
+        archetype_key: Diagnostic name for the model's routing contract.
+        expected_attrs: Attributes required by this MoE implementation.
+        combine: Compose routed outputs with any model-specific branches.
+        use_grouped_gemm: Select native grouped expert computation.
+        fix_router: Enable the benchmark-only balanced router.
+        capacity_factor: Optional selection capacity for ordinary EP.
+        overlap_fn: Independent computation to overlap with ordinary EP dispatch.
+        use_moonep: Select collective MoonEP execution.
+        moonep_token_dedup: Compress repeated token/destination vectors.
+        moonep_replica_capacity: Remote expert slots per rank; None means E/EP.
+        moonep_prefetch_depth: Earlier calls to prefetch without FSDP.
     """
     router_fn = resolve_moe_router(router_fn, fix_router)
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
-    if use_grouped_gemm:
+    if use_moonep:
+        bind_local_expert_forward(
+            module, ep_mesh["ep"].size(), use_moonep=True,
+            moonep_token_dedup=moonep_token_dedup,
+            moonep_replica_capacity=moonep_replica_capacity,
+            moonep_prefetch_depth=moonep_prefetch_depth,
+        )
+    elif use_grouped_gemm:
         bind_local_expert_forward(
             module,
             ep_mesh["ep"].size(),
