@@ -203,7 +203,8 @@ def _run_case(dtype, sharded):
 def _verify_graph(text, records, device_type, sharded, dtype):
     """Require native collective/GMM nodes and optionally persist the evidence."""
     assert "_c10d_functional" in text, f"Missing functional EP communication in graph: {text}"
-    assert "npu_grouped_matmul" in text, f"Missing grouped expert computation in graph: {text}"
+    if device_type == "npu":
+        assert "npu_grouped_matmul" in text, f"Missing grouped expert computation in graph: {text}"
     assert "alltoall_base_" not in text, f"Unexpected imperative collective in graph: {text}"
     output = os.environ.get("HP_EP_GRAPH_TEST_OUTPUT")
     if output:

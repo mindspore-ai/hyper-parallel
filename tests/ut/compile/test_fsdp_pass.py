@@ -55,6 +55,7 @@ from torch import fx, nn
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.compile.pass_config import GradientReduction, PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
+from hyper_parallel.compile.passes.parallel.fsdp_pass import FsdpParamSpec, FsdpPlan
 from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed.mesh import MeshContext
@@ -544,7 +545,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
         model = nn.Linear(4, 4)
         with _patch_dist(world_size=8):
             FSDPPass().run(gm, PassConfig(fsdp_degree=4), model=model,
-                           parameter_groups={"weight": ("unit", 2)})
+                           fsdp_plan=FsdpPlan({"weight": FsdpParamSpec("unit", 2)}))
         gm.graph.lint()
         self.assertEqual(tuple(model.weight.shape), (2, 4))
         self.assertEqual(tuple(model.bias.shape), (1,))
@@ -573,10 +574,10 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 model = _OddParam()
                 model.odd = nn.Parameter(torch.zeros(shape))
                 with _patch_dist(world_size=4, rank=0, initialized=True):
-                    with self.assertRaisesRegex(ValueError, "edp_shard degree 4"):
+                    with self.assertRaisesRegex(ValueError, "degree 4"):
                         FSDPPass().run(
                             gm, cfg, model=model, fsdp_group_name="fsdp",
-                            expert_param_names={"odd"}, expert_fsdp_group_name="fsdp_expert",
+                            fsdp_plan=FsdpPlan({"odd": FsdpParamSpec("fsdp_expert", 4, pad_policy="error")}),
                             gradient_reductions={"odd": GradientReduction("sum", 4)},
                         )
                 self.assertEqual(tuple(model.odd.shape), shape)
@@ -600,7 +601,10 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 with _patch_dist(world_size=2):
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=2), model=model,
-                        expert_param_names={"frozen", "buf"},
+                        fsdp_plan=FsdpPlan({
+                            "frozen": FsdpParamSpec("fsdp_expert", 2, mode="skip"),
+                            "buf": FsdpParamSpec("fsdp_expert", 2, mode="skip"),
+                        }),
                         gradient_reductions=dict.fromkeys({"frozen", "buf"}, GradientReduction("sum", 2)),
                     )
                 self.assertEqual(tuple(model.trainable.shape), (2, 4))
@@ -609,12 +613,16 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 1)
                 self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 1)
 
-    def test_expert_reduction_requires_an_explicit_policy(self):
-        """Do not infer an expert's normalization divisor from its group size."""
+    def test_plan_uses_default_gradient_reduction(self):
+        """A plan without an explicit policy falls back to the pass default."""
         with _patch_dist(world_size=4):
-            with self.assertRaisesRegex(ValueError, "explicit gradient reduction policies"):
-                FSDPPass().run(_odd_joint_graph(), PassConfig(fsdp_degree=4), model=_OddParam(),
-                               expert_param_names={"odd"})
+            gm = _odd_joint_graph()
+            FSDPPass().run(
+                gm, PassConfig(fsdp_degree=4), model=_OddParam(),
+                fsdp_plan=FsdpPlan({"odd": FsdpParamSpec("fsdp_expert", 2)}),
+            )
+        reductions = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_reduce_scatter"]
+        self.assertEqual([node.args[1:] for node in reductions], [("avg", 2, "fsdp_expert")])
 
     def _assert_gradient_reductions(self, graph_module, reductions):
         """Dense AVG and expert prescaled SUM use their selected groups."""
@@ -645,7 +653,12 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                     )
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=4), model=model, fsdp_group_name="dense",
-                        expert_param_names={"lin.weight"}, expert_fsdp_group_name="edp",
+                        fsdp_plan=FsdpPlan({
+                            "lin.weight": FsdpParamSpec(
+                                "edp", degree, mode="replicate" if degree == 1 else "shard",
+                                pad_policy="error",
+                            ),
+                        }),
                         gradient_reductions={"lin.weight": GradientReduction("sum", 4)},
                     )
                 expected_weight = weight[2:] if degree > 1 else weight
@@ -683,7 +696,10 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                         lambda group=None, degree=dp_degree: degree if group is None else 1
                     )
                     FSDPPass().run(
-                        gm, PassConfig(fsdp_degree=dp_degree), model=model, expert_param_names={"odd"},
+                        gm, PassConfig(fsdp_degree=dp_degree), model=model,
+                        fsdp_plan=FsdpPlan({
+                            "odd": FsdpParamSpec("fsdp_expert", 1, mode="replicate", pad_policy="error"),
+                        }),
                         gradient_reductions={"odd": GradientReduction("sum", dp_degree)},
                     )
                 loss, gradient, aux = gm(model.odd, torch.ones(4, 1), torch.full_like(model.odd, dp_degree))
@@ -706,7 +722,13 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                     )
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=4), model=model, parallel_plan=plan,
-                        fsdp_group_name="dense", expert_param_names={"extra"}, expert_fsdp_group_name="edp",
+                        fsdp_group_name="dense",
+                        fsdp_plan=FsdpPlan({
+                            "extra": FsdpParamSpec(
+                                "edp", degree, mode="replicate" if degree == 1 else "shard",
+                                pad_policy="error",
+                            ),
+                        }),
                         gradient_reductions={"extra": GradientReduction("sum", 4)},
                     )
                 self.assertEqual(tuple(model.extra.shape), (2, 2))
