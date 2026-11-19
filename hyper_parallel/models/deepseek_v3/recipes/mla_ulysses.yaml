@@ -14,10 +14,9 @@ optimizer:
     adamw_lr: 1.0e-5
 
 accelerator:
-  # With EP disabled, contiguous TP shards split the fused expert gate/up pair.
-  tp_size: 1
+  tp_size: 2
   cp_size: 4
-  sequence_parallel: false
+  sequence_parallel: false  # Optional TP sequence parallelism; both MLA strategies support enabling it.
   loss_parallel: false
 
 plan_overrides:
