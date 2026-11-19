@@ -171,14 +171,27 @@ def zeropower_via_newtonschulz5(
 
     step_coeffs = _resolve_ns_coefficients(steps, ns_variant, ns_coefficients)
 
-    for coeff_a, coeff_b, coeff_c in step_coeffs:
-        torch.matmul(mat_x, mat_x.mT, out=buf_a)
-        torch.matmul(buf_a, buf_a, out=buf_b)
-        buf_a.mul_(coeff_b)
-        buf_b.mul_(coeff_c)
-        buf_a.add_(buf_b)
-        torch.matmul(buf_a, mat_x, out=buf_c)
-        mat_x.mul_(coeff_a).add_(buf_c)
+    if mat_x.ndim == 3 and 1 < mat_x.shape[0] <= 32 and min(mat_x.shape[1], mat_x.shape[2]) >= 4096:
+        batch_size = mat_x.shape[0]
+        for coeff_a, coeff_b, coeff_c in step_coeffs:
+            for b in range(batch_size):
+                torch.mm(mat_x[b], mat_x[b].t(), out=buf_a[b])
+                torch.mm(buf_a[b], buf_a[b], out=buf_b[b])
+            buf_a.mul_(coeff_b)
+            buf_b.mul_(coeff_c)
+            buf_a.add_(buf_b)
+            for b in range(batch_size):
+                torch.mm(buf_a[b], mat_x[b], out=buf_c[b])
+            mat_x.mul_(coeff_a).add_(buf_c)
+    else:
+        for coeff_a, coeff_b, coeff_c in step_coeffs:
+            torch.matmul(mat_x, mat_x.mT, out=buf_a)
+            torch.matmul(buf_a, buf_a, out=buf_b)
+            buf_a.mul_(coeff_b)
+            buf_b.mul_(coeff_c)
+            buf_a.add_(buf_b)
+            torch.matmul(buf_a, mat_x, out=buf_c)
+            mat_x.mul_(coeff_a).add_(buf_c)
 
     del buf_a, buf_b, buf_c
 
