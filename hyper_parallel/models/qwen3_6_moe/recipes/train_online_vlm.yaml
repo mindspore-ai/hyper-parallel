@@ -10,7 +10,8 @@ model:
   force_hf: true
 
 training:
-  train_iters: 100
+  epochs: 1
+  max_steps: 100
   train_samples: null
   global_batch_size: 8
   micro_batch_size: 1
@@ -87,25 +88,19 @@ dataset:
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   # JSON/JSONL messages with image paths, or Parquet messages + images[].bytes/path.
   data_path: /home/chaoran/datasets/llava_1k_en/messages.jsonl
-  data_config: {}
+  data_config:
+    max_seq_len: 8192
   data_transform:
     _target_: hyper_parallel.data.omni.omni_transform.AutoProcessorTransform
-    max_seq_len: 8192
 
 dataloader:
-  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  _target_: hyper_parallel.data.batching.OmniPackingLoader
   collate_fn:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
   get_batch:
     _target_: hyper_parallel.models.qwen3_5_moe.vlm_cp.QwenVLMParallelBatch
     sequence_alignment: 128
   sampler_type: cyclic
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 
 loss_fn:
   _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss

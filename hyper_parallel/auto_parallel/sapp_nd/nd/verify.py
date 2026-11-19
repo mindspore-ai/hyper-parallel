@@ -375,7 +375,7 @@ def census_spec_yaml(yaml_path: str, folder: str) -> str:
     raw = _train_yaml(yaml_path)
     seq_len = 0
     if (raw.get("context") or {}).get("census"):
-        seq_len = int(((raw.get("dataset") or {}).get("data_transform") or {}).get("max_seq_len") or 4096)
+        seq_len = int(((raw.get("dataset") or {}).get("data_config") or {}).get("max_seq_len") or 4096)
     spec = resolve_hf_model_spec(raw["model"], census_seq_len=seq_len, census_spec=True)
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "model_spec.yaml")

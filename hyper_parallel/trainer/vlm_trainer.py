@@ -128,6 +128,7 @@ class VLMTrainer:
         data_transform = dataset_config.data_transform.build(
             processor=self.base.processor,
             training_mode=dataset_config.training_mode,
+            max_seq_len=dataset_config.data_config["max_seq_len"],
         )
         if not isinstance(data_transform, OmniDataTransform):
             raise TypeError("dataset.data_transform must build an OmniDataTransform")
@@ -137,25 +138,33 @@ class VLMTrainer:
     def _build_collate_fn(self) -> None:
         """Build the VLM collator and gradient-accumulation batch count."""
         dataloader_config = self.base.config.dataloader
+
         if dataloader_config is None or dataloader_config.collate_fn is None:
             raise ValueError("dataloader.collate_fn must define a build target")
+
         training_config = self.base.config.training
         self.base.num_micro_batches = calculate_num_micro_batches(
             global_batch_size=training_config.global_batch_size,
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
+        max_seq_len = self.base.config.dataset.data_config["max_seq_len"]
+
         self.base.collate_fn = dataloader_config.collate_fn.build(
             mesh_context=self.base.mesh,
+            max_seq_len=max_seq_len,
         )
 
     def _build_get_batch(self) -> None:
         """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
+
         if config.dataloader.get_batch is None:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
+
         if getattr(config.dataloader.get_batch, "encoder_parallel", None) is not None:
             raise ValueError("encoder_parallel belongs under accelerator, not dataloader.get_batch")
+
         encoder_runtime = build_encoder_parallel_runtime(
             config=config.accelerator.encoder_parallel,
             mesh_context=self.base.mesh,
@@ -174,10 +183,13 @@ class VLMTrainer:
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
+
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
+
             get_batch.batch_transport = EncoderParallelBatchTransport(runtime=encoder_runtime)
+
         self.base.get_batch = get_batch
 
     @property
@@ -340,9 +352,11 @@ class VLMTrainer:
         data_iterator = self._create_data_iterator()
         start_step = self.base.state.global_step - epoch * self.base.train_steps
         train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+
         if balanced_loader:
             start_step = 0
             train_steps = self.base.train_iters - self.base.state.global_step
+
         for _ in range(start_step, train_steps):
             try:
                 self.train_step(data_iterator)
@@ -354,6 +368,7 @@ class VLMTrainer:
                     "epoch:%s Dataloader finished with drop_last %s", epoch, self.base.config.dataloader.drop_last
                 )
                 return True
+
         return False
 
     @recovery_train_loop
@@ -377,14 +392,16 @@ class VLMTrainer:
             for epoch in epochs:
                 if self.base.state.global_step >= self.base.train_iters:
                     break
+
                 # Do not erase the cursor restored by on_train_begin on the first epoch.
-                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                if train_dataloader is not None and (not balanced_loader or epoch != start_epoch):
                     train_dataloader.set_epoch(epoch)
 
                 self.base.state.epoch = epoch
                 self.on_epoch_begin()
                 epoch_start_step = self.base.state.global_step
                 epoch_exhausted = self._train_epoch(epoch, balanced_loader)
+
                 if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
                     raise ValueError("VLM Dataset epoch cannot provide one complete optimizer step")
 

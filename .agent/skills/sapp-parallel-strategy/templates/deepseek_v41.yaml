@@ -23,7 +23,8 @@ model:
   validate_placement: false
 model_init_dtype: float32
 training:
-  train_iters: 1
+  epochs: 1
+  max_steps: 1
   train_samples: null
   eval_iters: 0
   global_batch_size: 16
@@ -106,10 +107,10 @@ dataset:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 4096
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: ./output/training_demo/deepseek_v41/online_4k.jsonl
   data_config:
+    max_seq_len: 4096
     create_attention_mask_in_dataloader: true
     labels_are_shifted: true
 dataloader:
@@ -126,13 +127,6 @@ dataloader:
       include_position_ids: false
       include_image_sequence_start: false
   sampler_type: single
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 optimizer:
   _target_: hyper_parallel.components.optim.Muon
   fp32_main_params: true

@@ -188,7 +188,8 @@ Hub Dataset ID
 dataset:
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: /data/docvqa/train.jsonl
-  data_config: {}
+  data_config:
+    max_seq_len: 4096
 ```
 
 原生 reader 启动时扫描文件并记录有效记录的 byte offset，后续通过整数索引按需读取。它不要求 Arrow
@@ -724,10 +725,10 @@ position >= assistant_start and token_types == TEXT
 每个样本局部的 `image_token_starts` 加上 packed sequence offset。`cu_seq_lens` 保存样本边界，用于隔离
 packed attention。
 
-collator 可以通过 `dataloader.collate_fn.pad_to_length: 1024` 把 packing 后的全局 token 长度固定为
-1024；默认 `null` 仅按 TP × CP 对齐。目标必须是 TP × CP 的整数倍，packed 长度超过目标时报错。
-padding 的 labels 为 `-100`，并作为独立尾段追加到 `cu_seq_lens`；图片 patch、grid 和图片起点保持不变。
-`max_seq_len` 控制单样本过滤，`token_budget` 控制 packing 选择，三者相互独立。配置及 CP 切片示例见
+`dataset.data_config.max_seq_len` 设置每条 packing 上限 S。loader 分别 packing B 条序列，
+默认 `pad_to_length: true` 将每条补到 S，得到 `[B,S]`；false 补到当前最长序列并按 TP×CP 对齐。
+S 必须能被 TP×CP 整除。token padding 为 0，labels 为 -100，每条序列的 PAD 作为独立段记录到
+`cu_seq_lens`；图片 patch 和 grid 保留。配置及 CP 切片示例见
 [固定 packing 后的输入长度](omni_online_data_guide.zh.md#固定-packing-后的输入长度)。
 
 `encode_batch()` 再把通用图片元数据转换成 DeepSeek-V4.1 forward 所需字段：

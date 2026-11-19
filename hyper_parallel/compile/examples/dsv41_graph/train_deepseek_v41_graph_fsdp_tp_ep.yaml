@@ -31,7 +31,8 @@ lr_scheduler:
     lr: 0.0001
     lr_warmup_steps: 0
 training:
-  train_iters: 30
+  epochs: 1
+  max_steps: 30
   global_batch_size: 8
   micro_batch_size: 1
   backend: hccl
@@ -72,13 +73,13 @@ dataset:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.text_transform.build_deepseek_v41_text_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 2304
     drop_ragged_tail: false
     # lcm of the model's active compress ratios: blocks never cross a document.
     sample_alignment_size: 2
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: ./output/datasets/wikitext-train.jsonl
   data_config:
+    max_seq_len: 2304
     create_attention_mask_in_dataloader: true
     labels_are_shifted: true
     cache_dir: ./output/dsv41_graph/wikitext_fsdp_tp_ep_cache
@@ -89,7 +90,7 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
     # Fixed packed row length: one captured graph replays for every batch and
     # eager keeps the identical shape contract.
-    pad_to_length: 2304
+    pad_to_length: true
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
@@ -106,14 +107,6 @@ dataloader:
   # Packing can consume several source documents per row; retain the natural
   # source instead of capping it at train_iters * global_batch_size.
   sampler_type: cyclic
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
-  token_budget: 2304
 checkpoint:
   save_ckpt: false
 model_init_dtype: float32

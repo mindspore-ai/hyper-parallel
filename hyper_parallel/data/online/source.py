@@ -172,7 +172,7 @@ class _OnlineLeafSourceLoader:
                     selected_splits.append(split_expression)
             selected_split = selected_splits
 
-        if load_dataset_path in ("json", "parquet") and "data_files" in load_options and not streaming:
+        if load_dataset_path in ("json", "parquet", "arrow") and "data_files" in load_options and not streaming:
             loaded_dataset = self._load_local_files(load_dataset_path, load_options["data_files"], selected_split)
         else:
             loaded_dataset = load_dataset(

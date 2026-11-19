@@ -540,13 +540,10 @@ def _census_replacements(raw: Dict[str, Any], census_seq_len: int) -> tuple:
 def _training_seq_len(raw: Dict[str, Any]) -> Any:
     """Return the training sequence length an AutoModels YAML states, or None.
 
-    Reads the three spellings the SAPP-ND parser accepts, in its order, so the
-    two halves of the cost model agree on where the length comes from: the
-    Online path's, an Indexed Dataset's, the legacy one.
+    Reads the dataset length, falling back to the legacy data section.
     """
     dataset_raw = _get_dict(raw, "dataset")
-    return (_get_dict(dataset_raw, "data_transform").get("max_seq_len")
-            or _get_dict(dataset_raw, "data_config").get("seq_length")
+    return (_get_dict(dataset_raw, "data_config").get("max_seq_len")
             or _get_dict(raw, "data").get("max_seq_len"))
 
 
@@ -567,7 +564,7 @@ def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any
         model_spec["max_position_embeddings"] = seq_len
     else:
         logger.warning(
-            "no dataset.data_transform.max_seq_len, dataset.data_config.seq_length "
+            "no dataset.data_config.max_seq_len "
             "nor data.max_seq_len: costing the model's context limit of %s tokens, "
             "which for a long-context model puts every candidate out of memory",
             model_spec.get("max_position_embeddings", 4096),

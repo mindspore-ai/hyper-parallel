@@ -1,5 +1,8 @@
 # Offline Dataset Preparation Guide
 
+For training YAML after preparation, including `max_seq_len`, `GPTDataset/GPTFromMRDataset`, and required tokenizer
+metadata, see [Dataset usage](../../../hyper_parallel/data/README.md#offline-indexed-text).
+
 **English** | [简体中文](offline_preparation_guide.zh.md)
 
 This guide explains how to convert local JSON/JSONL files or Hugging Face datasets into training-ready Megatron Indexed Datasets.

@@ -45,7 +45,7 @@ dataset:
   _target_: examples.training_demo.qwen3.packed_dataset.PackedTextDataset
   data_path: /path/to/packed_arrow_dataset
   data_config:
-    seq_length: 512
+    max_seq_len: 512
     labels_are_shifted: true
     create_attention_mask_in_dataloader: true
   sequence_length: 512
@@ -65,9 +65,6 @@ dataloader:
     source_type: packed_text
     attention_mode: dense
     reset_position_ids: true
-  drop_last: true
-  num_workers: 0
-  pin_memory: true
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW
   fp32_main_params: true

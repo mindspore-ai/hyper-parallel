@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -103,6 +104,8 @@ class IterableTransformDataset(IterableDataset):
         """Store the streaming source and its lazy sample transform."""
         self.source_dataset = source_dataset
         self.transform = transform
+        self._source_start_state = deepcopy(self.state_dict())
+        self._source_was_restored = False
 
     @property
     def output_index_for_resume(self) -> bool:
@@ -168,10 +171,17 @@ class IterableTransformDataset(IterableDataset):
             raise ValueError("Online iterable source does not support load_state_dict")
 
         state_loader(state_dict["source_dataset"])
+        self._source_was_restored = True
 
     def set_epoch(self, epoch: int) -> None:
         """Forward deterministic epoch state when supported upstream."""
+        # HF streams retain their restore offset across iterations; use it for only the saved pass.
+        if self._source_was_restored:
+            self.load_state_dict(self._source_start_state)
+            self._source_was_restored = False
+
         epoch_setter = getattr(self.source_dataset, "set_epoch", None)
+
         if callable(epoch_setter):
             epoch_setter(epoch)
 

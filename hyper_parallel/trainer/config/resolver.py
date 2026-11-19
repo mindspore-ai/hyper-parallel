@@ -449,6 +449,13 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
 
     config_fields = {field.name: field for field in fields(config) if field.init}
     name = parts[0]
+
+    if isinstance(config, DataLoaderConfig):
+        option = parts[1] if name == "target" and len(parts) > 1 else name
+
+        if option in config.internal_options:
+            raise ConfigResolutionError(f"{location}.{option}", "uses internal defaults and cannot be configured")
+
     if name not in config_fields:
         target = getattr(config, "target", None)
         if isinstance(target, Target):
@@ -700,6 +707,13 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         raise ConfigResolutionError(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
+    internal_options = DataLoaderConfig.internal_options.intersection(target_node)
+
+    if internal_options:
+        raise ConfigResolutionError(
+            path, f"options {sorted(internal_options)} use internal defaults and cannot be configured",
+        )
+
     if "dataloader_type" in target_node:
         raise ConfigResolutionError(f"{path}.dataloader_type", "renamed to sampler_type")
 
@@ -777,6 +791,8 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
     )
     # Dataset classes need path/split arguments supplied later by the indexed builder.
     data_options = dict(target_node.get("data_config", {}))
+    if "max_seq_len" not in data_options:
+        raise ConfigResolutionError(f"{path}.data_config.max_seq_len", "required; no default value")
     dataset_class = data_options.pop("low_level_dataset", None)
     if dataset_class is not None:
         target_node["data_config"] = data_options

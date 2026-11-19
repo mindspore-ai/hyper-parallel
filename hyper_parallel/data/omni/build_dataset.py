@@ -56,13 +56,15 @@ def build_online_omni_mapping_dataset(
         TypeError: If transform is not an OmniDataTransform.
         ValueError: If no Omni transform is configured.
     """
+
     if transform is None:
         raise ValueError("Online Omni Dataset requires a data_transform")
+
     if not isinstance(transform, OmniDataTransform):
         raise TypeError("Online Omni Dataset transform must be an OmniDataTransform")
 
     dataset_config = dict(data_config)
-    training_seed = getattr(training_config, "seed", None)
+    training_seed = training_config.seed if training_config is not None else None
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
 
     sample_filter = transform.is_valid_sample

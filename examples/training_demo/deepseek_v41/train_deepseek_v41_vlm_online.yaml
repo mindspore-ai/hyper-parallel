@@ -40,7 +40,8 @@ model:
 model_init_dtype: float32
 
 training:
-  train_iters: 100
+  epochs: 1
+  max_steps: 100
   train_samples: null
   eval_iters: 0
   # DP = 16 / (TP1 * CP4 * PP1) = 4; GBS8/micro1 accumulates two microbatches.
@@ -203,29 +204,23 @@ dataset:
   data_transform:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
     sample_format: image_caption  # pretrain: image_caption/interleaved; sft: messages/openai/hf/sharegpt.
-    max_seq_len: 4096
     sample_alignment_size: 1
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: /path/to/image_caption/train.jsonl
-  data_config: {}
+  data_config:
+    max_seq_len: 4096
 
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
   collate_fn:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
-    pad_to_length: 4096
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
     runtime_input_adapter:
       _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
   sampler_type: single
   # Pack whole samples within the fixed global token window.
-  token_budget: 4096
   min_buffered_samples: 20
-  drop_last: true
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 
 optimizer:
   _target_: hyper_parallel.components.optim.Sinkhorn

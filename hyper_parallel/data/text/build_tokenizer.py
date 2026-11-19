@@ -1,4 +1,5 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
 
 """Build the tokenizer used by the private LLM data stages."""
+
+from __future__ import annotations
 
 import json
 from collections import OrderedDict
@@ -196,8 +200,8 @@ class AutoTokenizer:
             force_hf: If True, build a wrapped Hugging Face tokenizer.
             trust_remote_code: Whether to trust remote code when loading config
             tokenizer_type: Use ``hf`` to load a Hugging Face tokenizer or ``pretokenized`` for metadata only.
-            vocab_size: Pretokenized-corpus vocabulary size.
-            eod_token_id: Pretokenized-corpus end-of-document token ID.
+            vocab_size: Pretokenized-corpus vocabulary size; required when tokenizer_type is pretokenized.
+            eod_token_id: Pretokenized-corpus end-of-document token ID; required when tokenizer_type is pretokenized.
             pad_token_id: Pretokenized-corpus padding token ID, when one exists.
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
 
@@ -206,9 +210,14 @@ class AutoTokenizer:
         """
         # ``force_default`` is retained for NeMo API compatibility; only the HF backend is supported.
         del force_default
+
         if tokenizer_type == "pretokenized":
             if pretrained_model_name_or_path is None:
                 raise ValueError("pretrained_model_name_or_path is required for a pretokenized Dataset")
+
+            if vocab_size is None or eod_token_id is None:
+                raise ValueError("tokenizer_type='pretokenized' requires both vocab_size and eod_token_id")
+
             tokenizer = _DatasetTokenizer(
                 pretrained_model_name_or_path,
                 vocab_size=vocab_size,
@@ -220,8 +229,10 @@ class AutoTokenizer:
         else:
             if vocab_size is not None or eod_token_id is not None or pad_token_id is not None:
                 raise ValueError("vocab_size, eod_token_id, and pad_token_id require tokenizer_type='pretokenized'")
+
             if pretrained_model_name_or_path is None:
                 raise ValueError("pretrained_model_name_or_path is required for a Hugging Face tokenizer")
+
             if tokenizer_type != "hf" and not force_hf:
                 raise ValueError("Only the Hugging Face tokenizer backend is currently supported")
 
