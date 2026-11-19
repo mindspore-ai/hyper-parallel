@@ -295,7 +295,6 @@ def _build_split_batch_sampler(
         data_rearrange_map=getattr(dataloader_target, "data_rearrange_map", None),
         sampler_type=getattr(dataloader_target, "sampler_type", "single"),
         data_sharding=getattr(dataloader_target, "data_sharding", False),
-        shuffle=getattr(dataloader_target, "shuffle", True),
         seed=seed,
     )
 
@@ -420,8 +419,8 @@ class FixedBatchDataLoader(StatefulDataLoader):
             prefetch_factor: int | None = None,
     ) -> None:
         """Initialize the stateful DataLoader."""
-        if sampler_type not in ("single", "cyclic", "distributed"):
-            raise ValueError("sampler_type must be 'single', 'cyclic', or 'distributed'")
+        if sampler_type not in ("single", "cyclic"):
+            raise ValueError("sampler_type must be 'single' or 'cyclic'")
 
         self.drop_last = drop_last
         self.sampler_type = sampler_type
