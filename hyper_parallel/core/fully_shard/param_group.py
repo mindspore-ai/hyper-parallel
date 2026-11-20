@@ -609,13 +609,19 @@ class HSDPParamGroup:
         grads_by_bucket = {}
         bucket_groups = {}
         for hsdp_param in self.hsdp_params:
-            # Never skip on ``grad is None``: sparse MoE experts not routed on
-            # this rank have no grad, and the set differs per DP rank.
-            # ``reduction_grad()`` substitutes exact zeros so the fused bucket
-            # layout is identical on every rank.
             if not hasattr(hsdp_param, "_unsharded_param") or not hsdp_param.sharded_param.requires_grad:
                 continue
-            unsharded_grad = hsdp_param.reduction_grad()
+            if hsdp_param.unsharded_accumulated_grad is not None:
+                unsharded_grad = hsdp_param.unsharded_accumulated_grad_data
+            elif hsdp_param.unsharded_param.grad is not None:
+                unsharded_grad = hsdp_param.unsharded_grad_data
+            elif hsdp_param.zero_grad_for_missing_params:
+                param = hsdp_param.unsharded_param
+                unsharded_grad = torch.zeros(
+                    param.shape, dtype=param.dtype, device=param.device
+                )
+            else:
+                continue
             shard_group = (
                 hsdp_param.mesh_info.shard_process_group
                 if isinstance(hsdp_param.mesh_info, FSDPMeshInfo)

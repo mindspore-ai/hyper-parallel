@@ -248,6 +248,12 @@ class HSDPSchedulerV2:
             raise ValueError(f"requires_grad_sync should be a bool, got {type(requires_grad_sync)}")
         self.hsdp_state.set_requires_grad_sync(requires_grad_sync)
 
+    def set_zero_grad_for_missing_params(self, enabled: bool) -> None:
+        """Set whether params without a grad reduce exact zeros."""
+        if not isinstance(enabled, bool):
+            raise ValueError(f"enabled should be a bool, got {type(enabled)}")
+        self.hsdp_state.set_zero_grad_for_missing_params(enabled)
+
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, args, kwargs):
         """Forward pre hook to unsharded parameter for forward process."""

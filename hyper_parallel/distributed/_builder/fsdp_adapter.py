@@ -872,6 +872,8 @@ class FSDP2Manager:
             dense_root_kwargs,
             ignored_params,
         )
+        if self.config.zero_grad_for_missing_params:
+            model.set_zero_grad_for_missing_params(True)
         self._log_gradient_scaling(gradient_scaled_units)
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
         self._configure_prefetch(

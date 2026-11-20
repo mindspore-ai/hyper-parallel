@@ -50,6 +50,9 @@ fsdp_config:
   enable_offload: true
   reshard_after_forward: true
   reshard_after_backward: true
+  # Zero-reduce params with no grad (sparse MoE routing) to keep collectives
+  # rank-invariant.
+  zero_grad_for_missing_params: true
 
 mixed_precision:
   enabled: false

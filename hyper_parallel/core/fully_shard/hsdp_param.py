@@ -198,6 +198,7 @@ class HSDPParamV2:
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
         self._init_sharded_param(param, shard_placement_fn)
         self.unsharded_accumulated_grad = None
+        self.zero_grad_for_missing_params = False
         self._param_fqn: Optional[str] = None
         self.unsharded_param_buffers: List[torch.Tensor] = []
         self.allgather_comm_ctx = AllGatherCommCtx()
@@ -889,28 +890,6 @@ class HSDPParamV2:
         """
         return self.unsharded_accumulated_grad
 
-    def reduction_grad(self) -> torch.Tensor:
-        """Return the gradient to feed into the FSDP reduction, never ``None``.
-
-        Sparse / conditionally-executed MoE layers (e.g. HF Qwen3-Omni experts)
-        only execute the experts that received tokens, so every *other* expert
-        has ``grad=None`` after backward. DP ranks see different samples and
-        therefore miss *different* experts, so the set of ``None``-grad params
-        is not rank-invariant. Reducing only the non-``None`` grads would give
-        each rank a different collective shape, which HCCL AllReduce /
-        ReduceScatter reject (EI0005 / dispatch timeout). An unused expert's
-        true gradient is exactly zero, so substitute a zero tensor of the
-        unsharded shape: every rank then reduces the same parameter set with
-        identical sizes, and the result is still exact.
-        """
-        if self.unsharded_accumulated_grad is not None:
-            return self.unsharded_accumulated_grad_data
-        grad = self.unsharded_grad_data
-        if grad is None:
-            param = self.unsharded_param
-            grad = torch.zeros(param.shape, dtype=param.dtype, device=param.device)
-        return grad
-
     def _assert_in_states(self, *states: ShardedState) -> None:
         """Assert current state is one of expected states."""
         if self.sharded_state not in states:
@@ -1171,12 +1150,20 @@ class HSDPParamV2:
                           The buffer must have ``padded_sharded_param_size.numel()`` elements
                           and the reduction dtype.
         """
-        grad = self.reduction_grad()
         if self.unsharded_accumulated_grad is not None:
+            self._grad = self.unsharded_accumulated_grad_data
             self.unsharded_accumulated_grad = None
-        else:
+        elif self.unsharded_param.grad is not None:
+            self._grad = self.unsharded_grad_data
             self.unsharded_param.grad = None
-        self._grad = grad.to(self.reduce_comm_dtype(grad))
+        elif self.zero_grad_for_missing_params:
+            param = self.unsharded_param
+            self._grad = torch.zeros(
+                param.shape, dtype=param.dtype, device=param.device
+            )
+        else:
+            return
+        self._grad = self._grad.to(self.reduce_comm_dtype(self._grad))
         shard_dim = self.hsdp_placement.dim
         if self.shard_world_size <= 1:
             self._grad = self._grad.view(-1)
