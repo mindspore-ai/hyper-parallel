@@ -89,7 +89,8 @@ def _expression(value: Any, imports: set[str]) -> str:
                     expression = expression.replace("self.", function.args.args[0].arg + ".", 1)
                 expressions[key] = expression
             function = _MethodNames(expressions).visit(function)
-            function.name = "_native_" + name.replace(".<locals>.", "_").replace(".", "_")
+            local_name = name.replace(".<locals>.", "_").replace(".", "_")
+            function.name = f"_native_{module.replace('.', '_')}_{local_name}"
             function.returns = None
             for argument in ast.walk(function.args):
                 if isinstance(argument, ast.arg):
@@ -99,7 +100,9 @@ def _expression(value: Any, imports: set[str]) -> str:
         lambdas = [node for node in ast.walk(tree) if isinstance(node, ast.Lambda)]
         if len(lambdas) == 1 and not inspect.getclosurevars(value).nonlocals:
             return ast.unparse(lambdas[0])
-    raise ValueError(f"Codegen cannot express native method state {type(value).__name__}: {getattr(value, '__qualname__', '')}")
+    raise ValueError(
+        f"Codegen cannot express native method state {type(value).__name__}: {getattr(value, '__qualname__', '')}"
+    )
 
 
 def _method_source(function: Any, name: str, imports: set[str]) -> str:
