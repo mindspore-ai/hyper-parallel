@@ -13,10 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """test ut for parallel transpose infer layout"""
-import os
 import unittest
 from unittest.mock import MagicMock, patch
-import numpy as np
 
 # pylint: disable=wrong-import-position
 
@@ -446,29 +444,10 @@ class TestParallelTransposeExtView(unittest.TestCase):
             f"got {ext_view_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_transpose_ext_view_basic_swap_3d_1(self, mock_platform):
-        """
-        Feature: Basic swap.
-        Description: swap dim0=0 and dim1=2 on 3D tensor map.
-        Expectation: tensor_map dims swapped.
-        """
-        mesh = self._make_2x2x2_mesh(mock_platform)
-        x_layout = _build_layout(mesh, (Shard(0), Shard(1), Shard(2)), 3)
-
-        self._run_scenario(x_layout, expected_map=(0, 1, 2), extra_args=(0, 2))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_transpose_ext_view_negative_dims_2(self, mock_platform):
-        """
-        Feature: Negative dims.
-        Description: swap dim0=-1 and dim1=-3 on 3D tensor map.
-        Expectation: normalized dims swapped.
-        """
-        mesh = self._make_2x2x2_mesh(mock_platform)
-        x_layout = _build_layout(mesh, (Shard(0), Shard(1), Shard(2)), 3)
-
-        self._run_scenario(x_layout, expected_map=(0, 1, 2), extra_args=(-1, -3))
+    # Note: "TransposeExtView" shares the dim-based branch with "transpose" in
+    # TransposeDistributedOp, so basic swap / negative dims are already covered
+    # by test_torch_transpose_basic / test_torch_transpose_negative_indices
+    # above. Only the error-handling scenarios unique to this suite remain.
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_ext_view_noop_same_dims_3(self, mock_platform):
@@ -544,4 +523,3 @@ class TestParallelTransposeExtView(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

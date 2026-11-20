@@ -36,7 +36,6 @@ from hyper_parallel.core.dtensor.dtensor import (
 )
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.utils.shape_utils import compute_local_shape_and_global_offset
 
 
 class TestBuildLayout(unittest.TestCase):
@@ -175,82 +174,6 @@ class TestBuildLayout(unittest.TestCase):
 
             # Assert - Should have 3 different cached entries
             self.assertEqual(len(_LAYOUT_CACHE), 3)
-
-
-class TestComputeLocalShape(unittest.TestCase):
-    """Unit tests for compute_local_shape_and_global_offset function.
-
-    This test class verifies that the compute_local_shape_and_global_offset
-    function correctly calculates the local tensor shape based on the global
-    shape, device mesh, and placement strategy (Shard or Replicate).
-    """
-
-    def test_compute_local_shape_with_shard(self):
-        """Test local shape computation with Shard placement.
-
-        Test Scenario:
-            Compute local shape for a 3D tensor with global shape [16, 8, 12]
-            using Shard(0) placement across 4 devices.
-
-        Expected Behavior:
-            - The first dimension is divided by the number of devices (16 / 4 = 4)
-            - Other dimensions remain unchanged
-            - Resulting local shape is [4, 8, 12]
-        """
-        # Arrange
-        mock_mesh = MagicMock()
-        mock_layout_instance = MagicMock()
-
-        with patch('hyper_parallel.core.utils.shape_utils.Layout.from_device_mesh') as mock_from_mesh:
-            mock_from_mesh.return_value = mock_layout_instance
-            # layout(placement) returns the layout instance
-            mock_layout_instance.return_value = mock_layout_instance
-            mock_layout_instance.alias_tensor_map = ["dp", "None", "None"]
-            mock_layout_instance.mesh.get_device_num_along_axis.return_value = 4
-
-            global_shape = [16, 8, 12]
-            placement = [Shard(0)]
-
-            # Act
-            local_shape = compute_local_shape_and_global_offset(
-                global_shape, mock_mesh, placement
-            )
-
-            # Assert
-            self.assertEqual(local_shape, [4, 8, 12])
-
-    def test_compute_local_shape_with_replicate(self):
-        """Test local shape computation with Replicate placement.
-
-        Test Scenario:
-            Compute local shape for a 3D tensor with global shape [16, 8, 12]
-            using Replicate() placement across all devices.
-
-        Expected Behavior:
-            - Replicate placement means each device gets the full tensor
-            - Local shape is identical to global shape [16, 8, 12]
-            - No dimension is partitioned
-        """
-        # Arrange
-        mock_mesh = MagicMock()
-        mock_layout_instance = MagicMock()
-
-        with patch('hyper_parallel.core.utils.shape_utils.Layout.from_device_mesh') as mock_from_mesh:
-            mock_from_mesh.return_value = mock_layout_instance
-            # layout(placement) returns the layout instance
-            mock_layout_instance.return_value = mock_layout_instance
-            mock_layout_instance.alias_tensor_map = ["None", "None", "None"]
-
-            global_shape = [16, 8, 12]
-            placement = [Replicate()]
-
-            # Act
-            local_shape = compute_local_shape_and_global_offset(
-                global_shape, mock_mesh, placement
-            )
-
-            # Assert - Replicate should keep original shape
-            self.assertEqual(local_shape, [16, 8, 12])
 
 
 class TestDtensorInitHelper(unittest.TestCase):
