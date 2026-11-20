@@ -25,7 +25,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ====================================================================="""Training-capable DeepSeek-V4.1 model implementation.
+# ============================================================================
+"""Training-capable DeepSeek-V4.1 model implementation.
 
 The public V4.1 repository contains an inference-only implementation. This
 module reuses the Transformers 5.13 DeepSeek-V4 building blocks for the
