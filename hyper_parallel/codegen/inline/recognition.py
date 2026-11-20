@@ -39,6 +39,8 @@ import sys
 import textwrap
 from typing import Any
 
+from hyper_parallel.distributed.recipe_spec import WRAPPER_CONTEXT
+
 
 @dataclass(frozen=True)
 class ReplacementArgument:
@@ -211,7 +213,9 @@ def _factory_arguments(
     return tuple(arguments)
 
 
-def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
+def inner_wrapper_target(
+    factory_path: str | None, *, construction_kwargs: tuple[str, ...] = (),
+) -> InnerWrapperTarget | None:
     """Recover an inner wrapper's emitted helper contract from its source."""
     if not factory_path:
         return None
@@ -245,7 +249,122 @@ def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
         helper_module=module_name,
         helper_name=helper_name,
         state_attr=_cp_mesh_companion_attr(tree),
+        inline_body=_helper_keyword_body(
+            request_owner, replacement_name, _module_function(tree, helper_name),
+            _wrapper_literals(factory_node, construction_kwargs),
+        ),
     )
+
+
+def _single_helper_delegate(
+    tree: ast.AST, replacement_name: str, helper_name: str,
+) -> tuple[ast.FunctionDef, ast.Call | None]:
+    """Identify a pure return call without discarding surrounding control flow."""
+    forward = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == replacement_name)
+    body = forward.body
+    if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return forward, None
+    call = body[0].value
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id == helper_name and any(item.arg is not None for item in call.keywords)):
+        return forward, None
+    return forward, call
+
+
+def _positional_contract(args: ast.arguments, excluded: set[str]) -> tuple[tuple[str, bool, str | None], ...]:
+    """Compare names, positional-only constraints and default expressions."""
+    parameters = (*args.posonlyargs, *args.args)
+    defaults = [None] * (len(parameters) - len(args.defaults)) + list(args.defaults)
+    return tuple((item.arg, index < len(args.posonlyargs), ast.dump(value) if value is not None else None)
+                 for index, (item, value) in enumerate(zip(parameters, defaults)) if item.arg not in excluded)
+
+
+def _keyword_names(call: ast.Call) -> set[str]:
+    """Collect symbols referenced by explicitly supplied helper keywords."""
+    return {node.id for item in call.keywords if item.arg is not None
+            for node in ast.walk(item.value) if isinstance(node, ast.Name)}
+
+
+def _forwards_parameters(args: ast.arguments, call: ast.Call) -> bool:
+    """Ensure the token can replace the native delegate's argument forwarding."""
+    names = [item.arg for item in (*args.posonlyargs, *args.args)]
+    if [ast.unparse(item) for item in call.args[1:]] != names:
+        return False
+    kwargs = [ast.unparse(item.value) for item in call.keywords if item.arg is None]
+    if kwargs != ([args.kwarg.arg] if args.kwarg else []):
+        return False
+    return not set(names).intersection(_keyword_names(call))
+
+
+def _helper_signature_matches(forward: ast.FunctionDef, helper: ast.FunctionDef, call: ast.Call) -> bool:
+    """Reject signature adaptation rather than changing positional/default behavior."""
+    if forward.args.vararg or forward.args.kwonlyargs:
+        return False
+    parameters = (*helper.args.posonlyargs, *helper.args.args)
+    if not parameters:
+        return False
+    excluded = {item.arg for item in call.keywords if item.arg is not None} | {parameters[0].arg}
+    if _positional_contract(forward.args, set()) != _positional_contract(helper.args, excluded):
+        return False
+    return _forwards_parameters(forward.args, call)
+
+
+def _original_forward_target(tree: ast.AST) -> str | None:
+    """Find the owner whose original forward the wrapper saves."""
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "forward" and isinstance(node.value.value, ast.Name)):
+            return node.value.value.id
+    return None
+
+
+def _wrapper_literals(factory: ast.FunctionDef, construction_kwargs: tuple[str, ...]) -> dict[str, Any]:
+    """Read only literal native defaults and recorded overrides, never runtime resources."""
+    parameters = (*factory.args.posonlyargs, *factory.args.args)
+    values = {}
+    for parameter, value in zip(parameters[len(parameters) - len(factory.args.defaults):], factory.args.defaults):
+        if parameter.arg in WRAPPER_CONTEXT:
+            continue
+        try:
+            values[parameter.arg] = ast.literal_eval(value)
+        except (ValueError, TypeError):
+            continue
+    for argument in construction_kwargs:
+        name, text = argument.split("=", 1)
+        if name in WRAPPER_CONTEXT:
+            raise ValueError(f"codegen: native runtime argument {name!r} cannot be frozen as configuration")
+        values[name] = ast.literal_eval(text)
+    return values
+
+
+def _helper_keyword_body(
+    tree: ast.AST, replacement_name: str, helper: ast.FunctionDef, literals: dict[str, Any],
+) -> str | None:
+    """Keep explicit keywords only when native argument forwarding is preserved."""
+    forward, call = _single_helper_delegate(tree, replacement_name, helper.name)
+    if call is None:
+        return None
+    if not _helper_signature_matches(forward, helper, call):
+        raise RuntimeError(f"codegen: helper delegate {replacement_name!r} is not an argument passthrough")
+    target = _original_forward_target(tree)
+    if target is None:
+        raise RuntimeError(
+            f"codegen: cannot preserve helper arguments for {replacement_name!r} without its target binding"
+        )
+    if not call.args or not isinstance(call.args[0], ast.Name) or call.args[0].id != target:
+        raise RuntimeError(f"codegen: helper delegate {replacement_name!r} has a different target")
+    lowered = ast.parse(_nested_forward_body(tree, replacement_name, target_name=target, literals=literals))
+    for item in ast.walk(lowered):
+        if isinstance(item, ast.Call) and isinstance(item.func, ast.Name) and item.func.id == helper.name:
+            names = _keyword_names(item)
+            if names - {"self"}:
+                raise RuntimeError(f"codegen: helper delegate has unresolved keyword names {sorted(names - {'self'})}")
+            item.args = [ast.Name(id="self", ctx=ast.Load()), ast.Name(id="__hp_forward_args__", ctx=ast.Load())]
+            item.keywords = [keyword for keyword in item.keywords if keyword.arg is not None]
+    return ast.unparse(ast.fix_missing_locations(lowered))
 
 
 def _module_function(tree: ast.Module, name: str) -> ast.AST | None:
@@ -425,7 +544,10 @@ def _captured_forward_names(tree: ast.AST, name: str) -> set[str]:
     return set()
 
 
-def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | None:
+def _nested_forward_body(
+    tree: ast.AST, replacement_name: str | None, *, target_name: str | None = None,
+    literals: dict[str, Any] | None = None,
+) -> str | None:
     """Lower a closure-backed rewrite into an imported-host dispatch body.
 
     A custom wrapper may build its replacement forward as a nested closure
@@ -459,6 +581,10 @@ def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | N
 
         def visit_Name(self, node: ast.Name) -> ast.AST:  # pylint: disable=invalid-name
             """Rewrite a referenced symbol into its resolved source form."""
+            if node.id == target_name:
+                return ast.copy_location(ast.Name(id="self", ctx=node.ctx), node)
+            if literals is not None and node.id in captured and node.id in literals:
+                return ast.copy_location(ast.parse(repr(literals[node.id]), mode="eval").body, node)
             attr = companion_attrs.get(node.id)
             if attr is None:
                 return node

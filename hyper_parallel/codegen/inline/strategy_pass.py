@@ -80,13 +80,14 @@ def build_strategy_patches(
     patch_set = InlinePatchSet()
     emitted: dict[tuple[str, str], str] = {}
     imported: set[tuple[str, bool]] = set()
-    subclassed: set[str] = set()
+    subclassed: dict[str, str] = {}
     for rule in rules:
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
             if target is None:
                 continue
             inner_wrapper = target == rule.inner_wrapper_target
-            spec = strategy_spec(target, model_type, inner_wrapper=inner_wrapper)
+            spec = strategy_spec(target, model_type, inner_wrapper=inner_wrapper,
+                                 construction_kwargs=rule.construction_kwargs if inner_wrapper else ())
             if spec is None:
                 continue
             if (target, inner_wrapper) not in imported:
@@ -143,7 +144,7 @@ def _materialize_cp_forward(
     target: str,
     model_type: str | None,
     boundary_classes: Mapping[str, str] | None,
-    subclassed: set[str],
+    subclassed: dict[str, str],
 ) -> None:
     """Materialize CP dispatch in the original host class exactly once."""
     host_classes = rule_block_classes(rule, boundary_classes)
@@ -157,8 +158,10 @@ def _materialize_cp_forward(
         )
     for host_class in sorted(host_classes):
         if host_class in subclassed:
+            if subclassed[host_class] != spec.subclass_shell:
+                raise RuntimeError(f"codegen: conflicting CP bindings for source class {host_class!r}")
             continue
-        subclassed.add(host_class)
+        subclassed[host_class] = spec.subclass_shell
         patch_set.forward_extracts.append(
             ForwardExtractPatch(
                 class_name=host_class,

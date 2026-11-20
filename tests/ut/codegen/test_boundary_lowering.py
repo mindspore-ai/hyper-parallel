@@ -33,6 +33,8 @@ the identical byte string.
 from __future__ import annotations
 
 import ast
+from importlib import util
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -121,6 +123,155 @@ def test_unbound_executor_closure_is_rejected_before_source_emission(factory):
     """Native closure ownership must not be changed to make unresolved code emit."""
     with pytest.raises(RuntimeError, match="unresolved captured state.*executor"):
         inner_wrapper_target(factory)
+
+
+@pytest.mark.parametrize("override", [None, False, True])
+@pytest.mark.parametrize("imported", [False, True])
+def test_helper_delegate_preserves_bound_keyword_and_original_fallback(monkeypatch, tmp_path, override, imported):
+    """A single helper call retains the native target, override and user kwargs."""
+    wrapper_source = '''
+def kernel(module, value, *, enabled=None, **kwargs):
+    return value
+
+def wrapper(target_module, enabled=None):
+    original_forward = target_module.forward
+    def cp_forward(value, **kwargs):
+        return kernel(target_module, value, enabled=enabled, **kwargs)
+    return _ForwardRewriteRequest(target_module, cp_forward,
+                                  companion_attrs={"parallel_enabled": enabled})
+'''
+    monkeypatch.setattr("hyper_parallel.codegen.inline.recognition._module_source_tree",
+                        lambda _: ast.parse(wrapper_source))
+    spec = _cp_strategy_spec("demo.wrapper", construction_kwargs=(f"enabled={override!r}",))
+    assert spec.imports[0] == ImportPatch("demo", ("kernel",))
+    source = '''
+class Attention:
+    cp_enable = True
+    def forward(self, value, **kwargs):
+        return value + 1
+'''
+    patches = InlinePatchSet(forward_extracts=[
+        ForwardExtractPatch("Attention", "forward", spec.subclass_shell),
+    ])
+    helper_source = '''
+calls = []
+def kernel(module, value, *, enabled=None, **kwargs):
+    calls.append((module, enabled, kwargs))
+    return value * 2 if enabled else value
+'''
+    def _load(name, text):
+        path = tmp_path / f"{name}.py"
+        path.write_text(text, encoding="utf-8")
+        module_spec = util.spec_from_file_location(name, path)
+        module = util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        return module
+
+    if imported:
+        base = _load("helper_base", helper_source + source)
+        monkeypatch.setitem(sys.modules, "demo", base)
+        patches.imports.append(ImportPatch("demo", ("Attention", "kernel")))
+        _materialize_imported_forward_hosts("", patches)
+        module = _load("helper_delegate", apply_patch_set("", patches))
+        calls = base.calls
+    else:
+        module = _load("helper_delegate", helper_source + apply_patch_set(source, patches))
+        calls = module.calls
+    attention = module.Attention()
+    attention.cp_enable = True
+    assert attention.forward(3, token=7) == (6 if override else 3)
+    assert calls == [(attention, override, {"token": 7})]
+    attention.cp_enable = False
+    calls.clear()
+    assert attention.forward(3, token=7) == 4
+    assert calls == []
+
+
+@pytest.mark.parametrize("override", [None, False, True])
+def test_dsa_helper_keeps_dense_stage_override(override):
+    """The source helper call must retain the model's explicit stage override."""
+    target = (
+        "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel."
+        "deepseek_v32_dsa_attention_cp_wrapper"
+    )
+    spec = _cp_strategy_spec(target, construction_kwargs=(f"dense_warmup={override!r}",))
+    assert f"use_dense={override!r}" in spec.subclass_shell
+    assert "target_module" not in spec.subclass_shell
+    assert spec.imports[0].names == ("_deepseek_v32_dsa_cp_forward",)
+
+
+def test_wrapper_override_survives_observation_and_strategy_cache():
+    """Different instances must not reuse another wrapper configuration's source."""
+    target = (
+        "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel."
+        "deepseek_v32_dsa_attention_cp_wrapper"
+    )
+    bodies = []
+    rules = []
+    for override in (True, False, None):
+        meta = SimpleNamespace(injections=[{
+            "match": "model.attn", "inner_wrapper": {"_target_": target, "dense_warmup": override},
+        }])
+        observations = collect_source_observations(meta)
+        assert len(observations) == 1
+        rule = observations[0]
+        assert rule.construction_kwargs == (f"dense_warmup={override!r}",)
+        patches = build_strategy_patches((rule,), boundary_classes={"model.attn": "Attention"})
+        body = patches.forward_extracts[0].body
+        assert f"use_dense={override!r}" in body
+        bodies.append(body)
+        rules.append(rule)
+    assert len(set(bodies)) == 3
+    with pytest.raises(RuntimeError, match="conflicting CP bindings"):
+        build_strategy_patches(tuple(rules), boundary_classes={"model.attn": "Attention"})
+
+
+@pytest.mark.parametrize(("helper_args", "forward_args", "call_args"), [
+    ("module, value=1", "value=2", "target_module, value"),
+    ("module, first, second", "first, second", "target_module, second, first"),
+    ("module, value", "value", "target_module, value + 1"),
+])
+def test_helper_token_rejects_argument_adaptation(monkeypatch, helper_args, forward_args, call_args):
+    """Default changes, reordering and transformed values cannot use passthrough lowering."""
+    source = f'''
+def kernel({helper_args}, *, enabled=None, **kwargs):
+    return None
+
+def wrapper(target_module, enabled=None):
+    original_forward = target_module.forward
+    def cp_forward({forward_args}, **kwargs):
+        return kernel({call_args}, enabled=enabled, **kwargs)
+    return _ForwardRewriteRequest(target_module, cp_forward, companion_attrs={{"enabled": enabled}})
+'''
+    monkeypatch.setattr("hyper_parallel.codegen.inline.recognition._module_source_tree", lambda _: ast.parse(source))
+    with pytest.raises(RuntimeError, match="not an argument passthrough"):
+        _cp_strategy_spec("demo.wrapper")
+
+
+def test_unbound_helper_mesh_keyword_is_not_silently_dropped():
+    """A required helper mesh must resolve before source emission can proceed."""
+    with pytest.raises(RuntimeError, match="unresolved captured state.*cp_mesh"):
+        _cp_strategy_spec(
+            "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.context_parallel."
+            "qwen3_vl_moe_async_ulysses_cp_wrapper"
+        )
+
+
+def test_helper_keyword_does_not_leak_factory_module_globals(monkeypatch):
+    """An imported helper does not import the globals used to build its arguments."""
+    source = '''
+ENABLED = True
+def kernel(module, value, *, enabled=None, **kwargs):
+    return value
+def wrapper(target_module):
+    original_forward = target_module.forward
+    def cp_forward(value, **kwargs):
+        return kernel(target_module, value, enabled=ENABLED, **kwargs)
+    return _ForwardRewriteRequest(target_module, cp_forward)
+'''
+    monkeypatch.setattr("hyper_parallel.codegen.inline.recognition._module_source_tree", lambda _: ast.parse(source))
+    with pytest.raises(RuntimeError, match="unresolved keyword names.*ENABLED"):
+        _cp_strategy_spec("demo.wrapper")
 
 
 def test_framework_inner_wrapper_resolves_without_model_adapter_path():

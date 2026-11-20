@@ -382,7 +382,8 @@ def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = No
             if target is None:
                 continue
             if strategy_spec(
-                target, model_type, inner_wrapper=target == rule.inner_wrapper_target
+                target, model_type, inner_wrapper=target == rule.inner_wrapper_target,
+                construction_kwargs=rule.construction_kwargs if target == rule.inner_wrapper_target else (),
             ) is not None:
                 continue
             # An inner_wrapper target has no runtime channel and stays
