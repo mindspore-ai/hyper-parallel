@@ -45,6 +45,12 @@ from hyper_parallel.codegen.emit.family_forwards import (
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_plan
+from hyper_parallel.codegen.inline.construction import (
+    construction_sites,
+    layer_selector,
+    materialize_module_constructions,
+    replacement_constructor,
+)
 
 # ---------------------------------------------------------------------------
 # source copy
@@ -349,7 +355,7 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     )
     text = materialize_parallel_family_forwards(text, getattr(meta, "parallel_forwards", {}))
     text = _lower_forward_boundaries(text, emission_meta, module_name)
-    text = _emit_module_constructors(text, getattr(meta, "preinstalled_components", ()))
+    text = materialize_module_constructions(text, getattr(meta, "preinstalled_components", ()))
     _verify_recorded_patch_materialization(
         text, emission_meta, patch_plan=patch_plan
     )
@@ -508,19 +514,59 @@ def _verify_local_records(
 
 def _verify_replacement_records(tree: ast.AST, records: Any, prepared: Any, materialized: Any) -> list[str]:
     """Require a source constructor matching each captured replacement path."""
-    expected_by_path = {
-        item["primary_fqn"]: _constructor_symbol(item).rsplit(":", 1)[-1].rsplit(".", 1)[-1]
-        for item in prepared
-    }
-    emitted = _module_constructor_calls(tree)
+    prepared_by_path = {item["primary_fqn"]: item for item in prepared}
     missing = []
     for record in records:
-        expected = expected_by_path.get(record.module_fqn)
-        if not expected or emitted.get(record.module_fqn) != expected:
+        item = prepared_by_path.get(record.module_fqn)
+        expected = replacement_constructor(item).rsplit(":", 1)[-1] if item and item.get("replacement_type") else None
+        valid = bool(item) and _has_source_constructor(tree, item, expected)
+        if not valid:
             missing.append(f"{record.module_fqn} (missing executable constructor {expected!r})")
         else:
             _record_materialized(materialized, record.module_fqn, expected, "module_replacement", "constructor")
     return missing
+
+
+def _has_source_constructor(tree: ast.AST, record: dict, expected: str) -> bool:
+    """Check actual attribute initialization instead of detached helper declarations."""
+    classes = _class_index(tree)
+    try:
+        sites = construction_sites(ast.unparse(tree), record)
+    except ValueError:
+        return False
+    for site in sites:
+        host = classes.get(site["owner"].split(":")[-1])
+        if host is None:
+            return False
+        values = []
+        for method in host.body:
+            if not isinstance(method, ast.FunctionDef) or method.name != "__init__":
+                continue
+            for node in ast.walk(method):
+                targets = node.targets if isinstance(node, ast.Assign) else (
+                    [node.target] if isinstance(node, ast.AnnAssign) else []
+                )
+                if any(isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                       and target.value.id == "self" and target.attr == site["attribute"] for target in targets):
+                    values.append(node.value)
+        if len(values) != 1:
+            return False
+        value = values[0]
+        if isinstance(value, ast.IfExp):
+            try:
+                selector = layer_selector(ast.unparse(tree), host.name)
+                index = int(record["primary_fqn"].rpartition(".")[0].rsplit(".", 1)[-1])
+                while isinstance(value, ast.IfExp):
+                    test = value.test
+                    if not (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                            and test.left.id == selector and len(test.ops) == 1 and isinstance(test.ops[0], ast.In)):
+                        return False
+                    value = value.body if index in ast.literal_eval(test.comparators[0]) else value.orelse
+            except (ValueError, TypeError):
+                return False
+        if not isinstance(value, ast.Call) or _call_name(value.func) != expected:
+            return False
+    return True
 
 
 def _module_constructor_calls(tree: ast.Module) -> dict[str, str]:

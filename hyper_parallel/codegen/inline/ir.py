@@ -55,6 +55,16 @@ class ForwardExtractPatch:
     merge_original_body: bool = False
 
 
+@dataclass(frozen=True)
+class ConstructorPatch:
+    """Replace a source constructor expression at one owning attribute."""
+
+    owner_class: str
+    attribute: str
+    source_class: str
+    expression: str
+
+
 @dataclass
 class InlinePatchSet:
     """All edits emitted by one inline pass."""
@@ -62,6 +72,7 @@ class InlinePatchSet:
     imports: list[ImportPatch] = field(default_factory=list)
     module_snippets: list[ModuleSnippetPatch] = field(default_factory=list)
     forward_extracts: list[ForwardExtractPatch] = field(default_factory=list)
+    constructors: list[ConstructorPatch] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

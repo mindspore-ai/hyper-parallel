@@ -19,11 +19,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from copy import deepcopy
 
 from torch import nn
 
 from hyper_parallel.codegen.emit.context import EmissionContext
 from hyper_parallel.codegen.emit.modeling import emit_modeling_file, _verify_recorded_patch_materialization
+from hyper_parallel.codegen.inline.construction import materialize_module_constructions
 
 
 class SourceBlock(nn.Module):
@@ -111,3 +113,70 @@ class TestConstructorMaterialization(unittest.TestCase):
         meta = SimpleNamespace(preinstalled_components=[_replacement_record()])
         with self.assertRaisesRegex(RuntimeError, "block"):
             _verify_recorded_patch_materialization(source, meta, patch_plan=_patch_plan())
+
+    def test_edit_does_not_replace_an_unselected_attribute_of_the_same_type(self):
+        """Matching a source type alone must not change unrelated children."""
+        source = (
+            f"from {__name__} import SourceBlock\n"
+            "class FutureModel:\n"
+            "    def __init__(self):\n"
+            "        self.block = SourceBlock()\n"
+            "        self.untouched = SourceBlock()\n"
+        )
+        rendered = materialize_module_constructions(source, [_replacement_record()])
+        namespace = {}
+        exec(rendered, namespace)
+        model = namespace["FutureModel"]()
+        self.assertIsInstance(model.block, FinalBlock)
+        self.assertIsInstance(model.untouched, SourceBlock)
+
+    def test_partial_layers_fail_instead_of_silently_replacing_every_layer(self):
+        """A shared class body cannot claim coverage for an unselected instance."""
+        source = (
+            f"from {__name__} import SourceBlock\n"
+            "class FutureLayer:\n"
+            "    def __init__(self):\n"
+            "        self.block = SourceBlock()\n"
+        )
+        record = _replacement_record()
+        record.update(primary_fqn="layers.0.block", module_fqns=["layers.0.block"], construction_sites=[{
+            "owner": "FutureLayer", "attribute": "block", "instances": ["layers.0", "layers.1"],
+        }])
+        with self.assertRaisesRegex(ValueError, "partial construction.*FutureLayer"):
+            materialize_module_constructions(source, [record])
+
+    def test_all_layers_with_the_same_selection_share_one_source_edit(self):
+        """Repeated observations must produce one class edit, not duplicate wrappers."""
+        source = (
+            f"from {__name__} import SourceBlock\n"
+            "class FutureLayer:\n"
+            "    def __init__(self):\n"
+            "        self.block = SourceBlock()\n"
+        )
+        records = []
+        for index in range(2):
+            record = deepcopy(_replacement_record())
+            path = f"layers.{index}.block"
+            record.update(primary_fqn=path, module_fqns=[path], construction_sites=[{
+                "owner": "FutureLayer", "attribute": "block", "instances": ["layers.0", "layers.1"],
+            }])
+            records.append(record)
+        rendered = materialize_module_constructions(source, records)
+        namespace = {}
+        exec(rendered, namespace)
+        self.assertIsInstance(namespace["FutureLayer"]().block, FinalBlock)
+        self.assertEqual(rendered.count("self.block = FinalBlock("), 1)
+
+    def test_ambiguous_assignment_is_rejected(self):
+        """Conditional construction needs explicit source coverage rather than guessing."""
+        source = (
+            f"from {__name__} import SourceBlock\n"
+            "class FutureModel:\n"
+            "    def __init__(self, condition):\n"
+            "        if condition:\n"
+            "            self.block = SourceBlock()\n"
+            "        else:\n"
+            "            self.block = SourceBlock()\n"
+        )
+        with self.assertRaisesRegex(ValueError, "expected one.*constructor, found 2"):
+            materialize_module_constructions(source, [_replacement_record()])

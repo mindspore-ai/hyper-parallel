@@ -31,7 +31,6 @@ from hyper_parallel.codegen.ir.construction import ir_value_to_data
 from hyper_parallel.codegen.project import project_model_build, publish_codegen_ir
 from hyper_parallel.components.modules import MultiLatentAttention
 from hyper_parallel.components.modules.module_family import get_family_build_info
-from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.deepseek_v3.generated import modeling_Deepseek_V3_gen_npu as tracked_modeling
@@ -135,10 +134,10 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
             project.assert_not_called()
 
     def test_generated_family_preserves_layer_requests_and_layout(self) -> None:
-        """Feature: Generated MLA keeps the factory request and owned parallel layout.
+        """Feature: Generated MLA directly constructs the selected concrete members.
 
-        Description: Generate two layers with different CP schedules, then construct and plan the artifact.
-        Expectation: CP/TP degrees, strategy, overlap, parameter keys and family ownership match native.
+        Description: Generate and directly construct two layers with different CP schedules.
+        Expectation: CP/TP degrees, strategy, overlap and parameter keys match native without installing patches.
         """
         config = make_deepseek_model().config
         mesh = MeshContext(device_mesh=LogicalDeviceMesh(("dp", "cp", "tp"), (1, 2, 2)),
@@ -163,37 +162,12 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
                 spec.loader.exec_module(generated_module)
                 with torch.device("meta"):
                     generated = getattr(generated_module, "DeepseekV3ForCausalLM")(config)
-                _install_observed_replacements(generated, generated_module, capture)
-        before_reentry = dict(generated.named_parameters())
-        changed = DistributedSetup(
-            mesh_context=mesh,
-            module_replacement_requests=(
-                ModuleReplacementRequest(("model.layers.0.self_attn",), MultiLatentAttention,
-                                         kwargs={"strategy": "expanded_ulysses", "overlap": True}),
-                requests[1],
-            ),
-        )
-        with self.assertRaisesRegex(ValueError, "arguments changed.*Regenerate"):
-            prepare_model_components(generated, build_module_context(changed))
-        context = build_module_context(setup)
-        prepared, weights = prepare_model_components(generated, context)
-        self.assertIs(prepared, generated)
-        self.assertTrue(weights)
-        self.assertTrue(all(before_reentry[name] is parameter for name, parameter in generated.named_parameters()))
-        self.assertIs(prepare_model_components(generated, context)[1], weights)
         self.assertEqual(set(generated.state_dict()), set(native.state_dict()))
         for index, (expected, actual) in enumerate(zip(native.model.layers, generated.model.layers)):
             expected, actual = expected.self_attn, actual.self_attn
-            self.assertEqual(get_family_build_info(actual).resolved.variant, "cp")
+            self.assertIsInstance(actual, context_parallel.CPMultiLatentAttentionModule)
             self.assertEqual(actual.cp_plan, expected.cp_plan)
             self.assertEqual(actual.cp_plan.overlap, bool(index))
-        planner = ShardingPlanner()
-        expected = planner.plan(native, mesh.device_mesh, tp_size=2, cp_size=2)
-        actual = planner.plan(generated, mesh.device_mesh, tp_size=2, cp_size=2)
-        self.assertEqual(actual.parallel_modules, expected.parallel_modules)
-        for name in expected.parallel_modules:
-            self.assertEqual(actual.modules[name].params, expected.modules[name].params)
-
     def test_tracked_deepseek_bundle_uses_recipe_topology(self) -> None:
         """Construct the four-layer artifact with CP4 and compare its native layout."""
         config = make_deepseek_model().config

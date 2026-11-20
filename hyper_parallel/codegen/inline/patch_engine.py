@@ -21,6 +21,7 @@ from hyper_parallel.codegen.astkit.index import build_source_index
 from hyper_parallel.codegen.inline.declaration_edits import declaration_edits
 from hyper_parallel.codegen.inline.forward_edits import forward_extract_edits
 from hyper_parallel.codegen.inline.ir import InlinePatchSet
+from hyper_parallel.codegen.inline.constructor_edits import constructor_edits
 
 
 def apply_patch_set(source_text: str, patch_set: InlinePatchSet) -> str:
@@ -30,5 +31,7 @@ def apply_patch_set(source_text: str, patch_set: InlinePatchSet) -> str:
         source_text, index.import_end, index.docstring_end, patch_set.imports, patch_set.module_snippets,
     )
     text = apply_edits(source_text, edits) if edits else source_text
+    edits = constructor_edits(text, patch_set.constructors)
+    text = apply_edits(text, edits) if edits else text
     edits = forward_extract_edits(text, patch_set.forward_extracts)
     return apply_edits(text, edits) if edits else text

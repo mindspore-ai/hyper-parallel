@@ -21,7 +21,7 @@ import sys
 from types import SimpleNamespace
 
 from hyper_parallel.codegen.emit.family_forwards import verify_parallel_family_forwards
-from hyper_parallel.codegen.emit.modeling import _module_constructor_calls, _verify_replacement_records
+from hyper_parallel.codegen.emit.modeling import _verify_replacement_records
 from hyper_parallel.codegen.train_sidecar import start_codegen_sidecar
 from scripts.check_codegen_bundle_parity import bundle_hashes
 from tests.common.mla_cp_utils import make_deepseek_model
@@ -65,11 +65,15 @@ def test_cli_and_rank_zero_sidecar_publish_identical_bundles(tmp_path, monkeypat
     source = modeling.read_text(encoding="utf-8")
     assert "__hp_prepared_components__" not in source
     tree = ast.parse(source)
-    emitted = _module_constructor_calls(tree)
+    assert "_hp_module_constructors" not in source
     assert not list(cli.glob("*.json"))
     assert "install_prepared_components" not in source
     name = "CPMultiLatentAttentionModule"
-    assert emitted["model.layers.0.self_attn"] == "build_prepared_family_replacement"
+    decoder = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DeepseekV3DecoderLayer")
+    assert any(isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+               and isinstance(node.value.func, ast.Name) and node.value.func.id == name
+               and any(isinstance(target, ast.Attribute) and target.attr == "self_attn" for target in node.targets)
+               for node in ast.walk(decoder))
     verify_parallel_family_forwards(tree, {
         "model.layers.0.self_attn": {
             "type": name,
@@ -86,7 +90,8 @@ def _hp_module_constructors():
     return {}
 """)
     record = SimpleNamespace(module_fqn="layer.attention", replacement_type=object)
-    prepared = ({"primary_fqn": "layer.attention", "replay": {"constructor": "demo:ParallelAttention"}},)
+    prepared = ({"primary_fqn": "layer.attention", "replacement_type": "demo:ParallelAttention",
+                 "replay": {"constructor": "demo:ParallelAttention"}},)
     missing = _verify_replacement_records(tree, (record,), prepared, [])
     assert missing == ["layer.attention (missing executable constructor 'ParallelAttention')"], (
         f"Metadata-only replacement should be rejected, got {missing}"

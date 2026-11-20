@@ -125,10 +125,35 @@ def project_model_build(capture: ModelBuildCapture) -> CodegenBuildIR:
     return CodegenBuildIR(
         source=capture.source or {},
         declarations=manifest.declarations,
-        replacements=tuple(item.to_legacy_dict() for item in manifest.replacements),
+        replacements=_construction_records(manifest, capture.model),
         plan=plan,
         reason=capture.reason,
     )
+
+
+def _construction_records(manifest: PreparationManifest, model: Any) -> tuple[dict, ...]:
+    """Locate observed replacements in their source owners without selecting members."""
+    applications = manifest.replacements
+    originals = {path: item.source_type.legacy_path() for item in applications for path in item.aliases}
+    owners = {}
+    for path, module in model.named_modules(remove_duplicate=False):
+        owners[path] = originals.get(path, f"{type(module).__module__}:{type(module).__qualname__}")
+    result = []
+    for item in applications:
+        record = item.to_legacy_dict()
+        sites = []
+        for path in item.aliases:
+            if not path:
+                raise ValueError("Codegen cannot express a root replacement as a source attribute construction")
+            parent, _, attribute = path.rpartition(".")
+            owner = owners[parent]
+            sites.append({
+                "owner": owner, "attribute": attribute,
+                "instances": [key for key, value in owners.items() if value == owner],
+            })
+        record["construction_sites"] = sites
+        result.append(record)
+    return tuple(result)
 
 
 def publish_codegen_ir(
