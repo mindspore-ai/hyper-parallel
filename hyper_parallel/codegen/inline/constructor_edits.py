@@ -55,6 +55,10 @@ def constructor_edits(source: str, patches: list[ConstructorPatch]) -> list[Text
         value = matches[0]
         start = offsets[value.lineno - 1] + len(lines[value.lineno - 1].encode()[:value.col_offset].decode())
         end = offsets[value.end_lineno - 1] + len(lines[value.end_lineno - 1].encode()[:value.end_col_offset].decode())
-        expression = patch.expression.replace("__source_module__", ast.get_source_segment(source, value))
+        if patch.expression.isidentifier():
+            value.func = ast.Name(id=patch.expression, ctx=ast.Load())
+            expression = ast.unparse(value)
+        else:
+            expression = patch.expression.replace("__source_module__", ast.get_source_segment(source, value))
         edits.append(TextEdit(start, end, expression))
     return edits

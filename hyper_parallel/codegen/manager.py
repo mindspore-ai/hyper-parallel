@@ -123,6 +123,7 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
         parallel_forwards=dict(frozen_plan.get("parallel_forwards") or {}),
         materialized_methods=dict(frozen_plan.get("materialized_methods") or {}),
         frozen_modules=list(frozen_plan.get("frozen_modules") or ()),
+        primitive_boundaries=list(frozen_plan.get("primitive_boundaries") or ()),
         emission_patches=emission_patches,
     )
 

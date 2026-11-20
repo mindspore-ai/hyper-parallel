@@ -27,6 +27,7 @@ from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.plan.observation import observe_emission_plan
 from hyper_parallel.codegen.plan.methods import observe_local_methods
 from hyper_parallel.codegen.emit.frozen import observe_frozen_modules
+from hyper_parallel.codegen.emit.primitives import observe_primitive_boundaries
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.models.build_capture import ModelBuildCapture
 from hyper_parallel.models.preparation_manifest import PreparationManifest, PreparedComponent
@@ -126,6 +127,7 @@ def project_model_build(capture: ModelBuildCapture) -> CodegenBuildIR:
         plan["parallel_dims"] = _parallel_dims(capture.mesh)
         plan["materialized_methods"] = observe_local_methods(capture.plan, capture.model, capture.mesh)
         plan["frozen_modules"] = frozen
+        plan["primitive_boundaries"] = observe_primitive_boundaries(capture)
 
     return CodegenBuildIR(
         source=capture.source or {},
