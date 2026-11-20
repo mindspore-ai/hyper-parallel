@@ -29,6 +29,7 @@ from typing import Any, Dict, Literal, Optional, Union
 import torch
 from torch import nn
 from hyper_parallel import DTensor
+from hyper_parallel.core.activation_memory import ActivationWrapper
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
     HuggingFaceCheckpointer,
@@ -45,10 +46,6 @@ from hyper_parallel.models.materialization import (
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
-from hyper_parallel.distributed.attention_swap import (
-    apply_attention_swap,
-    validate_attention_swap,
-)
 from hyper_parallel.distributed.compile import (
     _resolve_compile_config,
     apply_compile,
@@ -62,11 +59,11 @@ from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed.module_binding import validate_materialized_modules
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
-from hyper_parallel.models.registry import _resolve_custom_model_cls, resolve_model_adapter
 from hyper_parallel.components.modules.module_family import collect_family_modules
 from hyper_parallel.models.module_build import (
     attach_build_context, build_module_context, prepare_model_components, resolve_effective_model_spec,
 )
+from hyper_parallel.models.registry import _resolve_custom_model_cls, resolve_model_adapter
 from hyper_parallel.models.external_state import (
     ExternalBuildContext,
     ExternalLoadContext,
@@ -340,6 +337,8 @@ def _initialize_model_weights(model: nn.Module) -> None:
                     reset_parameters()
     if native_initialization:
         for module in model.modules():
+            if isinstance(module, ActivationWrapper):
+                continue
             if not getattr(module, "_hp_reset_after_materialization", False):
                 continue
             reset_parameters = getattr(module, "reset_parameters", None)
@@ -435,43 +434,28 @@ def _apply_materialization_adapter(model: nn.Module) -> None:
 
 def _apply_activation_features(
     model: nn.Module,
-    activation_checkpoint: Optional[str],
-    activation_swap: str,
+    activation_checkpoint: Optional[Any],
     compile_for_execution: bool,
-    mesh: Optional[MeshContext],
-    swap_inputs: bool = False,
-    selection: Optional[Any] = None,
-    allow_cache_entry_mutation: bool = False,
-    apply_checkpoint: bool = True,
-    apply_swap: bool = True,
 ) -> nn.Module:
-    """Apply activation checkpointing and attention swap in execution order.
-
-    ``apply_checkpoint`` is False in graph mode: the joint-graph
-    ``ActivationCheckpointPass`` owns recompute, so the live model must stay
-    unwrapped. ``apply_swap`` is also False in graph mode: the graph-mode
-    ``CpuOffloadPass`` owns host activation offload, so wrapping the live model
-    with the eager ``SwapManager`` would offload twice. The requested modes are
-    still validated so incompatible combinations keep failing.
-    """
-    if apply_checkpoint and activation_checkpoint not in (None, "off"):
+    """Apply the unified activation-checkpoint configuration."""
+    activation_checkpoint_mode = getattr(activation_checkpoint, "mode", None)
+    if activation_checkpoint is not None and activation_checkpoint_mode != "off":
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
-            swap_inputs=swap_inputs,
-            selection=selection,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
-    validate_attention_swap(
-        activation_swap,
-        activation_checkpoint=activation_checkpoint,
-        enable_compile=compile_for_execution,
-        pp_size=getattr(mesh, "pp_size", 1),
-    )
-    if not apply_swap or activation_swap == "none":
-        return model
-    return apply_attention_swap(model, activation_swap)
+        adapter_spec = resolve_model_adapter(model)
+        provider = getattr(adapter_spec, "activation_checkpointing", None)
+        if provider is not None:
+            if not callable(provider):
+                raise TypeError("ModelAdapterSpec.activation_checkpointing must be callable")
+            result = provider(model)
+            if result is not None:
+                raise TypeError(
+                    "ModelAdapterSpec.activation_checkpointing must mutate the model and return None"
+                )
+    return model
 
 
 def _materialize_and_load_model(
@@ -659,11 +643,7 @@ def apply_model_infrastructure(
     fp8_config: Optional[Any] = None,
     freeze_config: Optional[Any] = None,
     compile_config: Optional[Union[CompileConfig, dict]] = None,
-    activation_checkpoint: Optional[str] = None,
-    activation_checkpoint_selection: Optional[Any] = None,
-    activation_swap: str = "none",
-    swap_inputs: bool = False,
-    allow_cache_entry_mutation: bool = False,
+    activation_checkpoint: Optional[Any] = None,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -691,11 +671,7 @@ def apply_model_infrastructure(
         fp8_config: Optional model precision settings.
         freeze_config: Model subtrees whose parameters are frozen before planning.
         compile_config: Optional compilation settings.
-        activation_checkpoint: Activation checkpoint selection policy.
-        activation_checkpoint_selection: Resolved model-owned activation regions.
-        activation_swap: Activation memory policy.
-        swap_inputs: Whether checkpointing swaps its input activations.
-        allow_cache_entry_mutation: Whether activation checkpointing may update cache entries.
+        activation_checkpoint: Unified activation-checkpoint configuration.
         is_meta_device: Whether parameters need storage materialization.
         is_hf_model: Whether the source follows the HF model contract.
         device: Target device for initialization and loading.
@@ -707,12 +683,23 @@ def apply_model_infrastructure(
 
     """
 
+    unsupported_activation_options = sorted(
+        set(kwargs) & {
+            "activation_swap",
+            "activation_checkpoint_selection",
+            "allow_cache_entry_mutation",
+            "swap_inputs",
+        }
+    )
+    if unsupported_activation_options:
+        raise ValueError(
+            "unsupported legacy activation options: "
+            f"{unsupported_activation_options}"
+        )
+
     distributed_setup = kwargs.get("distributed_setup")
     compile_config, compile_for_execution = _resolve_compile_config(
         compile_config, validate_placement, fsdp2_manager
-    )
-    graph_mode_requested = bool(
-        compile_config is not None and compile_config.selects_graph_compiler()
     )
     _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
 
@@ -735,11 +722,9 @@ def apply_model_infrastructure(
     )
 
     model = _apply_activation_features(
-        model, activation_checkpoint, activation_swap, compile_for_execution, mesh,
-        swap_inputs=swap_inputs, selection=activation_checkpoint_selection,
-        allow_cache_entry_mutation=allow_cache_entry_mutation,
-        apply_checkpoint=not graph_mode_requested,
-        apply_swap=not graph_mode_requested,
+        model,
+        activation_checkpoint,
+        compile_for_execution,
     )
     external = _create_external_state(
         model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,

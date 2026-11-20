@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import importlib
 import os
 from unittest import mock
 
@@ -153,5 +154,6 @@ _preload_libgomp_early_for_static_tls()
 
 
 def pytest_configure(config) -> None:  # pylint: disable=unused-argument
-    """Import ``dtensor`` early so collection does not race the torch backend binding."""
-    import hyper_parallel.core.dtensor.dtensor  # noqa: F401 pylint: disable=unused-import
+    """Install UT compatibility and initialize the shared Torch binding."""
+    importlib.import_module("tests.ut.compile.conftest")
+    import hyper_parallel.core.dtensor.dtensor  # noqa: F401 pylint: disable=unused-import,C0415

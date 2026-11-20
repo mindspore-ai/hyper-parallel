@@ -8,7 +8,7 @@ For DeepSeek-V4.1, HyperParallel's adaptation goes beyond reproducing the model 
 
 CSA2's Full, Reindex, and Reuse paths share compressed KV, Indexer Keys, and Top-K state across layers. HyperParallel manages this state by attention role. Under context parallelism, each rank retains local Queries and obtains the KV and Indexer Keys needed for computation through asynchronous differentiable AllGather. Under tensor parallelism, scores from sharded Indexer Heads are aggregated before global Top-K selection.
 
-Activation recomputation follows the same state boundaries. Replay reuses the discrete indices selected during forward and avoids writing shared state again, keeping CSA2 recomputation consistent with the cross-layer state lifecycle.
+Activation recipes keep Full/Reindex indexer modules outside replay. Recomputed consumer paths reuse the shared state published during forward, while phase guards prevent replay from publishing that state again.
 
 ## 2. Engram: CPU Residency, EP Sharding, and Sparse Optimization
 

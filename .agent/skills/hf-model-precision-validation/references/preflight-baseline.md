@@ -33,10 +33,10 @@ Complete this gate before reserving devices or launching the full matrix:
 4. Instantiate the replacement-disabled reference model and the final replaced
    model, then reconcile exact parameter FQNs, final module counts, plan-glob
    matches, and required runtime fields. A partial match is not coverage.
-5. Resolve activation checkpoint selection through the final builder and assert
-   exact wrapper count/FQNs for `layer_count: 0`, one nonzero prefix, and an
-   explicit index selection. Config text alone is not evidence that the selection
-   reached the model.
+5. Resolve the explicit activation checkpoint configuration through the final
+   builder and assert exact wrapper count/FQNs for an empty `recompute_layer`, one
+   intermediate set, and the maximum intended layer set. Config text alone is not
+   evidence that the configuration reached the model.
 6. Run one high-risk topology smoke with `model_integration.mode=runtime` and
    require structured findings, input identity, numeric probes, and observed rank
    count. For multimodal scope, use real media and additionally require modality

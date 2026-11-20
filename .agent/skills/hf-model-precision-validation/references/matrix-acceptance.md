@@ -17,7 +17,7 @@ valid:
 | TP+CP+EP | Validate combined strategy |
 | TP with CP=1 in Validate mode | Expose attention internals hidden by CP regions |
 | Production vs Validate | Compare execution modes with identical inputs/state |
-| Explicit `layer_count`/`layer_indices` selections | Validate checkpointed activation and shared-state paths |
+| Explicit `recompute_layer` sets | Validate checkpointed activation and shared-state paths |
 | Online full/cropped pipeline | Smoke by default; formal only with replay/hash proof |
 
 Run every formal end-to-end self-consistency comparison for at least ten
@@ -36,8 +36,8 @@ available device budget. At minimum, classify:
 - DP/FSDP degrees and uneven-shard behavior;
 - every supported TP, CP, EP, and sequence-parallel degree;
 - meaningful hybrid strategies rather than only isolated axes;
-- `layer_count: 0`, an intermediate prefix, and a maximum-safe prefix or explicit
-  `layer_indices` selection;
+- an empty `recompute_layer`, an intermediate layer set, and the maximum intended
+  explicit layer set;
 - same- and cross-topology continuation;
 - Production and strict Validate execution;
 - language, vision, projector, and modality-fusion ownership independently.

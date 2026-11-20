@@ -1239,9 +1239,9 @@ def _teardown_wired_swap_layers(wired_modules: Iterable[Any]) -> None:
     """Release swap groups and prefetch hooks for an iterable of wired layers.
 
     Teardown for layers already registered through
-    :meth:`SwapManager.set_forward_prefetch_layer` (the swap-inputs paths in
-    ``distributed/activation_checkpoint.py`` and ``distributed/attention_swap.py``).
-    Those paths register the modules in the process-wide singleton and install
+    :meth:`SwapManager.set_forward_prefetch_layer` (the activation-swap paths in
+    ``distributed/activation_checkpoint.py``). Those paths register the modules
+    in the process-wide singleton and install
     hook handles, but never otherwise tear them down, so a long-lived process
     that rebuilds or discards models leaks ``SwapGroup`` entries and hook
     handles.  This is called from each path's life-cycle finalizer with the wired

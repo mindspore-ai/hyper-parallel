@@ -70,6 +70,16 @@ class TestDeferredPretrained(unittest.TestCase):
         self.assertIs(result, model)
         parent.assert_called_once_with(config, trust_remote_code=True)
 
+    def test_removed_activation_swap_option_is_rejected(self):
+        """The standalone activation-swap option must not pass through generic kwargs."""
+        with self.assertRaisesRegex(ValueError, "activation_swap has been removed"):
+            HyperAutoModelForImageTextToText._build_model(
+                None, is_hf_model=False, hf_config=None, mesh=None, sharding_planner=None,
+                fsdp2_manager=None, peft_config=None, torch_dtype=torch.float32,
+                attn_implementation="eager", validate_placement=False, load_base_model=False,
+                activation_swap="attention",
+            )
+
     def test_loader_selects_initial_construction_and_preserves_final_load(self):
         """Feature: automatic deferred HF loading.
 

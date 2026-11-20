@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Contracts that let a CSA2 attention layer be recomputed as a whole.
+"""Contracts for recomputing a CSA2 KV source without replaying its router.
 
-Three mechanisms make a recomputed attention legal, and this module exercises
-them on CPU against the real classes:
+The tests exercise the shared-state and context-parallel contracts on CPU:
 
 * ``is_recomputing()`` phase guards keep ``publish_*`` from running twice.
   Those calls contain no differentiable op, so skipping them cannot change the
   checkpoint's saved-tensor count.
-* the indexer's discrete selection is an exclusion region, because a recompute
-  must neither choose a different Top-K set nor drop saved tensors.
 * nothing drops a published entry early: a recomputed consumer reads its
   entries a second time during backward, so they stay alive until the graph
   releases the state.
@@ -31,7 +28,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest import mock
 
 import torch
 from torch import nn
@@ -41,15 +37,8 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext,
     SharedCompressedAttentionState,
     SharedCompressedDSAAttentionBase,
-    SharedCompressedDSAIndexer,
 )
 from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
-from hyper_parallel.models.deepseek_v41.adapter.policies import (
-    activation_checkpointing as attention_policy,
-)
-from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
-    attention_role,
-)
 
 HIDDEN, HEADS, HEAD_DIM, GROUPS, OUT_PER_GROUP = 8, 2, 8, 2, 4
 BATCH, SEQUENCE, RATIO, LAYER = 1, 8, 2, 20
@@ -127,57 +116,6 @@ class _Source(nn.Module):
         self.scaling = HEAD_DIM ** -0.5
 
 
-class _IndexerSource(nn.Module):
-    """Duck-typed indexer source for a Reindex-style layer."""
-
-    def __init__(self) -> None:
-        """Create the projections a Reindex-style indexer needs."""
-        super().__init__()
-        self.q_b_proj = nn.Linear(HIDDEN, HEADS * HEAD_DIM, bias=False)
-        self.weights_proj = nn.Linear(HIDDEN, HEADS, bias=False)
-        self.wk = nn.Linear(HIDDEN, HEAD_DIM, bias=False)
-        self.k_norm = nn.LayerNorm(HEAD_DIM, bias=False)
-        self.compress_ratio = RATIO
-        self.num_heads = HEADS
-        self.head_dim = HEAD_DIM
-        self.index_topk = 2
-        self.owns_key = False
-        self.is_candidate_source = False
-        self.uses_candidates = False
-        self.candidate_topk_blocks = 1
-        self.candidate_block_size = 2
-        self.loss_coeff = 0.0
-
-
-class _IndexSource(nn.Module):
-    """Attention source whose layer consumes shared state and republishes Top-K."""
-
-    def __init__(self) -> None:
-        """Describe the Reindex-style layer this source stands for."""
-        super().__init__()
-        self.q_a_proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
-        self.q_a_norm = nn.LayerNorm(HIDDEN, bias=False)
-        self.q_b_proj = nn.Linear(HIDDEN, HEADS * HEAD_DIM, bias=False)
-        self.kv_proj = nn.Linear(HIDDEN, HEAD_DIM, bias=False)
-        self.kv_norm = nn.LayerNorm(HEAD_DIM, bias=False)
-        self.o_a_proj = nn.Linear(GROUPS * OUT_PER_GROUP, HIDDEN, bias=False)
-        self.o_b_proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
-        self.sinks = nn.Parameter(torch.zeros(HEADS))
-        self.config = SimpleNamespace(o_groups=GROUPS, qk_rope_head_dim=4)
-        self.layer_idx = LAYER
-        self.num_heads = HEADS
-        self.num_key_value_groups = 1
-        self.compress_ratio = RATIO
-        self.is_kv_source = False
-        self.is_index_source = True
-        self.kv_source_layer_idx = LAYER
-        self.index_source_layer_idx = LAYER
-        self.candidate_source_layer_idx = LAYER
-        self.head_dim = HEAD_DIM
-        self.sliding_window = 4
-        self.scaling = HEAD_DIM ** -0.5
-
-
 class _GatherCounter:
     """Stand-in for the CP rank-ordered all-gather that counts its calls."""
 
@@ -227,19 +165,6 @@ def _kv_source_layer(use_cp, state):
     )
     layer.compressor = _Compressor()
     state.publish_topk_indices(LAYER, torch.zeros(BATCH, SEQUENCE, 2, dtype=torch.int32))
-    return layer, _inputs(), _GatherCounter() if use_cp else None
-
-
-def _index_source_layer(use_cp, state):
-    """Build a Reindex-style layer that republishes the shared Top-K."""
-    torch.manual_seed(11)
-    source = _IndexSource()
-    source.indexer = SharedCompressedDSAIndexer(_IndexerSource())
-    layer = SharedCompressedDSAAttentionBase(
-        source, replace_indexer=False, use_fused_ops=False
-    )
-    state.publish_compressed_kv(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
-    state.publish_index_key(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
     return layer, _inputs(), _GatherCounter() if use_cp else None
 
 
@@ -318,77 +243,3 @@ def test_checkpointed_kv_source_matches_plain_and_writes_state_once():
     """A recomputed KV source reproduces the plain result and writes state once."""
     for use_cp in (False, True):
         _assert_recompute_matches_plain(_kv_source_layer, use_cp=use_cp)
-
-
-def test_checkpointed_index_source_matches_plain_and_writes_state_once():
-    """A recomputed index source republishes its Top-K exactly once."""
-    for use_cp in (False, True):
-        _assert_recompute_matches_plain(_index_source_layer, use_cp=use_cp)
-
-
-class _FakeIndexer:
-    """Minimal indexer that records whether the selection pin was installed."""
-
-    def __init__(self) -> None:
-        """Start unpinned until the model-owned hook decides otherwise."""
-        self.selection_pinned = False
-
-    def enable_selection_exclude(self) -> None:
-        """Record that the hook pinned the discrete selection."""
-        self.selection_pinned = True
-
-
-class _FakeAttention(nn.Module):
-    """Attention stand-in exposing the attributes the CSA2 roles read."""
-
-    def __init__(self, layer_idx: int, *, kv_source: bool = False, index_source: bool = False) -> None:
-        """Describe one layer stand-in of a CSA2 role."""
-        super().__init__()
-        self.compress_ratio = 1
-        self.layer_idx = layer_idx
-        self.is_kv_source = kv_source
-        self.is_index_source = index_source
-        self.indexer = _FakeIndexer() if index_source else None
-
-
-def _role_model():
-    """Return a stand-in model with one attention per CSA2 role."""
-    attentions = {
-        "full": _FakeAttention(2, kv_source=True, index_source=True),
-        "reindex": _FakeAttention(24, index_source=True),
-        "reuse": _FakeAttention(25),
-    }
-    model = nn.Module()
-    model.norm = nn.LayerNorm(HIDDEN)
-    model.layers = nn.ModuleList(list(attentions.values()))
-    return model, attentions
-
-
-_RECOMPUTE_TIERS = (
-    # tier, roles kept out of the recompute, index sources that recompute and get pinned
-    ("none", ("full", "reindex", "reuse"), ()),
-    ("reuse", ("full", "reindex"), ()),
-    ("reuse_reindex", ("full",), ("reindex",)),
-    ("all", (), ("full", "reindex")),
-)
-
-
-def _keeps_out_of_recompute(policy, module: nn.Module) -> bool:
-    """Return whether one policy keeps a module outside the recompute regions."""
-    predicate = policy.exclude_predicate
-    return bool(predicate is not None and predicate("layer.self_attn", module))
-
-
-def test_recompute_tiers_exclude_and_pin_one_role_set():
-    """The tier selects which attentions recompute and which of them get pinned."""
-    for tier, resident, pinned in _RECOMPUTE_TIERS:
-        with mock.patch.object(attention_policy, "ATTENTION_RECOMPUTE_TIER", tier):
-            policy = attention_policy.build_recompute_policy()
-            model, attentions = _role_model()
-            policy.on_applied(model)
-
-            assert not _keeps_out_of_recompute(policy, model.norm)
-            for role, attention in attentions.items():
-                assert attention_role(attention) == role
-                assert _keeps_out_of_recompute(policy, attention) == (role in resident)
-                assert bool(getattr(attention.indexer, "selection_pinned", False)) == (role in pinned)

@@ -8,7 +8,7 @@
 
 CSA2 的 Full、Reindex、Reuse 路径会在不同层之间共享压缩 KV、Indexer Key 和 Top-K 等状态。HyperParallel 按注意力角色管理这些状态：上下文并行时，各 rank 保留本地 Query，通过异步可微 AllGather 获取计算所需的 KV 与 Indexer Key；张量并行时，先汇总各分片 Indexer Head 的分数，再完成全局 Top-K 选择。
 
-激活重计算也遵循相同的状态边界。重放时复用前向已经选出的离散索引，并避免再次写入共享状态，使 CSA2 的重计算与跨层状态生命周期保持一致。
+激活重计算配置会把 Full/Reindex 的 indexer 模块排除在 replay 外。参与重算的消费路径复用前向发布的共享状态，阶段守卫则避免 replay 再次发布该状态。
 
 ## 2. Engram：CPU 常驻、EP 分片和稀疏优化
 

@@ -501,10 +501,7 @@ def build_cropped_deepseek_v41(
         distributed_setup: DistributedSetup | None = None,
         peft_config: Any | None = None,
         compile_config: CompileConfig | dict[str, Any] | None = None,
-        activation_checkpoint: str | None = None,
-        activation_checkpoint_selection: Any | None = None,
-        swap_inputs: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Any | None = None,
         model_init_dtype: str = "float32",
         codegen: bool = False,
         codegen_config: Any | None = None,
@@ -534,10 +531,7 @@ def build_cropped_deepseek_v41(
         distributed_setup: Trainer-provided parallel topology.
         peft_config: Optional PEFT configuration.
         compile_config: Optional compilation configuration.
-        activation_checkpoint: Activation-checkpoint mode.
-        activation_checkpoint_selection: Optional adapter-safe region selection.
-        swap_inputs: Trainer-injected activation-swap input flag.
-        activation_swap: Activation-swap mode.
+        activation_checkpoint: Normalized activation-checkpoint configuration.
         model_init_dtype: Final parameter initialization dtype.
         codegen: Select the codegen ``gen`` backend for this build.
         codegen_config: Optional codegen backend configuration.
@@ -568,8 +562,6 @@ def build_cropped_deepseek_v41(
         torch_dtype=torch_dtype, validate_placement=validate_placement,
         distributed_setup=distributed_setup, peft_config=peft_config,
         compile_config=compile_config, activation_checkpoint=activation_checkpoint,
-        activation_checkpoint_selection=activation_checkpoint_selection,
-        swap_inputs=swap_inputs, activation_swap=activation_swap,
         model_init_dtype=model_init_dtype, codegen=codegen, codegen_config=codegen_config,
         pretrained_path=config_path if load_base_model else None,
         verify_hf_weights=verify_hf_weights,
@@ -584,10 +576,7 @@ def _run_validation_model_builder(
         distributed_setup: DistributedSetup | None,
         peft_config: Any | None,
         compile_config: CompileConfig | dict[str, Any] | None,
-        activation_checkpoint: str | None,
-        activation_checkpoint_selection: Any | None,
-        swap_inputs: bool,
-        activation_swap: str,
+        activation_checkpoint: Any | None,
         model_init_dtype: str,
         codegen: bool,
         codegen_config: Any | None,
@@ -603,9 +592,6 @@ def _run_validation_model_builder(
         "validate_placement": validate_placement,
         "compile_config": compile_config,
         "activation_checkpoint": activation_checkpoint,
-        "activation_checkpoint_selection": activation_checkpoint_selection,
-        "swap_inputs": swap_inputs,
-        "activation_swap": activation_swap,
         "model_init_dtype": model_init_dtype,
         "codegen": codegen,
         "codegen_config": codegen_config,

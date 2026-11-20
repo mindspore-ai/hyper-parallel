@@ -176,10 +176,21 @@ mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  # Recompute full model regions to reduce activation memory.
-  mode: full
-
-activation_swap: none
+  # Recompute full early layers, selected late-layer routers, and model-level
+  # embedding/output modules.
+  mode: hybrid
+  full:
+    recompute_layer: [0-19]
+    exclude_region:
+      save:
+        # Full attention sources stay outside replay, matching the model's
+        # shared-state contract. Layer 20 is not checkpointed here.
+        self_attn: [2, 8, 14]
+  selective:
+    recompute:
+      - mlp.gate: [20-39]
+      - model.embed_tokens
+      - lm_head
 
 compile:
   enabled: false
