@@ -33,9 +33,6 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel.components.functional.linear_attention_convolution import (
-    fused_causal_conv1d,
-)
 from hyper_parallel.components.functional.linear_attention_packed import (
     PackedSequenceInfo, packed_causal_conv1d, resolve_packed_sequence,
 )
@@ -50,6 +47,7 @@ from hyper_parallel.components.modules.gated_delta_net import (
     is_triton_gdn_available,
     torch_chunk_gated_delta_rule,
 )
+from hyper_parallel.components.ops import causal_conv1d, gdn
 from hyper_parallel.distributed.context_parallel.collectives import ulysses_head_to_seq, ulysses_seq_to_head
 from hyper_parallel.core.utils import communication
 
@@ -1025,7 +1023,7 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         module: nn.Module,
         device_mesh: Optional[DeviceMesh],
         *,
-        backend: str = "eager",
+        backend: str = "auto",
         chunk_size: int = 64,
     ) -> None:
         """Initialize the shared attention and convolution backend."""
@@ -1033,10 +1031,10 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         # The target owns this executor, so keep its back-reference outside the module tree.
         object.__setattr__(self, "module", module)
         backend = backend.lower()
-        if backend not in _GDN_BACKENDS:
+        if backend not in _GDN_BACKENDS | {"auto"}:
             raise ValueError(
                 f"unsupported GDN backend {backend!r}; "
-                f"expected one of {sorted(_GDN_BACKENDS)}."
+                f"expected one of {sorted(_GDN_BACKENDS | {'auto'})}."
             )
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
@@ -1050,7 +1048,7 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         self.seq_dim = 1
         self.head_dim = 2
         self._validate_module()
-        if self.gdn_backend != "eager":
+        if self.gdn_backend in ("triton", "ascendc"):
             _validate_gdn_activation(self.module)
             self._validate_fused_conv()
 
@@ -1180,16 +1178,13 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         base = self.module
         mixed_qkv = torch.cat((q_proj, k_proj, v_proj), dim=-1)
         weight, bias = self._local_conv_weight(), self._local_conv_bias()
-        if exchanged_info is not None:
-            return packed_causal_conv1d(
-                mixed_qkv, base.conv1d, exchanged_info,
-                weight=weight, bias=bias, backend=self.gdn_backend,
-            )
-        if self.gdn_backend != "eager":
-            return fused_causal_conv1d(
-                mixed_qkv, weight, bias, backend=self.gdn_backend,
-                dilation=base.conv1d.dilation[0],
-            )
+        convolution = base.conv1d
+        dilation = convolution.dilation[0]
+        if exchanged_info is not None or (
+            convolution.stride == (1,) and convolution.padding == ((weight.shape[-1] - 1) * dilation,)
+            and convolution.padding_mode == "zeros"
+        ):
+            return causal_conv1d(mixed_qkv, weight, bias, exchanged_info, dilation=dilation, backend=self.gdn_backend)
         conv_out = F.conv1d(
             input=mixed_qkv.transpose(1, 2),
             weight=weight,
@@ -1274,22 +1269,8 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             query = query.repeat_interleave(kv_groups, dim=2)
             key = key.repeat_interleave(kv_groups, dim=2)
 
-        cu_seqlens = None
-        if exchanged_info is not None:
-            cu_seqlens = (exchanged_info.local_offsets if self.gdn_backend == "ascendc" else
-                          exchanged_info.materialize(query.device, self.chunk_size).cu_seqlens)
-        core_attn_out, _ = chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            chunk_size=self.chunk_size,
-            use_qk_l2norm_in_kernel=True,
-            backend=self.gdn_backend,
-            cu_seqlens=cu_seqlens,
+        core_attn_out = gdn(
+            query, key, value, g, beta, chunk_size=self.chunk_size, info=exchanged_info, backend=self.gdn_backend,
         )
 
         core_attn_out = self._head_to_seq(core_attn_out)

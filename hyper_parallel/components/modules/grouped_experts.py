@@ -31,12 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
-from hyper_parallel.components.functional import (
-    grouped_matmul,
-    moe_token_permute,
-    moe_token_unpermute,
-    swiglu,
-)
+from hyper_parallel.components.ops import grouped_matmul, moe_token_reorder, moe_token_restore, swiglu
 
 
 @module_replacement
@@ -390,7 +385,7 @@ class GroupedExperts(nn.Module):
     def _grouped_gemm_expert_forward(
         self, gate_up_proj, down_proj, permuted, tokens_per_expert, permuted_probs
     ):
-        """GroupGemm expert computation (NPU-only)."""
+        """Run expert-major projections through the selected grouped GEMM."""
         self._tokens_per_expert_gmm = tokens_per_expert.to(device=permuted.device)
         self._group_list = self._tokens_per_expert_gmm.cumsum(dim=0)
 
@@ -400,9 +395,7 @@ class GroupedExperts(nn.Module):
         # up
         numel = permuted.nelement()
         if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
-            fc1_output = grouped_matmul(  # pylint: disable=not-callable
-                permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
-            )
+            fc1_output = grouped_matmul(permuted, gate_up_proj, self._group_list)
             if self.add_bias:
                 b1 = self.bias1.view(self.num_local_experts, -1)
                 fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
@@ -424,9 +417,7 @@ class GroupedExperts(nn.Module):
 
         numel = fc1_output.nelement()
         if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
-            fc2_output = grouped_matmul(  # pylint: disable=not-callable
-                fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
-            )
+            fc2_output = grouped_matmul(fc1_output, down_proj, self._group_list)
             if self.add_bias:
                 b2 = self.bias2.view(self.num_local_experts, -1)
                 fc2_output = fc2_output + torch.repeat_interleave(
@@ -471,12 +462,11 @@ class GroupedExperts(nn.Module):
         """Run grouped experts with the Transformers Experts interface."""
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        permuted_tokens, sorted_indices = moe_token_permute(  # pylint: disable=not-callable
-            hidden_states_flat,
-            top_k_index,
-        )
+        top_k_index = top_k_index.flatten(0, -2)
+        top_k_weights = top_k_weights.reshape_as(top_k_index)
+        permuted_tokens, order, positions = moe_token_reorder(hidden_states_flat, top_k_index)
         flatten_probs = top_k_weights.view(-1)
-        permuted_probs = flatten_probs.index_select(0, sorted_indices)
+        permuted_probs = flatten_probs.index_select(0, order)
         tokens_per_expert = torch.histc(
             top_k_index.view(-1).float(),
             bins=self.num_experts,
@@ -488,11 +478,7 @@ class GroupedExperts(nn.Module):
             tokens_per_expert,
             permuted_probs,
         )
-        output = moe_token_unpermute(  # pylint: disable=not-callable
-            expert_outputs,
-            sorted_indices,
-            top_k_weights,
-        )
+        output = moe_token_restore(expert_outputs, positions, top_k_weights)
         return output.view(hidden_shape)
 
 

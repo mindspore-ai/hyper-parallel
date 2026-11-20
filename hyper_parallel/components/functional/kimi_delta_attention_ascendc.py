@@ -27,7 +27,6 @@ import torch
 import torch.distributed as dist
 from torch.autograd.function import once_differentiable
 
-from hyper_parallel.components.functional.kimi_delta_attention_state_summary import apply_kda_state_summary
 from hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd import KDAStateRecursiveDoubling
 
 
@@ -267,6 +266,11 @@ class _NativeStateExchange:
     @staticmethod
     def apply(packed: torch.Tensor, incoming: torch.Tensor | None) -> torch.Tensor:
         """Apply forward M or native backward N directly, without transposing N."""
+        # The stateful summary uses Triton; the local Ascend C core can load independently.
+        from hyper_parallel.components.functional.kimi_delta_attention_state_summary import (  # pylint: disable=import-outside-toplevel
+            apply_kda_state_summary,
+        )
+
         return apply_kda_state_summary(packed[..., :128], packed[..., 128:], incoming)
 
     def exchange(self, ops: Any, packed: torch.Tensor | None,

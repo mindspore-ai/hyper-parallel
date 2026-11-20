@@ -31,8 +31,9 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
-from hyper_parallel.components import functional as hp_functional
+from hyper_parallel.components.ops import grouped_matmul
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
+from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     _deepseek_v41_grouped_expert_forward,
     deepseek_v41_ep_compute_fn,
@@ -65,25 +66,6 @@ def _expert_config() -> DeepseekV4Config:
 
 class TestV41ClampedGroupedGemm(unittest.TestCase):
     """Verify grouped GEMM retains the authoritative V4.1 clamp semantics."""
-
-    @staticmethod
-    def _cpu_grouped_matmul(
-            inputs: torch.Tensor,
-            weight: torch.Tensor,
-            *,
-            bias: None,
-            group_list: torch.Tensor,
-            group_type: int,
-            group_list_type: int,
-    ) -> torch.Tensor:
-        """Emulate m-axis grouped GEMM while retaining ordinary autograd."""
-        del bias, group_type, group_list_type
-        outputs = []
-        group_start = 0
-        for expert_id, group_end in enumerate(group_list.tolist()):
-            outputs.append(inputs[group_start:group_end] @ weight[expert_id])
-            group_start = group_end
-        return torch.cat(outputs, dim=0)
 
     def test_hf_grouped_forward_and_backward_preserve_clamp(self) -> None:
         """
@@ -147,18 +129,13 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         counts = torch.tensor([2, 0, 3, 1])
         inputs = torch.randn(counts.sum(), experts.hidden_dim, dtype=dtype, requires_grad=True)
         expected_inputs = inputs.detach().clone().requires_grad_()
-        grouped = Mock(side_effect=self._cpu_grouped_matmul)
-        # Patch the lazy export without importing the optional NPU backend on CPU.
-        with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}):
+        with patch.object(moe_engram_expert_parallel, "grouped_matmul", wraps=grouped_matmul) as grouped:
             output = _deepseek_v41_grouped_expert_forward(experts, inputs, counts)
         self.assertEqual(grouped.call_count, 2)
         self.assertEqual(output.dtype, dtype)
         for call in grouped.call_args_list:
             self.assertEqual(call.args[0].dtype, dtype)
-            self.assertIsNone(call.kwargs["bias"])
-            self.assertEqual(call.kwargs["group_type"], 0)
-            self.assertEqual(call.kwargs["group_list_type"], 0)
-            torch.testing.assert_close(call.kwargs["group_list"], counts.cumsum(0))
+            torch.testing.assert_close(call.args[2], counts.cumsum(0))
 
         expected_parts = []
         group_start = 0
@@ -225,8 +202,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         indices = torch.tensor([2, 0, 2, 3, 0, 2])
         inputs = torch.randn(len(indices), config.hidden_size, dtype=dtype, requires_grad=True)
         reference_inputs = inputs.detach().clone().requires_grad_()
-        matmul = Mock(side_effect=self._cpu_grouped_matmul)
-        with patch.dict(hp_functional.__dict__, {"grouped_matmul": matmul}):
+        with patch.object(moe_engram_expert_parallel, "grouped_matmul", wraps=grouped_matmul) as matmul:
             actual = experts(inputs, indices)
         self.assertEqual(matmul.call_count, 2 if grouped else 0)
         expected = torch.zeros_like(reference_inputs)
@@ -261,11 +237,9 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         with torch.no_grad():
             experts.gate_up_proj.copy_(torch.tensor([[[2.421875], [-4.40625]]]))
             experts.down_proj.fill_(1.0)
-        grouped = Mock(side_effect=self._cpu_grouped_matmul)
-        with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}):
-            actual = _deepseek_v41_grouped_expert_forward(
-                experts, torch.ones(1, 1, dtype=torch.bfloat16), torch.tensor([1]),
-            )
+        actual = _deepseek_v41_grouped_expert_forward(
+            experts, torch.ones(1, 1, dtype=torch.bfloat16), torch.tensor([1]),
+        )
         expected = torch.tensor([[-9.8125]], dtype=torch.bfloat16)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         gate, up = experts.gate_up_proj.flatten().unbind()

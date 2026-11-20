@@ -27,9 +27,8 @@ import torch
 from torch import nn
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 
-from hyper_parallel.components import functional
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
-from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
+from hyper_parallel.components.ops import mla_attention, rope as apply_rope, rope_interleaved
 from hyper_parallel.components.modules.rms_norm import RMSNorm
 
 
@@ -81,18 +80,9 @@ def apply_mla_rope(
     if cos.ndim == 2:
         cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
     if interleaved:
-        cos, sin = (part[..., :tensor.shape[-1] // 2].repeat_interleave(2, dim=-1)
-                    for part in (cos, sin))
-    cos, sin = (part.expand(tensor.shape[0], -1, -1).transpose(0, 1) for part in (cos, sin))
-    rotated = functional.apply_rotary_pos_emb_single(
-        tensor.transpose(0, 1), cos, sin,
-        rotary_interleaved=interleaved, use_fused_rotary_pos_emb=True,
-    )
-    if interleaved:
-        # V3 consumes real/imaginary half-bands; the kernel returns adjacent pairs.
-        rotated = rotated.permute(1, 2, 0, 3)
-        return rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2).transpose(1, 2)
-    return rotated.transpose(0, 1)
+        rotated, _ = rope_interleaved(tensor, tensor, cos, sin, unsqueeze_dim=2)
+        return rotated
+    return apply_rope(tensor, cos.unsqueeze(2), sin.unsqueeze(2))
 
 
 @dataclass(frozen=True)
@@ -131,7 +121,7 @@ class MultiLatentAttentionModule(nn.Module):
         module: nn.Module | None = None,
         config: Any = None,
         attention_interface: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] = (
-            npu_fusion_attention_forward
+            mla_attention
         ),
     ) -> None:
         """Construct MLA projections and attention math from a source module or config.

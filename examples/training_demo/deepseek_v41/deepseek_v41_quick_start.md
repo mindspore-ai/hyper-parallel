@@ -150,7 +150,7 @@ packing，无需转换为 `.bin/.idx`。CC12M 原始下载信息见[数据集说
 | 并行 | TP1 / CP4 / EP8 / PP1，dense DP4，encoder CP4 |
 | FSDP | `dp_shard_size=8`，`edp_shard_size=1`；DP+CP 域为 16 个 rank |
 | Batch / 序列 | global batch 8，micro batch 1，累计 2 个 microbatch，4096 token |
-| 优化 | Host Engram、CSA2 融合注意力、MegaMoe/MegaMhc/MegaGate、全重算、FSDP 预取 |
+| 优化 | Host Engram、OpSelect CSA2、分组 GEMM EP、流水式 mHC、路由与视觉注意力、全重算、FSDP 预取 |
 | 精度 / 步数 | BF16 前向；FP32 初始化、主参数及梯度归约；默认 100 步 |
 
 首次验证可先跑一步，并关闭历史 checkpoint 恢复：
@@ -245,21 +245,25 @@ model:
 中的资产路径。原始尺寸模型的资源需求与裁剪配方不同；HF 权重加载也不同于恢复 optimizer、RNG
 和数据游标的完整断点续训。
 
-### 关闭 CSA2 融合算子
+### 切换融合算子与参考实现
 
-将已有注意力替换规则中的 `use_fused_ops` 改为 `false`：
+三个示例通过顶层 `ops` 为各算子族选择实现。CSA2、路由、EP token 重排、mHC、分组专家计算和
+视觉注意力分别选型。缺省项按 `auto` 选择。
+
+例如传入 `--ops.dsa_sparse_attention=native`，只切换 Sparse Flash MLA，Indexer 和 KL 继续按
+各自配置执行。需要对照整套 CSA2 时，可写入以下配置。
 
 ```yaml
-plan_overrides:
-  - match: "model.layers.*.self_attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
-        use_fused_ops: false
+ops:
+  dsa_indexer: native
+  dsa_sparse_attention: native
+  dsa_indexer_kl: native
 ```
 
-此处只展示需修改的规则，其余 `plan_overrides` 保留。当前融合路径要求 TP1，并关闭 candidate pool。
+CSA2 融合实现要求适用的 BF16 输入、普通因果 TopK，以及调用所需的文档分段。
+当前示例使用 TP1 并关闭 candidate pool。分块 EP 和容量受限 EP 用参考 token 重排。
+视觉注意力在图文配置中由 `ops.attention` 控制。完整候选顺序见
+[算子后端选型与接入](../../../docs/guide/op_select.zh.md#算子支持矩阵)。
 
 ### 关闭 MegaKernel 后使用普通 EP
 

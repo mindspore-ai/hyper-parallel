@@ -21,6 +21,7 @@ __all__ = [
 ]
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -32,6 +33,27 @@ from hyper_parallel.trainer.config.resolver import (
     resolve_config,
 )
 from hyper_parallel.trainer.config.trainer import TrainerConfig
+
+
+class _TrainingConfigLoader(yaml.SafeLoader):
+    """Reject duplicate keys in the YAML ops mapping."""
+
+    def get_single_data(self) -> object:
+        root = self.get_single_node()
+        if root is None:
+            return None
+        if isinstance(root, yaml.MappingNode):
+            ops_nodes = [value for key, value in root.value if isinstance(key, yaml.ScalarNode) and key.value == "ops"]
+            if len(ops_nodes) > 1:
+                raise ConfigResolutionError("$.ops", "duplicate ops mapping")
+            if ops_nodes and isinstance(ops_nodes[0], yaml.MappingNode):
+                seen = set()
+                for key, _ in ops_nodes[0].value:
+                    if isinstance(key, yaml.ScalarNode):
+                        if key.value in seen:
+                            raise ConfigResolutionError("$.ops", f"duplicate family {key.value!r}")
+                        seen.add(key.value)
+        return self.construct_document(root)
 
 
 def _parse_override_tokens(tokens: Sequence[str]) -> list[tuple[str, str]]:
@@ -67,9 +89,15 @@ def _apply_typed_overrides(
             raise ConfigResolutionError(
                 f"CLI.{dot_path}", f"invalid YAML value {raw_value!r}: {exc}"
             ) from exc
-        config_with_overrides = replace_override_path(
-            config_with_overrides, dot_path.split("."), parsed_value, path=""
-        )
+        parts = dot_path.split(".")
+        if len(parts) == 2 and parts[0] == "ops":
+            selections = {**config_with_overrides.ops, parts[1]: parsed_value}
+            try:
+                config_with_overrides = replace(config_with_overrides, ops=selections)
+            except ValueError as exc:
+                raise ConfigResolutionError(f"CLI.{dot_path}", str(exc)) from exc
+        else:
+            config_with_overrides = replace_override_path(config_with_overrides, parts, parsed_value, path="")
     return config_with_overrides
 
 
@@ -80,7 +108,7 @@ def _load_training_config(
     """Load a YAML configuration and apply CLI overrides."""
     config_path = Path(config_file)
     try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_TrainingConfigLoader)
     except OSError as exc:
         raise ConfigResolutionError(config_path, f"could not read config file: {exc}") from exc
     except yaml.YAMLError as exc:

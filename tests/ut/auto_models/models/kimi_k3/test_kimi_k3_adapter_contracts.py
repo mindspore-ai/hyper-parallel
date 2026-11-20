@@ -239,7 +239,7 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
                 self.assertEqual(meta.kind, INNER_WRAPPER)
                 self.assertEqual(meta.context, {"target_module"} | _MESH_FAMILY)
                 parameters = inspect.signature(wrapper).parameters
-                self.assertEqual(parameters["backend"].default, "eager")
+                self.assertEqual(parameters["backend"].default, "auto" if "ulysses" in name else "eager")
                 self.assertEqual(parameters["chunk_size"].default, 64)
 
     def test_wrappers_return_atomic_request_without_mutating_target(self):

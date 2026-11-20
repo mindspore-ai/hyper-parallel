@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 import torch
-from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
+from hyper_parallel.components.ops import gqa_attention
 
 
 def run_qwen3_moe_flash_attention(
@@ -30,7 +30,7 @@ def run_qwen3_moe_flash_attention(
     if attention_mask is not None and attention_mask.ndim == 4:
         # Preserve HF cache-capacity masks while sharing all actual FA semantics.
         attention_mask = attention_mask[..., :key_states.shape[2]]
-    return npu_fusion_attention_forward(module, query_states, key_states, value_states,
+    return gqa_attention(module, query_states, key_states, value_states,
                                         attention_mask, dropout=dropout, scaling=scaling, **kwargs)
 
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from abc import ABC
 from collections import defaultdict
 from collections.abc import Callable
@@ -76,6 +77,7 @@ from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
+from hyper_parallel.components.ops import ops
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.models.external_state import get_model_external_state
@@ -380,6 +382,7 @@ class BaseTrainer(Stateful, ABC):
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
+        ops.set_backends(getattr(self.config, "ops", {}))
         self.model = self.config.model.build(
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
@@ -738,8 +741,32 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Named loss values for the optimizer step.
             grad_norm: Gradient norm measured before the optimizer update.
         """
+        if self.state.global_step == 1:
+            self._print_step_one_op_backends()
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    def _print_step_one_op_backends(self) -> None:
+        """Print the first step's operator backends to stderr on global rank zero."""
+        local_usage = ops.used_backends()
+        world_size = get_world_size_safe()
+        reports = [local_usage]
+        if world_size > 1:
+            # Some operators only run on pipeline stages or modality ranks other than rank zero.
+            reports = [()] * world_size
+            dist.all_gather_object(reports, local_usage)
+        if get_global_rank_safe() == 0:
+            usage = sorted({entry for report in reports for entry in report})
+            if usage:
+                rows = [("Op", "Variant", "Backend"), *usage]
+                widths = [max(len(value) for value in column) for column in zip(*rows)]
+                rows.insert(1, tuple("-" * width for width in widths))
+                table = "\n".join(
+                    "  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip()
+                    for row in rows
+                )
+                # Use the config log stream so torchrun applies the same worker prefix.
+                print(f"Fused operator backends used in training step 1\n\n{table}", file=sys.stderr, flush=True)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.

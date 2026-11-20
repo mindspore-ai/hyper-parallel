@@ -19,8 +19,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.nn import functional as F
-from hyper_parallel.components.functional.mhc_post import mhc_post
-from hyper_parallel.components.functional.sinkhorn import sinkhorn, sinkhorn_knopps
+from hyper_parallel.components.ops import mhc_post, sinkhorn
 from ._utils import _validate_settings
 
 
@@ -105,10 +104,7 @@ class PipelinedMhcModule(nn.Module):
         post = 2 * torch.sigmoid(post * post_scale + post_bias)
         residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
         residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
-        if hidden_streams.device.type == "npu" and hasattr(torch.ops.custom, "npu_sinkhorn"):
-            residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
-        else:
-            residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
         return pre, post, residual
 
 

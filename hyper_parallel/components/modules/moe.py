@@ -42,153 +42,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
+from hyper_parallel.components.ops import grouped_swiglu, swiglu
 from hyper_parallel.core.dtensor.dtensor import DTensor
-
-
-def _is_npu_tensor(tensor: torch.Tensor) -> bool:
-    """Return whether a tensor is stored on an Ascend NPU."""
-    return tensor.device.type == "npu"
-
-
-# ---------------------------------------------------------------------------
-# Grouped expert computation kernels
-# ---------------------------------------------------------------------------
-
-def _run_experts_for_loop(
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    scores: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run per-expert SwiGLU via a sequential loop (reference path).
-
-    Args:
-        w1: Shape ``[num_experts, hidden_dim, dim]``.
-        w2: Shape ``[num_experts, dim, hidden_dim]``.
-        w3: Shape ``[num_experts, hidden_dim, dim]``.
-        x: Routed tokens in expert-major order, shape
-            ``[total_routed_tokens, dim]``.
-        num_tokens_per_expert: 1-D integer tensor of length ``num_experts``.
-        scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
-            Routing weights applied to intermediate activations (``silu(w1(x)) * w3(x)``)
-            before the w2 projection. When ``None``, no weighting is applied.
-            Defaults to ``None``.
-
-    Returns:
-        Expert output of shape ``[total_routed_tokens, dim]``.
-    """
-    # Use ``torch.cat`` instead of ``zeros_like + in-place slice assign``.
-    # On some backends (notably torch_npu) in-place slice assignment onto a
-    # ``requires_grad=False`` leaf tensor does not reliably upgrade it to a
-    # non-leaf with a ``grad_fn`` — the forward result may end up with
-    # ``grad_fn=None`` and downstream ``backward()`` fails with
-    # "element 0 of tensors does not require grad and does not have a grad_fn".
-    #
-    # Drain ``num_tokens_per_expert`` to host **once** via ``.tolist()``
-    # rather than calling ``int(n)`` per loop iteration — a single D2H
-    # copy instead of ``num_local_experts`` separate ones.  Per-iter
-    # ``.item()`` would stall the host between expert kernels and shrink
-    # the dual-pipe overlap window.
-    counts_list = num_tokens_per_expert.tolist()
-    parts = []
-    offset = 0
-    for e, n in enumerate(counts_list):
-        if n == 0:
-            continue
-        x_e = x[offset:offset + n]
-        h = F.silu(x_e @ w1[e].T) * (x_e @ w3[e].T)
-        if scores is not None:
-            h = h * scores[offset:offset + n].unsqueeze(-1)
-        parts.append(h @ w2[e].T)
-        offset += n
-    if not parts:
-        # No routed tokens: return a grad-connected zero (not ``zeros_like``).
-        return x * 0.0
-    return torch.cat(parts, dim=0)
-
-
-def _run_experts_grouped_mm_gpu(
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    scores: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Fused grouped matmul path for NVIDIA GPU using ``torch._grouped_mm``.
-
-    Args:
-        w1: Shape ``[num_experts, hidden_dim, dim]``.
-        w2: Shape ``[num_experts, dim, hidden_dim]``.
-        w3: Shape ``[num_experts, hidden_dim, dim]``.
-        x: Shape ``[total_routed_tokens, dim]``.
-        num_tokens_per_expert: 1-D integer tensor of length ``num_experts``.
-        scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
-            Routing weights applied to intermediate activations (``silu(w1(x)) * w3(x)``)
-            before the w2 projection. When ``None``, no weighting is applied.
-            Defaults to ``None``.
-
-    Returns:
-        Expert output of shape ``[total_routed_tokens, dim]``.
-    """
-    # grouped_mm needs an end offset for every expert, including the last one.
-    offs = torch.cumsum(num_tokens_per_expert, dim=0).to(torch.int32)
-    # Column-major views let grouped_mm consume the existing parameter storage
-    # without retaining another full set of expert weights for backward.
-    w1_t = w1.transpose(1, 2)
-    w3_t = w3.transpose(1, 2)
-    w2_t = w2.transpose(1, 2)
-    h1 = torch._grouped_mm(x, w1_t, offs=offs)  # pylint: disable=protected-access
-    h3 = torch._grouped_mm(x, w3_t, offs=offs)  # pylint: disable=protected-access
-    h = F.silu(h1) * h3
-    if scores is not None:
-        h = h * scores.unsqueeze(-1)
-    return torch._grouped_mm(h, w2_t, offs=offs)  # pylint: disable=protected-access
-
-
-def _run_experts_grouped_mm_npu(
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    scores: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Fused grouped matmul path for Ascend NPU using ``torch_npu.npu_grouped_matmul``.
-
-    Requires ``torch_npu`` to be installed.
-
-    Args:
-        w1: Shape ``[num_experts, hidden_dim, dim]``.
-        w2: Shape ``[num_experts, dim, hidden_dim]``.
-        w3: Shape ``[num_experts, hidden_dim, dim]``.
-        x: Shape ``[total_routed_tokens, dim]``.
-        num_tokens_per_expert: 1-D integer tensor of length ``num_experts``.
-        scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
-            Routing weights applied after the bias-free w2 projection.
-            When ``None``, no weighting is applied. Defaults to ``None``.
-
-    Returns:
-        Expert output of shape ``[total_routed_tokens, dim]``.
-    """
-    if x.shape[0] == 0:
-        parameter_zero = (w1.sum() + w2.sum() + w3.sum()).to(x.dtype) * 0.0
-        return x + parameter_zero
-
-    gate_up_weight = torch.cat((w1, w3), dim=1)
-    output = npu_grouped_swiglu(
-        x,
-        gate_up_weight,
-        w2,
-        num_tokens_per_expert,
-    )
-    if scores is not None:
-        output = output * scores.to(output.dtype).unsqueeze(-1)
-    return output
-
 
 # ---------------------------------------------------------------------------
 # FeedForward — shared expert / standard SwiGLU FFN
@@ -233,7 +88,7 @@ class FeedForward(nn.Module):
         Returns:
             Output tensor with the same leading shape and last dimension ``dim``.
         """
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(swiglu(torch.cat((self.w1(x), self.w3(x)), dim=-1)))
 
 
 # ---------------------------------------------------------------------------
@@ -250,10 +105,8 @@ class GroupedExperts(nn.Module):
         dim: Token embedding dimension.
         hidden_dim: Expert hidden dimension (SwiGLU intermediate size).
         num_experts: Total number of experts.
-        use_grouped_mm: If ``True``, uses a hardware-accelerated grouped
-            matmul kernel (``torch._grouped_mm`` on GPU,
-            ``torch_npu.npu_grouped_matmul`` on NPU).  Falls back to the
-            for-loop path when neither is available.  Defaults to ``False``.
+        use_grouped_mm: Use the per-expert reference as the legacy default when
+            explicitly ``False``. An ``ops.grouped_swiglu`` selection takes precedence.
 
     Note:
         When weights are DTensors (e.g. after TP sharding via
@@ -274,7 +127,7 @@ class GroupedExperts(nn.Module):
         dim: int,
         hidden_dim: int,
         num_experts: int,
-        use_grouped_mm: bool = False,
+        use_grouped_mm: bool | None = None,
     ) -> None:
         """Initialize GroupedExperts with stacked expert weight matrices.
 
@@ -324,13 +177,9 @@ class GroupedExperts(nn.Module):
         w2 = self.w2.to_local() if isinstance(self.w2, DTensor) else self.w2
         w3 = self.w3.to_local() if isinstance(self.w3, DTensor) else self.w3
 
-        if not self.use_grouped_mm:
-            return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)
-        if _is_npu_tensor(x):
-            return _run_experts_grouped_mm_npu(w1, w2, w3, x, num_tokens_per_expert, scores)
-        if x.device.type == "cuda":
-            return _run_experts_grouped_mm_gpu(w1, w2, w3, x, num_tokens_per_expert, scores)
-        return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)
+        backend = "native" if self.use_grouped_mm is False else "auto"
+        return grouped_swiglu(x, w1, w2, w3, num_tokens_per_expert, scores, backend=backend)
+
 
 
 # ---------------------------------------------------------------------------
@@ -655,9 +504,7 @@ class MoE(nn.Module):
             in parallel; output added to routed-expert output.
         router_kwargs: Extra keyword arguments forwarded to
             :class:`TokenChoiceTopKRouter`.
-        use_grouped_mm: If ``True``, uses a hardware-accelerated grouped
-            matmul kernel (e.g. ``npu_grouped_matmul``) inside
-            :class:`GroupedExperts`.  Defaults to ``False``.
+        use_grouped_mm: Optional legacy control passed to :class:`GroupedExperts`.
 
     Note:
         *Auxiliary-loss-free load balancing*: call :func:`update_expert_bias`
@@ -682,7 +529,7 @@ class MoE(nn.Module):
         sequence_partition_group: Any | None = None,
         shared_expert: FeedForward | None = None,
         router_kwargs: dict | None = None,
-        use_grouped_mm: bool = False,
+        use_grouped_mm: bool | None = None,
     ) -> None:
         """Initialize MoE block with experts, router and optional shared expert.
 

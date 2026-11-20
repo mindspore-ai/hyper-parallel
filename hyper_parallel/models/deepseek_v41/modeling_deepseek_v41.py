@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -45,11 +46,9 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.modules.shared_expert import SharedExpertModule
-from hyper_parallel.components.modules.swiglu_mlp import swiglu_activation
-from hyper_parallel.components.modules.router import routing_scores, select_topk_scores
-from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
+from hyper_parallel.components.ops import moe_router, rms_norm_fp32_affine, router_scores, sinkhorn, swiglu_clamped
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
@@ -109,6 +108,20 @@ def _initialize_embedding_shard_safe(module: nn.Embedding, std: float) -> None:
     if module.padding_idx is None:
         return
     module.weight[module.padding_idx].zero_()
+
+
+class _Fp32AffineRMSNorm(DeepseekV4RMSNorm):
+    """Keep the DeepSeek FP32 affine contract and the source weight layout."""
+
+    def __init__(self, source: DeepseekV4RMSNorm) -> None:
+        nn.Module.__init__(self)  # pylint: disable=non-parent-init-called,super-init-not-called
+        self.weight = source.weight
+        self.variance_epsilon = source.variance_epsilon
+        self.train(source.training)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize with FP32 affine multiplication and restore the input dtype."""
+        return rms_norm_fp32_affine(hidden_states, self.weight, self.variance_epsilon)
 
 
 class DeepseekV41Engram(nn.Module):
@@ -199,13 +212,6 @@ class DeepseekV41Engram(nn.Module):
         )
 
 
-def _router_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
-    """Convert router logits to the released nonnegative expert scores."""
-    if scoring_func not in ("sqrtsoftplus", "softmax", "sigmoid"):
-        raise ValueError(f"Unsupported V4.1 router scoring function: {scoring_func!r}")
-    return routing_scores(logits, scoring_func)
-
-
 def _apply_router_training_state(
         module: nn.Module,
         hidden_states: torch.Tensor,
@@ -253,6 +259,8 @@ def _apply_router_training_state(
 class DeepseekV41TopKRouter(nn.Module):
     """V4.1 learned router with independent text and image correction biases."""
 
+    fp32_parameter_names = ("bias", "bias_vl")
+
     def __init__(self, config: Any) -> None:
         """Create the released noaux_tc routing parameter layout."""
         super().__init__()
@@ -280,6 +288,27 @@ class DeepseekV41TopKRouter(nn.Module):
             self.bias_vl = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False)
         else:
             self.register_parameter("bias_vl", None)
+
+    def _apply(
+            self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True,
+    ) -> DeepseekV41TopKRouter:
+        """Preserve FP32 correction biases while following device conversion."""
+        protected = set()
+        for parameter in (self.bias, self.bias_vl):
+            if parameter is not None:
+                protected.add(id(parameter))
+                if parameter.grad is not None:
+                    protected.add(id(parameter.grad))
+
+        def apply(tensor: torch.Tensor) -> torch.Tensor:
+            converted = fn(tensor)
+            if id(tensor) not in protected or converted.dtype == torch.float32:
+                return converted
+            if tensor.is_meta:
+                return converted.float()
+            return tensor.to(device=converted.device, dtype=torch.float32)
+
+        return super()._apply(apply, recurse=recurse)
 
     def forward(
             self,
@@ -310,25 +339,14 @@ class DeepseekV41TopKRouter(nn.Module):
             training with a positive coefficient, weights carry the auxiliary
             gradient and ``last_aux_loss`` stores its unweighted detached value.
         """
-        flattened = hidden_states.reshape(-1, self.hidden_size)
-        logits = functional.linear(  # pylint: disable=not-callable
-            flattened.float(), self.weight.float()
-        )
-        scores = _router_scores(logits, self.scoring_func)
-        correction_bias = self.bias
         if image_mask is not None:
             if image_mask.shape != hidden_states.shape[:-1] or image_mask.dtype != torch.bool:
                 raise ValueError("image_mask must be boolean and match the hidden-state token dimensions")
-            if self.bias_vl is not None:
-                correction_bias = torch.where(
-                    image_mask.reshape(-1, 1),
-                    self.bias_vl.unsqueeze(0),
-                    self.bias.unsqueeze(0),
-                )
-        weights, indices = select_topk_scores(
-            scores, top_k=self.top_k, correction_bias=correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor, normalize_topk=self.top_k > 1,
+        logits, weights, indices = moe_router(
+            hidden_states, self.weight, self.bias, self.bias_vl, image_mask,
+            self.top_k, self.scoring_func, self.routed_scaling_factor,
         )
+        scores = router_scores(logits, self.scoring_func) if self.training and self.aux_loss_coeff else None
         weights = _apply_router_training_state(
             self,
             hidden_states,
@@ -375,7 +393,7 @@ def deepseek_v41_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> t
         FP32 activation. The caller restores its projection input dtype before
         the down projection, keeping this math shared by routed and shared experts.
     """
-    return swiglu_activation(gate, up, limit=limit, activation_dtype="float32")
+    return swiglu_clamped(gate, up, limit)
 
 
 def _v41_shared_expert_forward(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -535,14 +553,14 @@ class _DeepseekV41AttentionState(DeepseekV4Attention):
 
 
 class DeepseekV41Attention(SharedCompressedDSAAttentionBase):
-    """Reference shared compressed attention owned by the model architecture."""
+    """Shared compressed attention owned by the model architecture."""
 
     def __init__(self, config: Any, layer_idx: int) -> None:
-        """Create the canonical parameter tree with non-fused reference execution."""
+        """Create the canonical parameter tree with configurable DSA backends."""
         super().__init__(
             _DeepseekV41AttentionState(config, layer_idx),
             replace_indexer=False,
-            use_fused_ops=False,
+            use_fused_ops=None,
         )
 
 
@@ -585,7 +603,7 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
         post = 2 * torch.sigmoid(post * post_scale + post_bias)
         residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
         residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
-        residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
         return pre, post, residual
 
 
@@ -855,6 +873,12 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
         self.gradient_checkpointing = False
         self._megamoe_runtime_prepared = False
+        norms = {}
+        for name, module in tuple(self.named_modules(remove_duplicate=False)):
+            if type(module) is DeepseekV4RMSNorm:  # pylint: disable=unidiomatic-typecheck
+                if module not in norms:
+                    norms[module] = _Fp32AffineRMSNorm(module)
+                self.set_submodule(name, norms[module])
         self.post_init()
 
     def _prepare_megamoe_runtime(self) -> None:

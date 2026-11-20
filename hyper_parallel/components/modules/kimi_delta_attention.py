@@ -42,10 +42,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from hyper_parallel.components.functional.kimi_delta_attention_ascendc import ascendc_chunk_kda
 from hyper_parallel.components.functional.linear_attention_packed import (
-    packed_causal_conv1d, packed_reference, resolve_packed_sequence,
+    packed_reference, resolve_packed_sequence,
 )
+from hyper_parallel.components.ops import causal_conv1d, kda
 
 _KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 _TRITON_KDA_HEAD_DIM = 128
@@ -400,7 +400,9 @@ def _prepare_kda_wy(
         torch.eye(chunk_size, dtype=torch.bool, device=query.device)
     )
 
-    gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
+    # Future-position differences can overflow before the final causal mask,
+    # leaving NaNs in backward even when the forward result is finite.
+    gate_pair = (gate.unsqueeze(-2) - gate.unsqueeze(-3)).masked_fill(~causal.unsqueeze(-1), -torch.inf)
     key_pair = torch.einsum(
         "...ik,...jk,...ijk->...ij",
         key,
@@ -438,7 +440,7 @@ def _run_kda_chunks(
         w_i = w[:, :, chunk_idx]
         u_i = u[:, :, chunk_idx]
 
-        relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
+        relative_gate = (gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)).masked_fill(~causal.unsqueeze(-1), -torch.inf)
         qk = torch.einsum(
             "bhik,bhjk,bhijk->bhij",
             query_i,
@@ -627,6 +629,11 @@ def chunk_kda(
     _validate_fused_state_contract(initial_state, output_final_state, use_qk_l2norm_in_kernel,
                                   use_gate_in_kernel, use_beta_sigmoid_in_kernel, backend)
     if backend == "ascendc":
+        # Only Ascend C loads the optional fused state helpers.
+        from hyper_parallel.components.functional.kimi_delta_attention_ascendc import (  # pylint: disable=C0415
+            ascendc_chunk_kda,
+        )
+
         output = ascendc_chunk_kda(
             query, key, value, gate, beta,
             a_log=a_log.float() if a_log is not None else None,
@@ -953,11 +960,9 @@ class KimiDeltaAttention(nn.Module):
         sequence_info=None,
     ) -> torch.Tensor:
         """Apply one causal depthwise convolution and trim its right padding."""
-        if sequence_info is not None:
-            return packed_causal_conv1d(projected, convolution, sequence_info)
-        sequence_length = projected.shape[1]
-        output = convolution(projected.transpose(1, 2))[:, :, :sequence_length]
-        return F.silu(output.transpose(1, 2))
+        return causal_conv1d(
+            projected, convolution.weight, convolution.bias, sequence_info, dilation=convolution.dilation[0],
+        )
 
     def _output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project the layer input to the per-head output gate."""
@@ -1004,7 +1009,7 @@ class KimiDeltaAttention(nn.Module):
         beta = self.b_proj(hidden_states).reshape(
             batch_size, sequence_length, self.num_v_heads
         )
-        output, _ = torch_chunk_kda(
+        output = kda(
             query,
             key,
             value,
@@ -1012,14 +1017,9 @@ class KimiDeltaAttention(nn.Module):
             beta,
             a_log=self.A_log,
             dt_bias=self.dt_bias,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
             lower_bound=self.gate_lower_bound,
             chunk_size=self.chunk_size,
-            cu_seqlens=None if sequence_info is None else sequence_info.local_offsets,
+            info=sequence_info,
         )
         output_gate = self._output_gate(hidden_states).reshape(
             batch_size, sequence_length, self.num_v_heads, self.head_v_dim

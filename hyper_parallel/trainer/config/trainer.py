@@ -23,6 +23,7 @@ from typing import Any, List, Literal, Optional
 
 from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.components.ops.catalog import builtin_registry
 
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
 from hyper_parallel.trainer.config.optimization import (
@@ -87,9 +88,11 @@ class TrainerConfig:
     stress_detect: StressDetectConfig = field(default_factory=StressDetectConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
+    ops: dict[str, str] = field(default_factory=dict, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
+        builtin_registry.validate_selections(self.ops)
         if (
             self.compile.enabled
             and not self.compile.selects_graph_compiler()

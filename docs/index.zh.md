@@ -22,6 +22,7 @@
 | [KDA 递归倍增与 Ulysses 混合 CP](./guide/kda_recursive_doubling.md) | RD 状态扫描、TND reset 剪枝与转移缓存 |
 | [线性注意力 TND 上下文并行](./guide/linear_attention_tnd_cp.md) | KDA / GDN 的文档边界、配置、状态交换与数值语义 |
 | [EP 专家并行](./guide/expert_parallel.zh.md) | ExpertParallel、MoE 构建模块、负载均衡 |
+| [算子后端选型与接入](./guide/op_select.zh.md) | YAML 配置、参考实现、后端支持矩阵与算子注册 |
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.zh.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.zh.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [Chunk Loss](./guide/chunk_loss.zh.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |
@@ -49,6 +50,7 @@
 |------|------|
 | [开发环境搭建](./contributing/dev_environment.zh.md) | 开发环境配置、依赖安装 |
 | [测试流程规范](./contributing/testing.zh.md) | 测试框架、标记规范、分布式测试 |
+| [OpSelect 算子开发与验收](./contributing/op_select_development.zh.md) | 计算契约、后端接入、native 精度基线及模块和性能验收 |
 | [发布流程规范](./contributing/release.zh.md) | 版本发布流程、文档更新规范 |
 
 ## 其他

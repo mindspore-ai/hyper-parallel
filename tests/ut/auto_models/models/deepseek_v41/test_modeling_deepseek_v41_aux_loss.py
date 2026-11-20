@@ -225,9 +225,10 @@ class TestV41RouterAuxLoss(unittest.TestCase):
 
         def dispatch(
                 target: Any, states: torch.Tensor, *, router_fn: Callable, ep_group: Any,
+                use_fused_moe_token_permute_and_unpermute: bool | None,
         ) -> torch.Tensor:
             """Exercise the real gate call without expert communication."""
-            del ep_group
+            del ep_group, use_fused_moe_token_permute_and_unpermute
             router_fn(target, states)
             return torch.zeros_like(states)
 
@@ -348,9 +349,9 @@ class TestV41NativeAuxLoss(unittest.TestCase):
         ep_mesh = Mock()
         ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
 
-        def _dispatch(target, inputs, *, router_fn, ep_group):
+        def _dispatch(target, inputs, *, router_fn, ep_group, use_fused_moe_token_permute_and_unpermute):
             """Use returned weights exactly as the real dispatch/combine path does."""
-            del ep_group
+            del ep_group, use_fused_moe_token_permute_and_unpermute
             _, weights = router_fn(target, inputs)
             return weights.sum(-1).reshape(*inputs.shape[:-1], 1).expand_as(inputs)
 
@@ -404,9 +405,10 @@ class TestV41NativeAuxLoss(unittest.TestCase):
 
             def dispatch(
                     target: Any, states: torch.Tensor, *, router_fn: Callable, ep_group: Any,
+                    use_fused_moe_token_permute_and_unpermute: bool | None,
             ) -> torch.Tensor:
                 """Use native experts to validate the EP region without communication."""
-                del ep_group
+                del ep_group, use_fused_moe_token_permute_and_unpermute
                 indices, weights = router_fn(target, states)
                 return target.experts(states.reshape(-1, states.shape[-1]), indices, weights).reshape_as(states)
 

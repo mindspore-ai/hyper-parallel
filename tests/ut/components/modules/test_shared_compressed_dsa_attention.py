@@ -22,12 +22,22 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
+from hyper_parallel.components.ops import DsaQueryLayout, dsa_sparse_attention_compressed_banks
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
+from hyper_parallel.components.ops import _dependency, ops
+from hyper_parallel.components.ops.families import dsa_indexer_kl as indexer_kl_impl
+from hyper_parallel.components.ops.families import dsa_sparse_attention as sparse_attention_impl
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import reference_sparse_attention
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
+
+
+class _MockNpuDevice(str):
+    """Report NPU metadata while retaining CPU allocations in mocked kernels."""
+
+    type = "npu"
 
 
 def _source(index_source=False):
@@ -82,7 +92,7 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
 
     def test_kl_required_mode_never_invokes_reference(self):
         """Reject unsupported active KL before entering the reference function."""
-        with patch.object(attention._SharedCompressedIndexerKLLoss, "apply") as reference:
+        with patch.object(indexer_kl_impl._SharedCompressedIndexerKLLoss, "apply") as reference:
             with self.assertRaisesRegex(RuntimeError, "Fused KL requires NPU inputs; got device=cpu"):
                 attention.shared_compressed_indexer_kl_loss(
                     self.query, self.key, self.weights, torch.ones(1, 1, 2, 128), self.key,
@@ -153,7 +163,7 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
 
     def test_replacement_config_selects_fused_kernels(self):
         """Resolve the original baseline and fused kernels through the same replacement Target."""
-        for use_fused_ops in (False, True):
+        for use_fused_ops in (False, True, None):
             with self.subTest(use_fused_ops=use_fused_ops):
                 entry = PlanOverride(
                     match="model.layers.*.self_attn",
@@ -172,9 +182,9 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 self.assertEqual(module.indexer.use_fused, use_fused_ops)
                 self.assertEqual({name: id(value) for name, value in module.named_parameters()}, parameters)
         default = attention.SharedCompressedDSAAttention(_source(True))
-        self.assertFalse(default.use_fused_ops)
-        self.assertFalse(default.indexer.use_fused)
-        for value in ("false", "true", "auto", None, 0, 1):
+        self.assertIsNone(default.use_fused_ops)
+        self.assertIsNone(default.indexer.use_fused)
+        for value in ("false", "true", "auto", 0, 1):
             with self.subTest(invalid=value), self.assertRaisesRegex(ValueError, "use_fused_ops must be a bool"):
                 attention.SharedCompressedDSAAttention(_source(), use_fused_ops=value)
 
@@ -188,6 +198,61 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 module = attention.SharedCompressedDSAAttention(source, use_fused_ops=True)
                 with self.assertRaisesRegex(NotImplementedError, "candidate-pool"):
                     module.indexer._select_indices(self.query, self.key, self.weights, None, 0, None, None, None)
+
+    def test_indexer_falls_back_only_for_auto(self) -> None:
+        """The same incompatible Indexer call uses native in auto and rejects explicit CANN."""
+        self.addCleanup(ops.set_backends, ops.get_backends())
+        args = {"compress_ratio": 1, "sparse_count": 2}
+        expected = attention.compressed_causal_topk(self.query, self.key, self.weights, **args)
+
+        ops.set_backends({"dsa_indexer": "auto"})
+        with patch.object(torch.Tensor, "device", property(lambda _x: _MockNpuDevice("cpu"))):
+            actual = attention.compressed_causal_topk(self.query, self.key, self.weights, **args, use_fused=None)
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(ops.used_backends(), (("dsa_indexer", "compressed_causal_topk", "native"),))
+
+        ops.set_backends({"dsa_indexer": "cann"})
+        with (
+            self.assertRaisesRegex(RuntimeError, "LI V2 requires BF16"),
+            patch.object(torch.Tensor, "device", property(lambda _x: _MockNpuDevice("cpu"))),
+        ):
+            attention.compressed_causal_topk(self.query, self.key, self.weights, **args, use_fused=None)
+
+    def test_sparse_attention_derives_raw_document_origins(self) -> None:
+        """Use the same logical document layout for eager, graph and CANN packing."""
+        generator = torch.Generator().manual_seed(23)
+        query = torch.randn(1, 1, 4, 512, generator=generator, dtype=torch.bfloat16, requires_grad=True)
+        raw = torch.randn(1, 1, 5, 512, generator=generator, dtype=torch.bfloat16)
+        main = torch.randn(1, 2, 512, generator=generator, dtype=torch.bfloat16)
+        indices = torch.tensor([[[1, -1, -1], [1, -1, -1], [-1, -1, -1], [2, -1, -1]]], dtype=torch.int32)
+        segments = ((0, 2, 1, 2, 1), (2, 4, 2, 3, 0))
+        layout = DsaQueryLayout(compress_ratio=2, query_offset=4, segments=segments)
+        tensor_layout = DsaQueryLayout(compress_ratio=2, query_offset=4, segment_starts=torch.tensor([[3, 3, 6, 6]]))
+        args = (query, raw, main, indices, torch.zeros(1))
+        options = {
+            "scale": 512**-.5, "window": 128, "global_sequence_length": 8,
+            "raw_key_offset": 3, "main_key_offset": 1, "global_key_length": 3,
+        }
+
+        actual = dsa_sparse_attention_compressed_banks(*args, layout=layout, **options)
+        expected = dsa_sparse_attention_compressed_banks(*args, layout=tensor_layout, **options)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(torch.autograd.grad(actual.sum(), query)[0],
+                                   torch.autograd.grad(expected.sum(), query)[0])
+
+        self.addCleanup(ops.set_backends, ops.get_backends())
+        ops.set_backends({"dsa_sparse_attention": "cann"})
+        with (
+            patch.object(torch.Tensor, "device", property(lambda _x: _MockNpuDevice("cpu"))),
+            patch.object(_dependency, "require_symbol"),
+            patch.object(_dependency, "require_package", return_value=object()),
+            patch.object(sparse_attention_impl, "supports_fused_attention_inputs", return_value=True),
+            patch.object(sparse_attention_impl, "sparse_flash_mla", return_value=expected) as kernel,
+        ):
+            result = dsa_sparse_attention_compressed_banks(*args, layout=layout, **options)
+        kernel.assert_called_once()
+        self.assertEqual(kernel.call_args.args[-1], ((0, 3), (2, 6)))
+        torch.testing.assert_close(result, expected)
 
     def test_zero_loss_does_not_require_an_unused_kernel(self):
         """A zero objective is not an attempted fused calculation."""

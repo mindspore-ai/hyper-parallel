@@ -44,6 +44,7 @@ import torch.nn.functional as F
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
+from hyper_parallel.components.ops import _check_native_ep_reorder, moe_token_reorder, moe_token_restore
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
 )
@@ -436,7 +437,7 @@ def _prepare_ep_dispatch(
     ep_size: int,
     ep_group: Any,
     keep: Optional[torch.Tensor] = None,
-    use_fused_moe_token_permute_and_unpermute: bool = False,
+    use_fused_moe_token_permute_and_unpermute: Optional[bool] = False,
 ) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts.
 
@@ -463,11 +464,12 @@ def _prepare_ep_dispatch(
         source_indices = _routed_slot_token_ids(
             token_count, experts_per_token, flattened_states.device)[flat_keep]
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
-    use_fused_moe_token_permute_and_unpermute = (
-        use_fused_moe_token_permute_and_unpermute and flattened_states.device.type == "npu" and keep is None
-    )
     unpermute_indices = None
-    if use_fused_moe_token_permute_and_unpermute:
+    if use_fused_moe_token_permute_and_unpermute is None and keep is None:
+        dispatched_states, dispatch_order, unpermute_indices = moe_token_reorder(
+            flattened_states, topk_indices,
+        )
+    elif use_fused_moe_token_permute_and_unpermute and flattened_states.device.type == "npu" and keep is None:
         # Keep optional NPU dependencies out of the generic dispatch path.
         from hyper_parallel.components.functional.moe_token_permute import (  # pylint: disable=C0415
             moe_token_permute,
@@ -530,7 +532,7 @@ def _prepare_ep_dispatch(
         send_counts=send_counts,
         receive_counts=receive_counts,
         unpermute_indices=unpermute_indices,
-        routing_weights=topk_weights if use_fused_moe_token_permute_and_unpermute else None,
+        routing_weights=topk_weights if unpermute_indices is not None else None,
     )
 
 
@@ -1044,7 +1046,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
-    use_fused_moe_token_permute_and_unpermute: bool = True,
+    use_fused_moe_token_permute_and_unpermute: Optional[bool] = True,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -1083,7 +1085,8 @@ def ep_routed_forward(
     ``use_fused_moe_token_permute_and_unpermute`` replaces the generic sort/index-add routing
     with NPU token permute/unpermute. It defaults to enabled on NPU and does
     not require grouped GEMM. CPU/GPU, chunked dispatch and capacity-limited
-    dispatch retain the generic permutation path.
+    dispatch retain the generic permutation path. Set the option to ``None`` to
+    select the backend through ``ops.moe_token_reorder``.
 
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
@@ -1103,6 +1106,15 @@ def ep_routed_forward(
 
     output_shape = tuple(hidden_states.shape)
     topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
+    allow_fused_reorder = (
+        use_fused_moe_token_permute_and_unpermute is not False
+        and chunk_count == 1 and _resolve_capacity_factor(module) is None
+    )
+    reorder_mode = use_fused_moe_token_permute_and_unpermute
+    if not allow_fused_reorder:
+        if reorder_mode is None:
+            _check_native_ep_reorder(hidden_states)
+        reorder_mode = False
     dispatch = _prepare_ep_dispatch(
         hidden_states,
         topk_indices,
@@ -1111,10 +1123,7 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
-        use_fused_moe_token_permute_and_unpermute=(
-            use_fused_moe_token_permute_and_unpermute
-            and chunk_count == 1 and _resolve_capacity_factor(module) is None
-        ),
+        use_fused_moe_token_permute_and_unpermute=reorder_mode,
     )
     if chunk_count > 1:
         return _chunked_ep_forward(
@@ -1130,6 +1139,10 @@ def ep_routed_forward(
         ep_group,
         expert_offset,
     )
+    if reorder_mode is None:
+        return moe_token_restore(
+            combined_expert_outputs, dispatch.unpermute_indices, dispatch.routing_weights,
+        ).view(*output_shape)
     return _aggregate_ep_outputs(
         combined_expert_outputs,
         dispatch.expert_weights,

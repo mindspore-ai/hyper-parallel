@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cache
 from numbers import Integral
 from typing import Any, Optional
 
@@ -88,6 +89,7 @@ def _causal_attention_mask(
     return torch.logical_not(allowed)
 
 
+@cache
 def _get_compressed_causal_mask(device: torch.device) -> torch.Tensor:
     """Return the mask required by Ascend compressed causal sparse modes."""
     return torch.ones(
@@ -292,7 +294,7 @@ def _prepare_attention_mask(
             if sliding_window is not None:
                 context.sparse_mode = 4
                 context.pre_tokens = sliding_window - 1
-            elif context.query_length > _COMPRESSED_CAUSAL_MASK_SIZE:
+            else:
                 context.sparse_mode = 2
     if context.is_packed and sliding_window is not None and sliding_window > 0:
         # Match the existing padding-to-TND window contract: W includes the current token.

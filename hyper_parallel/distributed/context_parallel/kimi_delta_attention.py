@@ -46,6 +46,7 @@ from hyper_parallel.components.modules.kimi_delta_attention import (
     torch_apply_kda_state_summary,
     torch_kda_state_summary,
 )
+from hyper_parallel.components.ops import causal_conv1d, kda
 from hyper_parallel.core.utils import communication
 from hyper_parallel.distributed.context_parallel.kimi_delta_attention_state import (
     build_kda_state_cp,
@@ -75,32 +76,10 @@ def _run_local_kda(
     """Run the explicitly selected local KDA implementation."""
     if backend in ("triton", "ascendc") and not safe_gate:
         raise RuntimeError("The fused KDA backend requires the lower-bounded gate.")
-    cu_seqlens = None
-    if sequence_info is not None:
-        # Native APIs consume host metadata; do not materialize an NPU plan
-        # only to copy its offsets back to the host at every layer.
-        cu_seqlens = (sequence_info.local_offsets if backend == "ascendc" else
-                      sequence_info.materialize(query.device, chunk_size).cu_seqlens)
-    output, _ = chunk_kda(
-        query,
-        key,
-        value,
-        gate,
-        beta,
-        a_log=a_log,
-        dt_bias=dt_bias,
-        scale=scale,
-        lower_bound=lower_bound,
-        chunk_size=chunk_size,
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        backend=backend,
-        cu_seqlens=cu_seqlens,
+    return kda(
+        query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale,
+        lower_bound=lower_bound if safe_gate else None, chunk_size=chunk_size, info=sequence_info, backend=backend,
     )
-    return output
 
 
 def _is_official_kimi_layer(module: nn.Module) -> bool:
@@ -702,7 +681,7 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
         chunk_size: int = 64,
         lower_bound: float = -5.0,
         safe_gate: bool = True,
-        backend: str = "eager",
+        backend: str = "auto",
     ) -> None:
         """Initialize the KDA Ulysses executor for one 1-D CP mesh."""
         super().__init__()
@@ -711,10 +690,10 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
         if lower_bound >= 0:
             raise ValueError(f"lower_bound must be negative, got {lower_bound}.")
         backend = backend.lower()
-        if backend not in _KDA_BACKENDS:
+        if backend not in _KDA_BACKENDS | {"auto"}:
             raise ValueError(
                 f"unsupported KDA backend {backend!r}; "
-                f"expected one of {sorted(_KDA_BACKENDS)}."
+                f"expected one of {sorted(_KDA_BACKENDS | {'auto'})}."
             )
         self.cp_mesh = _ensure_1d(device_mesh)
         self.cp_size = self.cp_mesh.size()
@@ -1014,7 +993,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
         device_mesh: DeviceMesh,
         *,
         chunk_size: int = 64,
-        backend: str = "eager",
+        backend: str = "auto",
     ) -> None:
         """Initialize the full-layer adapter without replacing its parameters.
 
@@ -1131,15 +1110,13 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
         bias = convolution.bias
         if bias is not None:
             bias = bias.narrow(0, channel_start, local_channels)
-        if sequence_info is not None:
-            return packed_causal_conv1d(
-                projected, convolution, sequence_info, weight=weight, bias=bias,
-                backend=self.backend,
-            )
-        if self.backend != "eager":
-            return fused_causal_conv1d(
-                projected, weight, bias, backend=self.backend,
-                dilation=convolution.dilation[0],
+        dilation = convolution.dilation[0]
+        if sequence_info is not None or (
+            convolution.stride == (1,) and convolution.padding == ((weight.shape[-1] - 1) * dilation,)
+            and convolution.padding_mode == "zeros"
+        ):
+            return causal_conv1d(
+                projected, weight, bias, sequence_info, dilation=dilation, backend=self.backend,
             )
         output = F.conv1d(  # pylint: disable=not-callable
             projected.transpose(1, 2),
