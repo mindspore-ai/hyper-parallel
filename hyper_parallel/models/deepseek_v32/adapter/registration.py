@@ -31,21 +31,11 @@ def _load_replacements():
     return module_replacement
 
 
-def _load_context_parallel():
-    """Return the DeepSeek-V3.2 DSA CP wrapper provider lazily."""
-    from hyper_parallel.models.deepseek_v32.adapter.distributed import (  # pylint: disable=C0415
-        context_parallel,
-    )
-
-    return context_parallel
-
-
 DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV32ForCausalLM",
     model_type="deepseek_v32",
     replacements=_load_replacements,
     materialization=register_rotary_materialization,
-    context_parallel=_load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)

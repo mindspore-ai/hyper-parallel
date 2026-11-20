@@ -63,19 +63,16 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+        _target_: hyper_parallel.components.modules.DeepseekSparseAttention
+        kv_cp_size: 2
+        kv_cp_strategy: allgather
+        cp_comm_overlap: true
+        dense_warmup: null
   - match: "*.mlp.experts"
     replace:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
-  - match: "*.self_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
-        dense_warmup: null
 
 mixed_precision:
   enabled: false

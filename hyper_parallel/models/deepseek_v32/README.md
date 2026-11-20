@@ -24,8 +24,6 @@ models/deepseek_v32/
 ├── adapter/
 │   ├── conversion/
 │   │   └── module_replacement.py    # RMSNorm/DSA factories and the legacy expert entry
-│   ├── distributed/
-│   │   └── context_parallel.py      # DSA context-parallel wrapper
 │   ├── policies/
 │   │   └── sharding.py              # TP sharding rules for MLA and the indexer
 │   ├── materialization.py           # Restores the RoPE buffers after weights load
@@ -40,18 +38,18 @@ models/deepseek_v32/
 ## Features
 
 - **NPU module replacements**, selected by the recipe's `plan_overrides`: `*.input_layernorm`,
-  `*.post_attention_layernorm` and `model.norm` use the fused `RMSNorm`; `*.self_attn` uses `DeepseekV32DSAAttention`,
+  `*.post_attention_layernorm` and `model.norm` use the fused `RMSNorm`; `*.self_attn` uses `DeepseekSparseAttention`,
   which runs the indexer and the sparse attention through CANN fused operators; `*.mlp.experts` selects the
   [routed expert family](../../components/modules/moe/grouped_experts/README.md).
 - **Parallelism**: FSDP, TP (with loss parallelism), CP and EP. PP and sequence parallelism are not supported.
-- **Training behavior** follows the Transformers implementation:
+- **Training behavior**:
   - the router selects experts with `e_score_correction_bias` (sigmoid scores, group-limited top-k), and the bias keeps
     its initial value;
   - there is no load-balancing loss;
   - the MTP layer (layer 61) of the released checkpoint is ignored and not trained;
-  - the indexer is not trained, because its output only feeds the non-differentiable top-k selection.
-- **Data**: each row is one causal sequence. DSA does not read the contents of `attention_mask`, and supports no padding
-  mask, dropout or KV cache.
+  - the indexer supports KL auxiliary-loss training, disabled by default.
+- **Data**: causal sequences and packed documents with explicit boundaries are supported. Arbitrary padding masks,
+  dropout and KV cache are not supported.
 
 ## Requirements
 
@@ -78,21 +76,30 @@ Trailing arguments override YAML fields, for example `--training.train_iters=200
 
 ### Multiple devices
 
-Set the topology with command-line overrides. The recipe's `when: cp` entry enables the DSA CP wrapper.
-Both ordinary recipes select the expert family directly:
+Set the topology with command-line overrides. The recipe replaces the whole `*.self_attn` module with
+`DeepseekSparseAttention`, which selects its CP member when `cp_size > 1`. Set `kv_cp_size` to the same value as
+`accelerator.cp_size`; the example uses `allgather` with communication overlap. See the
+[sparse-attention guide](../../components/modules/attention/deepseek_sparse_attention/readme.md) for parameter meanings.
+Keep the recipe's other module replacements. For CP2, update the attention entry as below. The expert family selects
+local or EP execution from the job mesh; keep native MoE routing and shared experts rather than adding the legacy
+`deepseekv3_ep_compute_fn` method replacement.
 
 ```yaml
 plan_overrides:
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.DeepseekSparseAttention
+        kv_cp_size: 2
+        kv_cp_strategy: allgather
+        cp_comm_overlap: true
   - match: "*.mlp.experts"
     replace:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
 ```
-
-The family selects local/EP from the job mesh. Keep the native parent MoE forward for routing and shared experts;
-do not add the old `deepseekv3_ep_compute_fn` method replacement around this path. The ordinary EP path currently
-runs the shared branch in native order, without the old shared-expert overlap option.
 
 For example, eight devices with TP2 × CP2 × DP2 and EP4:
 

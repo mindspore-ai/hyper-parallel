@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.mtp import (
         MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
     )
-    from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
+    from hyper_parallel.components.modules.attention.deepseek_sparse_attention import (
+        CPDeepseekSparseAttentionModule, DeepseekSparseAttention, DeepseekSparseAttentionModule,
+    )
     from hyper_parallel.components.modules.attention.grouped_query_attention import (
         GroupedQueryAttention,
     )
@@ -80,8 +82,9 @@ _EXPORT_TO_MODULE = {
     "MTPLayer": "mtp",
     "MultiTokenPrediction": "mtp",
     "MTPOutput": "mtp",
-    "DeepseekV32DSAAttention": "dsa_attention",
-    "DSAAttention": "dsa_attention",
+    "DeepseekSparseAttention": "attention.deepseek_sparse_attention",
+    "DeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",
+    "CPDeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",
     "GroupedQueryAttention": "attention.grouped_query_attention.grouped_query_attention_family",
     "GatedGroupedQueryAttention": "attention.gated_grouped_query_attention.gated_grouped_query_attention_family",
     "EngramModule": "engram",
