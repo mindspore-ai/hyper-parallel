@@ -15,6 +15,7 @@
 """Unit tests for hyper_parallel.core.dtensor._mesh_layout (pure logic, no external deps)."""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -606,6 +607,57 @@ class TestMeshLayoutRemapToNumpy(unittest.TestCase):
         # So used={0,1,2} != 4
         with self.assertRaises(ValueError):
             ml2.remap_to_numpy([0, 1, 2, 3])
+
+    def test_is_contiguous(self):
+        """Test contiguous detection for flat and nested layouts."""
+        self.assertTrue(_MeshLayout((2, 3), (3, 1)).is_contiguous())
+        self.assertTrue(_MeshLayout(1, 1).is_contiguous())
+        self.assertTrue(_MeshLayout(((2, 3), 4), ((12, 4), 1)).is_contiguous())
+        self.assertFalse(_MeshLayout((2, 2), (4, 1)).is_contiguous())
+        self.assertFalse(_MeshLayout((2, 4), (1, 2)).is_contiguous())
+
+    def test_contiguous_layout_with_multiple_groups(self):
+        """A contiguous layout must tile the rank map in C order."""
+        ml = _MeshLayout((2, 3), (3, 1))
+        result = ml.remap_to_numpy(list(range(12)))
+        self.assertEqual(result.shape, (2, 2, 3))
+        np.testing.assert_array_equal(result, np.arange(12).reshape(2, 2, 3))
+
+    def test_contiguous_fast_path_matches_general_algorithm(self):
+        """The contiguous fast path must produce the same values as the anchor scan."""
+        cases = [
+            ((4,), (1,)),
+            ((2, 3), (3, 1)),
+            ((2, 2, 2), (4, 2, 1)),
+            (((2, 3), 4), ((12, 4), 1)),
+        ]
+        rank_map = np.random.RandomState(0).permutation(48)
+        for shape, stride in cases:
+            ml = _MeshLayout(shape, stride)
+            input_ranks = rank_map[:ml.numel() * (len(rank_map) // ml.numel())]
+            with self.subTest(shape=shape):
+                fast = ml.remap_to_numpy(input_ranks)
+                with patch.object(_MeshLayout, "is_contiguous", return_value=False):
+                    slow = ml.remap_to_numpy(input_ranks)
+                np.testing.assert_array_equal(fast, slow)
+
+    def test_non_contiguous_layout_remap(self):
+        """Strided (interleaved) layouts must go through the anchor scan."""
+        ml = _MeshLayout((2, 2), (4, 1))
+        result = ml.remap_to_numpy(list(range(8)))
+        np.testing.assert_array_equal(
+            result,
+            np.array([[[0, 1], [4, 5]], [[2, 3], [6, 7]]]),
+        )
+
+    def test_non_contiguous_layout_respects_rank_map_order(self):
+        """The remapped values follow the rank map, not the index space."""
+        ml = _MeshLayout((2, 2), (4, 1))
+        result = ml.remap_to_numpy([4, 5, 6, 7, 0, 1, 2, 3])
+        np.testing.assert_array_equal(
+            result,
+            np.array([[[4, 5], [0, 1]], [[6, 7], [2, 3]]]),
+        )
 
 
 if __name__ == "__main__":

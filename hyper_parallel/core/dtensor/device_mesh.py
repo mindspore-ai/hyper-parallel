@@ -430,21 +430,38 @@ class DeviceMesh:
 
     @staticmethod
     def _init_one_process_group(mesh_shape: tuple[int, ...], mesh_dim_names: tuple[str, ...],
-                                dim_name: str, rank_list: tuple[int, ...]) -> str:
-        """Create one process-group family for the named mesh dimension."""
-        group_key = None
-        split_ranks = set()
-        if not isinstance(dim_name, tuple):
-            dim_name = (dim_name,)
-        for rank in rank_list:
-            split_rank = _get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, dim_name, rank)
-            sorted_rank = tuple(sorted(split_rank))
-            split_ranks.add(sorted_rank)
-            if rank == dist.get_rank():
-                group_key = str(sorted_rank)
-        split_ranks = sorted([list(item) for item in split_ranks])
+                                dim_name: Union[str, tuple[str, ...]], rank_list: tuple[int, ...]) -> Optional[str]:
+        """Create one process-group family for the named mesh dimension.
+
+        The subgroups along one axis are derived in a single vectorized pass
+        instead of calling ``_get_sub_rank_list`` once per rank, which made the
+        old implementation O(N^2) in the cluster size.
+        """
+        dim_names = (dim_name,) if not isinstance(dim_name, tuple) else dim_name
+        mesh_np = np.asarray(rank_list, dtype=np.int64).reshape(mesh_shape)
+
+        # Named axes are kept in each subgroup; the remaining axes index the
+        # subgroups. Moving them to the front makes one C-order reshape emit
+        # ``(num_subgroups, subgroup_size)`` in the same order as
+        # ``_get_sub_rank_list`` did for a single rank.
+        select_axes = [axis for axis, name in enumerate(mesh_dim_names) if name in dim_names]
+        other_axes = [axis for axis in range(mesh_np.ndim) if axis not in select_axes]
+        moved = np.moveaxis(mesh_np, other_axes, range(len(other_axes)))
+        subgroup_size = int(np.prod([mesh_shape[axis] for axis in select_axes], dtype=np.int64))
+        subgroups = moved.reshape(-1, subgroup_size)
+
+        # Canonicalize (sorted rows) and deduplicate. Every rank must derive
+        # the same creation order, which process-group creation requires.
+        subgroups = np.unique(np.sort(subgroups, axis=1), axis=0)
+        split_ranks = subgroups.tolist()
+        split_ranks.sort()
         _utils.split_group(split_ranks=split_ranks)
-        return group_key
+
+        current_rank = dist.get_rank()
+        hits = np.nonzero((subgroups == current_rank).any(axis=1))[0]
+        if hits.size == 0:
+            return None
+        return str(tuple(int(rank) for rank in subgroups[int(hits[0])]))
 
     @staticmethod
     def _build_dim_split_ranks(
@@ -452,24 +469,20 @@ class DeviceMesh:
             rank_map: Tensor,
     ) -> tuple[list[list[int]], Optional[str]]:
         """Build rank lists and the local cache key for one logical mesh axis."""
-        pg_ranks_by_dim = sub_layout.remap_to_numpy(rank_map.cpu().numpy())
+        pg_ranks_by_dim = np.asarray(sub_layout.remap_to_numpy(rank_map.cpu().numpy()))
+        # Sort each subgroup and deduplicate vectorially; the old per-group
+        # Python loop made this O(N * s) with a large constant.
+        subgroup_rows = np.sort(pg_ranks_by_dim.reshape(pg_ranks_by_dim.shape[0], -1), axis=1)
+        split_ranks = np.unique(subgroup_rows, axis=0).tolist()
+        split_ranks.sort()
+
         current_rank = dist.get_rank()
-        split_ranks = []
-        split_ranks_set = set()
-        group_key = None
-        for dim_mesh in np.array(pg_ranks_by_dim):
-            subgroup_ranks = tuple(int(rank) for rank in np.array(dim_mesh).reshape(-1).tolist())
-            subgroup_ranks_sorted = tuple(sorted(subgroup_ranks))
-            if subgroup_ranks_sorted not in split_ranks_set:
-                split_ranks_set.add(subgroup_ranks_sorted)
-                split_ranks.append(list(subgroup_ranks_sorted))
-            if current_rank in subgroup_ranks:
-                if group_key is not None:
-                    raise RuntimeError(
-                        "Each device mesh dimension should get only one process group per rank."
-                    )
-                group_key = str(subgroup_ranks_sorted)
-        split_ranks = sorted(split_ranks)
+        hits = np.nonzero((subgroup_rows == current_rank).any(axis=1))[0]
+        if hits.size > 1:
+            raise RuntimeError(
+                "Each device mesh dimension should get only one process group per rank."
+            )
+        group_key = str(tuple(int(rank) for rank in subgroup_rows[int(hits[0])])) if hits.size else None
         return split_ranks, group_key
 
     @staticmethod
