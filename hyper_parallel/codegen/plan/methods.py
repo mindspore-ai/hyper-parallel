@@ -24,7 +24,7 @@ import inspect
 import textwrap
 from typing import Any
 
-from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
+from hyper_parallel.distributed._builder.rule_resolver import _resolve_inner_target, _resolve_local_compute_fn
 from hyper_parallel.distributed.mesh import LogicalDeviceMesh
 from hyper_parallel.models.registry import resolve_model_adapter
 
@@ -176,7 +176,9 @@ def observe_local_methods(plan: Any, model: Any, mesh_context: Any) -> dict[str,
     """
     entries = [(path, spec) for path, spec in getattr(plan, "modules", {}).items()
                if getattr(spec, "local_compute_fn", None) is not None]
-    if not entries:
+    wrappers = [(path, spec) for path, spec in getattr(plan, "modules", {}).items()
+                if getattr(spec, "inner_wrapper", None) is not None]
+    if not entries and not wrappers:
         return {}
     dense = mesh_context.device_mesh
     expert = mesh_context.fsdp_moe_mesh
@@ -196,11 +198,32 @@ def observe_local_methods(plan: Any, model: Any, mesh_context: Any) -> dict[str,
             factory = spec.local_compute_fn
             factory = getattr(factory, "_target_", factory)
             resolved.setdefault(path, {})[factory.__name__] = function
-        return _describe_methods(modules, before, resolved)
+        result = _describe_methods(modules, before, resolved)
+        _observe_wrapper_flags(result, wrappers, modules)
+        return result
     finally:
         for path, module in modules.items():
             module.__dict__.clear()
             module.__dict__.update(before[path])
+
+
+def _observe_wrapper_flags(records: dict, wrappers: list, modules: dict) -> None:
+    """Keep selected source wrapper switches active without constructing live resources."""
+    selected = {}
+    for path, spec in wrappers:
+        target = _resolve_inner_target(modules[path], spec)
+        target_path = path if spec.inner_target == "self" else f"{path}.{spec.inner_target}"
+        selected[target_path] = target
+    for path, module in selected.items():
+        expected = {id(value) for value in modules.values() if type(value) is type(module)}
+        actual = {id(value) for value in selected.values() if type(value) is type(module)}
+        if actual != expected:
+            raise ValueError(f"Codegen cannot enable an inner wrapper on a partially selected class at {path!r}")
+        record = records.setdefault(path, {
+            "type": f"{type(module).__module__}:{type(module).__qualname__}",
+            "methods": {}, "fields": {}, "imports": [], "local_compute": False, "dispatch": None,
+        })
+        record["fields"]["cp_enable"] = "True"
 
 
 def _describe_methods(modules: dict, before: dict, resolved: dict) -> dict[str, dict]:

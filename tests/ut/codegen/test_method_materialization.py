@@ -23,6 +23,7 @@ from torch import nn
 from hyper_parallel.codegen.emit.methods import (
     materialize_method_hosts, materialize_observed_methods, verify_observed_methods,
 )
+from hyper_parallel.codegen.emit.validation import verify_generated_source_structure
 from hyper_parallel.codegen.plan.methods import observe_local_methods
 from hyper_parallel.distributed.mesh import LogicalDeviceMesh, MeshContext
 from hyper_parallel.distributed.recipe_spec import local_compute
@@ -161,6 +162,26 @@ class TestMethodMaterialization(unittest.TestCase):
     def test_no_injection_does_not_require_any_mesh(self):
         self.assertEqual(observe_local_methods(SimpleNamespace(modules={}), nn.Module(), None), {})
 
+    def test_selected_inner_wrapper_is_active_after_direct_construction(self):
+        model = nn.Module()
+        model.block = MethodBlock()
+        plan = SimpleNamespace(modules={"block": SimpleNamespace(
+            local_compute_fn=None, inner_wrapper=object(), inner_target="self",
+        )}, mesh_dim_names=("tp", "cp"))
+        topology = MeshContext(device_mesh=LogicalDeviceMesh(("tp", "cp"), (1, 2)), cp_size=2)
+        records = observe_local_methods(plan, model, topology)
+        source = ("class MethodBlock:\n    cp_enable = False\n"
+                  "    def forward(self, value):\n        return value * (2 if self.cp_enable else 1)\n")
+        namespace = {}
+        exec(materialize_observed_methods(source, records), namespace)
+        generated = namespace["MethodBlock"]()
+        self.assertTrue(generated.cp_enable)
+        self.assertEqual(generated.forward(3), 6)
+        self.assertFalse(hasattr(model.block, "cp_enable"))
+        model.other = MethodBlock()
+        with self.assertRaisesRegex(ValueError, "partially selected class"):
+            observe_local_methods(plan, model, topology)
+
     def test_native_instance_dispatch_gets_the_materialized_class_flag(self):
         model = nn.Module()
         model.block = MethodBlock()
@@ -178,11 +199,13 @@ class TestMethodMaterialization(unittest.TestCase):
                   "    if self.ep_enable:\n        return self.method_factory(hidden_states)\n"
                   "    return self.experts(hidden_states)\n")
         namespace = {}
-        exec(materialize_observed_methods(source, records), namespace)
+        rendered = materialize_observed_methods(source, records)
+        verify_generated_source_structure({"modeling_future.py": rendered})
+        exec(rendered, namespace)
         generated = namespace["MethodBlock"]()
         generated._hp_ep_group = object()
         self.assertTrue(generated.ep_enable)
-        self.assertEqual(namespace["bound_forward"](generated, 3), 6)
+        self.assertEqual(generated.forward(3), 6)
 
     def test_mesh_rank_and_group_tuple_remain_runtime_resources(self):
         model = nn.Module()

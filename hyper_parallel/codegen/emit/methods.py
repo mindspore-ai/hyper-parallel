@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+from copy import deepcopy
 from importlib import import_module
 import inspect
 import textwrap
@@ -116,6 +117,13 @@ def materialize_observed_methods(source: str, records: dict) -> str:
             else:
                 edits.append(TextEdit(old.def_offset, old.body_end, text))
         fields = record["fields"]
+        if "cp_enable" in fields:
+            host_node = next(node for node in ast.parse(source).body
+                             if isinstance(node, ast.ClassDef) and node.name == name)
+            if not any(isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "cp_enable" for target in node.targets
+            ) for node in host_node.body):
+                raise ValueError(f"Codegen selected inner wrapper at {path!r} has no source CP dispatch")
         if fields:
             statements = "\n".join(f"        self.{key} = {value}" for key, value in fields.items())
             initializer = host.methods.get("__init__")
@@ -142,6 +150,14 @@ def materialize_observed_methods(source: str, records: dict) -> str:
                 for node in ast.walk(bound)
             ):
                 additions.insert(0, "    ep_enable = True\n")
+                forward = deepcopy(bound)
+                forward.name = "forward"
+                text = textwrap.indent(ast.unparse(forward), "    ") + "\n"
+                original = host.methods.get("forward")
+                if original is None:
+                    additions.append(text)
+                else:
+                    edits.append(TextEdit(original.def_offset, original.body_end, text))
             elif len(flags) == 1:
                 flag = flags[0]
                 edits.append(TextEdit(offsets[flag.lineno - 1], offsets[flag.end_lineno], "    ep_enable = True\n"))
