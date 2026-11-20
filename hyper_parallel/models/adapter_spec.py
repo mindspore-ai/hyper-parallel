@@ -129,6 +129,12 @@ class ModelAdapterSpec:
         native_parallel: provider declaring explicit CP/EP stage protocols without replacing modules.
         codegen: lazy provider for model-owned source compatibility and source
             renderers used only while exporting a generated bundle.
+        stock_model_patches: no-arg callable applying the family's idempotent
+            fixes to the installed stock Transformers modeling classes before
+            a model is constructed (e.g. NPU-kernel workarounds for defects
+            the upstream modeling still ships). The shared auto-model resolves
+            the family through the registry and calls this provider, so the
+            shared path never imports family code directly.
     """
 
     architecture: str
@@ -152,3 +158,4 @@ class ModelAdapterSpec:
     codegen: Optional[Callable[..., Any]] = None
     sharding: Optional[Callable[..., Any]] = None
     native_parallel: Optional[Callable[..., Any]] = None
+    stock_model_patches: Optional[Callable[[], None]] = None

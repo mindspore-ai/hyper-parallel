@@ -28,10 +28,12 @@ from transformers import AutoConfig
 
 from hyper_parallel.models._transformers.auto_model import (
     HyperAutoModelForMultimodalLM,
-    _ensure_omni_packed_audio_input,
-    _ensure_omni_deepstack_2d_masks,
-    _ensure_omni_patch_embed_linear,
-    _ensure_omni_thinker_forward,
+)
+from hyper_parallel.models.qwen3_omni.adapter.model_patches import (
+    ensure_packed_audio_input,
+    ensure_deepstack_2d_masks,
+    ensure_patch_embed_linear,
+    ensure_thinker_forward,
 )
 
 # ``from_config`` accepts these keyword arguments; forward only the ones the
@@ -70,7 +72,7 @@ def build_qwen3_omni_randinit(
         attn_implementation: ``eager`` (NPC-safe default) or ``sdpa``.
         enable_audio_output: If False, build the thinker only.
         num_hidden_layers: If given, trim the thinker decoder (MoE) to this many
-            layers. The 48-layer full thinker (\~16.7B params, \~33.5GB bf16)
+            layers. The 48-layer full thinker (~16.7B params, ~33.5GB bf16)
             does not fit on 64GB NPUs without offload; a few layers keep the
             smoke run small, fast and memory-light.
         **kwargs: Absorbs the trainer build-time kwargs (``distributed_setup``,
@@ -93,17 +95,18 @@ def build_qwen3_omni_randinit(
         if thinker is not None and hasattr(thinker, "text_config"):
             thinker.text_config.num_hidden_layers = int(num_hidden_layers)
 
-    # ``from_pretrained`` applies this patch (the generation-only omni wrapper
-    # needs a training ``forward`` delegating to ``thinker``); ``from_config``
-    # does not, so apply it here too before the trainer calls model(**batch).
-    _ensure_omni_thinker_forward()
+    # ``from_pretrained`` applies the family patch set (the generation-only
+    # omni wrapper needs a training ``forward`` delegating to ``thinker``);
+    # ``from_config`` does not, so apply it here too before the trainer calls
+    # model(**batch).
+    ensure_thinker_forward()
 
     # HF 4.57.1 stock-bug fixes, same set ``from_pretrained`` applies (details
-    # in each _ensure_ docstring): Conv3d-backward NPU segfault / packed-audio
+    # in each ensure_* docstring): Conv3d-backward NPU segfault / packed-audio
     # dead branch / deepstack 3-D-mask joint-branch crash.
-    _ensure_omni_patch_embed_linear()
-    _ensure_omni_packed_audio_input()
-    _ensure_omni_deepstack_2d_masks()
+    ensure_patch_embed_linear()
+    ensure_packed_audio_input()
+    ensure_deepstack_2d_masks()
 
     fwd = {}
     for key in _FORWARD_KWARGS:

@@ -1,0 +1,135 @@
+# Qwen3-Omni-30B-A3B thinker SFT recipe (single node, 8 x Ascend NPU, hccl backend).
+#
+# The model is loaded HF-native through HyperAutoModelForMultimodalLM — the only
+# auto class whose mapping contains Qwen3OmniMoeForConditionalGeneration — with
+# audio output disabled, so the thinker (vision tower + audio tower + sparse-MoE
+# decoder) is the trainable module. The family adapter registered as `qwen3_omni`
+# applies the stock-model patches, derived-buffer materialization and vision
+# FSDP2 unit declarations automatically.
+#
+# Default loads public Hugging Face resources. Local or offline resources are
+# overridden on the command line, e.g.:
+#   scripts/train_vl.py <this file> \
+#     --model.pretrained_model_name_or_path=/path/to/Qwen3-Omni-30B-A3B-Instruct
+
+model:
+  _target_: hyper_parallel.models._transformers.HyperAutoModelForMultimodalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+  enable_audio_output: false
+  ignore_mismatched_sizes: true
+  validate_placement: false
+
+model_init_dtype: bfloat16
+
+training:
+  train_iters: 16
+  eval_iters: 0
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+
+# The VLM data pipeline requires tp=cp=pp=1.
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  enable_offload: true
+  reshard_after_forward: true
+  reshard_after_backward: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  training_mode: sft
+  _target_: hyper_parallel.data.vlm.build_vlm_dataset
+  data_path: /data/qwen3_omni/datasets/scienceqa/train_sub2048.json
+  data_config:
+    source_type: online
+  model_assets:
+    _target_: hyper_parallel.data.omni.build_auto_processor
+    pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  data_transform:
+    _target_: hyper_parallel.models.qwen3_omni.adapter.data.transform_fn.build_qwen3_omni_transform
+    max_seq_len: 1024
+
+dataloader:
+  _target_: hyper_parallel.data.batching.build_dataloader.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.build_vlm_collator
+  get_batch:
+    _target_: hyper_parallel.data.vlm.build_vlm_get_batch
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+  pin_memory: false
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 0
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/qwen3_omni/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiler:
+  enable: false
+  start_step: 1
+  stop_step: 10
+  memory: true
+  rank_ids: null
+  output_path: ./outputs/qwen3_omni
+  level: 1
+  with_stack: false
+  data_simplification: false

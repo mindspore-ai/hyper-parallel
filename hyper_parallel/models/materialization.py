@@ -349,12 +349,61 @@ def rebuild_materialized_state(
         _validate_protected_model_state(model, protected)
 
 
+def restore_fp32_rebuildable_buffers(model: nn.Module) -> list[str]:
+    """Re-copy float32-sourced rebuildable buffers after a dtype cast.
+
+    ``Module._apply`` (``model.to(dtype)``) downcasts every floating buffer,
+    including derived buffers a family declared as rebuildable with an
+    explicitly float32 source — the precision a stock module computes them
+    in and the forward implicitly re-widens from. Re-copy each such source
+    into the (possibly re-materialised) buffer storage; the FSDP-wrapped
+    identity is preserved by writing through ``Module._buffers`` dict
+    replace semantics only when the existing buffer dtype diverges.
+
+    Returns the restored buffer names for logging.
+    """
+    restored = []
+    for module in model.modules():
+        specs = module.__dict__.get("_hp_rebuildable_buffer_specs", {})
+        for name, spec in specs.items():
+            if spec.source is None or spec.source.dtype != torch.float32:
+                continue
+            target = module._buffers.get(name)  # pylint: disable=protected-access
+            if target is None or not target.is_floating_point() or target.dtype == torch.float32:
+                continue
+            value = spec.source.to(device=target.device)
+            module._buffers[name] = value  # pylint: disable=protected-access
+            module._non_persistent_buffers_set.add(name)  # pylint: disable=protected-access
+            restored.append(name)
+    return restored
+
+
+def fp32_rebuildable_buffer_ids(model: nn.Module) -> set[int]:
+    """Identity set of buffers exempt from the generic dtype validation.
+
+    A family declared these buffers as float32-sourced rebuildable state;
+    ``_validate_model_state_dtype`` must accept them at their declared
+    precision rather than the configured ``model_init_dtype``.
+    """
+    exempt = set()
+    for module in model.modules():
+        specs = module.__dict__.get("_hp_rebuildable_buffer_specs", {})
+        for name, spec in specs.items():
+            if spec.source is not None and spec.source.dtype == torch.float32:
+                target = module._buffers.get(name)  # pylint: disable=protected-access
+                if target is not None:
+                    exempt.add(id(target))
+    return exempt
+
+
 __all__ = [
     "MaterializationContext",
     "MaterializationReason",
     "MaterializedStateHook",
     "RebuildableBufferSpec",
+    "fp32_rebuildable_buffer_ids",
     "rebuild_materialized_state",
     "register_materialized_state_hook",
     "register_rebuildable_buffer",
+    "restore_fp32_rebuildable_buffers",
 ]
