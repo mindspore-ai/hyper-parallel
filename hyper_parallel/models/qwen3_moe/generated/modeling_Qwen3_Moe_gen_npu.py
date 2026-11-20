@@ -67,6 +67,177 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 
+import hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention
+
+
+import hyper_parallel.components.modules.grouped_experts
+
+
+import hyper_parallel.distributed.expert_parallel.experts as _native_hyper_parallel_distributed_expert_parallel_experts
+import hyper_parallel.distributed.expert_parallel.recipes as _native_hyper_parallel_distributed_expert_parallel_recipes
+import hyper_parallel.distributed.expert_parallel.routing as _native_hyper_parallel_distributed_expert_parallel_routing
+import torch.nn.functional as _native_torch_nn_functional
+
+
+import torch.nn.modules.linear
+import torch.nn.modules.sparse
+
+
+import transformers.models.qwen3_moe.modeling_qwen3_moe
+from hyper_parallel.components.modules.rms_norm import RMSNormModule
+
+
+
+
+
+class Linear(torch.nn.modules.linear.Linear):
+    _hp_boundary_form = "tp_collective"
+
+    def _forward_impl(self, input):
+        return super().forward(input)
+    def forward(self, input):
+        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime
+        # re-validates this form at install time and replaces the forward
+        # with the generic engine on any mismatch.
+        # input: tp S(1) -> R ==> all_gather(dim=1)
+        input = self._hp_tp.all_gather(input, dim=1)
+        # [HYPER TP-COLLECTIVE] original forward body (now ``_forward_impl``)
+        outputs = self._forward_impl(input)
+        return outputs
+class Embedding(torch.nn.modules.sparse.Embedding):
+    _hp_boundary_form = "tp_collective"
+
+    def _forward_impl(self, input):
+        input_ids = input
+        args = ()
+        kwargs = {}
+        original_forward = super().forward
+        to_local = getattr(self.weight, 'to_local', None)
+        local_weight = to_local() if callable(to_local) else self.weight
+        v_local = local_weight.shape[0]
+        lo = self._hp_tp_mesh.get_local_rank() * v_local
+        hi = lo + v_local
+        mask = (input_ids >= lo) & (input_ids < hi)
+        local_ids = torch.where(mask, input_ids - lo, torch.zeros_like(input_ids))
+        out = original_forward(local_ids, *args, **kwargs)
+        return out * mask.unsqueeze(-1).to(out.dtype)
+    def forward(self, input):
+        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime
+        # re-validates this form at install time and replaces the forward
+        # with the generic engine on any mismatch.
+        # input: identity ==> to_local
+        input = self._hp_tp.to_local(input)
+        # [HYPER TP-COLLECTIVE] original forward body (now ``_forward_impl``)
+        outputs = self._forward_impl(input)
+        # output: tp P(sum) -> S(1) ==> reduce_scatter(dim=1)
+        outputs = self._hp_tp.reduce_scatter(outputs, dim=1)
+        return outputs
+
+
+
+
+
+class GroupedExperts(hyper_parallel.components.modules.grouped_experts.GroupedExperts):
+    pass
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.local_expert_count = 4
+        self._ep_act_fn = _native_torch_nn_functional.silu
+        self._ep_apply_gate = None
+        self._ep_use_grouped_gemm = True
+
+    def forward(self, dispatched_states, local_expert_indices):
+        """Compute dispatched tokens with the local stacked SwiGLU experts.
+
+        This function is installed as ``experts.forward`` for the HF-native EP
+        path. Calling the expert module, instead of indexing its parameters from
+        the parent MoE forward, allows nested FSDP forward hooks to unshard and
+        reshard expert parameters around the local computation.
+        """
+        token_order = _native_hyper_parallel_distributed_expert_parallel_experts._argsort_keys(local_expert_indices, bound=self.local_expert_count)
+        sorted_states = dispatched_states[token_order]
+        local_expert_counts = _native_hyper_parallel_distributed_expert_parallel_experts._expert_token_counts(local_expert_indices, self.local_expert_count)
+        if getattr(self, '_ep_use_grouped_gemm', False):
+            grouped_forward = getattr(self, 'forward_expert_major', None)
+            if callable(grouped_forward):
+                sorted_output = grouped_forward(sorted_states, local_expert_counts)
+            else:
+                gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
+                if up_weight is not None:
+                    raise ValueError('EP grouped GEMM currently requires packed gate_up_proj weights')
+                sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.npu_grouped_swiglu(sorted_states, gate_weight, down_weight, local_expert_counts)
+            output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
+            output[token_order] = sorted_output
+            return output
+        gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
+        expert_token_counts = local_expert_counts.tolist()
+        sorted_outputs = []
+        token_start = 0
+        for local_expert_index in range(self.local_expert_count):
+            expert_token_count = expert_token_counts[local_expert_index]
+            expert_states = sorted_states[token_start:token_start + expert_token_count]
+            if up_weight is None:
+                gate_up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
+                apply_gate = getattr(self, '_ep_apply_gate', None)
+                if apply_gate is None:
+                    gate_states, up_states = gate_up_states.chunk(2, dim=-1)
+                    activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
+                    activated_states = activation(gate_states) * up_states
+                else:
+                    activated_states = apply_gate(gate_up_states)
+            else:
+                gate_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
+                up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, up_weight[local_expert_index])
+                activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
+                activated_states = activation(gate_states) * up_states
+            sorted_outputs.append(_native_hyper_parallel_distributed_expert_parallel_experts.F.linear(activated_states, down_weight[local_expert_index]))
+            token_start += expert_token_count
+        sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.cat(sorted_outputs)
+        output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
+        output[token_order] = sorted_output
+        return output
+
+
+
+
+
+class CPGroupedQueryAttentionModule(hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention.CPGroupedQueryAttentionModule):
+    # CP forward stages selected by native preparation.
+    _hp_boundary_form = "tp_collective"
+
+    def _forward_impl(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, actual_seq_len=None, **kwargs):
+        query_shape = hidden_states.shape[:2]
+        positions = self.prepare_positions(query_shape, position_embeddings)
+        prepared = self.prepare_attention_inputs(hidden_states, positions, attention_mask, past_key_values, actual_seq_len, **kwargs)
+        inputs = self.exchange_attention(prepared)
+        del prepared
+        output, weights = self.run_attention(inputs)
+        output_state = inputs.output_state
+        del inputs
+        output, output_state = self.restore_attention(output, output_state)
+        return (self.project_output(output, output_state), weights)
+    def forward(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, actual_seq_len=None, **kwargs):
+        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime
+        # re-validates this form at install time and replaces the forward
+        # with the generic engine on any mismatch.
+        # hidden_states: tp S(1) -> R ==> all_gather(dim=1)
+        hidden_states = self._hp_tp.all_gather(hidden_states, dim=1)
+        # [HYPER TP-COLLECTIVE] original forward body (now ``_forward_impl``)
+        outputs = self._forward_impl(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values,
+            actual_seq_len,
+            **kwargs,
+        )
+        # output: tp P(sum) -> S(1) ==> reduce_scatter(dim=1)
+        _hp_output_0 = self._hp_tp.reduce_scatter(outputs[0], dim=1)
+        outputs = (_hp_output_0, *outputs[1:])
+        return outputs
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -289,7 +460,7 @@ class Qwen3MoeTopKRouter(nn.Module):
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, config: Qwen3MoeConfig):
         super().__init__()
-        self.experts = GroupedExperts(module=_SourceQwen3MoeExperts_2(config), context={'tp': True, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'})
+        self.experts = GroupedExperts(module=transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts(config), context={'tp': True, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'})
         self.gate = Qwen3MoeTopKRouter(config)
 
     ep_enable = True
@@ -343,15 +514,15 @@ class Qwen3MoeRMSNorm(nn.Module):
 class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = CPGroupedQueryAttentionModule(module=_SourceQwen3MoeAttention_1(config, layer_idx), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, ulysses_degree=1, fuse_qkv=True, overlap=False)
+        self.self_attn = CPGroupedQueryAttentionModule(module=transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention(config, layer_idx), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, ulysses_degree=1, fuse_qkv=True, overlap=False)
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(config)
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = RMSNormModule(module=_SourceQwen3MoeRMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
-        self.post_attention_layernorm = RMSNormModule(module=_SourceQwen3MoeRMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.input_layernorm = RMSNormModule(module=transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.post_attention_layernorm = RMSNormModule(module=transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -488,11 +659,11 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = ParallelEmbedding_1(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNormModule(module=_SourceQwen3MoeRMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.norm = RMSNormModule(module=transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'tp': True, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -649,7 +820,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3MoeModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = ParallelLinear_0(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -762,169 +933,4 @@ __all__ = [
     "Qwen3MoeForSequenceClassification",
     "Qwen3MoeForTokenClassification",
 ]
-
-
-from hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention import CPGroupedQueryAttentionModule as _hp_parallel_base_0
-
-
-import hyper_parallel.distributed.expert_parallel.experts as _native_hyper_parallel_distributed_expert_parallel_experts
-import hyper_parallel.distributed.expert_parallel.recipes as _native_hyper_parallel_distributed_expert_parallel_recipes
-import hyper_parallel.distributed.expert_parallel.routing as _native_hyper_parallel_distributed_expert_parallel_routing
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts as _NativeGroupedExperts
-import torch.nn.functional as _native_torch_nn_functional
-
-
-from torch.nn.modules.linear import Linear as _NativeLinear_1
-from torch.nn.modules.sparse import Embedding as _NativeEmbedding_2
-
-
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm as _SourceQwen3MoeRMSNorm_0
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention as _SourceQwen3MoeAttention_1
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts as _SourceQwen3MoeExperts_2
-from hyper_parallel.components.modules.rms_norm import RMSNormModule
-
-
-
-
-
-class CPGroupedQueryAttentionModule(_hp_parallel_base_0):
-    # CP forward stages selected by native preparation.
-    _hp_boundary_form = "tp_collective"
-
-    def _forward_impl(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, actual_seq_len=None, **kwargs):
-        query_shape = hidden_states.shape[:2]
-        positions = self.prepare_positions(query_shape, position_embeddings)
-        prepared = self.prepare_attention_inputs(hidden_states, positions, attention_mask, past_key_values, actual_seq_len, **kwargs)
-        inputs = self.exchange_attention(prepared)
-        del prepared
-        output, weights = self.run_attention(inputs)
-        output_state = inputs.output_state
-        del inputs
-        output, output_state = self.restore_attention(output, output_state)
-        return (self.project_output(output, output_state), weights)
-    def forward(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, actual_seq_len=None, **kwargs):
-        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime
-        # re-validates this form at install time and replaces the forward
-        # with the generic engine on any mismatch.
-        # hidden_states: tp S(1) -> R ==> all_gather(dim=1)
-        hidden_states = self._hp_tp.all_gather(hidden_states, dim=1)
-        # [HYPER TP-COLLECTIVE] original forward body (now ``_forward_impl``)
-        outputs = self._forward_impl(
-            hidden_states,
-            position_embeddings,
-            attention_mask,
-            past_key_values,
-            actual_seq_len,
-            **kwargs,
-        )
-        # output: tp P(sum) -> S(1) ==> reduce_scatter(dim=1)
-        _hp_output_0 = self._hp_tp.reduce_scatter(outputs[0], dim=1)
-        outputs = (_hp_output_0, *outputs[1:])
-        return outputs
-
-class GroupedExperts(_NativeGroupedExperts):
-    pass
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.local_expert_count = 4
-        self._ep_act_fn = _native_torch_nn_functional.silu
-        self._ep_apply_gate = None
-        self._ep_use_grouped_gemm = True
-
-    def forward(self, dispatched_states, local_expert_indices):
-        """Compute dispatched tokens with the local stacked SwiGLU experts.
-
-        This function is installed as ``experts.forward`` for the HF-native EP
-        path. Calling the expert module, instead of indexing its parameters from
-        the parent MoE forward, allows nested FSDP forward hooks to unshard and
-        reshard expert parameters around the local computation.
-        """
-        token_order = _native_hyper_parallel_distributed_expert_parallel_experts._argsort_keys(local_expert_indices, bound=self.local_expert_count)
-        sorted_states = dispatched_states[token_order]
-        local_expert_counts = _native_hyper_parallel_distributed_expert_parallel_experts._expert_token_counts(local_expert_indices, self.local_expert_count)
-        if getattr(self, '_ep_use_grouped_gemm', False):
-            grouped_forward = getattr(self, 'forward_expert_major', None)
-            if callable(grouped_forward):
-                sorted_output = grouped_forward(sorted_states, local_expert_counts)
-            else:
-                gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
-                if up_weight is not None:
-                    raise ValueError('EP grouped GEMM currently requires packed gate_up_proj weights')
-                sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.npu_grouped_swiglu(sorted_states, gate_weight, down_weight, local_expert_counts)
-            output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
-            output[token_order] = sorted_output
-            return output
-        gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
-        expert_token_counts = local_expert_counts.tolist()
-        sorted_outputs = []
-        token_start = 0
-        for local_expert_index in range(self.local_expert_count):
-            expert_token_count = expert_token_counts[local_expert_index]
-            expert_states = sorted_states[token_start:token_start + expert_token_count]
-            if up_weight is None:
-                gate_up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
-                apply_gate = getattr(self, '_ep_apply_gate', None)
-                if apply_gate is None:
-                    gate_states, up_states = gate_up_states.chunk(2, dim=-1)
-                    activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
-                    activated_states = activation(gate_states) * up_states
-                else:
-                    activated_states = apply_gate(gate_up_states)
-            else:
-                gate_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
-                up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, up_weight[local_expert_index])
-                activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
-                activated_states = activation(gate_states) * up_states
-            sorted_outputs.append(_native_hyper_parallel_distributed_expert_parallel_experts.F.linear(activated_states, down_weight[local_expert_index]))
-            token_start += expert_token_count
-        sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.cat(sorted_outputs)
-        output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
-        output[token_order] = sorted_output
-        return output
-
-
-class ParallelLinear_0(_NativeLinear_1):
-    _hp_boundary_form = "tp_collective"
-
-    def _forward_impl(self, input):
-        return super().forward(input)
-    def forward(self, input):
-        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime
-        # re-validates this form at install time and replaces the forward
-        # with the generic engine on any mismatch.
-        # input: tp S(1) -> R ==> all_gather(dim=1)
-        input = self._hp_tp.all_gather(input, dim=1)
-        # [HYPER TP-COLLECTIVE] original forward body (now ``_forward_impl``)
-        outputs = self._forward_impl(input)
-        return outputs
-
-class ParallelEmbedding_1(_NativeEmbedding_2):
-    _hp_boundary_form = "tp_collective"
-
-    def _forward_impl(self, input):
-        input_ids = input
-        args = ()
-        kwargs = {}
-        original_forward = super().forward
-        to_local = getattr(self.weight, 'to_local', None)
-        local_weight = to_local() if callable(to_local) else self.weight
-        v_local = local_weight.shape[0]
-        lo = self._hp_tp_mesh.get_local_rank() * v_local
-        hi = lo + v_local
-        mask = (input_ids >= lo) & (input_ids < hi)
-        local_ids = torch.where(mask, input_ids - lo, torch.zeros_like(input_ids))
-        out = original_forward(local_ids, *args, **kwargs)
-        return out * mask.unsqueeze(-1).to(out.dtype)
-    def forward(self, input):
-        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime
-        # re-validates this form at install time and replaces the forward
-        # with the generic engine on any mismatch.
-        # input: identity ==> to_local
-        input = self._hp_tp.to_local(input)
-        # [HYPER TP-COLLECTIVE] original forward body (now ``_forward_impl``)
-        outputs = self._forward_impl(input)
-        # output: tp P(sum) -> S(1) ==> reduce_scatter(dim=1)
-        outputs = self._hp_tp.reduce_scatter(outputs, dim=1)
-        return outputs
 # codespell:ignore-end

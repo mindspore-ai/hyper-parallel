@@ -870,17 +870,17 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             assets = json.load(assets_file)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = ParallelEmbedding_1(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
-            layer.attn_hc = DeepseekV41HyperMegaMhc(module=_SourceDeepseekV41PipelinedHyperConnection_3(layer.attn_hc), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, token_tile=32)
-            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=_SourceDeepseekV41PipelinedHyperConnection_3(layer.ffn_hc), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, token_tile=32)
-            layer.self_attn = SharedCompressedDSAAttention(module=_SourceDeepseekV41Attention_1(config, layer_idx), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, use_fused_ops=True, indexer_load_balance='none', main_kv_comm='all_gather', indexer_balance_block_size=None, indexer_zigzag_min_length=None)
+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection(layer.attn_hc), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, token_tile=32)
+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection(layer.ffn_hc), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, token_tile=32)
+            layer.self_attn = SharedCompressedDSAAttention(module=hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention(config, layer_idx), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, use_fused_ops=True, indexer_load_balance='none', main_kv_comm='all_gather', indexer_balance_block_size=None, indexer_zigzag_min_length=None)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
-            layer.mlp.gate = DeepseekV41MegaGate(module=_SourceDeepseekV41TopKRouter_4(config), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, module_fqn=f'model.layers.{layer_idx}.mlp.gate')
+            layer.mlp.gate = DeepseekV41MegaGate(module=hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41TopKRouter(config), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, module_fqn=f'model.layers.{layer_idx}.mlp.gate')
             layer.mlp.gate.bias.requires_grad_(False)
             layer.mlp.shared_experts = SharedExpertModule(
                 module=layer.mlp.shared_experts, preserve_source_layout=True,
@@ -889,7 +889,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             layer.mlp._forward_impl = MethodType(_v41_sparse_moe_forward_hp_impl, layer.mlp)
             layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in getattr(config, "v41_engram_layer_ids", assets["layer_ids"]):
-            self.layers[layer_id].engram = HostEngramModule(module=_SourceDeepseekV41Engram_0(config, layer_id, assets), config=None, context={'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'tp': False, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'})
+            self.layers[layer_id].engram = HostEngramModule(module=hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram(config, layer_id, assets), config=None, context={'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'tp': False, 'cp': True, 'ep': True, 'pp': False, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'})
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.vision = None
@@ -1382,7 +1382,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         self.model = DeepseekV41Model(config)
         self.model_mode = self.model.model_mode
         self.vocab_size = config.vocab_size
-        self.lm_head = ParallelLinear_0(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -1518,27 +1518,64 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttention as _SharedCompressedDSAAttentionBase
 
 
-from hyper_parallel.components.modules.engram.host_engram import HostEngramModule as _NativeHostEngramModule
+import hyper_parallel.components.modules.engram.host_engram
 
 
 import hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel as _native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel
 
 
-from torch.nn.modules.linear import Linear as _NativeLinear_1
-from torch.nn.modules.sparse import Embedding as _NativeEmbedding_2
-
-
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Engram as _SourceDeepseekV41Engram_0
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention as _SourceDeepseekV41Attention_1
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts as _SourceDeepseekV4Experts_2
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41PipelinedHyperConnection as _SourceDeepseekV41PipelinedHyperConnection_3
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter as _SourceDeepseekV41TopKRouter_4
+import hyper_parallel.models.deepseek_v41.modeling_deepseek_v41
+import transformers.models.deepseek_v4.modeling_deepseek_v4
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 
 
 
 
+
+
+class HostEngramModule(hyper_parallel.components.modules.engram.host_engram.HostEngramModule):
+    ep_enable = True
+
+    def _forward_impl(self, hidden_states, input_ids, segment_starts=None, token_mask=None):
+        return super().forward(hidden_states, input_ids, segment_starts, token_mask)
+    def forward(self, hidden_states, input_ids, segment_starts=None, token_mask=None):
+        if self.ep_enable:
+            # [HYPER LOCAL REGION] boundary entry
+            args, kwargs = self._hp_boundary.redistribute_inputs(
+                ((hidden_states, input_ids, segment_starts, token_mask), {}),
+            )
+            # [HYPER LOCAL REGION] run the region compute fn on local tensors
+            # Native compute from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn, materialized as a class method.
+            outputs = self.deepseek_v41_engram_compute_fn(*args, **kwargs)
+            # [HYPER LOCAL REGION] boundary exit
+            outputs = self._hp_boundary.redistribute_outputs(outputs)
+            return outputs
+        return self._forward_impl(hidden_states, input_ids, segment_starts, token_mask)
+
+    def deepseek_v41_engram_compute_fn(self, hidden_states, input_ids, segment_starts=None, token_mask=None):
+        """Route hash-row requests and run the exact V4.1 fusion.
+
+        Args:
+            module: Active Engram module.
+            hidden_states: TP-local decoder hidden rows.
+            input_ids: CP-local token IDs.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: CP-local mask selecting Engram updates.
+        """
+        from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
+        if isinstance(self.embed, HostEngramTable):
+            ids = self._aligned_hash_ids(hidden_states, input_ids, segment_starts, token_mask, cp_group=self._hp_cp_group, cp_rank=self._hp_cp_mesh.get_local_rank(), cp_size=4, tp_rank=0, tp_size=1)
+            fused = self._fuse(hidden_states, self.embed(ids))
+            if token_mask is None:
+                return fused
+            return _native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.where(token_mask.to(_native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states)
+        if 8 > 1:
+            return self.parallel_forward(hidden_states, input_ids, segment_starts, token_mask, ep_group=self._hp_ep_group, ep_rank=self._hp_ep_mesh.get_local_rank(), ep_size=8, cp_group=self._hp_cp_group, cp_rank=self._hp_cp_mesh.get_local_rank(), cp_size=4, tp_rank=0, tp_size=1)
+        hash_ids = self._aligned_hash_ids(hidden_states, input_ids, segment_starts, token_mask, cp_group=self._hp_cp_group, cp_rank=self._hp_cp_mesh.get_local_rank(), cp_size=4, tp_rank=0, tp_size=1)
+        fused = self._fuse(hidden_states, self.embed(hash_ids))
+        mask = _native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.local_token_mask(token_mask, hidden_states, tp_rank=0, tp_size=1)
+        return fused if mask is None else _native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.where(mask.to(_native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states)
 
 
 
@@ -2405,7 +2442,7 @@ class DeepseekV4SparseMoeBlock(nn.Module):
         super().__init__()
         self.is_hash = config.mlp_layer_types[layer_idx] == 'hash_moe'
         self.gate = DeepseekV4HashRouter(config) if self.is_hash else DeepseekV4TopKRouter(config)
-        self.experts = DeepseekV41MegaMoeExperts(module=_SourceDeepseekV4Experts_2(config), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, dispatch_mode='push', initial_capacity_factor=None, capacity_growth_factor=None, initializer_range=0.02)
+        self.experts = DeepseekV41MegaMoeExperts(module=transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts(config), context={'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'float32'}, dispatch_mode='push', initial_capacity_factor=None, capacity_growth_factor=None, initializer_range=0.02)
         self.shared_experts = DeepseekV4MLP(config)
 
     def forward(self: nn.Module, hidden_states: torch.Tensor, input_ids: torch.Tensor | None=None, image_mask: torch.Tensor | None=None, router_token_mask: torch.Tensor | None=None, router_sequence_ids: torch.Tensor | None=None, router_num_sequences: int | None=None) -> torch.Tensor:
@@ -2669,57 +2706,4 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=outputs.past_key_values, hidden_states=outputs.hidden_states, attentions=outputs.attentions, router_logits=outputs.router_logits)
 
 _hp_nested___all__ = ['DeepseekV4PreTrainedModel', 'DeepseekV4Model', 'DeepseekV4ForCausalLM']
-
-
-class HostEngramModule(_NativeHostEngramModule):
-    ep_enable = True
-
-    def _forward_impl(self, hidden_states, input_ids, segment_starts=None, token_mask=None):
-        return super().forward(hidden_states, input_ids, segment_starts, token_mask)
-    def forward(self, hidden_states, input_ids, segment_starts=None, token_mask=None):
-        if self.ep_enable:
-            # [HYPER LOCAL REGION] boundary entry
-            args, kwargs = self._hp_boundary.redistribute_inputs(
-                ((hidden_states, input_ids, segment_starts, token_mask), {}),
-            )
-            # [HYPER LOCAL REGION] run the region compute fn on local tensors
-            # Native compute from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn, materialized as a class method.
-            outputs = self.deepseek_v41_engram_compute_fn(*args, **kwargs)
-            # [HYPER LOCAL REGION] boundary exit
-            outputs = self._hp_boundary.redistribute_outputs(outputs)
-            return outputs
-        return self._forward_impl(hidden_states, input_ids, segment_starts, token_mask)
-    def deepseek_v41_engram_compute_fn(self, hidden_states, input_ids, segment_starts=None, token_mask=None):
-        """Route hash-row requests and run the exact V4.1 fusion.
-
-        Args:
-            module: Active Engram module.
-            hidden_states: TP-local decoder hidden rows.
-            input_ids: CP-local token IDs.
-            segment_starts: Optional packed sequence boundaries.
-            token_mask: CP-local mask selecting Engram updates.
-        """
-        from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
-        if isinstance(self.embed, HostEngramTable):
-            ids = self._aligned_hash_ids(hidden_states, input_ids, segment_starts, token_mask, cp_group=self._hp_cp_group, cp_rank=self._hp_cp_mesh.get_local_rank(), cp_size=4, tp_rank=0, tp_size=1)
-            fused = self._fuse(hidden_states, self.embed(ids))
-            if token_mask is None:
-                return fused
-            return _native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.where(token_mask.to(_native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states)
-        if 8 > 1:
-            return self.parallel_forward(hidden_states, input_ids, segment_starts, token_mask, ep_group=self._hp_ep_group, ep_rank=self._hp_ep_mesh.get_local_rank(), ep_size=8, cp_group=self._hp_cp_group, cp_rank=self._hp_cp_mesh.get_local_rank(), cp_size=4, tp_rank=0, tp_size=1)
-        hash_ids = self._aligned_hash_ids(hidden_states, input_ids, segment_starts, token_mask, cp_group=self._hp_cp_group, cp_rank=self._hp_cp_mesh.get_local_rank(), cp_size=4, tp_rank=0, tp_size=1)
-        fused = self._fuse(hidden_states, self.embed(hash_ids))
-        mask = _native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.local_token_mask(token_mask, hidden_states, tp_rank=0, tp_size=1)
-        return fused if mask is None else _native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.where(mask.to(_native_hyper_parallel_models_deepseek_v41_adapter_distributed_moe_engram_expert_parallel.torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states)
-
-
-class ParallelLinear_0(_NativeLinear_1):
-    def forward(self, input):
-        return super().forward(input)
-
-
-class ParallelEmbedding_1(_NativeEmbedding_2):
-    def forward(self, input):
-        return super().forward(input)
 # codespell:ignore-end

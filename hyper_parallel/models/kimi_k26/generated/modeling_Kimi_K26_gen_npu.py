@@ -984,12 +984,8 @@ import hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute as _native_
 import hyper_parallel.distributed.expert_parallel.experts as _native_hyper_parallel_distributed_expert_parallel_experts
 
 
-from torch.nn.modules.sparse import Embedding as _NativeEmbedding_1
-
-
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3RMSNorm as _SourceDeepseekV3RMSNorm_0
+import transformers.models.deepseek_v3.modeling_deepseek_v3
 from hyper_parallel.components.modules.rms_norm import RMSNormModule
-
 
 
 
@@ -1337,10 +1333,10 @@ class DeepseekV3Attention(nn.Module):
             self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-            self.q_a_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.q_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+            self.q_a_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.q_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
             self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=config.attention_bias)
-        self.kv_a_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(self.kv_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.kv_a_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(self.kv_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.kv_b_proj = nn.Linear(self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias)
         self.scaling = self.qk_head_dim ** (-0.5)
@@ -1396,8 +1392,8 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
             self.mlp = DeepseekV3MoE(config)
         else:
             self.mlp = DeepseekV3MLP(config)
-        self.input_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
-        self.post_attention_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.input_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.post_attention_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None=None, position_ids: torch.LongTensor | None=None, past_key_values: Cache | None=None, use_cache: bool | None=False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None=None, **kwargs: Unpack[TransformersKwargs]) -> torch.Tensor:
         residual = hidden_states
@@ -1443,9 +1439,9 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = ParallelEmbedding_0(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.norm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()
@@ -1521,9 +1517,4 @@ class DeepseekV3ForTokenClassification(GenericForTokenClassification, DeepseekV3
     pass
 
 _hp_nested___all__ = ['DeepseekV3PreTrainedModel', 'DeepseekV3Model', 'DeepseekV3ForCausalLM', 'DeepseekV3ForSequenceClassification', 'DeepseekV3ForTokenClassification']
-
-
-class ParallelEmbedding_0(_NativeEmbedding_1):
-    def forward(self, input):
-        return super().forward(input)
 # codespell:ignore-end
