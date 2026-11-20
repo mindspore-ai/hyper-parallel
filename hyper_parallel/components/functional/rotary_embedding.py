@@ -270,9 +270,7 @@ def apply_rotary_pos_emb_single_freqs(
     sin_ = torch.sin(freqs).to(t.dtype)
 
     rotary_mode = "interleave" if rotary_interleaved else "half"
-    t_copy = t.clone()
-    t = torch_npu.npu_rotary_mul(t_copy, cos_, sin_, rotary_mode=rotary_mode)
-    t_copy.untyped_storage().resize_(0)
+    t = torch_npu.npu_rotary_mul(t.clone(), cos_, sin_, rotary_mode=rotary_mode)
 
     if t_pass is not None:
         return torch.cat((t, t_pass), dim=-1)
