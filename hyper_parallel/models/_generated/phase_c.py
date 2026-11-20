@@ -21,6 +21,7 @@ from typing import Any
 
 from hyper_parallel.distributed._builder.applier import (
     _boundary_post_order_key,
+    _family_boundary_state,
     _get_cp_submesh,
     _get_tp_submesh,
 )
@@ -211,6 +212,9 @@ def apply_generated_phase_c(
         if not spec.is_boundary:
             continue
         module = _resolve_module(model, module_fqn)
+        owned, skip = _family_boundary_state(module, module_fqn, spec, plan)
+        if skip and not _has_generated_boundary_forward(module):
+            continue
         boundary = PrecompiledBoundary(spec, mesh, mesh_dim_names, op_lowerer=lowerer)
         _bind_input_indices(boundary, module)
         module._hp_boundary = _GeneratedBoundary(boundary)  # pylint: disable=protected-access
@@ -221,18 +225,19 @@ def apply_generated_phase_c(
                 _maybe_add_deferred_biases, module, spec,
             )
 
-        _configure_inner_wrapper(
-            module,
-            spec,
-            cp_mesh=cp_mesh,
-            mesh=mesh,
-            mesh_dim_names=mesh_dim_names,
-            tp_mesh=tp_mesh,
-            expert_mesh=expert_mesh,
-            module_fqn=module_fqn,
-        )
+        if not owned:
+            _configure_inner_wrapper(
+                module,
+                spec,
+                cp_mesh=cp_mesh,
+                mesh=mesh,
+                mesh_dim_names=mesh_dim_names,
+                tp_mesh=tp_mesh,
+                expert_mesh=expert_mesh,
+                module_fqn=module_fqn,
+            )
 
-        compute_fn = _resolve_local_compute_fn(
+        compute_fn = None if owned else _resolve_local_compute_fn(
             module, spec, mesh, mesh_dim_names, expert_mesh,
         )
         generated_local_compute = (

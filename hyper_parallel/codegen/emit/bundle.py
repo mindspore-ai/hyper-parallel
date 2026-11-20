@@ -90,7 +90,7 @@ def emit_bundle(
 
     Manager-facing entry point.  Returns a ``filename -> content`` dict
     holding the generated modeling file, the unified diff against the original
-    source, and ``__init__.py``; the caller (manager) stages and atomically
+    source, and the package entry. The manager atomically
     swaps the complete bundle directory.
 
     """

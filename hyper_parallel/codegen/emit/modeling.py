@@ -22,9 +22,8 @@ appended layers:
   strategies lowered into the copied source at their semantic sites.
 
 Boundary forwards are then lowered at the boundary classes. The artifact is
-both an auditable source export and a directly executable model training entry.
-Training still derives its live plan from the supplied YAML through the native
-Trainer; preflight validates syntax and the recorded generation contract.
+a source export for review. Runtime resources remain external; developer tests
+instantiate the generated classes without reinstalling model or method patches.
 """
 
 from __future__ import annotations
@@ -38,9 +37,24 @@ from typing import Any
 
 from hyper_parallel.codegen.source.composition import compose_nested_model_sources
 from hyper_parallel.codegen.source.compat import sanitize_source_compat
+from hyper_parallel.codegen.emit.family_forwards import (
+    materialize_parallel_family_forwards,
+    verify_parallel_family_forwards,
+)
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
+from hyper_parallel.codegen.emit.methods import (
+    materialize_method_hosts, materialize_observed_methods, verify_observed_methods,
+)
+from hyper_parallel.codegen.emit.frozen import materialize_frozen_modules
+from hyper_parallel.codegen.emit.primitives import materialize_primitive_boundaries
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_plan
+from hyper_parallel.codegen.inline.construction import (
+    construction_sites,
+    layer_selector,
+    materialize_module_constructions,
+    replacement_constructor,
+)
 
 # ---------------------------------------------------------------------------
 # source copy
@@ -48,16 +62,7 @@ from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_p
 
 
 def copy_original_modeling(source: Any) -> str:
-    """Read the original modeling source text from a ``ResolvedSource``-like.
-
-    ``source`` is ``meta.source`` — the ``ResolvedSource.to_dict()`` form with
-    a ``file_path`` key.  Accepts either a dict or a ``ResolvedSource`` (the
-    dict form is what the manager records, but the helper tolerates the live
-    dataclass so it stays usable outside the meta path).
-
-    Args:
-        source: Resolved source metadata containing the original modeling file.
-    """
+    """Read the modeling source selected by the native build."""
     if isinstance(source, dict):
         path = source.get("file_path")
     else:
@@ -339,6 +344,7 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     text = rewrite_relative_imports(text, module_name)
     text = compose_nested_model_sources(text, meta)
     text, emission_meta = _apply_inline_modeling(text, meta, patch_plan=patch_plan)
+    text = materialize_method_hosts(text, getattr(meta, "materialized_methods", {}))
     source_path = (
         meta.source.get("file_path")
         if isinstance(meta.source, dict)
@@ -352,7 +358,13 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
             None if getattr(emission_meta, "nested_components", None) else source_path
         ),
     )
+    text = materialize_parallel_family_forwards(text, getattr(meta, "parallel_forwards", {}))
+    text = materialize_observed_methods(text, getattr(meta, "materialized_methods", {}))
+    text = materialize_primitive_boundaries(text, emission_meta)
     text = _lower_forward_boundaries(text, emission_meta, module_name)
+    text = materialize_module_constructions(text, getattr(meta, "preinstalled_components", ()))
+    text = materialize_frozen_modules(text, getattr(meta, "frozen_modules", ()))
+    verify_observed_methods(text, getattr(meta, "materialized_methods", {}))
     _verify_recorded_patch_materialization(
         text, emission_meta, patch_plan=patch_plan
     )
@@ -376,16 +388,18 @@ def _verify_recorded_patch_materialization(
     wrapper_records = (
         getattr(patches, "inner_wrappers", ()) if patches is not None else ()
     )
-    if not local_records and not replacement_records and not wrapper_records:
+    parallel_forwards = getattr(meta, "parallel_forwards", {})
+    if not local_records and not replacement_records and not wrapper_records and not parallel_forwards:
         return
     tree = ast.parse(text)
+    verify_parallel_family_forwards(tree, parallel_forwards)
     classes = _class_index(tree)
     materialized = getattr(meta, "materialized_patches", None)
     if isinstance(materialized, list):
         materialized.clear()
     missing = _verify_local_records(tree, classes, local_records, materialized)
     missing += _verify_replacement_records(
-        tree, classes, replacement_records, materialized
+        tree, replacement_records, getattr(meta, "preinstalled_components", ()), materialized
     )
     missing += _verify_wrapper_records(
         classes, wrapper_records, replacement_records, materialized
@@ -475,32 +489,61 @@ def _verify_local_records(
     return missing
 
 
-def _verify_replacement_records(
-    tree: ast.AST, classes: dict[str, ast.ClassDef], records: Any, materialized: Any
-) -> list[str]:
-    """Verify replacement constructors in one source unit."""
-    bound_names = {
-        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-    } | set(classes)
+def _verify_replacement_records(tree: ast.AST, records: Any, prepared: Any, materialized: Any) -> list[str]:
+    """Require a source constructor matching each captured replacement path."""
+    prepared_by_path = {item["primary_fqn"]: item for item in prepared}
     missing = []
     for record in records:
-        constructor = getattr(record, "factory", None) or record.replacement_type
-        name = constructor.__name__
-        visible = name in bound_names and any(
-            isinstance(node, ast.Call) and _call_name(node.func) == name
-            for node in ast.walk(tree)
-        )
-        if visible:
-            _record_materialized(
-                materialized,
-                record.module_fqn,
-                name,
-                "module_replacement",
-                "constructor",
-            )
+        item = prepared_by_path.get(record.module_fqn)
+        expected = replacement_constructor(item).rsplit(":", 1)[-1] if item and item.get("replacement_type") else None
+        valid = bool(item) and _has_source_constructor(tree, item, expected)
+        if not valid:
+            missing.append(f"{record.module_fqn} (missing executable constructor {expected!r})")
         else:
-            missing.append(f"{record.module_fqn} (replacement {name})")
+            _record_materialized(materialized, record.module_fqn, expected, "module_replacement", "constructor")
     return missing
+
+
+def _has_source_constructor(tree: ast.AST, record: dict, expected: str) -> bool:
+    """Check actual attribute initialization instead of detached helper declarations."""
+    classes = _class_index(tree)
+    try:
+        sites = construction_sites(ast.unparse(tree), record)
+    except ValueError:
+        return False
+    for site in sites:
+        host = classes.get(site["owner"].split(":")[-1])
+        if host is None:
+            return False
+        values = []
+        for method in host.body:
+            if not isinstance(method, ast.FunctionDef) or method.name != "__init__":
+                continue
+            for node in ast.walk(method):
+                targets = node.targets if isinstance(node, ast.Assign) else (
+                    [node.target] if isinstance(node, ast.AnnAssign) else []
+                )
+                if any(isinstance(target, ast.Attribute) and ast.unparse(target.value) == site.get("base", "self")
+                       and target.attr == site["attribute"] for target in targets):
+                    values.append(node.value)
+        if len(values) != 1:
+            return False
+        value = values[0]
+        if isinstance(value, ast.IfExp):
+            try:
+                selector = layer_selector(ast.unparse(tree), host.name)
+                index = int(record["primary_fqn"].rpartition(".")[0].rsplit(".", 1)[-1])
+                while isinstance(value, ast.IfExp):
+                    test = value.test
+                    if not (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                            and test.left.id == selector and len(test.ops) == 1 and isinstance(test.ops[0], ast.In)):
+                        return False
+                    value = value.body if index in ast.literal_eval(test.comparators[0]) else value.orelse
+            except (ValueError, TypeError):
+                return False
+        if not isinstance(value, ast.Call) or _call_name(value.func) != expected:
+            return False
+    return True
 
 
 def _wrapper_identity(record: Any) -> tuple[Any, str, str]:

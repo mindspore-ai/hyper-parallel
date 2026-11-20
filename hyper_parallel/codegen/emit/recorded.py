@@ -78,6 +78,7 @@ def materialize_recorded_forwards(
             rendered = _materialize_bound_module_function(
                 rendered, source_function, group[0], meta
             )
+            _mark_class_source_lowering_skipped(meta, host_type.__name__)
             continue
         if not _has_source_class(rendered, host_type.__name__):
             continue
@@ -85,10 +86,14 @@ def materialize_recorded_forwards(
             rendered, host_type.__name__, group[0], meta
         )
         _mark_class_source_lowering_skipped(meta, host_type.__name__)
-    return rendered
+    return _materialize_declared_local_computes(
+        rendered, meta, excluded_fqns=frozenset(record.module_fqn for record in records),
+    )
 
 
-def _materialize_declared_local_computes(source_text: str, meta: Any) -> str:
+def _materialize_declared_local_computes(
+    source_text: str, meta: Any, excluded_fqns: frozenset[str] = frozenset(),
+) -> str:
     """Lower explicit frozen local-compute injections when no live record exists."""
     boundary_classes = getattr(meta, "boundary_classes", None) or {}
     injections = getattr(meta, "injections", None) or ()
@@ -101,6 +106,8 @@ def _materialize_declared_local_computes(source_text: str, meta: Any) -> str:
     for injection in injections:
         local = injection.get("local_compute_fn")
         module_fqn = injection.get("match")
+        if module_fqn in excluded_fqns:
+            continue
         class_name = boundary_classes.get(module_fqn)
         if local is None or not module_fqn or class_name not in source_classes:
             continue

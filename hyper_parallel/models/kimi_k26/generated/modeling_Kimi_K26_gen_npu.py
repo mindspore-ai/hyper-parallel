@@ -476,6 +476,7 @@ class Kimi_K25VisionModel(Kimi_K25PreTrainedModel):
         self.layers = nn.ModuleList([Kimi_K25VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.final_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-05)
         self.post_init()
+        self.requires_grad_(False)
 
     def temporal_patch_merger(
         self,
@@ -961,16 +962,32 @@ from transformers.utils.generic import is_flash_attention_requested, maybe_autoc
 
 from transformers.utils.output_capturing import capture_outputs
 
-
-
-from hyper_parallel.components.modules.rms_norm import RMSNorm
-
-
-
-
-# Codegen replacement: RMSNorm wraps DeepseekV3RMSNorm; the original class is kept as the wrapper input.
-
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+
+def _native_hyper_parallel_distributed_expert_parallel_routing_make_balanced_router_balanced_router(module, hidden_states):
+    """Run ``real_router`` and replace its destinations round-robin."""
+    topk_idx, topk_w = _native_hyper_parallel_distributed_expert_parallel_routing._sigmoid_group_router(module, hidden_states)
+    token_count, experts_per_token = topk_idx.shape
+    balanced_idx = _native_hyper_parallel_distributed_expert_parallel_routing._balanced_expert_indices(int(token_count), int(experts_per_token), _native_hyper_parallel_distributed_expert_parallel_routing._global_expert_count(module), int(getattr(getattr(module, 'experts', None), 'local_expert_count', None) or 1), device=topk_idx.device)
+    return (balanced_idx.to(topk_idx.dtype), topk_w)
+def _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_combine(module, hidden_states, routed, overlapped=None):
+    """Merge the routed branch with the shared-experts branch."""
+    shared = module.shared_experts(hidden_states) if overlapped is None else overlapped
+    return routed + shared
+def _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_overlap_shared(module, hidden_states):
+    """Shared-experts branch, evaluated while the dispatch exchange is in flight."""
+    return module.shared_experts(hidden_states)
+import hyper_parallel.distributed.expert_parallel.recipes as _native_hyper_parallel_distributed_expert_parallel_recipes
+import hyper_parallel.distributed.expert_parallel.routing as _native_hyper_parallel_distributed_expert_parallel_routing
+import hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute as _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute
+import hyper_parallel.distributed.expert_parallel.experts as _native_hyper_parallel_distributed_expert_parallel_experts
+
+
+import transformers.models.deepseek_v3.modeling_deepseek_v3
+from hyper_parallel.components.modules.rms_norm import RMSNormModule
+
+
 
 @use_kernel_forward_from_hub('RMSNorm')
 class DeepseekV3RMSNorm(nn.Module):
@@ -1104,25 +1121,60 @@ class DeepseekV3Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.local_expert_count = 3
+        self._ep_apply_gate = None
+        self._ep_use_grouped_gemm = True
 
-    def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-        return final_hidden_states
+    def forward(self, dispatched_states, local_expert_indices):
+        """Compute dispatched tokens with the local stacked SwiGLU experts.
+
+        This function is installed as ``experts.forward`` for the HF-native EP
+        path. Calling the expert module, instead of indexing its parameters from
+        the parent MoE forward, allows nested FSDP forward hooks to unshard and
+        reshard expert parameters around the local computation.
+        """
+        token_order = _native_hyper_parallel_distributed_expert_parallel_experts._argsort_keys(local_expert_indices, bound=self.local_expert_count)
+        sorted_states = dispatched_states[token_order]
+        local_expert_counts = _native_hyper_parallel_distributed_expert_parallel_experts._expert_token_counts(local_expert_indices, self.local_expert_count)
+        if getattr(self, '_ep_use_grouped_gemm', False):
+            grouped_forward = getattr(self, 'forward_expert_major', None)
+            if callable(grouped_forward):
+                sorted_output = grouped_forward(sorted_states, local_expert_counts)
+            else:
+                gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
+                if up_weight is not None:
+                    raise ValueError('EP grouped GEMM currently requires packed gate_up_proj weights')
+                sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.npu_grouped_swiglu(sorted_states, gate_weight, down_weight, local_expert_counts)
+            output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
+            output[token_order] = sorted_output
+            return output
+        gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
+        expert_token_counts = local_expert_counts.tolist()
+        sorted_outputs = []
+        token_start = 0
+        for local_expert_index in range(self.local_expert_count):
+            expert_token_count = expert_token_counts[local_expert_index]
+            expert_states = sorted_states[token_start:token_start + expert_token_count]
+            if up_weight is None:
+                gate_up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
+                apply_gate = getattr(self, '_ep_apply_gate', None)
+                if apply_gate is None:
+                    gate_states, up_states = gate_up_states.chunk(2, dim=-1)
+                    activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
+                    activated_states = activation(gate_states) * up_states
+                else:
+                    activated_states = apply_gate(gate_up_states)
+            else:
+                gate_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
+                up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, up_weight[local_expert_index])
+                activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
+                activated_states = activation(gate_states) * up_states
+            sorted_outputs.append(_native_hyper_parallel_distributed_expert_parallel_experts.F.linear(activated_states, down_weight[local_expert_index]))
+            token_start += expert_token_count
+        sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.cat(sorted_outputs)
+        output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
+        output[token_order] = sorted_output
+        return output
 
 class DeepseekV3MoE(nn.Module):
     """
@@ -1136,7 +1188,7 @@ class DeepseekV3MoE(nn.Module):
         self.gate = DeepseekV3TopkRouter(config)
         self.shared_experts = DeepseekV3MLP(config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
 
-    ep_enable = False
+    ep_enable = True
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residuals = hidden_states
@@ -1153,12 +1205,19 @@ class DeepseekV3MoE(nn.Module):
                 ((hidden_states,), {}),
             )
             # [HYPER LOCAL REGION] run the region compute fn on local tensors
-            # hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute.kimi_k26_ep_compute_fn is bound to self by generated source.
+            # Native compute from hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute.kimi_k26_ep_compute_fn, materialized as a class method.
             outputs = self.kimi_k26_ep_compute_fn(*args, **kwargs)
             # [HYPER LOCAL REGION] boundary exit
             outputs = self._hp_boundary.redistribute_outputs(outputs)
             return outputs
         return self._forward_impl(hidden_states)
+
+    def kimi_k26_ep_compute_fn(self, hidden_states):
+        """Dispatch, run ``overlap_fn`` against the in-flight exchange, then finish."""
+        state = _native_hyper_parallel_distributed_expert_parallel_recipes.ep_routed_dispatch(self, hidden_states, router_fn=_native_hyper_parallel_distributed_expert_parallel_routing_make_balanced_router_balanced_router, ep_group=self._hp_ep_group)
+        overlapped = _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_overlap_shared(self, hidden_states)
+        routed = _native_hyper_parallel_distributed_expert_parallel_recipes.ep_routed_experts_and_combine(self, state, self._hp_ep_group)
+        return _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_combine(self, hidden_states, routed, overlapped)
 def _hp_nested_rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., :x.shape[-1] // 2]
@@ -1274,10 +1333,10 @@ class DeepseekV3Attention(nn.Module):
             self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-            self.q_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.q_lora_rank), module_fqn='', context={})
+            self.q_a_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.q_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
             self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=config.attention_bias)
-        self.kv_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(self.kv_lora_rank), module_fqn='', context={})
+        self.kv_a_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(self.kv_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.kv_b_proj = nn.Linear(self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias)
         self.scaling = self.qk_head_dim ** (-0.5)
@@ -1333,8 +1392,8 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
             self.mlp = DeepseekV3MoE(config)
         else:
             self.mlp = DeepseekV3MLP(config)
-        self.input_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
-        self.post_attention_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
+        self.input_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.post_attention_layernorm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None=None, position_ids: torch.LongTensor | None=None, past_key_values: Cache | None=None, use_cache: bool | None=False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None=None, **kwargs: Unpack[TransformersKwargs]) -> torch.Tensor:
         residual = hidden_states
@@ -1382,7 +1441,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
+        self.norm = RMSNormModule(module=transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()

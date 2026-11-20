@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,25 +87,6 @@ def test_dynamic_module_import_retargets_copied_configuration() -> None:
     assert rendered == "from .configuration_kimi_k3 import KimiK3Config\n"
 
 
-@dataclass
-class _ModelTarget:
-    """Minimal immutable-like model target for config preparation tests."""
-
-    kwargs: dict[str, object] = field(default_factory=dict)
-
-    def replace(self, **changes: object) -> "_ModelTarget":
-        """Return a target carrying the supplied configured arguments."""
-        return _ModelTarget({**self.kwargs, **changes})
-
-
-@dataclass
-class _TrainingConfig:
-    """Minimal dataclass accepted by ``dataclasses.replace``."""
-
-    model: _ModelTarget = field(default_factory=_ModelTarget)
-    codegen: bool = False
-
-
 def _bundle_files(layout: object) -> dict[str, str]:
     return {
         os.path.basename(layout.modeling_path): "VALUE = 1\n",
@@ -128,30 +108,27 @@ def test_default_artifact_layout_uses_current_working_directory(
     assert Path(layout.modeling_path).name == "modeling_Qwen3_MoE_gen_npu.py"
 
 
-def test_load_training_config_does_not_prepare_codegen(
+def test_training_args_preserve_resolved_config_and_yaml_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Loading the training config must not eagerly prepare codegen."""
-    config = _TrainingConfig(codegen=True)
+    """Training keeps the parser result and the YAML path used by the sidecar."""
+    config = SimpleNamespace()
     yaml_path = tmp_path / "train.yaml"
-    monkeypatch.setattr(config_parser, "_load_training_config", lambda *_args: config)
+    override = "--training.seed=42"
+    calls = []
 
-    loaded = config_parser.load_training_config(yaml_path)
+    def load(path, overrides):
+        calls.append((Path(path), list(overrides)))
+        return config
+
+    monkeypatch.setattr(config_parser, "_load_training_config", load)
+
+    loaded = config_parser.parse_training_args([str(yaml_path), override])
 
     assert loaded is config
+    assert calls == [(yaml_path, [override])]
     assert loaded._yaml_path == str(yaml_path.resolve())  # pylint: disable=protected-access
-
-
-def test_training_args_only_parse_config(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    config = _TrainingConfig(codegen=True)
-    yaml_path = tmp_path / "train.yaml"
-    monkeypatch.setattr(config_parser, "_load_training_config", lambda *_args: config)
-
-    assert config_parser.parse_training_args([str(yaml_path)]) is config
 
 
 def test_deepseek_v41_engram_params_target_planner_boundary() -> None:
@@ -179,12 +156,16 @@ def test_deepseek_v41_engram_params_target_planner_boundary() -> None:
         },
     }
 
-    resolved = resolve_component(params_entry, annotation=PlanOverride, path="$.plan_overrides[0]")
-    overrides = entries_to_plan_overrides([resolved], ep_size=8)
+    entries = [
+        resolve_component(entry, annotation=PlanOverride, path=f"$.plan_overrides[{index}]")
+        for index, entry in enumerate((params_entry, method_entry))
+    ]
+    overrides = entries_to_plan_overrides(entries, ep_size=8)
 
     assert set(overrides) == {"model.layers.*.engram"}
-    assert overrides["model.layers.*.engram"].params is not None
-    assert method_entry["match"] == "model.layers.*.engram.forward"
+    engram = overrides["model.layers.*.engram"]
+    assert set(engram.params) == set(params_entry["params"])
+    assert engram.local_compute_fn is entries[1].replace.implementation
 
 
 def test_atomic_bundle_publishes_only_emitted_files(tmp_path: Path) -> None:
@@ -208,21 +189,6 @@ def test_atomic_bundle_publishes_remote_siblings(tmp_path: Path) -> None:
     write_bundle_atomic(layout, files)
     sibling = Path(layout.artifact_dir) / "configuration_demo.py"
     assert sibling.read_text(encoding="utf-8") == "VALUE = 1\n"
-
-
-def test_each_publication_replaces_the_previous_bundle(
-    tmp_path: Path,
-) -> None:
-    """A fresh generation never preserves stale files from an older bundle."""
-    layout = resolve_default_artifact_layout(str(tmp_path / "generated"), "demo")
-    write_bundle_atomic(layout, _bundle_files(layout))
-
-    write_bundle_atomic(layout, {"source_helper.py": "HELPER = 1\n"})
-
-    assert not Path(layout.modeling_path).exists()
-    assert (Path(layout.artifact_dir) / "source_helper.py").read_text(
-        encoding="utf-8"
-    ) == "HELPER = 1\n"
 
 
 @pytest.mark.parametrize(
@@ -252,9 +218,15 @@ def test_complete_bundle_replacement_drops_obsolete_files(tmp_path: Path) -> Non
     initial["obsolete_helper.py"] = "OLD = True\n"
     write_bundle_atomic(layout, initial)
 
-    write_bundle_atomic(layout, _bundle_files(layout))
+    modeling = Path(layout.modeling_path)
+    updated = _bundle_files(layout)
+    updated.pop("__init__.py")
+    updated[modeling.name] = "VALUE = 2\n"
+    write_bundle_atomic(layout, updated)
 
-    assert not (Path(layout.artifact_dir) / "obsolete_helper.py").exists()
+    published = Path(layout.artifact_dir)
+    assert {path.name for path in published.iterdir()} == set(updated) | {"__init__.py"}
+    assert modeling.read_text(encoding="utf-8") == "VALUE = 2\n"
 
 
 def test_temp_artifact_cleanup_only_removes_codegen_siblings(tmp_path: Path) -> None:

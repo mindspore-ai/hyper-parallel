@@ -123,7 +123,7 @@ def build_source_index(source_text: str) -> SourceIndex:
     # Frozen constants belong after the docstring and before imports.
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
         if isinstance(body[0].value.value, str) and body[0].end_lineno is not None:
-            docstring_end = offset_for(body[0].end_lineno)
+            docstring_end = offset_for(body[0].end_lineno + 1)
 
     # Import block: the leading (or maximal) run of Import/ImportFrom at module
     # level.  In a well-formed module imports are first, so we take the span
@@ -133,7 +133,7 @@ def build_source_index(source_text: str) -> SourceIndex:
     for node in body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             if node.end_lineno is not None:
-                import_end = offset_for(node.end_lineno)
+                import_end = offset_for(node.end_lineno + 1)
 
     for node in body:
         if isinstance(node, ast.ClassDef):
@@ -154,7 +154,7 @@ def _build_class_info(node: ast.ClassDef, text: str, offset_for) -> ClassInfo:
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             methods[child.name] = _build_function_info(child, text, offset_for)
     end_offset = (
-        offset_for(node.end_lineno) if node.end_lineno is not None else len(text)
+        offset_for(node.end_lineno + 1) if node.end_lineno is not None else len(text)
     )
     return ClassInfo(
         name=node.name,

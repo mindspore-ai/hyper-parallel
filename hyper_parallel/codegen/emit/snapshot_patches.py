@@ -35,15 +35,7 @@ def emission_patches_from_snapshot_payload(
     """
     applications = payload["replacements"]["applications"]
     replacements = [
-        {
-            "module_fqn": item["primary_fqn"],
-            "source_type": item["source_type"],
-            "replacement_type": item["replacement_type"],
-            **({"factory": item["family_request"]["factory"],
-                "factory_kwargs": {**item["family_request"]["kwargs"],
-                                   "context": item["family_request"]["context"]}}
-               if item.get("family_request") else {}),
-        }
+        {"module_fqn": item["primary_fqn"], "replacement_type": item["replacement_type"]}
         for item in applications
     ]
     replacement_types = {

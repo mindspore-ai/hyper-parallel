@@ -17,17 +17,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Optional
 
 
 @dataclass(frozen=True)
 class SourceObservation:
-    """One normalized replacement or injection observed during native build."""
+    """One parallel forward injection observed during native build."""
 
     match: tuple[str, ...]
-    module_type: Optional[str] = None
-    replace_target: Optional[str] = None
-    construction_kwargs: tuple[str, ...] = ()
     inner_wrapper_target: Optional[str] = None
     local_compute_target: Optional[str] = None
 
@@ -49,29 +46,6 @@ class ModuleSnippetPatch:
 
 
 @dataclass(frozen=True)
-class ConstructorReplacePatch:
-    """Replace constructor calls in source text.
-
-    ``scope_attrs`` carries the attribute names of the rule's *matched* FQNs
-    (``{"input_layernorm", "post_attention_layernorm", "norm"}`` for the
-    RMSNorm rule).  Native replaces module instances by FQN, so a whole-file
-    class-name rewrite would silently replace call sites the rule never
-    matched -- for example the Q/K norm inside the attention class that the
-    recipe deliberately leaves as the original implementation.  An empty scope
-    means the caller imposes no restriction; the YAML-driven pass never emits
-    an unscoped patch.
-    """
-
-    old_ctor: str
-    new_ctor: str
-    mode: Literal["name", "wrap_source"] = "name"
-    keyword_args: tuple[str, ...] = ()
-    scope_attrs: tuple[str, ...] = ()
-    scope_fqns: tuple[str, ...] = ()
-    defer_to_fqns: bool = False
-
-
-@dataclass(frozen=True)
 class ForwardExtractPatch:
     """Keep the original method as ``_forward_impl`` and replace its body."""
 
@@ -82,17 +56,14 @@ class ForwardExtractPatch:
 
 
 @dataclass(frozen=True)
-class ClassRemovalPatch:
-    """Remove an unused original HF class definition and rewrite its references.
+class ConstructorPatch:
+    """Replace a source constructor expression at one owning attribute."""
 
-    ``old_name`` is the class being removed; ``new_name`` is the fused
-    replacement that any surviving bare reference (e.g. inside
-    ``_can_record_outputs`` or ``isinstance`` checks) should be rewritten to.
-    Constructor calls are handled separately by ``ConstructorReplacePatch``.
-    """
-
-    old_name: str
-    new_name: str
+    owner_class: str
+    attribute: str
+    source_class: str
+    expression: str
+    base: str = "self"
 
 
 @dataclass
@@ -101,24 +72,8 @@ class InlinePatchSet:
 
     imports: list[ImportPatch] = field(default_factory=list)
     module_snippets: list[ModuleSnippetPatch] = field(default_factory=list)
-    constructor_replaces: list[ConstructorReplacePatch] = field(default_factory=list)
     forward_extracts: list[ForwardExtractPatch] = field(default_factory=list)
-    class_removals: list[ClassRemovalPatch] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class ReplacementSpec:
-    """Source-level form of one module replacement implementation."""
-
-    old_ctor: str
-    new_ctor: str
-    imports: tuple[ImportPatch, ...]
-    mode: str = "name"
-    keyword_args: tuple[str, ...] = ()
-    snippets: tuple[ModuleSnippetPatch, ...] = ()
-    remove_class: bool = True
-    replacement_note: str | None = None
-    defer_to_fqns: bool = False
+    constructors: list[ConstructorPatch] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,12 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.build_capture import (
+    is_model_build_capture_active,
+    record_model_plan_for_capture,
+    record_model_source_for_capture,
+    record_model_without_plan_for_capture,
+)
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
@@ -264,8 +270,10 @@ def _plan_and_apply_sharding(
         or mesh is None
         or (is_hf_model and not model_sharding_requested and not _has_module_owned_layouts(model))
     ):
+        record_model_without_plan_for_capture(model, mesh, sharding_planner)
         return model, None
     if mesh.device_mesh is None:
+        record_model_plan_for_capture(model, None, mesh, reason="device_mesh_unavailable")
         logger.warning("MeshContext has no device_mesh; skipping sharding")
         return model, None
 
@@ -287,6 +295,8 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
+    if record_model_plan_for_capture(model, plan, mesh):
+        return model, None
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
@@ -708,6 +718,7 @@ def apply_model_infrastructure(
     """
 
     distributed_setup = kwargs.get("distributed_setup")
+    capture_active = is_model_build_capture_active()
     compile_config, compile_for_execution = _resolve_compile_config(
         compile_config, validate_placement, fsdp2_manager
     )
@@ -715,11 +726,15 @@ def apply_model_infrastructure(
         compile_config is not None and compile_config.selects_graph_compiler()
     )
     _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
+    record_model_source_for_capture(
+        model,
+        pretrained_model_name_or_path=pretrained_path,
+    )
 
     model, weights_mapping = _maybe_apply_module_replacements(
         model, distributed_setup, low_precision_config, load_base_model,
     )
-    if is_meta_device:
+    if is_meta_device and not capture_active:
         _apply_materialization_adapter(model)
 
     _tie_model_weights_before_parallelism(model)
@@ -733,6 +748,8 @@ def apply_model_infrastructure(
     model, source_shard_info = _plan_and_apply_sharding(
         model, mesh, sharding_planner, is_hf_model, validate_placement,
     )
+    if capture_active:
+        return model
 
     model = _apply_activation_features(
         model, activation_checkpoint, activation_swap, compile_for_execution, mesh,

@@ -45,7 +45,6 @@ from hyper_parallel.codegen.inline.framework_spec import (
     strategy_spec_for,
 )
 from hyper_parallel.codegen.inline.ir import (
-    ConstructorReplacePatch,
     ForwardExtractPatch,
     ImportPatch,
     InlinePatchSet,
@@ -61,7 +60,6 @@ from hyper_parallel.codegen.inline.pipeline import (
 from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.framework_spec import cp_dispatch_shell_body
-from hyper_parallel.codegen.inline.observations import collect_source_observations
 
 SOURCE_TEXT = '''\
 import torch
@@ -503,6 +501,28 @@ def test_frozen_local_compute_rewrites_class_without_live_record():
     }]
 
 
+def test_recorded_and_declared_local_regions_are_both_materialized():
+    """A legacy record for one class must not hide another final-plan declaration."""
+    alpha_type = type("Alpha", (), {"forward": _recorded_alpha_forward})
+    record = SimpleNamespace(module_fqn="alpha", module_type=alpha_type,
+                             original_forward=alpha_type.forward, factory="demo.ep.factory")
+    meta = SimpleNamespace(
+        param_plan={"alpha": _identity_entry(), "beta": _identity_entry()},
+        boundary_classes={"alpha": "Alpha", "beta": "Beta"}, external_state_classes=[],
+        mesh_dim_names=("ep",), materialized_patches=[],
+        injections=[{"match": name, "local_compute_fn": {"_target_": "demo.ep.compute"}}
+                    for name in ("alpha", "beta")],
+    )
+    rendered = materialize_recorded_forwards(SOURCE_TEXT, meta, patch_plan=SimpleNamespace(local_computes=(record,)))
+    tree = ast.parse(rendered)
+    for name in ("Alpha", "Beta"):
+        host = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
+        methods = [node.name for node in host.body if isinstance(node, ast.FunctionDef)]
+        assert methods.count("_forward_impl") == 1
+        assert methods.count("forward") == 1
+    assert all(entry["skip_source_lowering"] for entry in meta.param_plan.values())
+
+
 def test_cp_dispatch_rewrites_same_class_without_constructor_swap():
     """CP dispatch is an in-place forward rewrite with the original signature."""
     patches = InlinePatchSet(
@@ -628,12 +648,10 @@ def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
 
 
 def test_replacement_verifier_requires_constructor_call():
-    """An imported replacement symbol alone is not a materialized replacement."""
-    source_type = type("SourceBlock", (), {})
+    """A constructor must be wired to the exact replacement path."""
     replacement_type = type("ReplacementBlock", (), {})
     record = SimpleNamespace(
         module_fqn="blocks.alpha",
-        source_type=source_type,
         replacement_type=replacement_type,
     )
     patches = SimpleNamespace(
@@ -641,7 +659,10 @@ def test_replacement_verifier_requires_constructor_call():
         module_replacements=(record,),
         inner_wrappers=(),
     )
-    meta = SimpleNamespace(materialized_patches=[])
+    meta = SimpleNamespace(materialized_patches=[], preinstalled_components=(
+        {"primary_fqn": "blocks.alpha", "replacement_type": "demo:ReplacementBlock",
+         "replay": {"constructor": "demo:ReplacementBlock"}},
+    ))
     imported_only = "from demo import ReplacementBlock\n"
 
     with pytest.raises(RuntimeError, match="were not materialized"):
@@ -649,7 +670,17 @@ def test_replacement_verifier_requires_constructor_call():
             imported_only, meta, patch_plan=patches
         )
 
-    rendered = imported_only + "\nblock = ReplacementBlock(source)\n"
+    rendered = imported_only + """
+def _hp_module_constructors():
+    return {"blocks.alpha": lambda **kwargs: ReplacementBlock(**kwargs)}
+"""
+    with pytest.raises(RuntimeError, match="were not materialized"):
+        _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
+    rendered = imported_only + """
+class FutureBlocks:
+    def __init__(self):
+        self.alpha = ReplacementBlock()
+"""
     _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
 
     assert meta.materialized_patches == [{
@@ -779,27 +810,6 @@ def test_observed_inner_wrapper_rebinds_boundary_to_replacement_type():
     }
 
 
-def test_model_adapter_replacement_keeps_declared_factory_contract():
-    """Observed types do not erase a model-owned factory's interface facts."""
-    meta = SimpleNamespace(
-        module_overrides=[{
-            "factory": "hyper_parallel.components.modules.GroupedQueryAttention",
-            "replacement_target": (
-                "hyper_parallel.models.qwen3_moe.adapter.conversion."
-                "module_replacement.replace_qwen3_moe_flash_attention"
-            ),
-            "module_type": "demo.OriginalAttention",
-            "fqns": ["model.layers.0.self_attn"],
-        }],
-        injections=[],
-    )
-
-    rules = collect_source_observations(meta)
-
-    assert len(rules) == 1
-    assert rules[0].replace_target == meta.module_overrides[0]["replacement_target"]
-
-
 def test_imported_cp_host_and_boundary_share_one_forward_impl():
     """CP dispatch and boundary lowering compose into one implementation."""
     patches = InlinePatchSet(
@@ -843,40 +853,6 @@ def test_imported_cp_host_and_boundary_share_one_forward_impl():
     assert "return mla_cp_forward(self, *args, **kwargs)" in rendered
     assert "return super().forward(*args, **kwargs)" in rendered
     assert "return self._forward_impl(*args, **kwargs)" not in rendered
-
-
-def test_imported_replacement_owner_is_lowered_after_root_construction():
-    """An observed wrapper needs no constructor call in the copied source."""
-    source = """\
-class Root(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.model = ImportedDecoder(config)
-"""
-    patches = InlinePatchSet(
-        imports=[ImportPatch("demo.replacements", ("WrappedExperts",))],
-        constructor_replaces=[
-            ConstructorReplacePatch(
-                old_ctor="ImportedExperts",
-                new_ctor="WrappedExperts",
-                mode="wrap_source",
-                keyword_args=("module_fqn=''", "context={}"),
-                scope_attrs=("experts",),
-                scope_fqns=(
-                    "model.layers.0.mlp.experts",
-                    "model.layers.1.mlp.experts",
-                ),
-            )
-        ],
-    )
-
-    rendered = apply_patch_set(source, patches)
-
-    ast.parse(rendered)
-    assert "self.model = ImportedDecoder(config)" in rendered
-    assert "for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts')" in rendered
-    assert "WrappedExperts(" in rendered
-    assert "module=_hp_source, module_fqn=_hp_fqn, context={}" in rendered
 
 
 def test_tp_collective_boundary_renders_static_operators():

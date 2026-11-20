@@ -189,11 +189,25 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
             events.append(("model", kwargs))
             return object()
 
+    capture = SimpleNamespace(complete=True)
+
     @contextmanager
-    def _model_overlay(_session, received_artifact_dir):
-        """Provide the artifact normally populated by the overlay."""
+    def _capture_model_build_plan(**kwargs):
+        """Expose the capture normally populated by the shared model build."""
+        events.append(("capture", kwargs))
+        yield capture
+
+    build_ir = object()
+
+    def _project_model_build(received_capture):
+        assert received_capture is capture
+        events.append(("project", received_capture))
+        return build_ir
+
+    def _publish_codegen_ir(received_ir, received_artifact_dir):
+        assert received_ir is build_ir
         assert received_artifact_dir == "bundle"
-        yield SimpleNamespace(artifact_layout=layout)
+        return SimpleNamespace(artifact_layout=layout)
 
     config = SimpleNamespace(
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
@@ -211,7 +225,9 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
     )
     setup = object()
     monkeypatch.setattr(build, "create_offline_distributed_setup", lambda _config: setup)
-    monkeypatch.setattr(build, "use_codegen_model_build_overlay", _model_overlay)
+    monkeypatch.setattr(build, "capture_model_build_plan", _capture_model_build_plan)
+    monkeypatch.setattr(build, "project_model_build", _project_model_build)
+    monkeypatch.setattr(build, "publish_codegen_ir", _publish_codegen_ir)
     monkeypatch.setattr(
         build,
         "normalize_distributed_setup_overrides",
@@ -220,7 +236,7 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
     result = build.generate_from_native_build(config, artifact_dir="bundle")
 
     assert result is layout
-    assert [event[0] for event in events] == ["normalize", "model"]
+    assert [event[0] for event in events] == ["normalize", "capture", "model", "project"]
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
@@ -242,7 +258,7 @@ def test_native_build_requires_published_artifact(monkeypatch):
     monkeypatch.setattr(build, "create_offline_distributed_setup", lambda _config: object())
     monkeypatch.setattr(build, "normalize_distributed_setup_overrides", lambda *_args: None)
 
-    with pytest.raises(RuntimeError, match="without publishing"):
+    with pytest.raises(RuntimeError, match="without a complete preparation capture"):
         build.generate_from_native_build(config)
 
 
@@ -263,9 +279,8 @@ def test_native_build_reports_isolated_publication_failure(monkeypatch):
         model_init_dtype=None,
     )
 
-    @contextmanager
-    def _failed_overlay(_session, _artifact_dir):
-        yield SimpleNamespace(
+    def _failed_publication(_build_ir, _artifact_dir):
+        return SimpleNamespace(
             artifact_layout=None,
             snapshot=SimpleNamespace(
                 failure=SimpleNamespace(
@@ -277,7 +292,8 @@ def test_native_build_reports_isolated_publication_failure(monkeypatch):
 
     monkeypatch.setattr(build, "create_offline_distributed_setup", lambda _config: object())
     monkeypatch.setattr(build, "normalize_distributed_setup_overrides", lambda *_args: None)
-    monkeypatch.setattr(build, "use_codegen_model_build_overlay", _failed_overlay)
+    monkeypatch.setattr(build, "project_model_build", lambda _capture: object())
+    monkeypatch.setattr(build, "publish_codegen_ir", _failed_publication)
 
     with pytest.raises(
         RuntimeError,

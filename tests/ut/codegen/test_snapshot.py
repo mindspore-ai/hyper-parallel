@@ -28,19 +28,11 @@ def _derived_snapshot() -> CodegenSnapshot:
     session.record_source({"model_type": "toy", "identity": {"revision": "v1"}})
     session.record_replacements(
         declarations=[{"rule_id": "replace-1", "target": "ToyBlock"}],
-        applications=[{"fqn": "model.layers.0", "rule_id": "replace-1"}],
+        applications=[{"primary_fqn": "model.layers.0", "rule_id": "replace-1"}],
     )
-    session.record_plan({"placements": {"model.layers.0": ["R", "S(0)"]}})
+    session.record_plan({"param_plan": {"model.layers.0": ["R", "S(0)"]}})
     session.record_diagnostics({"rank": 0, "temporary_dir": "/tmp/ignored"})
     return session.finish()
-
-
-def test_snapshot_exposes_mutable_emission_data_without_mutating_itself():
-    snapshot = _derived_snapshot()
-    payload = snapshot.to_dict()
-    payload["source"]["model_type"] = "changed"
-
-    assert snapshot.to_dict()["source"]["model_type"] == "toy"
 
 
 def test_session_recording_deep_copies_nested_input():
@@ -61,11 +53,11 @@ def test_snapshot_output_deep_copy_isolated_from_nested_mutation():
     payload = snapshot.to_dict()
 
     payload["source"]["identity"]["revision"] = "v2"
-    payload["replacements"]["applications"][0]["fqn"] = "changed"
+    payload["replacements"]["applications"][0]["primary_fqn"] = "changed"
 
     fresh = snapshot.to_dict()
     assert fresh["source"]["identity"]["revision"] == "v1"
-    assert fresh["replacements"]["applications"][0]["fqn"] == "model.layers.0"
+    assert fresh["replacements"]["applications"][0]["primary_fqn"] == "model.layers.0"
 
 
 class TestSnapshotMemoryOwnership(unittest.TestCase):
@@ -92,5 +84,5 @@ class TestSnapshotMemoryOwnership(unittest.TestCase):
         with mock.patch.object(snapshot_module, "deepcopy", wraps=snapshot_module.deepcopy) as copier:
             payload = snapshot.to_dict()
             self.assertEqual(copier.call_count, 1)
-        payload["replacements"]["applications"][0]["fqn"] = "changed"
-        self.assertEqual(snapshot.replacements.applications[0]["fqn"], "model.layers.0")
+        payload["replacements"]["applications"][0]["primary_fqn"] = "changed"
+        self.assertEqual(snapshot.replacements.applications[0]["primary_fqn"], "model.layers.0")

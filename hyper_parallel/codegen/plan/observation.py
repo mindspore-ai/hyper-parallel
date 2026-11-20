@@ -34,6 +34,7 @@ class EmissionPlanObservation:
     boundary_classes: dict[str, str] = field(default_factory=dict)
     boundary_types: dict[str, str] = field(default_factory=dict)
     nested_components: list[dict[str, str]] = field(default_factory=list)
+    parallel_forwards: dict[str, dict[str, Any]] = field(default_factory=dict)
     mesh_dim_names: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,8 +52,24 @@ def observe_emission_plan(plan: Any, model: Any) -> EmissionPlanObservation:
         boundary_classes=_observe_boundary_classes(plan, model),
         boundary_types=_observe_boundary_types(plan, model),
         nested_components=_observe_nested_components(plan, model),
+        parallel_forwards=_observe_parallel_forwards(plan, model),
         mesh_dim_names=tuple(getattr(plan, "mesh_dim_names", ()) or ()),
     )
+
+
+def _observe_parallel_forwards(plan: Any, model: Any) -> dict[str, dict[str, Any]]:
+    """Keep native CP/EP protocol stages for source lowering."""
+    result = {}
+    for fqn, binding in (getattr(plan, "parallel_modules", {}) or {}).items():
+        if binding.binding_kind not in ("cp", "ep"):
+            continue
+        member = type(model.get_submodule(fqn))
+        result[fqn] = {
+            "type": f"{member.__module__}:{member.__qualname__}",
+            "kind": binding.binding_kind,
+            "stages": list(binding.stages),
+        }
+    return result
 
 
 def _observe_boundary_plan(plan: Any) -> dict[str, dict[str, Any]]:

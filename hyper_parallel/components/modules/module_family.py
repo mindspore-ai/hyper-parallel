@@ -266,6 +266,17 @@ def _build_family_member(
     return result
 
 
+def build_prepared_family_replacement(
+    *, module: nn.Module, module_fqn: str, prepared: Mapping[str, Any],
+) -> nn.Module:
+    """Load bundles emitted with the original replay import path."""
+    # The replay addon imports the shared constructor from this module.
+    from hyper_parallel.models.prepared_family import (  # pylint: disable=C0415,R0401
+        build_prepared_family_replacement as replay,
+    )
+    return replay(module=module, module_fqn=module_fqn, prepared=prepared)
+
+
 def build_family(
     target: Callable | str | FamilyRequest,
     *,

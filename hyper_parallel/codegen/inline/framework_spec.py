@@ -12,60 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Resolve inline codegen declarations from structure, not family render specs.
-
-This module replaces per-family ``render_spec.py`` files. Every fact a
-generated artifact needs is derived from the family's *existing runtime
-providers* plus the frozen plan, never from a family-name dispatch table:
-
-* a YAML ``replace_module._target_`` names the family's own
-  ``@module_replacement`` factory; inspecting that factory's source reveals
-  which generic component it constructs (``RMSNorm`` / ``GroupedExperts`` /
-  ``GroupedQueryAttention``) and, for fused attention, the kernel entry it hands over;
-* a YAML ``replace_module._target_`` that names a generic component class
-  directly (under ``hyper_parallel.components.``) resolves through that
-  component's own wrap-style constructor -- the same declaration the native
-  ``_target_replacement_factory`` builds, so no family factory is required;
-* a CP ``inner_wrapper`` target under the ``models/<family>/adapter``
-  convention resolves to the framework CP attention strategy — imports
-  and a recognizable inner forward rewrite additionally materializes an
-  in-artifact CP dispatch subclass;
-
-The source class name an artifact must model (``Qwen3MoeRMSNorm``) is not
-duplicated here either: it is read from the rule's own ``module_type``, which
-the YAML already carries for its type check. No model-family codegen
-declaration remains.
-
-Heavy resolution (importing the real generic component to render a fused
-attention class) stays lazy: it only runs when a fused-attention target is
-actually present, so importing this module never pulls torch / torch_npu.
-Resolved specs are cached so repeated lookups stay cheap and stable (callers
-may rely on object identity across calls).
-"""
+"""Lower recorded forward strategies to source edits."""
 
 from __future__ import annotations
 
-import importlib
-import inspect
-from typing import Any, Callable, cast
+from hyper_parallel.codegen.inline.ir import ImportPatch, StrategySpec
+from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 
-from hyper_parallel.components.modules.family import get_module_family
-
-from hyper_parallel.codegen.inline.ir import (
-    ImportPatch,
-    ModuleSnippetPatch,
-    ReplacementSpec,
-    StrategySpec,
-)
-from hyper_parallel.codegen.inline.recognition import (
-    ReplacementArgument,
-    ReplacementTarget,
-    adapter_path_parts,
-    class_name_of,
-    family_from_target,
-    inner_wrapper_target,
-    replacement_target,
-)
 
 _CP_DISPATCH_SHELL = '''if self.cp_enable:
     return {helper_name}(self, __hp_forward_args__)
@@ -85,344 +38,7 @@ def cp_dispatch_shell_body(helper_name: str) -> str:
 #: The framework CP attention strategy kind (structure-keyed, not family-named).
 CP_ATTENTION_KIND = "cp_attention"
 
-def _family_provider(model_type: str | None, provider: str) -> Any | None:
-    """Return one family adapter provider module, or ``None`` if unregistered."""
-    if not model_type:
-        return None
-    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
-
-    adapter = get_model_adapter(model_type)
-    loader = getattr(adapter, provider, None) if adapter is not None else None
-    if loader is None:
-        return None
-    return loader()
-
-
-def _family_key(model_type: str | None, target: str | None) -> str | None:
-    """Canonical family key for one lookup.
-
-    Every spelling of an identity (``qwen3_moe`` / ``Qwen3MoeForCausalLM``)
-    normalizes to the registered ``model_type``, so repeated lookups share one
-    resolved spec -- callers may rely on object identity.  A target under the
-    ``models/<family>/adapter`` convention supplies the family when the caller
-    did not name one.  An unregistered identity is kept verbatim so resolution
-    still fails closed (``None``) instead of falling back to another family.
-    """
-    if model_type is None:
-        model_type = family_from_target(target)
-    if not model_type:
-        return None
-    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
-
-    adapter = get_model_adapter(model_type)
-    return adapter.model_type if adapter is not None else model_type
-
-
-def _factory_function(target: str, model_type: str | None):
-    """Resolve a YAML replacement ``_target_`` to the family's real factory.
-
-    Returns ``None`` when the target is not a factory exported by this family's
-    replacements provider — a target the framework cannot structurally resolve.
-    """
-    module = _family_provider(model_type, "replacements")
-    if module is None:
-        return None
-    prefix = module.__name__ + "."
-    if not target.startswith(prefix):
-        return None
-    name = target[len(prefix):]
-    if "." in name:
-        return None
-    return getattr(module, name, None)
-
-
-#: Generic components are valid direct targets without a decorator. Model-owned
-#: classes are accepted only when their native replacement decorator marks them.
-_COMPONENTS_PREFIX = "hyper_parallel.components."
-
-
-def _direct_component_class(target: str) -> type | None:
-    """Import a generic or natively decorated replacement class."""
-    module_name, _, attr = target.rpartition(".")
-    if not module_name or not attr:
-        return None
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError:
-        return None
-    component = getattr(module, attr, None)
-    if not isinstance(component, type):
-        return None
-    if (
-        target.startswith(_COMPONENTS_PREFIX)
-        or getattr(component, "_hp_module_replacement", False)
-    ):
-        return component
-    return None
-
-
-def _component_replacement_target(component: type) -> ReplacementTarget | None:
-    """Read a wrap-style component's own constructor as its replacement target.
-
-    The structural mirror of ``_target_replacement_factory``: a component
-    whose constructor accepts the wrapped ``module`` declares the same
-    replacement a family factory does -- the matched source instance is
-    handed over (``wraps_source``), and each remaining framework keyword the
-    native factory passes (``module_fqn`` / ``context``) applies the
-    component's own constructor default.
-    """
-    parameters = inspect.signature(component).parameters
-    if "module" not in parameters:
-        return None
-    arguments = tuple(
-        ReplacementArgument(name, value)
-        for name, value in (("module_fqn", "''"), ("context", "{}"))
-        if name in parameters
-    )
-    return ReplacementTarget(
-        component=component.__name__,
-        module=component.__module__,
-        wraps_source=True,
-        arguments=arguments,
-    )
-
-
-def _replacement_component(target: ReplacementTarget) -> Callable[..., Any]:
-    """Import the component class or registered family a factory constructs.
-
-    Lazy by construction: the component's own module is imported only when a
-    rule that constructs it is actually present (``components.modules``
-    re-exports lazily, so this pulls in one submodule, never the whole set).
-    """
-    module = importlib.import_module(target.module)
-    component = getattr(module, target.component, None)
-    if not isinstance(component, type) and get_module_family(component) is None:
-        raise RuntimeError(
-            f"codegen: {target.module!r} does not export the component "
-            f"{target.component!r} the replacement factory constructs"
-        )
-    return component
-
-
-def _render_arguments(
-    target: ReplacementTarget, component: Callable[..., Any]
-) -> tuple[str, ...] | None:
-    """Render the constructor keywords the generated call passes.
-
-    Arguments the factory binds to its own parameters have no value at
-    generation time, so the component's own constructor default is emitted --
-    the framework never restates a component's keyword shape. ``None`` means the
-    component does not accept one of the keywords the factory passes, i.e. the
-    factory constructs an interface codegen cannot sink.
-    """
-    parameters = inspect.signature(component).parameters
-    rendered: list[str] = []
-    for argument in target.arguments:
-        if argument.value is not None:
-            rendered.append(f"{argument.name}={argument.value}")
-            continue
-        if argument.name not in parameters:
-            return None
-        rendered.append(f"{argument.name}={parameters[argument.name].default!r}")
-    return tuple(rendered)
-
-
-def _interface_function(factory: Any, target: ReplacementTarget) -> Any:
-    """The family kernel entry the factory hands its component."""
-    interface = getattr(factory, "__globals__", {}).get(target.interface)
-    if not callable(interface):
-        raise RuntimeError(
-            f"codegen: replacement factory {getattr(factory, '__name__', factory)!r} "
-            f"hands over {target.interface!r}, which its module does not define"
-        )
-    return interface
-
-
-def _build_replacement_spec(
-    factory: Any,
-    target: ReplacementTarget,
-    old_ctor: str,
-    model_type: str | None,
-) -> ReplacementSpec | None:
-    """Build the source-level replacement one factory declares.
-
-    Every field comes from the factory's own structure: the class it constructs
-    (and the module it imports it from), whether it hands the matched module over
-    as a wrap, the constructor keywords it passes, and the family interface it
-    hands to the component -- which is what makes the component's class rendered
-    (visible in the artifact) instead of merely imported. ``None`` means the
-    construction is not one codegen can sink into the generated ``__init__``.
-    """
-    component = _replacement_component(target)
-    keyword_args = _render_arguments(target, component)
-    if keyword_args is None:
-        return None
-    if get_module_family(component) is not None:
-        # A thin source-model adapter may delegate to a registered family.
-        # Preserve that request so later TP/CP promotion does not freeze the local class.
-        return ReplacementSpec(
-            old_ctor=old_ctor, new_ctor=target.component,
-            imports=(ImportPatch(target.module, (target.component,)),),
-            mode="wrap_source", keyword_args=keyword_args, remove_class=False, defer_to_fqns=True,
-        )
-    # A component that receives a family interface is rendered into the artifact,
-    # so its class is defined there -- importing it as well would be dead weight
-    # the rendered definition shadows.
-    imports: list[ImportPatch] = (
-        [] if target.interface else [ImportPatch(target.module, (target.component,))]
-    )
-    snippets: tuple[ModuleSnippetPatch, ...] = ()
-    if target.interface:
-        provider = _family_provider(model_type, "codegen")
-        renderer = getattr(provider, "render_replacement_source", None)
-        if not callable(renderer):
-            return None
-        render_source = cast(Callable[..., Any], renderer)
-        expanded = render_source(  # pylint: disable=not-callable
-            component, interface=_interface_function(factory, target)
-        )
-        imports.extend(
-            ImportPatch(module="", names=(), raw=line) for line in expanded.imports
-        )
-        snippets = (ModuleSnippetPatch(expanded.source),)
-    mode = "wrap_source" if target.wraps_source else "name"
-    return ReplacementSpec(
-        old_ctor=old_ctor,
-        new_ctor=target.component,
-        mode=mode,
-        keyword_args=keyword_args,
-        imports=tuple(imports),
-        remove_class=not target.wraps_source,
-        snippets=snippets,
-        replacement_note=(
-            f"{target.component} wraps {old_ctor}; the original class is kept "
-            "as the wrapper input."
-            if target.wraps_source
-            else f"{target.component} replaces {old_ctor}."
-        ),
-    )
-
-
-#: Resolved-spec caches. Keyed by everything the resolution reads, so a
-#: repeated lookup returns the same object (callers may compare identity) and
-#: the expensive fused-attention render runs once.
-_REPLACEMENT_CACHE: dict[tuple[str | None, Any, str | None], ReplacementSpec | None] = {}
-_STRATEGY_CACHE: dict[tuple[str | None, str | None, bool], StrategySpec | None] = {}
-
-
-def replacement_spec_for(
-    target: str | None,
-    model_type: str | None = None,
-    *,
-    module_type: str | None = None,
-) -> ReplacementSpec | None:
-    """Resolve a ``replace_module`` target to its structural component spec.
-
-    ``module_type`` is the matched source module's dotted type path from the
-    YAML rule; the source class name (``old_ctor``) is its class name — a
-    property of the matched source module, never a hand-written literal.
-
-    Args:
-        target: Import path of the replacement factory or component.
-        model_type: Optional source model type.
-        module_type: Observed source module type used to match construction sites.
-    """
-    if target is None:
-        return None
-    # Builder observations serialize callables as module:attribute, while YAML
-    # commonly uses module.attribute. Both identify the same replacement.
-    target = target.replace(":", ".", 1)
-    family_spec = _module_family_replacement_spec(target, module_type)
-    if family_spec is not None:
-        return family_spec
-    if _direct_component_class(target) is not None:
-        return _component_replacement_spec(target, model_type, module_type=module_type)
-    if not adapter_path_parts(target):
-        return None
-    model_type = _family_key(model_type, target)
-    factory = _factory_function(target, model_type)
-    if factory is None:
-        return None
-    # The spec is derived from the *factory's* structure, so the factory is
-    # part of the key: a target re-pointed at a different factory (or a family
-    # re-registered with one) must not reuse the previous resolution.
-    key = (model_type, factory, module_type)
-    if key in _REPLACEMENT_CACHE:
-        return _REPLACEMENT_CACHE[key]
-    spec = _resolve_replacement_spec(factory, model_type, module_type, target)
-    _REPLACEMENT_CACHE[key] = spec
-    return spec
-
-
-
-def _module_family_replacement_spec(target: str, module_type: str | None) -> ReplacementSpec | None:
-    """Retain registered module-family construction instead of freezing its concrete class."""
-    module_name, _, name = target.replace(":", ".", 1).rpartition(".")
-    if not module_name or not name:
-        return None
-    try:
-        factory = getattr(importlib.import_module(module_name), name, None)
-    except ImportError:
-        return None
-    if get_module_family(factory) is None or not class_name_of(module_type):
-        return None
-    return ReplacementSpec(
-        old_ctor=class_name_of(module_type), new_ctor=name,
-        imports=(ImportPatch(module_name, (name,)),), mode="wrap_source",
-        keyword_args=("module_fqn=''",), remove_class=False, defer_to_fqns=True,
-    )
-
-
-def _resolve_replacement_spec(
-    factory: Any, model_type: str | None, module_type: str | None, target: str
-) -> ReplacementSpec | None:
-    """One construction path for every replacement: read the factory.
-
-    Whatever component a family's factory constructs, the spec is derived from
-    that factory's own source, so a new family (or a new component inside one)
-    needs no codegen declaration.  A factory with no constructor call to sink --
-    or a rule with no ``module_type`` naming the source class it replaces -- has
-    no spec, and the rule is left to the native path.
-    """
-    del target
-    # The source class the constructor call replaces: without the rule's
-    # ``module_type`` there is no call site to rewrite, and guessing one would
-    # silently target the wrong class.
-    old_ctor = class_name_of(module_type)
-    if not old_ctor:
-        return None
-    replacement = replacement_target(factory)
-    if replacement is None:
-        return None
-    return _build_replacement_spec(factory, replacement, old_ctor, model_type)
-
-
-def _component_replacement_spec(
-    target: str, model_type: str | None, *, module_type: str | None
-) -> ReplacementSpec | None:
-    """Resolve a target that names a generic component class directly.
-
-    The component's own constructor is the declaration: the spec is derived
-    from it exactly as the factory channel derives one from the factory's
-    construction call, so a wrap-style component needs no family factory to
-    be sunk into the generated ``__init__``.
-    """
-    component = _direct_component_class(target)
-    if component is None:
-        return None
-    key = (model_type, component, module_type)
-    if key in _REPLACEMENT_CACHE:
-        return _REPLACEMENT_CACHE[key]
-    spec = None
-    old_ctor = class_name_of(module_type)
-    if old_ctor:
-        replacement = _component_replacement_target(component)
-        if replacement is not None:
-            # No interface: a direct component hands over no family kernel,
-            # so the factory argument of _build_replacement_spec is unused.
-            spec = _build_replacement_spec(None, replacement, old_ctor, model_type)
-    _REPLACEMENT_CACHE[key] = spec
-    return spec
+_STRATEGY_CACHE: dict[tuple[str, bool], StrategySpec | None] = {}
 
 
 def strategy_spec_for(
@@ -433,7 +49,7 @@ def strategy_spec_for(
 ) -> StrategySpec | None:
     """Resolve a strategy target from structure.
 
-    A CP ``inner_wrapper`` target under the adapter convention resolves to the
+    A recorded CP ``inner_wrapper`` target resolves to the
     framework CP attention strategy (imports only). EP mutations come from the
     builder recorder instead of secondary structural inference. Anything else
     is unresolvable and yields ``None`` — recognition never guesses a strategy.
@@ -445,8 +61,8 @@ def strategy_spec_for(
     """
     if target is None:
         return None
-    model_type = _family_key(model_type, target)
-    key = (target, model_type, inner_wrapper)
+    del model_type
+    key = (target, inner_wrapper)
     if key in _STRATEGY_CACHE:
         return _STRATEGY_CACHE[key]
     spec = _resolve_strategy_spec(target, inner_wrapper)
@@ -498,6 +114,5 @@ def _cp_strategy_spec(target: str) -> StrategySpec:
 __all__ = [
     "CP_ATTENTION_KIND",
     "cp_dispatch_shell_body",
-    "replacement_spec_for",
     "strategy_spec_for",
 ]

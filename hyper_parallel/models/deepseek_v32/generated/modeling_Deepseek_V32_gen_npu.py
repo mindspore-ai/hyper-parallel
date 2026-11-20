@@ -55,20 +55,14 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
-
-
-from hyper_parallel.components.modules import DeepseekV32DSAAttention, GroupedExperts, RMSNorm
-
-
-
-
-# Codegen replacement: RMSNorm wraps DeepseekV32RMSNorm; the original class is kept as the wrapper input.
-
-# Codegen replacement: DeepseekV32DSAAttention wraps DeepseekV32Attention; the original class is kept as the wrapper input.
-
-# Codegen replacement: GroupedExperts wraps DeepseekV32Experts; the original class is kept as the wrapper input.
-
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
+
+
+import transformers.models.deepseek_v32.modeling_deepseek_v32
+from hyper_parallel.components.modules.dsa_attention import DeepseekV32DSAAttention
+from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.modules.rms_norm import RMSNormModule
+
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -607,7 +601,7 @@ class DeepseekV32MoE(nn.Module):
     def __init__(self, config: DeepseekV32Config):
         super().__init__()
         self.config = config
-        self.experts = GroupedExperts(module=DeepseekV32Experts(config), module_fqn='', context=None)
+        self.experts = GroupedExperts(module=transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Experts(config), context={'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'})
         self.gate = DeepseekV32TopkRouter(config)
         self.shared_experts = DeepseekV32MLP(
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
@@ -627,15 +621,15 @@ class DeepseekV32DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: DeepseekV32Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = DeepseekV32DSAAttention(module=DeepseekV32Attention(config, layer_idx), module_fqn='', context=None)
+        self.self_attn = DeepseekV32DSAAttention(module=transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Attention(config, layer_idx), context={'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'})
 
         if config.mlp_layer_types[layer_idx] == "sparse":
             self.mlp = DeepseekV32MoE(config)
         else:
             self.mlp = DeepseekV32MLP(config)
 
-        self.input_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
-        self.post_attention_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
+        self.input_layernorm = RMSNormModule(module=transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': False, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.post_attention_layernorm = RMSNormModule(module=transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': False, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 
     def forward(
         self,
@@ -712,7 +706,7 @@ class DeepseekV32Model(DeepseekV32PreTrainedModel):
         self.layers = nn.ModuleList(
             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context=None)
+        self.norm = RMSNormModule(module=transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': False, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 

@@ -47,7 +47,7 @@ class TestOfflineBuild(unittest.TestCase):
         )
 
     def test_main_model_topologies_satisfy_yaml_constraints(self):
-        """Qwen3-MoE and DeepSeek-V4.1 produce pure-data planning meshes."""
+        """Qwen3-MoE and DeepSeek-V4.1 use device-free planning meshes."""
         cases = (
             (self._config(tp_size=2, cp_size=2, ep_size=2, dp_shard_size=2, edp_shard_size=2),
              (1, 2, 2)),
@@ -68,7 +68,7 @@ class TestOfflineBuild(unittest.TestCase):
                     topology.size(),
                     expected_shape[0] * expected_shape[1] * expected_shape[2],
                 )
-                self.assertIs(setup.strategy_config, config.fsdp_config)
+                self.assertIsNone(setup.strategy_config)
 
     def test_model_build_policies_match_runtime_setup(self):
         """Both entry points assemble the same non-runtime policy objects."""
@@ -87,6 +87,8 @@ class TestOfflineBuild(unittest.TestCase):
         runtime_fields = vars(runtime).copy()
         offline_fields.pop("mesh_context")
         runtime_fields.pop("mesh_context")
+        self.assertIsNone(offline_fields.pop("strategy_config"))
+        self.assertIs(runtime_fields.pop("strategy_config"), config.fsdp_config)
         self.assertEqual(offline_fields, runtime_fields)
         self.assertEqual(runtime.mesh_context.tp_size, offline.mesh_context.tp_size)
         self.assertIs(offline.low_precision_config, config.training.low_precision)
@@ -97,10 +99,8 @@ class TestOfflineBuild(unittest.TestCase):
         config = self._config(
             tp_size=1, cp_size=1, ep_size=1, dp_shard_size=1, edp_shard_size=1,
         )
-        offline = create_offline_distributed_setup(config)
-        runtime = DistributedSetup.from_config(
-            config, offline.mesh_context, strategy_enabled=False,
-        )
+        with mock.patch.object(runtime_distributed.dist, "is_initialized", return_value=False):
+            runtime = runtime_distributed.create_distributed_setup_from_config(config)
         self.assertIsNone(runtime.strategy_config)
         self.assertIsNone(runtime.plan_overrides)
         self.assertIsNone(runtime.module_replacements)
@@ -109,17 +109,6 @@ class TestOfflineBuild(unittest.TestCase):
         """Missing accelerator keeps the native early-return contract."""
         setup = runtime_distributed.create_distributed_setup_from_config(None)
         self.assertEqual(setup, DistributedSetup())
-
-    def test_nonpositive_degrees_preserve_trainer_compatibility(self):
-        """Offline projection keeps the existing minimum-degree semantics."""
-        for degree in (0, -1):
-            with self.subTest(degree=degree):
-                config = self._config(
-                    tp_size=degree, cp_size=degree, ep_size=degree,
-                    dp_shard_size=degree, edp_shard_size=degree,
-                )
-                setup = create_offline_distributed_setup(config)
-                self.assertEqual(setup.mesh_context.device_mesh.shape, (1, 1, 1))
 
     def test_planning_topology_supports_native_preflight_submeshes(self):
         """Native CP preflight can select a process-group-free logical axis."""

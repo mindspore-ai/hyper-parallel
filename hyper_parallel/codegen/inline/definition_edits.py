@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Rewrite or remove top-level definitions after constructor replacement."""
+"""Remove copied definitions shadowing native helper imports."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ import ast
 from collections.abc import Iterable
 
 from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
-from hyper_parallel.codegen.inline.ir import ClassRemovalPatch
 
 
 def drop_shadowed_definitions(text: str, imported_names: Iterable[str]) -> str:
@@ -39,62 +38,6 @@ def drop_shadowed_definitions(text: str, imported_names: Iterable[str]) -> str:
         for start, end in (_node_span(node, offsets),)
     ]
     return apply_edits(text, edits) if edits else text
-
-
-def apply_class_removals(
-    text: str, patches: Iterable[ClassRemovalPatch]
-) -> str:
-    """Rewrite surviving references and delete classes made unused by patches."""
-    patch_list = list(patches)
-    if not patch_list:
-        return text
-    tree = ast.parse(text)
-    offsets = _line_offsets(text)
-    names = {patch.old_name for patch in patch_list}
-    removable = {name for name in names if not _name_is_referenced(tree, name)}
-    if not removable:
-        return text
-    replacements = {patch.old_name: patch.new_name for patch in patch_list}
-    classes = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name in removable
-    }
-    deletion_spans = [_node_span(node, offsets) for node in classes.values()]
-    edits = _reference_edits(tree, offsets, removable, replacements, deletion_spans)
-    for name, node in classes.items():
-        del name
-        start, end = _node_span(node, offsets)
-        edits.append(TextEdit(start, _skip_trailing_blank_lines(text, end), ""))
-    return apply_edits(text, edits) if edits else text
-
-
-def _reference_edits(
-    tree: ast.AST,
-    offsets: tuple[int, ...],
-    removable: set[str],
-    replacements: dict[str, str],
-    deletion_spans: list[tuple[int, int]],
-) -> list[TextEdit]:
-    """Rewrite references that survive class deletion."""
-    edits = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Name) or node.id not in removable:
-            continue
-        start, end = _node_span(node, offsets)
-        if any(span <= start < stop for span, stop in deletion_spans):
-            continue
-        edits.append(TextEdit(start, end, replacements[node.id]))
-    return edits
-
-
-def _name_is_referenced(tree: ast.AST, name: str) -> bool:
-    """Return whether a name survives outside its own definition."""
-    return any(
-        (isinstance(node, ast.Name) and node.id == name)
-        or (isinstance(node, ast.Attribute) and node.attr == name)
-        for node in ast.walk(tree)
-    )
 
 
 def _node_span(node: ast.AST, offsets: tuple[int, ...]) -> tuple[int, int]:
@@ -130,4 +73,4 @@ def _skip_trailing_blank_lines(text: str, end: int) -> int:
     return end
 
 
-__all__ = ["apply_class_removals", "drop_shadowed_definitions"]
+__all__ = ["drop_shadowed_definitions"]

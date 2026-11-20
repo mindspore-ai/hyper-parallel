@@ -35,7 +35,6 @@ from hyper_parallel.codegen.artifact import (
     write_bundle_atomic,
 )
 from hyper_parallel.codegen.emit import emit_bundle
-from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
 from hyper_parallel.codegen.emit.snapshot_patches import (
     emission_patches_from_snapshot_payload,
 )
@@ -106,8 +105,8 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
     source = dict(payload["source"])
     status = snapshot.status
     frozen_plan = dict(payload["plan"] or {})
-    module_overrides = list(replacement_records_from_snapshot(payload))
     is_derived = status is CodegenStatus.DERIVED
+    preinstalled = _preinstalled_records(payload) if is_derived else []
     emission_patches = (
         emission_patches_from_snapshot_payload(payload) if is_derived else {}
     )
@@ -120,9 +119,25 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
         boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
         nested_components=list(frozen_plan.get("nested_components") or ()),
         mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
-        module_overrides=(module_overrides if is_derived else []),
+        preinstalled_components=preinstalled,
+        parallel_forwards=dict(frozen_plan.get("parallel_forwards") or {}),
+        materialized_methods=dict(frozen_plan.get("materialized_methods") or {}),
+        frozen_modules=list(frozen_plan.get("frozen_modules") or ()),
+        primitive_boundaries=list(frozen_plan.get("primitive_boundaries") or ()),
         emission_patches=emission_patches,
     )
+
+
+def _preinstalled_records(payload: dict) -> list:
+    """Require concrete construction inputs captured by shared preparation."""
+    applications = payload["replacements"]["applications"]
+    unsupported = [item["primary_fqn"] for item in applications
+                   if not item.get("source_type") or not item.get("replacement_type")
+                   or ("resolved_arguments" not in item.get("family_request", {}).get("selection", {})
+                       and "constructor_arguments" not in item.get("replay", {}))]
+    if unsupported:
+        raise ValueError(f"Codegen replacement has no concrete construction inputs at {unsupported!r}")
+    return list(applications)
 
 
 def _model_type_to_modeling_token(model_type: str) -> str:

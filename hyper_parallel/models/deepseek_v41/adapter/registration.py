@@ -79,6 +79,13 @@ def _load_loss():
     return chunk_loss
 
 
+def _load_codegen():
+    """Keep optional source-export dependencies outside native training imports."""
+    from hyper_parallel.models.deepseek_v41.adapter import codegen  # pylint: disable=C0415
+
+    return codegen
+
+
 register_custom_model(
     "DeepseekV41ForCausalLM",
     "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
@@ -100,6 +107,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,
     loss=_load_loss,
+    codegen=_load_codegen,
 )
 register_model_adapter(DEEPSEEK_V41_ADAPTER_SPEC)
 

@@ -14,20 +14,15 @@
 # ============================================================================
 """Contracts for recording native module replacement decisions."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from torch import nn
 
-from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
-from hyper_parallel.codegen.inline.framework_spec import replacement_spec_for
-from hyper_parallel.codegen.model_build_overlay import (
-    _observe_replacement_installations,
-    _observe_replacements,
-)
+from hyper_parallel.codegen.manager import _preinstalled_records
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.models import replacement as replacement_api
+from hyper_parallel.models.module_build import build_module_context, prepare_model_components
+from hyper_parallel.models.preparation_manifest import collect_replacement_applications, get_preparation_manifest
 from hyper_parallel.models.replacement import (
     ModuleReplacementSpec,
     apply_module_replacements,
@@ -66,15 +61,6 @@ class _ReplacementBlock(nn.Module):
 
 
 @module_replacement
-class _ObservedReplacementBlock(_ReplacementBlock):
-    """Model-owned replacement with required native executor arguments."""
-
-    def __init__(self, *, module, module_fqn, context):
-        del module_fqn, context
-        super().__init__(module)
-
-
-@module_replacement
 def _replace_source_block(*, module, module_fqn, context):
     del module_fqn, context
     return _ReplacementBlock(module)
@@ -106,11 +92,11 @@ def test_native_replacement_records_declaration_and_application_once():
     session.record_source({"model_type": "toy"})
 
     plan = compile_module_replacements(model, (spec,))
-    with _observe_replacement_installations(plan.specs) as applications:
+    with collect_replacement_applications() as applications:
         apply_module_replacements(model, plan, context={"ep": True})
     session.record_replacements(
         declarations=replacement_api.describe_replacement_declarations(plan.specs),
-        applications=applications,
+        applications=[application.to_legacy_dict() for application in applications],
     )
     session.mark_not_required("replacement_only_test")
     snapshot = session.finish().to_dict()
@@ -135,18 +121,7 @@ def test_native_replacement_records_declaration_and_application_once():
     assert application["source_type"].endswith(":_SourceBlock")
     assert application["replacement_type"].endswith(":_ReplacementBlock")
     assert application["weight_transforms"] == []
-    assert replacement_records_from_snapshot(session.finish()) == (
-        {
-            "exact_type": True,
-            "factory": f"{_ReplacementBlock.__module__}.{_ReplacementBlock.__qualname__}",
-            "fqn": "alias",
-            "fqns": ["alias", "primary"],
-            "match": ["primary"],
-            "module_type": f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}",
-            "replacement_target": "tests.replace_block",
-            "target_config": {"mode": "pipelined"},
-        },
-    )
+    assert application.get("replay") is None
 
 
 def test_python_replacement_rule_gets_stable_order_fallback():
@@ -160,15 +135,14 @@ def test_python_replacement_rule_gets_stable_order_fallback():
     model = nn.Module()
     model.block = _SourceBlock()
     spec = ModuleReplacementSpec(("block",), replace_block, _SourceBlock, True)
-    applications = []
 
     plan = compile_module_replacements(model, (spec,))
-    with _observe_replacement_installations(plan.specs) as applications:
+    with collect_replacement_applications() as applications:
         apply_module_replacements(model, plan)
 
     declarations = replacement_api.describe_replacement_declarations(plan.specs)
     assert declarations[0]["rule_id"] == "python-replacement-0000"
-    assert applications[0]["rule_id"] == "python-replacement-0000"
+    assert applications[0].declaration_id == "python-replacement-0000"
 
 
 def test_inferred_source_type_is_recorded_from_native_application():
@@ -185,11 +159,11 @@ def test_inferred_source_type_is_recorded_from_native_application():
     session.record_source({"model_type": "toy"})
 
     plan = compile_module_replacements(model, (spec,))
-    with _observe_replacement_installations(plan.specs) as applications:
+    with collect_replacement_applications() as applications:
         apply_module_replacements(model, plan)
     session.record_replacements(
         declarations=replacement_api.describe_replacement_declarations(plan.specs),
-        applications=applications,
+        applications=[application.to_legacy_dict() for application in applications],
     )
     session.mark_not_required("replacement_only_test")
     snapshot = session.finish()
@@ -199,9 +173,8 @@ def test_inferred_source_type_is_recorded_from_native_application():
     assert replacements["applications"][0]["source_type"] == (
         f"{_SourceBlock.__module__}:{_SourceBlock.__qualname__}"
     )
-    assert replacement_records_from_snapshot(snapshot)[0]["module_type"] == (
-        f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}"
-    )
+    replay = replacements["applications"][0]["replay"]
+    assert replay["constructor"] == f"{_replace_source_block.__module__}:{_replace_source_block.__qualname__}"
 
 
 def test_yaml_replacement_preserves_declaration_order_and_static_arguments():
@@ -231,65 +204,27 @@ def test_yaml_replacement_preserves_declaration_order_and_static_arguments():
     assert spec.static_arguments == {"mode": "pipelined"}
 
 
-def test_unmatched_rule_is_recorded_before_native_error_is_raised():
-    """Capture an unmatched rule before its native error propagates."""
+def test_unmatched_rule_fails_before_preparation_publishes_a_manifest():
+    """An unmatched native rule fails before publishing any application."""
     spec = ModuleReplacementSpec(
         match=("missing",),
         factory=_replace_source_block,
         module_type=_SourceBlock,
         declaration_id="missing-rule",
     )
-    session = CodegenBuildSession()
-    session.record_source({"model_type": "toy"})
-
+    model = nn.Module()
     with pytest.raises(ValueError, match="matched no final module"):
-        _observe_replacements(
-            nn.Module(),
-            SimpleNamespace(module_replacements=(spec,), mesh_context=None),
-            None,
-            False,
-            session,
-        )
+        prepare_model_components(model, {**build_module_context(None), "module_replacements": (spec,)})
 
-    session.mark_not_required("expected_native_error_probe")
-    unmatched = session.finish().to_dict()["replacements"]["unmatched"]
-    assert unmatched == [
-        {
-            "pattern": "missing",
-            "reason": "matched_no_final_module",
-            "rule_id": "missing-rule",
-        }
-    ]
+    with pytest.raises(RuntimeError, match="have not produced a PreparationManifest"):
+        get_preparation_manifest(model)
 
 
-def test_replacement_observer_restores_native_installer_after_error():
-    """Failed observation restores the native installer and leaves no partial replacement record."""
-    original_prepare = replacement_api._prepare_replacement_target
-    original_install = replacement_api._install_module_candidates
-
-    with pytest.raises(RuntimeError, match="probe"):
-        with _observe_replacement_installations(()):
-            assert replacement_api._prepare_replacement_target is not original_prepare
-            assert replacement_api._install_module_candidates is not original_install
-            raise RuntimeError("probe")
-
-    assert replacement_api._prepare_replacement_target is original_prepare
-    assert replacement_api._install_module_candidates is original_install
-
-
-@pytest.mark.parametrize("separator", [".", ":"])
-def test_observed_replacement_class_needs_no_codegen_declaration(separator):
-    """Avoid duplicate declarations for an observed replacement class."""
-    replacement_type = (
-        f"{_ObservedReplacementBlock.__module__}{separator}"
-        f"{_ObservedReplacementBlock.__qualname__}"
-    )
-    source_type = f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}"
-
-    spec = replacement_spec_for(replacement_type, module_type=source_type)
-
-    assert spec is not None
-    assert spec.old_ctor == "_SourceBlock"
-    assert spec.new_ctor == "_ObservedReplacementBlock"
-    assert spec.mode == "wrap_source"
-    assert spec.keyword_args == ("module_fqn=''", "context={}")
+def test_missing_constructor_inputs_are_rejected_at_exact_fqn():
+    """A factory identity alone does not describe the final model construction."""
+    payload = {"replacements": {"applications": [
+        {"primary_fqn": "layers.0.attention", "replay": {"constructor": "demo:Attention"}},
+        {"primary_fqn": "layers.0.experts"},
+    ]}}
+    with pytest.raises(ValueError, match=r"no concrete construction inputs.*layers\.0\.experts"):
+        _preinstalled_records(payload)

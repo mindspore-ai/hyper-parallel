@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Generated model build overlays remain scoped to explicit callers."""
+"""Tests for the published generated modeling files."""
 
 from types import SimpleNamespace
 
@@ -24,12 +24,6 @@ pytest.importorskip("transformers")
 # pylint: disable=wrong-import-position
 from hyper_parallel.codegen.artifact import ArtifactLayout
 from hyper_parallel.codegen.emit import bundle
-from hyper_parallel.models._generated import build_overlay
-from hyper_parallel.models._transformers import auto_model, model_builder
-
-
-class FutureArchitecture:
-    """Unregistered class used to prove the overlay has no family allowlist."""
 
 
 def test_generated_modeling_has_no_training_entry(
@@ -142,35 +136,3 @@ def test_generated_bundle_normalizes_copied_source_spelling(
     assert first_typo not in files["modeling_Future_gen_npu.py.diff"]
     assert second_typo not in files["modeling_Future_gen_npu.py.diff"]
     assert files["__init__.py"].startswith("# Copyright 2026 Huawei")
-
-
-def test_generated_build_overlay_restores_native_hooks_on_error() -> None:
-    """The generated build overlay restores native hooks after failure."""
-    apply_module = build_overlay.distributed_apply
-    model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
-    originals = (
-        model_builder._resolve_custom_model_cls,  # pylint: disable=protected-access
-        model_builder._maybe_apply_module_replacements,  # pylint: disable=protected-access
-        apply_module._apply_phase_c,  # pylint: disable=protected-access
-        model_class.__dict__["_from_config_parent_class"],
-        model_class.__dict__["_from_pretrained_parent_class"],
-    )
-
-    with pytest.raises(RuntimeError, match="probe"):
-        with build_overlay.generated_model_build(FutureArchitecture, "FutureArchitecture"):
-            assert (
-                model_builder._resolve_custom_model_cls(  # pylint: disable=protected-access
-                    "FutureArchitecture"
-                )
-                is FutureArchitecture
-            )
-            raise RuntimeError("probe")
-
-    restored = (
-        model_builder._resolve_custom_model_cls,  # pylint: disable=protected-access
-        model_builder._maybe_apply_module_replacements,  # pylint: disable=protected-access
-        apply_module._apply_phase_c,  # pylint: disable=protected-access
-        model_class.__dict__["_from_config_parent_class"],
-        model_class.__dict__["_from_pretrained_parent_class"],
-    )
-    assert restored == originals

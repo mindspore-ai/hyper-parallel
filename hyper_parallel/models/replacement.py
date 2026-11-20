@@ -38,6 +38,10 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightRenaming,
     get_model_conversion_mapping,
 )
+from hyper_parallel.models.preparation_manifest import (
+    record_replacement_applications,
+    replacement_application_capture,
+)
 
 
 ModuleReplacementFactory = Callable[..., nn.Module]
@@ -308,6 +312,9 @@ def _matches_module_type(module: nn.Module, rule: ModuleReplacementSpec | Module
     """Share source type checks while leaving error policy to each rule consumer."""
     if rule.module_type is None:
         return True
+    source_type = getattr(module, "_hp_preinstalled_source_type", None)
+    if source_type is not None:
+        return source_type is rule.module_type if rule.exact_type else issubclass(source_type, rule.module_type)
     return (type(module) is rule.module_type  # pylint: disable=unidiomatic-typecheck
             if rule.exact_type else isinstance(module, rule.module_type))
 
@@ -765,6 +772,31 @@ def _prepare_replacement_batches(plan, context, weights_mapping):
             yield [candidate]
 
 
+def _apply_replacement_batches(
+    model: nn.Module,
+    plan: ModuleReplacementPlan,
+    context: Mapping[str, Any],
+    weights_mapping: list[WeightRenaming | WeightConverter] | None,
+    capture_checkpoint_metadata: bool,
+) -> tuple[nn.Module, dict[str, tuple[int, ...]] | None, list[WeightRenaming | WeightConverter]]:
+    """Prepare and install every batch while committing capture records after success."""
+    capture_batch = replacement_application_capture(plan, context, _replacement_rule_id)
+    source_shapes = None
+    extra_transforms: list[WeightRenaming | WeightConverter] = []
+    for prepared in _prepare_replacement_batches(plan, context, weights_mapping):
+        captured_applications = capture_batch(prepared) if capture_batch is not None else ()
+        if capture_checkpoint_metadata and source_shapes is None and any(transforms for _, _, transforms in prepared):
+            source_shapes = _named_tensor_shapes(model)
+        model = _install_module_candidates(
+            model, ((target.module_fqns, target.source, candidate) for target, candidate, _ in prepared),
+        )
+        if captured_applications:
+            record_replacement_applications(captured_applications)
+        for _, _, transforms in prepared:
+            extra_transforms.extend(transforms)
+    return model, source_shapes, extra_transforms
+
+
 def apply_module_replacements(
     model: nn.Module,
     plan: ModuleReplacementPlan,
@@ -788,20 +820,21 @@ def apply_module_replacements(
     """
 
     context = MappingProxyType(dict(context or {}))
-    source_shapes = None
-    extra_transforms: list[WeightRenaming | WeightConverter] = []
-    for prepared in _prepare_replacement_batches(plan, context, weights_mapping):
-        if capture_checkpoint_metadata and source_shapes is None and any(transforms for _, _, transforms in prepared):
-            source_shapes = _named_tensor_shapes(model)
-        model = _install_module_candidates(
-            model, ((target.module_fqns, target.source, candidate) for target, candidate, _ in prepared),
-        )
-        for _, _, transforms in prepared:
-            extra_transforms.extend(transforms)
+    model, source_shapes, extra_transforms = _apply_replacement_batches(
+        model,
+        plan,
+        context,
+        weights_mapping,
+        capture_checkpoint_metadata,
+    )
     if extra_transforms:
         if capture_checkpoint_metadata:
+            if hasattr(model, "_hp_preinstalled_topology"):
+                source_shapes.update(getattr(model, "_hp_checkpoint_source_shapes", {}))
             model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access
-            model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
+            model._hp_replacement_weight_conversions = [  # pylint: disable=protected-access
+                *extra_transforms, *getattr(model, "_hp_preinstalled_conversions", ()),
+            ]
         weights_mapping[:0] = extra_transforms
     previous_replacements = tuple(getattr(model, "_hp_replaced_module_fqns", ()) or ())
     current_replacements = tuple(

@@ -22,6 +22,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed._builder.tp_collective_lowering import TPCollectiveLowerer
+from hyper_parallel.distributed._builder.applier import _apply_phase_c
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models._generated import phase_c
 
@@ -80,6 +81,7 @@ def test_generated_phase_c_binds_state_without_rewriting_forward(monkeypatch) ->
     boundary = object()
 
     monkeypatch.setattr(phase_c, "_get_cp_submesh", lambda mesh, names: object())
+    monkeypatch.setattr(phase_c, "_family_boundary_state", lambda *args: (False, False))
     monkeypatch.setattr(phase_c, "_get_tp_submesh", lambda mesh, names: object())
     monkeypatch.setattr(phase_c, "create_tp_collective_lowerer", lambda mesh, names: lowerer)
     monkeypatch.setattr(phase_c, "_resolve_module", lambda model, fqn: module)
@@ -95,7 +97,8 @@ def test_generated_phase_c_binds_state_without_rewriting_forward(monkeypatch) ->
 
     monkeypatch.setattr(phase_c, "_wrap_inner_attention", install_inner)
 
-    phase_c.apply_generated_phase_c(object(), plan, object(), False)
+    model = SimpleNamespace(_hp_bind_materialized_forwards=phase_c.apply_generated_phase_c)
+    _apply_phase_c(model, plan, object(), False)
 
     assert module.forward is _original_forward
     assert module._hp_boundary.compiled is boundary
@@ -136,13 +139,14 @@ class Block(nn.Module):
         spec = ModuleShardingSpec(**{
             f"{side}_src": {name: {"tp": Replicate()}}, f"{side}_dst": {name: {"tp": Shard(1)}},
         })
-        plan = SimpleNamespace(mesh_dim_names=("tp",), modules={"block": spec})
+        plan = SimpleNamespace(mesh_dim_names=("tp",), modules={"block": spec}, parallel_modules={})
         for rank in (0, 1):
             lowerer = TPCollectiveLowerer(("tp",), object(), 2, rank, "hccl")
             monkeypatch.setattr(phase_c, "create_tp_collective_lowerer", lambda *args, op=lowerer: op)
             for trace in (False, True):
                 module = namespace["Block"]()
-                phase_c.apply_generated_phase_c(SimpleNamespace(block=module), plan, object(), False)
+                model = SimpleNamespace(block=module, _hp_bind_materialized_forwards=phase_c.apply_generated_phase_c)
+                _apply_phase_c(model, plan, object(), False)
                 value = torch.arange(24.0).reshape(3, 8).requires_grad_()
                 reference = value.detach().clone().requires_grad_()
                 weight = module.weight.detach().clone().requires_grad_()
