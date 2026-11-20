@@ -42,6 +42,8 @@ hyper_parallel/
 ```
 
 模型族的替换工厂、CP/EP 规则和训练入口收敛在 `models/<family>/` 下；当前交付
-`models/qwen3_moe/recipes/train.yaml`、`models/deepseek_v32/recipes/train.yaml` 与
+`models/qwen3_moe/recipes/train.yaml`、`models/deepseek_v32/recipes/train.yaml`、
 `models/kimi_k26/recipes/train.yaml`（Kimi-K2.6 多模态，4 超节点 / 512 卡主线配方，
-家族说明见 [`models/kimi_k26/README.md`](kimi_k26/README.zh.md)）。
+家族说明见 [`models/kimi_k26/README.md`](kimi_k26/README.zh.md)）与
+`models/qwen3_omni/recipes/train.yaml`（Qwen3-Omni 多模态 MoE，单机 8 卡 ScienceQA SFT 配方，
+家族说明见 [`models/qwen3_omni/README.md`](qwen3_omni/README.zh.md)）。
