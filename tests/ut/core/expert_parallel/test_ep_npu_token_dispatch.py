@@ -23,9 +23,7 @@ import pytest
 import torch
 from torch import nn
 
-from hyper_parallel.components.ops.catalog import builtin_registry
-from hyper_parallel.components.ops.factory import OpRuntime
-from hyper_parallel.components.ops.registry import OpBuildContext
+from hyper_parallel.components.ops import ops
 from hyper_parallel.distributed.expert_parallel import experts as ep_experts
 
 
@@ -125,8 +123,10 @@ def test_token_dispatch_preserves_local_expert_forward():
 
 @pytest.mark.parametrize("token_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("enabled", [None, False, "auto", "native"])
-def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
+def test_npu_ep_dispatcher_matches_reference(monkeypatch, request, token_dtype, enabled):
     """Preserve FP32 routing weights and weighted Top-K forward/backward semantics."""
+    previous = ops.get_backends()
+    request.addfinalizer(lambda: ops.set_backends(previous))
     permute = Mock(side_effect=_reference_token_permute)
     monkeypatch.setitem(
         sys.modules,
@@ -183,15 +183,14 @@ def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
         "use_fused_moe_token_permute_and_unpermute": False if enabled is False else None,
     }
     selections = {"moe_token_reorder": enabled} if isinstance(enabled, str) else {}
-    runtime = OpRuntime(builtin_registry, selections, OpBuildContext(_MockNpuDevice("cpu"), None, {}))
-    with runtime.activate():
-        output = ep_experts.ep_routed_forward(
-            module,
-            hidden_states,
-            router_fn=lambda owner, states: (topk_indices, topk_weights),
-            ep_group=_SingleRankGroup(),
-            **options,
-        )
+    ops.set_backends(selections)
+    output = ep_experts.ep_routed_forward(
+        module,
+        hidden_states,
+        router_fn=lambda owner, states: (topk_indices, topk_weights),
+        ep_group=_SingleRankGroup(),
+        **options,
+    )
     fused = enabled in (None, "auto")
     if not fused:
         permute.assert_not_called()
@@ -201,10 +200,11 @@ def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
         unpermute.assert_called_once()
     if isinstance(enabled, str):
         selected = "torch_npu" if fused else "native"
-        assert runtime.report() == {
-            ("moe_token_reorder", "standard"): selected,
-            ("moe_token_reorder", "weighted_restore"): selected,
-        }
+        expected_usage = {("moe_token_reorder", "standard", selected),
+                          ("moe_token_reorder", "weighted_restore", selected)}
+        assert set(ops.used_backends()) == expected_usage, (
+            f"Expected usage {expected_usage}, got {ops.used_backends()}"
+        )
 
     scales = topk_indices.to(hidden_states.dtype) + 1
     reference_states = hidden_states.detach().clone().requires_grad_()

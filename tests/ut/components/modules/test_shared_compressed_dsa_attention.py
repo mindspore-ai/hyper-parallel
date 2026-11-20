@@ -25,16 +25,19 @@ from hyper_parallel.components.functional import sparse_flash_mla as attention_o
 from hyper_parallel.components.ops import DsaQueryLayout, dsa_sparse_attention_compressed_banks
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
-from hyper_parallel.components.ops import _dependency
+from hyper_parallel.components.ops import _dependency, ops
 from hyper_parallel.components.ops.families import dsa_indexer_kl as indexer_kl_impl
 from hyper_parallel.components.ops.families import dsa_sparse_attention as sparse_attention_impl
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import reference_sparse_attention
-from hyper_parallel.components.ops.catalog import builtin_registry
-from hyper_parallel.components.ops.factory import OpRuntime
-from hyper_parallel.components.ops.registry import OpBuildContext
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
+
+
+class _MockNpuDevice(str):
+    """Report NPU metadata while retaining CPU allocations in mocked kernels."""
+
+    type = "npu"
 
 
 def _source(index_source=False):
@@ -198,19 +201,21 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
 
     def test_indexer_falls_back_only_for_auto(self) -> None:
         """The same incompatible Indexer call uses native in auto and rejects explicit CANN."""
-        context = OpBuildContext(SimpleNamespace(type="npu"), None, {})
-        selections = {"dsa_indexer": "auto"}
-        automatic = OpRuntime(builtin_registry, selections, context)
-        explicit = OpRuntime(builtin_registry, {"dsa_indexer": "cann"}, context)
+        self.addCleanup(ops.set_backends, ops.get_backends())
         args = {"compress_ratio": 1, "sparse_count": 2}
         expected = attention.compressed_causal_topk(self.query, self.key, self.weights, **args)
 
-        with automatic.activate():
+        ops.set_backends({"dsa_indexer": "auto"})
+        with patch.object(torch.Tensor, "device", property(lambda _x: _MockNpuDevice("cpu"))):
             actual = attention.compressed_causal_topk(self.query, self.key, self.weights, **args, use_fused=None)
         torch.testing.assert_close(actual, expected)
-        self.assertEqual(automatic.report(), {("dsa_indexer", "compressed_causal_topk"): "native"})
+        self.assertEqual(ops.used_backends(), (("dsa_indexer", "compressed_causal_topk", "native"),))
 
-        with self.assertRaisesRegex(RuntimeError, "LI V2 requires BF16"), explicit.activate():
+        ops.set_backends({"dsa_indexer": "cann"})
+        with (
+            self.assertRaisesRegex(RuntimeError, "LI V2 requires BF16"),
+            patch.object(torch.Tensor, "device", property(lambda _x: _MockNpuDevice("cpu"))),
+        ):
             attention.compressed_causal_topk(self.query, self.key, self.weights, **args, use_fused=None)
 
     def test_sparse_attention_derives_raw_document_origins(self) -> None:
@@ -235,10 +240,10 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         torch.testing.assert_close(torch.autograd.grad(actual.sum(), query)[0],
                                    torch.autograd.grad(expected.sum(), query)[0])
 
-        context = OpBuildContext(SimpleNamespace(type="npu"), None, {})
-        runtime = OpRuntime(builtin_registry, {"dsa_sparse_attention": "cann"}, context)
+        self.addCleanup(ops.set_backends, ops.get_backends())
+        ops.set_backends({"dsa_sparse_attention": "cann"})
         with (
-            runtime.activate(),
+            patch.object(torch.Tensor, "device", property(lambda _x: _MockNpuDevice("cpu"))),
             patch.object(_dependency, "require_symbol"),
             patch.object(_dependency, "require_package", return_value=object()),
             patch.object(sparse_attention_impl, "supports_fused_attention_inputs", return_value=True),

@@ -20,7 +20,7 @@ from typing import Protocol
 
 import torch
 
-from ..registry import OpBuildContext, OpRegistry
+from ..registry import OpRegistry
 from ..spec import OpSpec
 from .._dependency import require_package, require_symbol
 
@@ -87,11 +87,11 @@ def _load_cuda() -> GroupedMatmulFn:
     return run
 
 
-def check_torch_grouped_mm(context: OpBuildContext) -> str | None:
+def check_torch_grouped_mm(x: torch.Tensor) -> str | None:
     """Check CUDA requirements shared by grouped matrix multiplication users."""
-    if context.input_dtype != torch.bfloat16:
+    if x.dtype != torch.bfloat16:
         return "torch_grouped_mm requires BF16 inputs"
-    if torch.cuda.get_device_capability(context.target_device)[0] < 8:
+    if torch.cuda.get_device_capability(x.device)[0] < 8:
         return "torch_grouped_mm requires compute capability 8.0 or later"
     return None
 

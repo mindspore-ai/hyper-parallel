@@ -25,7 +25,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
 from hyper_parallel.components.modules import TritonGDN
 from hyper_parallel.components.ops import ops
-from hyper_parallel.components.ops.catalog import builtin_registry
 from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
 from hyper_parallel.distributed.context_parallel import gated_delta_net as cp_gdn
 
@@ -91,21 +90,19 @@ class TestGatedDeltaNet(unittest.TestCase):
         )
         original = Qwen3_5GatedDeltaNet(config, 0)
         replacement = TritonGDN(module=original)
-        runtime = ops.configure(
-            registry=builtin_registry, selections={"gdn": "native", "causal_conv1d": "native"}, target_device="cpu",
-        )
+        self.addCleanup(ops.set_backends, ops.get_backends())
+        ops.set_backends({"gdn": "native", "causal_conv1d": "native"})
         inputs = torch.randn(2, 5, 16, requires_grad=True)
-        with runtime.activate():
-            baseline = original(inputs)
-            self.assertEqual(runtime.used_backends(), ())
-            output = replacement(inputs)
+        baseline = original(inputs)
+        self.assertEqual(ops.used_backends(), ())
+        output = replacement(inputs)
         torch.testing.assert_close(output, baseline, atol=2e-6, rtol=2e-5)
         torch.testing.assert_close(
             torch.autograd.grad(output.sum(), inputs)[0], torch.autograd.grad(baseline.sum(), inputs)[0],
             atol=2e-6, rtol=2e-5,
         )
         self.assertIs(replacement.in_proj_qkv.weight, original.in_proj_qkv.weight)
-        self.assertEqual(set(runtime.used_backends()), {("causal_conv1d", "standard", "native"),
+        self.assertEqual(set(ops.used_backends()), {("causal_conv1d", "standard", "native"),
                                                        ("gdn", "zero_state", "native")})
 
     def test_cp_wraps_direct_triton_primitive(self):

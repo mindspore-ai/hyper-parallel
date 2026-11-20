@@ -30,23 +30,13 @@ class ImplementationUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True)
-class OpBuildContext:
-    """Model execution facts available when resolving an implementation."""
-
-    target_device: torch.device
-    dtype: torch.dtype | None
-    parallel: Mapping[str, int | bool]
-    input_dtype: torch.dtype | None = None
-
-
-@dataclass(frozen=True)
 class _Implementation:
     load: Callable[[], Any]
-    check_compatibility: Callable[[OpBuildContext], str | None] | None
+    check_compatibility: Callable[[torch.Tensor], str | None] | None
 
 
 class OpRegistry:
-    """Assemble a catalog and seal it before using it in model runtimes."""
+    """Assemble a catalog and seal it before resolving operator calls."""
 
     def __init__(self) -> None:
         """Start with an empty catalog open for registration."""
@@ -87,7 +77,7 @@ class OpRegistry:
         name: str,
         devices: tuple[DeviceType, ...],
         load: Callable[[], Fn],
-        check_compatibility: Callable[[OpBuildContext], str | None] | None = None,
+        check_compatibility: Callable[[torch.Tensor], str | None] | None = None,
     ) -> None:
         """Register a lazy implementation for the given contract and devices."""
         self._require_mutable()
@@ -139,12 +129,12 @@ class OpRegistry:
                 raise ValueError(f"Invalid ops.{key} value {name!r}, expected one of {allowed}")
 
     def resolve(
-        self, spec: OpSpec[Fn], selection: str, context: OpBuildContext, *, native_only: str | None = None,
+        self, spec: OpSpec[Fn], selection: str, x: torch.Tensor, *, native_only: str | None = None,
         blocked_backends: tuple[tuple[str, str], ...] = (),
     ) -> tuple[str, Fn]:
         """Return the selected name and callable, or explain candidate rejection."""
         self._require_spec(spec)
-        device_type = context.target_device.type
+        device_type = x.device.type
         names = self._auto.get((spec, device_type), ()) if selection == "auto" else (selection,)
         reasons = []
         blocked = dict(blocked_backends)
@@ -160,7 +150,7 @@ class OpRegistry:
                 reasons.append(f"{name}: not registered for this contract and device")
                 continue
             if impl.check_compatibility is not None:
-                reason = impl.check_compatibility(context)
+                reason = impl.check_compatibility(x)
                 if reason is not None:
                     reasons.append(f"{name}: {reason}")
                     continue
@@ -175,5 +165,5 @@ class OpRegistry:
         detail = ", ".join(reasons) or "no auto candidates registered"
         raise RuntimeError(
             f"Cannot select ops.{spec.config_key}={selection!r} "
-            f"for variant {spec.variant!r} on {context.target_device}: {detail}"
+            f"for variant {spec.variant!r} on {x.device}: {detail}"
         )

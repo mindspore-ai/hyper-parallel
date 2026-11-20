@@ -125,10 +125,8 @@ class TestStepOneOperatorBackends(unittest.TestCase):
         trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
         trainer.state = SimpleNamespace(global_step=1)
         trainer._callbacks = []  # pylint: disable=protected-access
-        trainer.op_runtime = MagicMock(spec=base_module.OpRuntime)
         local = (("rms_norm", "fp32_affine", "torch_npu"),)
         remote = (*local, ("rms_norm", "fp32_affine", "native"), ("swiglu", "standard", "native"))
-        trainer.op_runtime.used_backends.return_value = local
 
         def gather(reports: list, usage: tuple) -> None:
             self.assertEqual(usage, local)
@@ -139,6 +137,7 @@ class TestStepOneOperatorBackends(unittest.TestCase):
         with (
             patch.object(base_module, "get_world_size_safe", return_value=2),
             patch.object(base_module, "get_global_rank_safe", return_value=0),
+            patch.object(base_module.ops, "used_backends", return_value=local),
             patch.object(base_module.dist, "all_gather_object", side_effect=gather) as collective,
             redirect_stderr(io.StringIO()) as output,
         ):
@@ -161,12 +160,12 @@ class TestStepOneOperatorBackends(unittest.TestCase):
         """A rank with no local backend usage still participates in the step-one collective."""
         trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
         trainer.state = SimpleNamespace(global_step=1)
-        trainer.op_runtime = None
         trainer._callbacks = []  # pylint: disable=protected-access
 
         with (
             patch.object(base_module, "get_world_size_safe", return_value=2),
             patch.object(base_module, "get_global_rank_safe", return_value=1),
+            patch.object(base_module.ops, "used_backends", return_value=()),
             patch.object(base_module.dist, "all_gather_object") as collective,
             redirect_stderr(io.StringIO()) as output,
         ):

@@ -21,11 +21,11 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
-from torch.nn import functional
 
 from hyper_parallel.components.modules.spatial_merge_projector import SpatialMergeProjectorModule
 from hyper_parallel.components.modules.rms_norm import NativeRMSNormModule
 from hyper_parallel.components.modules.swiglu_mlp import W1W2SwiGLUMLPModule
+from hyper_parallel.components.ops import vision_attention
 
 
 def _vision_cos_sin(
@@ -62,27 +62,6 @@ def _apply_vision_rotary(
     )
 
 
-def _npu_vision_attention(
-        module: nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-) -> torch.Tensor:
-    """Run bidirectional fused attention on canonical BNSD tensors."""
-    # The NPU extension is optional for CPU/GPU vision and checkpoint tests.
-    from hyper_parallel.components.functional.npu_fusion_attention import (  # pylint: disable=C0415
-        npu_fusion_attention_forward,
-    )
-
-    output, _ = npu_fusion_attention_forward(
-        module, query, key, value, attention_mask=None,
-        dropout=0.0, scaling=query.shape[-1] ** -0.5,
-        is_causal=False, sparse_mode=0,
-        pre_tokens=2147483647, next_tokens=2147483647,
-    )
-    return output
-
-
 def _vision_attention(
         module: nn.Module,
         query: torch.Tensor,
@@ -102,6 +81,7 @@ def _vision_attention(
     Returns:
         Attended rows in sequence/head/dimension order.
     """
+    del module
     if key_length is not None:
         key = key[:key_length]
         value = value[:key_length]
@@ -110,12 +90,7 @@ def _vision_attention(
     query = query.transpose(0, 1).contiguous().view(1, heads, query.shape[0], head_dim)
     key = key.transpose(0, 1).contiguous().view(1, heads, key.shape[0], head_dim)
     value = value.transpose(0, 1).contiguous().view(1, heads, value.shape[0], head_dim)
-    if query.device.type == "npu":
-        return _npu_vision_attention(module, query, key, value).squeeze(0)
-    output = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-        query, key, value, is_causal=False,
-    )
-    return output.squeeze(0).transpose(0, 1)
+    return vision_attention(query, key, value).squeeze(0)
 
 
 class DeepseekV41VisionRMSNorm(NativeRMSNormModule):

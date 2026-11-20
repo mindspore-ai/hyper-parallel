@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""OpSelect operator entry points and runtime configuration."""
+"""OpSelect operator entry points and backend configuration."""
 
 from __future__ import annotations
 
@@ -112,8 +112,8 @@ def _dense_attention(
             window = pre_tokens + 1
     query_offset = kwargs.get("query_offset")
     blocked = ()
-    if lengths is not None and (window is not None or attention_mask is not None):
-        blocked = (("torch_npu", "packed attention requires segment boundaries without a window or external mask"),)
+    if lengths is not None and attention_mask is not None:
+        blocked = (("torch_npu", "packed attention requires segment boundaries without an external mask"),)
     operation = _select_for_call(spec, query, blocked_backends=blocked)
     scale = query.shape[-1] ** -0.5 if scaling is None else scaling
     return operation(

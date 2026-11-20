@@ -29,6 +29,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from hyper_parallel.components.ops import ops
 from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
 from hyper_parallel.distributed.recipe_spec import (
     LOCAL_COMPUTE,
@@ -524,6 +525,12 @@ class TestEpFactoryContract(unittest.TestCase):
             )
 
 
+class _MockNpuDevice(str):
+    """Expose NPU metadata while allocating recording-kernel tensors on CPU."""
+
+    type = "npu"
+
+
 class _AttentionNpuStub(types.ModuleType):
     """Recording ``torch_npu`` stub for the flash-attention kernel path."""
 
@@ -545,15 +552,19 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
     def _run(self, query, key, value, attention_mask, module=None, **options):
         """Run the attention helper with a recording ``torch_npu`` stub."""
         stub = _AttentionNpuStub()
-        with unittest.mock.patch.dict(sys.modules, {"torch_npu": stub}):
-            output, weights = run_qwen3_moe_flash_attention(
-                module if module is not None else nn.Module(),
-                query,
-                key,
-                value,
-                attention_mask,
-                **options,
-            )
+        previous = ops.get_backends()
+        try:
+            ops.set_backends({"attention": "torch_npu"})
+            with (
+                unittest.mock.patch.dict(sys.modules, {"torch_npu": stub}),
+                unittest.mock.patch.object(torch.Tensor, "device", property(lambda _x: _MockNpuDevice("cpu"))),
+            ):
+                output, weights = run_qwen3_moe_flash_attention(
+                    module if module is not None else nn.Module(),
+                    query, key, value, attention_mask, **options,
+                )
+        finally:
+            ops.set_backends(previous)
         return stub, output, weights
 
     def test_packed_lengths_reach_tnd_kernel(self):
@@ -627,13 +638,14 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
             call["atten_mask"], float_mask.bool() | torch.ones(4, 4, dtype=torch.bool).triu(1)
         ))
 
-    def test_next_tockens_requires_causal_self_attention(self):
-        """next_tockens=0 is withheld for cross-attention or is_causal=False."""
+    def test_explicit_cross_attention_mask_is_authoritative(self):
+        """Offset masks and noncausal attention retain their explicitly allowed key positions."""
         query = torch.randn(1, 2, 2, 8)
         key = torch.randn(1, 2, 4, 8)
         mask = torch.ones(1, 1, 2, 4, dtype=torch.bool)
         stub, _, _ = self._run(query, key, key, mask)
-        self.assertEqual(stub.calls[0]["next_tockens"], 0)
+        self.assertEqual(stub.calls[0]["next_tockens"], 2147483647)
+        self.assertFalse(stub.calls[0]["atten_mask"].any())
         non_causal = nn.Module()
         non_causal.is_causal = False
         self_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)

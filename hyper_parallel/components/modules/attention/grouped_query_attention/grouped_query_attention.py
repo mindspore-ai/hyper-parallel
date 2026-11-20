@@ -26,7 +26,7 @@ from torch import nn
 
 from hyper_parallel.components.checkpoint import InterleaveQKV
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
-from hyper_parallel.components.functional import apply_rotary_pos_emb_single, npu_fusion_attention_forward
+from hyper_parallel.components.ops import gqa_attention, rope, rope_interleaved
 from hyper_parallel.components.modules.rms_norm import RMSNorm
 
 
@@ -55,24 +55,10 @@ def apply_gqa_position(tensor: torch.Tensor, positions: Any, interleaved: bool) 
     cos, sin = positions
     if cos.ndim == 2:
         cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
-    rotary_dim = cos.shape[-1]
-    if rotary_dim > tensor.shape[-1] or rotary_dim % 2:
-        raise ValueError("GQA rotary dimension must be even and fit the head dimension")
-    # Keep partial-width half-layout rotation on its established eager path.
-    if not interleaved and rotary_dim < tensor.shape[-1]:
-        rotary, tail = tensor.split((rotary_dim, tensor.shape[-1] - rotary_dim), dim=-1)
-        return torch.cat((rotary * cos.unsqueeze(2) + rotate_half(rotary) * sin.unsqueeze(2), tail), dim=-1)
     if interleaved:
-        cos, sin = (part[..., :rotary_dim // 2].repeat_interleave(2, dim=-1) for part in (cos, sin))
-    cos, sin = (part.expand(tensor.shape[0], -1, -1).transpose(0, 1) for part in (cos, sin))
-    result = apply_rotary_pos_emb_single(tensor.transpose(0, 1), cos, sin,
-                                       rotary_interleaved=interleaved, use_fused_rotary_pos_emb=True)
-    result = result.transpose(0, 1)
-    if interleaved:
-        rotary, tail = result.split((rotary_dim, result.shape[-1] - rotary_dim), dim=-1)
-        rotary = rotary.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
-        result = torch.cat((rotary, tail), dim=-1) if tail.shape[-1] else rotary
-    return result
+        result, _ = rope_interleaved(tensor, tensor, cos, sin, unsqueeze_dim=2)
+        return result
+    return rope(tensor, cos.unsqueeze(2), sin.unsqueeze(2))
 
 
 @dataclass(frozen=True)
@@ -245,7 +231,7 @@ class GroupedQueryAttentionModule(nn.Module):
         if (config is None) == (module is None):
             raise ValueError("GroupedQueryAttention requires exactly one of config or module")
         self._config_initialization = module is None or getattr(module, "_config_initialization", False)
-        self.attention_interface = npu_fusion_attention_forward
+        self.attention_interface = gqa_attention
         self.config = config if module is None else module.config
         source = config if module is None else module
         self.layer_idx = getattr(source, "layer_idx", getattr(source, "layer_number", None))
