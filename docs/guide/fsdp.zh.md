@@ -199,19 +199,4 @@ stage = PipelineStage(stage_model, stage_index, stage_num=pp_size)
 
 ### FSDP + EP
 
-构造 `(fsdp, ep)` 二维 mesh，先在 `ep` 子维度对专家层应用专家并行，再对整个 MoE 模块应用 FSDP：
-
-```python
-from hyper_parallel import init_device_mesh, fully_shard
-from hyper_parallel.core.expert_parallel import ExpertParallel
-
-moe = ...  # MoE model that developer created
-
-mesh = init_device_mesh("npu", (fsdp_size, ep_size), mesh_dim_names=("fsdp", "ep"))
-
-# EP 在专家维度切分专家层
-ExpertParallel().apply(moe.experts, mesh["ep"])
-
-# FSDP 在 fsdp 维度切分整个 MoE 模块
-fully_shard(moe, mesh=mesh["fsdp"])
-```
+在模型训练 recipe 中配置 EP 和 FSDP。recipe 在 EP mesh 上放置路由专家权重，Trainer 构建相应的 FSDP 分组。参见 [EP 指南](expert_parallel.zh.md)和 [Qwen3-MoE recipe](../../hyper_parallel/models/qwen3_moe/recipes/train.yaml)。

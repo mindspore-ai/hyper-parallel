@@ -18,7 +18,7 @@ The factory must forward ``fix_router`` / ``overlap_shared_expert`` /
 ``capacity_factor`` to the public ``build_ep_compute`` skeleton and must NOT carry its
 own copy of the balanced router: the router contract itself (arithmetic, generality,
 ``<name>_fixed`` registry) is pinned in
-``tests/ut/core/expert_parallel/test_ep_balanced_router.py``.
+the recipe's router adapter and fixed-routing contract.
 """
 
 import os

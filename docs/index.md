@@ -21,7 +21,7 @@ Documentation for the distributed parallel acceleration library optimized for As
 | [KDA Context Parallelism](./guide/kda_context_parallel.md) | Configuration and memory usage for KDA P2P, AllGather, Ulysses, and hybrid strategies |
 | [KDA Recursive Doubling and Ulysses Hybrid CP](./guide/kda_recursive_doubling.md) | RD state scans, TND reset pruning, and transition caching |
 | [Linear Attention TND Context Parallelism](./guide/linear_attention_tnd_cp.md) | KDA / GDN document boundaries, configuration, state exchange, and numerical semantics |
-| [EP Expert Parallelism](./guide/expert_parallel.md) | ExpertParallel, MoE building blocks, and load balancing |
+| [EP Expert Parallelism](./guide/expert_parallel.md) | MoE recipes and token dispatch |
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper, swap_wrapper, swap_tensor_wrapper, and combined configuration |
 | [Optimizer](./guide/optimizer.md) | AdamW, Muon, ChainedOptimizer, and learning rate schedulers |
 | [Chunk Loss](./guide/chunk_loss.md) | Chunked output projection and cross-entropy for large vocabularies; Trainer and Qwen3-MoE integration |

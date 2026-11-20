@@ -263,7 +263,7 @@ schedule.register_custom_function(MetaStepType.OVERLAP_B_F, callback)
 losses = schedule.run(*inputs)
 ```
 
-完整示例见 `examples/torch/pp_overlap/pp_overlap_moe_example.py`。
+[PP+EP overlap 示例](../../examples/torch/pp_overlap/pp_overlap_moe_example.py) 沿用原有的流水线同步钩子，从 [MoE 示例目录](../../examples/torch/moe/legacy_expert_parallel.py)导入 ExpertParallel。[运行命令和配置](../../examples/README.md#pytorch-moe-examples)
 
 ---
 

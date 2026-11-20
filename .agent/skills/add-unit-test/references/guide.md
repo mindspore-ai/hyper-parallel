@@ -275,7 +275,7 @@ pytest --cov=hyper_parallel --cov-report=html tests/ut
 pytest --cov=hyper_parallel --cov-report=html tests/ut/collectives/test_cc.py
 
 # Run specific test class with coverage report. Besides HTML, also supports json and markdown formats.
-pytest --cov=hyper_parallel --cov-report=html tests/ut/core/expert_parallel/test_expert_parallel.py
+pytest --cov=hyper_parallel --cov-report=html tests/ut/dual_mode_dtensor/test_ep_moe_local_region.py
 
 # Run specific test method with coverage report. Besides HTML, also supports json and markdown formats.
 pytest --cov=hyper_parallel --cov-report=html tests/ut/collectives/test_cc.py::TestProcessGroupWrappers::test_get_group_local_rank_forwards_group
@@ -286,7 +286,7 @@ pytest --cov=hyper_parallel --cov-report=html tests/ut/collectives/test_cc.py::T
 | Test File | Description | Key Patterns |
 | --------- | ----------- | ------------ |
 | `tests/ut/compile/test_tpsp.py` | Compile-pass tests over a sharded graph | Patching the module-level `dist`, mock process group |
-| `tests/ut/core/expert_parallel/test_expert_parallel.py` | Expert-parallel rank resolution | Patching the module-level `dist`, `assert_called` |
+| `tests/ut/dual_mode_dtensor/test_ep_moe_local_region.py` | Expert-parallel recipe boundary | Patching the module-level `dist`, `assert_called` |
 | `tests/ut/core/fully_shard/test_fully_shard.py` | Fully sharded parameter tests | Mocking DTensor, state transitions |
 
 ## Integration with Development Workflow

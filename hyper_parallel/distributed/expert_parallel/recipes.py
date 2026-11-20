@@ -87,10 +87,16 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
+import math
 from typing import Any, Callable, Optional
 
 import torch
 
+from hyper_parallel.distributed._builder.rule_resolver import (
+    _check_target_config_keys,
+    _is_delayed_target,
+    fill_context_kwargs,
+)
 from hyper_parallel.distributed.expert_parallel.routing import (
     resolve_moe_router,
 )
@@ -102,7 +108,9 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import (
+    LOCAL_COMPUTE,
     local_compute,
+    require_injection_meta,
 )
 
 
@@ -211,6 +219,50 @@ def build_ep_compute(
             routed = ep_routed_experts_and_combine(module, state, ep_group)
             return combine(module, hidden_states, routed, overlapped)
 
+    return compute_fn
+
+
+@local_compute
+def ep_compute_with_dispatch_options(
+    *,
+    module: Any,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+    compute: Any,
+    capacity_factor: Optional[float] = None,
+) -> Callable:
+    """Apply an optional capacity limit around an existing EP compute factory.
+
+    Args:
+        module: MoE boundary containing the routed experts.
+        mesh: Boundary device mesh.
+        tp_mesh: Framework-provided tensor-parallel mesh.
+        cp_mesh: Framework-provided context-parallel mesh.
+        ep_mesh: Framework-provided expert-parallel mesh.
+        compute: Nested YAML target for the existing MoE compute factory.
+        capacity_factor: Optional positive per-source capacity multiplier.
+
+    Returns:
+        The local compute callable from the nested factory.
+    """
+    source = "ep_compute_with_dispatch_options.compute"
+    if not _is_delayed_target(compute):
+        raise TypeError(f"{source} requires a nested _target_ for an EP local compute factory")
+    _require_ep_group(ep_mesh, source)
+    _check_target_config_keys(compute, source)
+    meta = require_injection_meta(compute.callable, LOCAL_COMPUTE, source=source)
+    context = {"module": module, "mesh": mesh, "tp_mesh": tp_mesh, "cp_mesh": cp_mesh, "ep_mesh": ep_mesh}
+    configured = compute._kwargs  # pylint: disable=protected-access
+    compute_fn = compute.build(**fill_context_kwargs(meta, context, configured, source=source))
+    experts = getattr(module, "experts", None)
+    if not hasattr(experts, "_ep_use_grouped_gemm"):
+        raise ValueError(f"{source} must bind the routed experts with bind_local_expert_forward")
+    if capacity_factor is not None:
+        if not math.isfinite(capacity_factor) or capacity_factor <= 0:
+            raise ValueError("capacity_factor must be finite and positive")
+        experts.capacity_factor = capacity_factor
     return compute_fn
 
 

@@ -199,19 +199,4 @@ stage = PipelineStage(stage_model, stage_index, stage_num=pp_size)
 
 ### FSDP + EP
 
-Construct a two-dimensional `(fsdp, ep)` mesh, apply expert parallelism to expert layers on `ep`, then apply FSDP to the entire MoE module:
-
-```python
-from hyper_parallel import init_device_mesh, fully_shard
-from hyper_parallel.core.expert_parallel import ExpertParallel
-
-moe = ...  # MoE model that developer created
-
-mesh = init_device_mesh("npu", (fsdp_size, ep_size), mesh_dim_names=("fsdp", "ep"))
-
-# EP shards the expert layers along the expert dimension.
-ExpertParallel().apply(moe.experts, mesh["ep"])
-
-# FSDP shards the entire MoE module along the fsdp dimension.
-fully_shard(moe, mesh=mesh["fsdp"])
-```
+Configure expert parallelism and FSDP in the model's training recipe. The recipe places routed expert weights on the EP mesh and lets the trainer build the FSDP groups. See the [EP guide](expert_parallel.md) and [Qwen3-MoE recipe](../../hyper_parallel/models/qwen3_moe/recipes/train.yaml).

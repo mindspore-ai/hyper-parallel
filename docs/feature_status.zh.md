@@ -43,7 +43,7 @@
 
 #### EP
 
-- [x] ExpertParallel / ExpertTensorParallel 基础流程
+- [x] 基于模型 recipe 的专家放置与路由执行
 - [x] MoE 构建模块（GroupedExperts / TokenChoiceTopKRouter / MoE）
 - [x] 负载均衡（expert_bias + aux_loss + AutoScaler）
 - [x] MoE zero-overhead activation storage

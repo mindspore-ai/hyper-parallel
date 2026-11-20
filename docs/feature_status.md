@@ -43,7 +43,7 @@ This document records HyperParallel's supported and planned model and system cap
 
 #### EP
 
-- [x] Basic ExpertParallel / ExpertTensorParallel workflow
+- [x] Expert parallel placement and routed execution through model recipes
 - [x] MoE building blocks (GroupedExperts / TokenChoiceTopKRouter / MoE)
 - [x] Load balancing (expert_bias + aux_loss + AutoScaler)
 - [x] MoE zero-overhead activation storage

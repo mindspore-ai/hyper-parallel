@@ -17,19 +17,21 @@ from __future__ import annotations
 
 from typing import Any
 from math import isfinite
+
+import torch
 from torch import nn
 
-from hyper_parallel.components.modules.moe import TokenChoiceTopKRouter as SourceTokenChoiceTopKRouter
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.gate import routing_scores, select_topk_scores
 
 
-class TokenChoiceTopKRouterModule(SourceTokenChoiceTopKRouter):
+class TokenChoiceTopKRouterModule(nn.Module):
     """Keep gate state and the weights/indices/counts output contract unchanged."""
 
     def __init__(self, *, config: Any = None, module: nn.Module | None = None) -> None:
         """Create a public router or reuse its gate Parameters and routing settings."""
+        super().__init__()
         if (config is None) == (module is None):
             raise ValueError("provide exactly one of config or module")
         source = config if config is not None else module
@@ -43,19 +45,18 @@ class TokenChoiceTopKRouterModule(SourceTokenChoiceTopKRouter):
                 or not isfinite(source.route_scale)):
             raise ValueError("route_scale must be finite")
         self._validate_groups(source)
+        if source.score_func not in ("sigmoid", "softmax"):
+            raise ValueError("score_func must be 'sigmoid' or 'softmax'")
+        for name in ("num_experts", "top_k", "score_func", "num_expert_groups",
+                     "num_limited_groups", "route_scale"):
+            setattr(self, name, getattr(source, name))
         if module is not None:
-            if type(module) not in (SourceTokenChoiceTopKRouter, TokenChoiceTopKRouterModule):
+            if module.__class__ is not TokenChoiceTopKRouterModule:
                 raise TypeError("model-specific routers require their own adapter")
-            nn.Module.__init__(self)  # pylint: disable=non-parent-init-called
             self.gate = module.gate
-            for name in ("num_experts", "top_k", "score_func", "num_expert_groups",
-                         "num_limited_groups", "route_scale"):
-                setattr(self, name, getattr(module, name))
             self.train(module.training)
         else:
-            super().__init__(dim=config.dim, num_experts=config.num_experts, top_k=config.top_k,
-                             score_func=config.score_func, num_expert_groups=config.num_expert_groups,
-                             num_limited_groups=config.num_limited_groups, route_scale=config.route_scale)
+            self.gate = nn.Linear(config.dim, config.num_experts, bias=False)
 
     @staticmethod
     def _validate_groups(source: Any) -> None:
@@ -74,6 +75,38 @@ class TokenChoiceTopKRouterModule(SourceTokenChoiceTopKRouter):
     def reset_parameters(self) -> None:
         """Initialize the gate after meta materialization."""
         self.gate.reset_parameters()
+
+    def forward(
+        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return unbiased weights, expert IDs and counts for the selected experts.
+
+        Scale scores before group selection. Correction bias affects expert
+        selection only, and the returned weights retain their original scores.
+        """
+        scores = routing_scores(self.gate(x).float(), self.score_func)
+        if self.route_scale != 1.0:
+            scores = scores * self.route_scale
+        selection_scores = scores
+        if self.num_expert_groups is not None:
+            selection_scores = self._get_node_limited_routing_scores(scores)
+        if expert_bias is not None:
+            selection_scores = selection_scores + expert_bias.float()
+        selected_experts = selection_scores.topk(self.top_k, dim=-1).indices
+        top_scores = scores.gather(1, selected_experts)
+        counts = torch.bincount(selected_experts.flatten(), minlength=self.num_experts)
+        return top_scores, selected_experts, counts
+
+    def _get_node_limited_routing_scores(self, scores: torch.Tensor) -> torch.Tensor:
+        """Mask experts outside the groups selected by their highest scores."""
+        num_tokens, num_experts = scores.shape
+        experts_per_group = num_experts // self.num_expert_groups
+        grouped_scores = scores.view(num_tokens, self.num_expert_groups, experts_per_group)
+        selected_groups = grouped_scores.max(dim=-1).values.topk(self.num_limited_groups, dim=-1).indices
+        mask = scores.new_zeros(num_tokens, self.num_expert_groups)
+        mask.scatter_(1, selected_groups, 1.0)
+        mask = mask.unsqueeze(-1).expand_as(grouped_scores).reshape_as(scores)
+        return scores.masked_fill(mask == 0, float("-inf"))
 
 
 @module_replacement
