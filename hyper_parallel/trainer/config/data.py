@@ -49,7 +49,13 @@ class DatasetConfig:
 
     def __getattr__(self, name: str) -> Any:
         """Expose configured Dataset options through the wrapped target."""
-        return getattr(self.target, name)
+        # __getattr__ runs for *missing* attributes. During copy/pickle
+        # reconstruction the instance dict is still empty, so probing
+        # "target" through normal attribute lookup would recurse forever.
+        target = self.__dict__.get("target")
+        if target is None:
+            raise AttributeError(name)
+        return getattr(target, name)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize Dataset components in their compact nested YAML shape."""
@@ -86,7 +92,12 @@ class DataLoaderConfig:
 
     def __getattr__(self, name: str) -> Any:
         """Expose configured DataLoader options through the wrapped target."""
-        return getattr(self.target, name)
+        # See DatasetConfig.__getattr__: guard the not-yet-initialized state
+        # reached during copy/pickle reconstruction.
+        target = self.__dict__.get("target")
+        if target is None:
+            raise AttributeError(name)
+        return getattr(target, name)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize components in their compact nested YAML shape."""

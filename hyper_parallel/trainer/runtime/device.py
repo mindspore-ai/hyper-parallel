@@ -37,6 +37,8 @@ __all__ = [
     "stream_synchronize",
     "empty_cache",
     "set_device",
+    "simulate_device_runtime",
+    "is_device_runtime_simulated",
     "get_device_rng_state",
     "set_device_rng_state",
     "is_nccl_backend",
@@ -51,6 +53,17 @@ from typing import Any
 
 import torch
 
+# Logical-simulation mode: when enabled (by the dry-run tool before it drives
+# real Trainer code over FakeTensors), every device-side effect in this module
+# becomes a no-op so the process never binds an accelerator, initializes its
+# runtime, or appears on device tooling. Pure queries (device type, flags)
+# stay live — simulation intentionally reports the real accelerator topology.
+# The switch itself is owned by core so core components (activation swap,
+# optimizer swap, FSDP offload) consult the same process-wide state.
+from hyper_parallel.core.utils.simulation import (
+    is_device_runtime_simulated,
+    simulate_device_runtime,
+)
 from hyper_parallel.models.build_options import (
     IS_CUDA_AVAILABLE,
     IS_NPU_AVAILABLE,
@@ -79,11 +92,15 @@ def get_dist_comm_backend() -> str:
 
 def synchronize() -> None:
     """Execute torch synchronize operation."""
+    if is_device_runtime_simulated():
+        return
     get_torch_device().synchronize()
 
 
 def stream_synchronize() -> None:
     """Execute device stream synchronize operation."""
+    if is_device_runtime_simulated():
+        return
     if IS_CUDA_AVAILABLE:
         torch.cuda.current_stream().synchronize()
     elif IS_NPU_AVAILABLE:
@@ -94,11 +111,15 @@ def stream_synchronize() -> None:
 
 def empty_cache() -> None:
     """Execute torch empty cache operation."""
+    if is_device_runtime_simulated():
+        return
     get_torch_device().empty_cache()
 
 
 def set_device(device: torch.types.Device) -> None:
     """Execute set device operation."""
+    if is_device_runtime_simulated():
+        return
     get_torch_device().set_device(device)
 
 

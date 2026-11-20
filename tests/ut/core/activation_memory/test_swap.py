@@ -29,7 +29,7 @@ from hyper_parallel.core.activation_memory.swap import (  # noqa: E402
     SwapManager,
     SwapTensor,
     Storage,
-    _collect_device_storage_ptrs,
+    _collect_device_storage_ids,
     _get_cpu_pinned_buf,
     _return_cpu_pinned_buf,
     _teardown_wired_swap_layers,
@@ -151,17 +151,17 @@ class TestModuleFunctions(unittest.TestCase):
         self.assertIn("torch.float32", _CPU_PINNED_POOL)
         self.assertIn(buf, _CPU_PINNED_POOL["torch.float32"])
 
-    def test_collect_device_storage_ptrs_device_tensor(self):
-        """Test _collect_device_storage_ptrs collects storage ptrs from device tensors."""
+    def test_collect_device_storage_ids_device_tensor(self):
+        """Test _collect_device_storage_ids collects storage identities from device tensors."""
         with _swap_plat_patch() as mp:
             mp.Tensor = torch.Tensor
             mp.tree_map = _build_mock_platform().tree_map
             t = torch.empty(10, device="meta")
-            result = _collect_device_storage_ptrs(t)
+            result = _collect_device_storage_ids(t)
             self.assertEqual(len(result), 1)
-            self.assertIn(t.untyped_storage().data_ptr(), result)
+            self.assertIn(id(t.untyped_storage()), result)
 
-    def test_collect_device_storage_ptrs_unwraps_dtensor(self):
+    def test_collect_device_storage_ids_unwraps_dtensor(self):
         """Test storage collection reads the local shard of a DTensor-like object."""
         local_tensor = torch.empty(3, device="meta")
 
@@ -176,29 +176,29 @@ class TestModuleFunctions(unittest.TestCase):
         with _swap_plat_patch() as mp, patch.object(swap_module, "DTensor", FakeDTensor):
             mp.Tensor = torch.Tensor
             mp.tree_map = _build_mock_platform().tree_map
-            result = _collect_device_storage_ptrs(FakeDTensor())
+            result = _collect_device_storage_ids(FakeDTensor())
 
-        self.assertEqual(result, {local_tensor.untyped_storage().data_ptr()})
+        self.assertEqual(result, {id(local_tensor.untyped_storage())})
 
-    def test_collect_device_storage_ptrs_nested(self):
-        """Test _collect_device_storage_ptrs traverses nested structures."""
+    def test_collect_device_storage_ids_nested(self):
+        """Test _collect_device_storage_ids traverses nested structures."""
         with _swap_plat_patch() as mp:
             mp.Tensor = torch.Tensor
             mp.tree_map = _build_mock_platform().tree_map
             t1 = torch.empty(10, device="meta")
             t2 = torch.empty(20, device="meta")
             nested = {"a": t1, "b": [t2, 1.0]}
-            result = _collect_device_storage_ptrs(nested)
-            # Meta tensors share data_ptr=0 so set deduplicates; verify at least 1 found
-            self.assertGreaterEqual(len(result), 1)
+            result = _collect_device_storage_ids(nested)
+            # Storage identity distinguishes meta tensors that data_ptr=0 collapsed.
+            self.assertEqual(len(result), 2)
 
-    def test_collect_device_storage_ptrs_cpu_tensor_ignored(self):
-        """Test _collect_device_storage_ptrs ignores CPU tensors."""
+    def test_collect_device_storage_ids_cpu_tensor_ignored(self):
+        """Test _collect_device_storage_ids ignores CPU tensors."""
         with _swap_plat_patch() as mp:
             mp.Tensor = torch.Tensor
             mp.tree_map = _build_mock_platform().tree_map
             t_cpu = torch.empty(10, device="cpu")
-            result = _collect_device_storage_ptrs(t_cpu)
+            result = _collect_device_storage_ids(t_cpu)
             self.assertEqual(len(result), 0)
 
 
@@ -293,8 +293,8 @@ class TestSwapTensor(unittest.TestCase):
             mp.get_element_size = lambda t: t.element_size()
             t = self._make_tensor(3)
             st = SwapTensor(t, "test_func")
-            alias_ptrs = {t.untyped_storage().data_ptr()}
-            st.protect_if_aliases(alias_ptrs)
+            alias_ids = {id(t.untyped_storage())}
+            st.protect_if_aliases(alias_ids)
             self.assertTrue(st._keep_on_device)
 
     def test_protect_if_aliases_no_match(self):
@@ -832,23 +832,23 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertTrue(st2._duplicate_swap)
 
-    def test_protect_alias_storage_ptrs_no_aliases(self):
-        """Test protect_alias_storage_ptrs with empty set is no-op."""
+    def test_protect_alias_storage_ids_no_aliases(self):
+        """Test protect_alias_storage_ids with empty set is no-op."""
         t = torch.empty(3, device="meta")
         st = SwapTensor(t, "f1")
         s = Storage()
         s["key1"].append(st)
-        s.protect_alias_storage_ptrs(set())
+        s.protect_alias_storage_ids(set())
         self.assertFalse(st._keep_on_device)
 
-    def test_protect_alias_storage_ptrs_with_alias(self):
-        """Test protect_alias_storage_ptrs protects aliased tensors."""
+    def test_protect_alias_storage_ids_with_alias(self):
+        """Test protect_alias_storage_ids protects aliased tensors."""
         t = torch.empty(3, device="meta")
         st = SwapTensor(t, "f1")
         s = Storage()
         s["key1"].append(st)
-        alias_ptrs = {t.untyped_storage().data_ptr()}
-        s.protect_alias_storage_ptrs(alias_ptrs)
+        alias_ids = {id(t.untyped_storage())}
+        s.protect_alias_storage_ids(alias_ids)
         self.assertTrue(st._keep_on_device)
 
     def test_launch_load(self):
@@ -992,12 +992,12 @@ class TestSwapGroup(unittest.TestCase):
 
         with patch.object(
             swap_module,
-            "_collect_device_storage_ptrs",
+            "_collect_device_storage_ids",
             return_value={1, 2, 3},
         ):
             group.protect_alias_tensors(sentinel.output)
 
-        storage.protect_alias_storage_ptrs.assert_called_once_with({1, 2, 3})
+        storage.protect_alias_storage_ids.assert_called_once_with({1, 2, 3})
 
     def test_collect_packable_tensors_empty(self):
         """Test _collect_packable_tensors returns 0 when no tensors are packable."""

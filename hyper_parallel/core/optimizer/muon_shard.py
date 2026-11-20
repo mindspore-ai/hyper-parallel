@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
+from hyper_parallel.core.utils import simulation
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPCommGroup,
     ParamLayoutSpec,
@@ -126,6 +127,31 @@ def _debug_param_shard_metadata(hsdp_group, param_to_meta: Dict[torch.nn.Paramet
         )
 
 
+def _comm_device_for_group(
+        shard_pg: Optional[dist.ProcessGroup],
+        device: torch.device,
+) -> torch.device:
+    """Return a device the group's backend can run collectives on.
+
+    With CPU offload the parameter locals live on host while the shard group
+    is an accelerator backend (HCCL/NCCL) with no CPU path; the metadata
+    gather must then run on the accelerator. Under logical simulation the
+    group is a fake backend and the simulated accelerator plays that role, so
+    the staging allocations land where a real run puts them.
+    """
+    if device.type != "cpu" or shard_pg is None:
+        return device
+    backend = dist.get_backend(shard_pg)
+    if backend == "hccl":
+        return torch.device("npu", torch.npu.current_device())
+    if backend == "nccl":
+        return torch.device("cuda", torch.cuda.current_device())
+    lied_accelerator = simulation.simulated_accelerator()
+    if backend == "fake" and lied_accelerator is not None:
+        return torch.device(lied_accelerator, 0)
+    return device
+
+
 def _allgather_shapes_for_group(
         local_shapes: List[Tuple[int, ...]],
         shard_pg: Optional[dist.ProcessGroup],
@@ -136,6 +162,7 @@ def _allgather_shapes_for_group(
     if shard_pg is None or shard_size <= 1:
         return [[tuple(shape) for shape in local_shapes]]
 
+    device = _comm_device_for_group(shard_pg, device)
     shape_tensor = torch.tensor(local_shapes, dtype=torch.int64, device=device)
     gathered = torch.empty((shard_size, *shape_tensor.shape), dtype=torch.int64, device=device)
     dist.all_gather_into_tensor(gathered.view(-1), shape_tensor.contiguous().view(-1), group=shard_pg)
@@ -380,10 +407,17 @@ def _pack_and_allgather(
         shard_size: int,
         buffer_cache: Optional[Dict],
 ) -> torch.Tensor:
-    """Pack local shards into one buffer, all-gather, return gathered view."""
+    """Pack local shards into one buffer, all-gather, return gathered view.
+
+    The pack and gather buffers live on a device the group's backend supports:
+    with CPU offload the shards live on host while the shard group is an
+    accelerator backend, so the collective is staged there and the gathered
+    view is brought back to the shards' device for the NS computation.
+    """
+    comm_device = _comm_device_for_group(shard_pg, device)
     pack_buffer = _get_or_alloc_buffer(
-        buffer_cache, ("fused_allgather", axis_idx, dtype, device), total_padded_numel,
-        dtype, device,
+        buffer_cache, ("fused_allgather", axis_idx, dtype, comm_device), total_padded_numel,
+        dtype, comm_device,
     )[:total_padded_numel]
 
     pack_buffer.zero_()
@@ -392,12 +426,14 @@ def _pack_and_allgather(
 
     gathered_buffer = _get_or_alloc_buffer(
         buffer_cache,
-        ("fused_allgather_out", axis_idx, dtype, device),
+        ("fused_allgather_out", axis_idx, dtype, comm_device),
         total_padded_numel * shard_size,
-        dtype, device,
+        dtype, comm_device,
     )[:total_padded_numel * shard_size]
 
     dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
+    if comm_device != device:
+        gathered_buffer = gathered_buffer.to(device)
     return gathered_buffer.view(shard_size, total_padded_numel)
 
 

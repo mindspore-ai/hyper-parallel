@@ -85,6 +85,7 @@ class TrainerConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profiler: ProfilingConfig = field(default_factory=ProfilingConfig)
     stress_detect: StressDetectConfig = field(default_factory=StressDetectConfig)
+    dry_run: Optional[Any] = None
     magi: Optional[Any] = None
     peft: Optional[Any] = None
 

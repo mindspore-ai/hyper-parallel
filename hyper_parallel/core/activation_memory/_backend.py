@@ -21,6 +21,7 @@ __all__ = [
     "get_stream_context",
     "get_current_stream",
     "new_event",
+    "record_stream",
     "no_grad",
     "preserve_version_counter",
     "cat",
@@ -37,26 +38,58 @@ import torch
 from torch import Tensor
 
 from hyper_parallel.core.utils.communication import get_device_handle
+from hyper_parallel.core.utils.simulation import (
+    hold_for_simulated_stream,
+    is_device_runtime_simulated,
+    simulated_device_handle,
+)
+
+
+def _stream_owner():
+    """Return the namespace owning streams and events for this process.
+
+    Under logical simulation the process never binds an accelerator, so stream
+    and event primitives come from the simulated handle: every transfer then
+    completes in host program order, which preserves the storage lifecycle the
+    swap state machine expresses while dropping only device-side overlap.
+    """
+    if is_device_runtime_simulated():
+        return simulated_device_handle()
+    return get_device_handle()
 
 
 def new_stream():
     """Create a new device stream on the current accelerator."""
-    return get_device_handle().Stream()
+    return _stream_owner().Stream()
 
 
 def get_stream_context():
     """Return the stream context manager (``torch.npu.stream`` / ``torch.cuda.stream``)."""
-    return get_device_handle().stream
+    return _stream_owner().stream
 
 
 def get_current_stream():
     """Return the current device stream."""
-    return get_device_handle().current_stream()
+    return _stream_owner().current_stream()
 
 
 def new_event():
     """Create a new device event on the current accelerator."""
-    return get_device_handle().Event()
+    return _stream_owner().Event()
+
+
+def record_stream(tensor, stream) -> None:
+    """Reserve ``tensor``'s storage for ``stream`` until its pending work ends.
+
+    Under simulation the reference is held until the next simulated wait —
+    the same point a real caching allocator could first reclaim it — so the
+    logical lifetime of staging buffers is conservative, never shorter than
+    the real one.
+    """
+    if is_device_runtime_simulated():
+        hold_for_simulated_stream(tensor)
+        return
+    tensor.record_stream(stream)
 
 
 def no_grad():
@@ -76,6 +109,10 @@ def cat(tensors, dim=0):
 
 def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
     """Allocate an uninitialized tensor shaped like *tensor*."""
+    if pin_memory and is_device_runtime_simulated():
+        # Pinning needs a live device runtime; logically it only affects DMA
+        # speed, never which host bytes are allocated.
+        pin_memory = False
     return torch.empty_like(tensor, dtype=dtype, device=device, pin_memory=pin_memory)
 
 
@@ -91,8 +128,10 @@ def get_element_size(tensor) -> int:
 
 def alloc_tensor_buffer(numel: int, dtype, device="cpu", pin_memory: bool = False):
     """Allocate an uninitialized 1-D tensor buffer."""
-    if pin_memory:
+    if pin_memory and not is_device_runtime_simulated():
         return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
+    if pin_memory:
+        return torch.empty(numel, dtype=dtype, device="cpu")
     return torch.empty(numel, dtype=dtype, device=device)
 
 

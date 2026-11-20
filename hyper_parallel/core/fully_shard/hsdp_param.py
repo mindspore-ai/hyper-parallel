@@ -925,11 +925,11 @@ class HSDPParamV2:
         """Return whether communication storage already aliases the local tensor."""
         if not isinstance(self._sharded_param_data, torch.Tensor):
             return False
-        sharded_data_ptr = self._sharded_param_data.untyped_storage().data_ptr()
+        # Storage identity instead of data_ptr: empty shards and FakeTensors
+        # report data_ptr 0 for distinct storages, which faked aliasing here.
         return (
-            # Empty shards may have a zero data pointer and must still be rebuilt.
-            sharded_data_ptr > 0
-            and sharded_data_ptr == local_tensor.untyped_storage().data_ptr()
+            self._sharded_param_data.untyped_storage()
+            is local_tensor.untyped_storage()
         )
 
     def _validate_reset_local_tensor(
@@ -1037,9 +1037,11 @@ class HSDPParamV2:
     def _update_shardedparam_storage_forcely(self,):
         sharded_param_data = self.sharded_param.data
         local_tensor_data = self.sharded_param._local_tensor.data
+        # Storage identity instead of data_ptr: data_ptr is 0 for empty shards
+        # and FakeTensors, so distinct storages would look identical here.
         if (
             sharded_param_data.device != local_tensor_data.device
-            or sharded_param_data.data_ptr() != local_tensor_data.data_ptr()
+            or sharded_param_data.untyped_storage() is not local_tensor_data.untyped_storage()
         ):
             local_tensor_data.requires_grad_(self.sharded_param.requires_grad)
             # TensorImpl keeps storage_ptr, storage_offset, sizes, strides, dtype and metadatas
