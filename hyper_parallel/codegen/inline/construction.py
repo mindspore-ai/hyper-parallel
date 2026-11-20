@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 from importlib import import_module
 import inspect
+import textwrap
 from typing import Any
 
 from hyper_parallel.codegen.inline.ir import ConstructorPatch, ImportPatch, InlinePatchSet
@@ -94,9 +95,13 @@ def materialize_module_constructions(source: str, records: list[dict]) -> str:
             key = (site["owner"].split(":")[-1], site["attribute"])
             groups.setdefault(key, []).append((record, site))
     classes = {node.name for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+    source_aliases = {}
     for (owner, attribute), members in groups.items():
         record, _ = members[0]
-        calls = [_constructor_expression(item, patches.imports, classes) for item, _ in members]
+        calls = [_constructor_expression(
+            item, patches.imports, classes,
+            _source_expression(source, item, records, patches.imports, source_aliases),
+        ) for item, _ in members]
         selected = {path.rpartition(".")[0] for item, _ in members
                     for path in item.get("module_fqns", [item["primary_fqn"]])}
         expected = {path for _, site in members for path in site.get("instances", selected)}
@@ -152,7 +157,33 @@ def _per_instance_expression(source: str, owner: str, members: list, calls: list
     return expression
 
 
-def _constructor_expression(record: dict, imports: list[ImportPatch], classes: set[str]) -> str:
+def _source_expression(source: str, record: dict, records: list[dict], imports: list, aliases: dict) -> str:
+    """Keep original conversion type identity when its source class has no artifact edits."""
+    path = record['primary_fqn']
+    if any(item['primary_fqn'].startswith(path + '.') for item in records):
+        return '__source_module__'
+    module, name = record['source_type'].split(':', 1)
+    if not name.isidentifier():
+        return '__source_module__'
+    copied = next((node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == name), None)
+    if copied is None:
+        return '__source_module__'
+    try:
+        original = ast.parse(textwrap.dedent(inspect.getsource(_symbol(record['source_type'])))).body[0]
+    except (OSError, TypeError):
+        return '__source_module__'
+    if ast.dump(copied) != ast.dump(original):
+        return '__source_module__'
+    alias = aliases.setdefault(record['source_type'], f'_Source{name}_{len(aliases)}')
+    if all(part.isidentifier() for part in module.split('.')):
+        statement = f'from {module} import {name} as {alias}'
+    else:
+        statement = f"{alias} = __import__({module!r}, fromlist=[{name!r}]).{name}"
+    imports.append(ImportPatch(module, (), raw=statement))
+    return f'{alias}(__source_arguments__)'
+
+
+def _constructor_expression(record: dict, imports: list[ImportPatch], classes: set[str], source: str) -> str:
     identity = replacement_constructor(record)
     module, name = identity.split(":", 1)
     if not name.isidentifier():
@@ -170,7 +201,7 @@ def _constructor_expression(record: dict, imports: list[ImportPatch], classes: s
     context = selection.get("construction_context", record.get("replay", {}).get("context", {"mapping": {}}))
     # The concrete source-conversion constructor owns parameter reuse and conversion.
     # The generated module neither selects a family nor installs a replacement.
-    runtime = {"module": "__source_module__", "config": "None", "context": _value_expression(context, imports)}
+    runtime = {"module": source, "config": "None", "context": _value_expression(context, imports)}
     kwargs = [f"{key}={value}" for key, value in runtime.items() if key in signature.parameters]
     # module_fqn is optional diagnostic context; never freeze one layer's path for all layers.
     if "module_fqn" in signature.parameters and signature.parameters["module_fqn"].default is inspect.Parameter.empty:

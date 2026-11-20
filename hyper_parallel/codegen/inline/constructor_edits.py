@@ -22,6 +22,24 @@ from hyper_parallel.codegen.astkit.edits import TextEdit
 from hyper_parallel.codegen.inline.ir import ConstructorPatch
 
 
+class _SourceArgument(ast.NodeTransformer):
+    """Substitute syntax nodes without altering string literals in arguments."""
+
+    def __init__(self, source: ast.Call) -> None:
+        self.source = source
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:  # pylint: disable=invalid-name
+        if node.id == '__source_module__':
+            return self.source
+        return node
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:  # pylint: disable=invalid-name
+        if len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == '__source_arguments__':
+            return ast.copy_location(ast.Call(func=node.func, args=self.source.args,
+                                             keywords=self.source.keywords), node)
+        return self.generic_visit(node)
+
+
 def constructor_edits(source: str, patches: list[ConstructorPatch]) -> list[TextEdit]:
     """Edit only an explicitly identified source class and attribute assignment."""
     classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
@@ -59,6 +77,6 @@ def constructor_edits(source: str, patches: list[ConstructorPatch]) -> list[Text
             value.func = ast.Name(id=patch.expression, ctx=ast.Load())
             expression = ast.unparse(value)
         else:
-            expression = patch.expression.replace("__source_module__", ast.get_source_segment(source, value))
+            expression = ast.unparse(_SourceArgument(value).visit(ast.parse(patch.expression, mode='eval').body))
         edits.append(TextEdit(start, end, expression))
     return edits

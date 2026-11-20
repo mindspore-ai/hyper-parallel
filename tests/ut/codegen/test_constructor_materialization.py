@@ -15,11 +15,13 @@
 """Generated constructors must install the observed model without patch replay."""
 
 import ast
+import inspect
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from copy import deepcopy
+import textwrap
 
 from torch import nn
 
@@ -48,6 +50,14 @@ class FinalBlock(nn.Module):
         return value * 2
 
 
+class IdentitySensitiveBlock(FinalBlock):
+    """Represent native conversion policies that depend on source type provenance."""
+
+    def __init__(self, *, module=None, module_fqn="", context=None):
+        super().__init__(module=module, module_fqn=module_fqn, context=context)
+        self.source_module = type(module).__module__
+
+
 def _replacement_record():
     return {
         "primary_fqn": "block",
@@ -73,6 +83,18 @@ def _patch_plan():
 
 class TestConstructorMaterialization(unittest.TestCase):
     """Inspect the model actually built by the generated source."""
+
+    def test_conversion_preserves_unmodified_source_type_identity(self):
+        """Moving copied definitions must not change an existing conversion policy."""
+        source = ('from torch import nn\n' + textwrap.dedent(inspect.getsource(SourceBlock)) +
+                  '\nclass FutureModel:\n    def __init__(self):\n        self.block = SourceBlock()\n')
+        record = _replacement_record()
+        record['replacement_type'] = f'{__name__}:IdentitySensitiveBlock'
+        rendered = materialize_module_constructions(source, [record])
+        namespace = {'__name__': '_generated_source_namespace'}
+        exec(rendered, namespace)
+        actual = namespace['FutureModel']().block
+        self.assertEqual(actual.source_module, SourceBlock.__module__)
 
     def test_model_builds_selected_member_without_external_installation(self):
         """A normal constructor and forward must suffice to observe replacement."""
