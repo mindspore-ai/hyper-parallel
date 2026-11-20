@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 from typing import Any
 
 from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
@@ -64,13 +65,20 @@ def _frozen_candidates(path: str, modules: dict, *, parameter: bool = False) -> 
                 compatible = False
                 break
         if compatible:
-            result.append({"owner": type(owner).__name__, "relative": relative})
+            result.append({"owner": type(owner).__name__, "module": type(owner).__module__, "relative": relative})
     return result
 
 
 def materialize_frozen_modules(source: str, records: list[dict]) -> str:
     """Emit requires_grad_ calls after the source owner has built its children."""
     index = build_source_index(source)
+    tree = ast.parse(source)
+    bindings = {(node.module, alias.name): alias.asname or alias.name for node in tree.body
+                if isinstance(node, ast.ImportFrom) for alias in node.names}
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
     edits = []
     emitted = set()
     for record in records:
@@ -78,6 +86,22 @@ def materialize_frozen_modules(source: str, records: list[dict]) -> str:
             host = index.classes.get(candidate["owner"])
             initializer = host.methods.get("__init__") if host else None
             if initializer is None:
+                imported = bindings.get((candidate.get("module"), candidate["owner"]))
+                assignments = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+                               and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                               and imported is not None and node.value.func.id == imported]
+                for node in assignments:
+                    targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+                    for target_node in targets:
+                        target = ast.unparse(target_node)
+                        target += "." + candidate["relative"] if candidate["relative"] else ""
+                        key = (node.end_lineno, target)
+                        if key not in emitted:
+                            statement = " " * node.col_offset + f"{target}.requires_grad_(False)\n"
+                            edits.append(TextEdit(offsets[node.end_lineno], offsets[node.end_lineno], statement))
+                            emitted.add(key)
+                if assignments:
+                    break
                 continue
             target = "self" + ("." + candidate["relative"] if candidate["relative"] else "")
             key = (host.name, target)
