@@ -83,6 +83,23 @@ class RequiredDiscardBlock(FinalBlock):
         super().__init__()
         del context
 
+
+class ForwardedContextBlock(FinalBlock):
+    """An optional context only passed to a parent that discards it."""
+
+    def __init__(self, *, module, context=None):
+        super().__init__(module=module, context=context)
+
+
+class LateDiscardBlock(FinalBlock):
+    """An unused context discarded after unrelated validation."""
+
+    def __init__(self, *, module, context=None):
+        if module is None:
+            raise ValueError("module is required")
+        del context
+        super().__init__(module=module)
+
 def _replacement_record():
     return {
         "primary_fqn": "block",
@@ -114,6 +131,7 @@ class TestConstructorMaterialization(unittest.TestCase):
         record["replay"]["context"] = {"mapping": {"ep_size": 2}}
         for constructor, expected_context in (
             (FinalBlock, False), (ContextSensitiveBlock, True), (RequiredDiscardBlock, True),
+            (ForwardedContextBlock, False), (LateDiscardBlock, False),
         ):
             with self.subTest(constructor=constructor.__name__):
                 record["replacement_type"] = f"{__name__}:{constructor.__name__}"
@@ -122,6 +140,8 @@ class TestConstructorMaterialization(unittest.TestCase):
                 self.assertEqual("context" in keywords, expected_context)
                 self.assertIn("module", keywords)
                 self.assertNotIn("config", keywords)
+                if constructor is RequiredDiscardBlock:
+                    self.assertIn("context=None", expression)
 
     def test_native_owner_loop_preserves_required_instance_paths(self):
         source = (f"from {__name__} import SourceBlock\n"

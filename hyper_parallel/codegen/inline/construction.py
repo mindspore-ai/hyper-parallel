@@ -251,29 +251,44 @@ def _source_expression(source: str, record: dict, records: list[dict], imports: 
 
 
 def _discarded_constructor_parameters(member: Any) -> set[str]:
-    """Recognize explicit argument discards before constructor-specific work.
+    """Find explicit discards, including arguments only forwarded to a discarding base.
 
-    Only the leading discard convention is supported. Unknown, decorated or
-    inherited behavior remains unchanged rather than inferring argument usage.
+    Inspect only named arguments and ordinary super initializer forwarding.
+    Unknown source, decorators and dynamic local access retain all arguments.
     """
-    constructor = member.__init__
-    if inspect.unwrap(constructor) is not constructor:
-        return set()
-    try:
-        function = ast.parse(textwrap.dedent(inspect.getsource(constructor))).body[0]
-    except (OSError, TypeError, SyntaxError):
-        return set()
-    body = function.body[1:] if ast.get_docstring(function) else function.body
-    discarded = set()
-    for statement in body:
-        if isinstance(statement, ast.Delete):
-            discarded.update(target.id for target in statement.targets if isinstance(target, ast.Name))
-        elif (isinstance(statement, ast.Expr)
-              and ast.dump(statement.value) == ast.dump(ast.parse("super().__init__()", mode="eval").body)):
-            continue
-        else:
-            break
-    return discarded
+    def discarded_in(mro: tuple) -> set[str]:
+        owner_index = next((index for index, owner in enumerate(mro) if "__init__" in owner.__dict__), None)
+        if owner_index is None:
+            return set()
+        constructor = mro[owner_index].__dict__["__init__"]
+        if inspect.unwrap(constructor) is not constructor:
+            return set()
+        try:
+            function = ast.parse(textwrap.dedent(inspect.getsource(constructor))).body[0]
+        except (OSError, TypeError, SyntaxError):
+            return set()
+        nodes = list(ast.walk(function))
+        if any(isinstance(node, ast.Name) and node.id in ("locals", "vars", "eval", "exec") for node in nodes):
+            return set()
+        direct = {target.id for statement in function.body if isinstance(statement, ast.Delete)
+                  for target in statement.targets if isinstance(target, ast.Name)}
+        forwarded = {}
+        for node in nodes:
+            if (isinstance(node, ast.Call)
+                    and ast.dump(node.func) == ast.dump(ast.parse("super().__init__", mode="eval").body)):
+                for keyword in node.keywords:
+                    if isinstance(keyword.value, ast.Name) and keyword.arg == keyword.value.id:
+                        forwarded[id(keyword.value)] = keyword.arg
+        base_discarded = discarded_in(mro[owner_index + 1:]) if forwarded else set()
+        candidates = direct | base_discarded
+        return {name for name in candidates if all(
+            isinstance(node.ctx, ast.Del)
+            or (name in base_discarded and forwarded.get(id(node)) == name)
+            for node in nodes if isinstance(node, ast.Name) and node.id == name
+        )}
+
+    return discarded_in(member.__mro__)
+
 
 def _constructor_expression(
     record: dict, imports: list[ImportPatch], classes: set[str], source: str, fqn: str | None,
@@ -305,7 +320,9 @@ def _constructor_expression(
         if key != "module" and parameter.default is not inspect.Parameter.empty:
             if key in discarded or (value == "None" and parameter.default is None):
                 continue
-        expression = _value_expression(context, imports) if key == "context" else value
+        expression = value
+        if key == "context":
+            expression = "None" if key in discarded else _value_expression(context, imports)
         kwargs.append(f"{key}={expression}")
     if fqn is not None:
         kwargs.append(f"module_fqn={fqn}")
