@@ -1,0 +1,131 @@
+{
+  "schema": "ascend-fusion-catalog/v1",
+  "entries": [
+    {
+      "id": "fusion-attention",
+      "symbol": "torch_npu.npu_fusion_attention",
+      "tags": [
+        "attention",
+        "softmax",
+        "bmm",
+        "flashattention"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000156.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000156.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "documented_training",
+      "review_note": "Documented for training only. Verify masks, scale, dropout, layout, variable lengths, and backward. Do not substitute inference FlashAttention."
+    },
+    {
+      "id": "rms-norm",
+      "symbol": "torch_npu.npu_rms_norm",
+      "tags": [
+        "rmsnorm",
+        "rms_norm",
+        "rsqrt",
+        "pow",
+        "reduce"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000139.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000139.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "backward_intermediate_documented",
+      "review_note": "Preserve epsilon, normalization dimensions, and gamma dtype. The documented outputs include backward intermediates; validate actual autograd behavior independently."
+    },
+    {
+      "id": "swiglu",
+      "symbol": "torch_npu.npu_swiglu",
+      "tags": [
+        "swiglu",
+        "silu",
+        "sigmoid",
+        "mul"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000143.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000143.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "requires_backward_verification",
+      "review_note": "The selected dimension must be divisible by 2, and the input must be contiguous and nonempty. Verify gate/up ordering and backward."
+    },
+    {
+      "id": "rotary",
+      "symbol": "torch_npu.npu_rotary_mul",
+      "tags": [
+        "rotary",
+        "rope",
+        "sin",
+        "cos"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000141.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000141.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "training_constraints_documented",
+      "review_note": "Verify half/interleaved layout and cos/sin gradients. The documentation notes that training may retain inputs and increase device memory."
+    },
+    {
+      "id": "grouped-matmul",
+      "symbol": "torch_npu.npu_grouped_matmul",
+      "tags": [
+        "matmul",
+        "gemm",
+        "expert",
+        "moe"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000160.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000160.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "inference_only_in_cached_version",
+      "review_note": "The cached documentation explicitly restricts this interface to inference. Training integration requires a matching training/backward implementation and independent validation."
+    },
+    {
+      "id": "moe-init-routing",
+      "symbol": "torch_npu.npu_moe_init_routing",
+      "tags": [
+        "moe",
+        "gather",
+        "sort",
+        "routing"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000169.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000169.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "inference_only_in_cached_version",
+      "review_note": "The cached documentation describes inference only and does not establish autograd support. Validate permutation, token conservation, and gradients."
+    },
+    {
+      "id": "moe-finalize-routing",
+      "symbol": "torch_npu.npu_moe_finalize_routing",
+      "tags": [
+        "moe",
+        "scatter",
+        "routing"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000167.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000167.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "inference_only_in_cached_version",
+      "review_note": "The cached documentation describes inference only. Training requires a separately implemented and validated backward that preserves scale weights and routing-index semantics."
+    },
+    {
+      "id": "fused-adamw",
+      "symbol": "torch_npu.optim.NpuFusedAdamW",
+      "tags": [
+        "adamw",
+        "optimizer"
+      ],
+      "doc_version": "Pytorch/700; PyTorch2.5.1 documentation branch",
+      "url": "https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_000298.html",
+      "content_url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/700/apiref/apilist/ptaoplist_000298.html",
+      "status": "candidate_requires_runtime_verification",
+      "training_support": "optimizer_requires_update_equivalence",
+      "review_note": "Applies to AdamW parameters only and cannot replace Muon. Verify optimizer states, bias correction, decoupled weight decay, epsilon, and per-step parameter updates."
+    }
+  ]
+}

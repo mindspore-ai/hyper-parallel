@@ -118,6 +118,13 @@ flops_per_step = flops_per_layer × L × (B / (dp × b))
 
 **Simplified**: `flops_per_step ≈ 6 × total_params × s × B`
 
+> Accounting convention: `6 × params` already includes forward and backward
+> computation; do not multiply it by two again. This approximation omits
+> attention terms proportional to `4·s²·b·h` and underestimates long-sequence
+> work. Use the detailed expression above or the framework's PaLM-style
+> telemetry when reporting MFU. See
+> `.agent/skills/perf-playbook/references/mfu-targets.md`.
+
 ## 2.4 Baseline Summary
 
 ```

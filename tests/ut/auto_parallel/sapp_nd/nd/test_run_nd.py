@@ -1583,9 +1583,9 @@ class TestSappNDRunND(unittest.TestCase):
         """
         Feature: TestSappNDRunND.
         Description: ``-f hyper_v2 -s search.yaml`` with a ``-d`` that is not a whole number of
-                     nodes: 8 cards on A3, whose node holds 16, and 12 where the config states 8.
+                     nodes: 4 dies on A3, whose node holds 8, and 12 where the config states 8.
         Expectation: The run stops with a usage error before any search: the search config counts
-                     whole nodes and would price 16 devices for either.
+                     whole nodes and cannot represent either partial node.
         """
         with tempfile.TemporaryDirectory() as tmp_dir, \
                 patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
@@ -1597,7 +1597,7 @@ class TestSappNDRunND(unittest.TestCase):
                 fh.write("parallelism:\n  dp: [1, 2]\n")
 
             for flags, cluster_spec, node in (
-                    (["-A", "A3", "-d", "8"], {"num_nodes": 4, "device_type": "A2"}, 16),
+                    (["-A", "A3", "-d", "4"], {"num_nodes": 4, "device_type": "A2"}, 8),
                     (["-d", "12"], {"num_nodes": 4, "cards_per_node": 8, "device_type": "A2"}, 8),
             ):
                 fake_config = SimpleNamespace(resolved_strategy=None, constraint={}, cluster_spec=cluster_spec)
@@ -3260,8 +3260,8 @@ class TestSappNDRunND(unittest.TestCase):
         Feature: state_machine_links.
         Description: A config and a multimodal one with a submodule, given
             the A3 machine, then a config given no machine.
-        Expectation: Each config takes A3's 16 ranks a node and its 200 and
-            25 GB/s links, where every config kept 8, 400 and 25 whatever
+        Expectation: Each config takes A3's 8 ranks a node and its 196 and
+            196 GB/s links, where every config kept 8, 400 and 25 whatever
             the machine; without a machine nothing is stated.
         """
         plain, child = SimpleNamespace(), SimpleNamespace()
@@ -3269,7 +3269,7 @@ class TestSappNDRunND(unittest.TestCase):
         for cfg in (plain, multimodal):
             Par.state_machine_links(cfg, Hard.Device_A3)
         got = [(cfg.device_per_node, cfg.bw_intra, cfg.bw_inter) for cfg in (plain, multimodal, child)]
-        self.assertEqual(got, [(16, 200, 25)] * 3)
+        self.assertEqual(got, [(8, 196, 196)] * 3)
         untouched = SimpleNamespace()
         Par.state_machine_links(untouched, None)
         self.assertEqual(vars(untouched), {})

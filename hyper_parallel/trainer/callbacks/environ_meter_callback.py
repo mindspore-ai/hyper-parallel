@@ -16,17 +16,30 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
+
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.trainer.runtime.flops import estimate_step_flops
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.trainer.runtime.device import get_device_type, get_torch_device
+from hyper_parallel.trainer.runtime.model_flops import (
+    DeltaRuleLayer,
+    MatmulParamCount,
+    ModelFlopsProfile,
+    attention_layers_from_config,
+    count_matmul_params,
+)
 
 from .base import Callback, TrainerState
+
+
+logger = logging.getLogger(__name__)
 
 
 class EnvironMeterCallback(Callback):
@@ -56,6 +69,13 @@ class EnvironMeterCallback(Callback):
         self._local_mean_metrics: dict[str, tuple[Any, int]] = {}
         self._consumed_tokens = 0
         self._consumed_samples = 0
+        self._flops_profile: ModelFlopsProfile | None = None
+        self._peak_flops_per_device: float | None = None
+        self._recompute_all_layers = False
+        self._flops_per_token_logged = False
+        self._hfu_extra_flops_per_step = 0.0
+        self._target_specs: list[tuple[str, str, float, bool]] = []
+        self._target_stats: dict[str, dict[str, float]] = {}
         self.trainer.step_train_metrics = {}
         self.trainer.step_env_metrics = {}
 
@@ -306,6 +326,196 @@ class EnvironMeterCallback(Callback):
             "memory/device_max_reserved_gb": reserved / gibibyte,
         }
 
+    def _log_rank_zero(self, level: int, message: str, *args: Any) -> None:
+        """Log once per job from global rank zero."""
+        if getattr(self.trainer, "global_rank", 0) == 0:
+            logger.log(level, message, *args)
+
+    def _mfu_config(self) -> Any:
+        """Return ``training.mfu`` when the trainer carries a configuration."""
+        training = getattr(getattr(self.trainer, "config", None), "training", None)
+        return getattr(training, "mfu", None)
+
+    def _gather_pipeline_counts(self, count: MatmulParamCount) -> MatmulParamCount:
+        """Sum the disjoint parameter counts of pipeline stages.
+
+        Every rank of a stage reports the same global DTensor sizes, so the
+        world-wide sum is divided by the number of ranks per stage. Exact
+        integers travel as objects because the counts exceed float32 precision.
+        """
+        pp_size = int(getattr(getattr(self.trainer, "mesh", None), "pp_size", 1) or 1)
+        if pp_size <= 1 or not dist.is_initialized():
+            return count
+        world_size = dist.get_world_size()
+        gathered: list[Any] = [None] * world_size
+        dist.all_gather_object(gathered, count)
+        ranks_per_stage = world_size // pp_size
+        return MatmulParamCount(
+            matmul_params=sum((item.matmul_params for item in gathered), start=0) / ranks_per_stage,
+            output_head_params=sum((item.output_head_params for item in gathered), start=0) / ranks_per_stage,
+            vision_params=sum((item.vision_params for item in gathered), start=0) / ranks_per_stage,
+            unsupported=tuple(sorted({reason for item in gathered for reason in item.unsupported})),
+        )
+
+    def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
+        """Prepare PaLM model-FLOPs reporting when ``training.mfu.enabled`` is set.
+
+        Args:
+            state: Current training progress.
+            **kwargs: Unused callback context.
+
+        Raises:
+            ValueError: If the configured peak throughput is not positive.
+        """
+        del state, kwargs
+        mfu_config = self._mfu_config()
+        if mfu_config is None or not mfu_config.enabled:
+            return
+        peak_tflops = mfu_config.peak_tflops_per_device
+        if peak_tflops is not None and peak_tflops <= 0:
+            raise ValueError(f"training.mfu.peak_tflops_per_device must be positive, but got {peak_tflops}")
+        self._validate_mfu_targets(mfu_config)
+
+        model_parts = getattr(self.trainer, "model_parts", None) or [self.trainer.model]
+        model_config = getattr(self.trainer, "model_config", None)
+        count = self._gather_pipeline_counts(count_matmul_params(model_parts, model_config))
+        attention_layers, attention_reason = attention_layers_from_config(model_config)
+        unsupported = list(count.unsupported) + ([attention_reason] if attention_reason else [])
+        if unsupported:
+            self._log_rank_zero(logging.WARNING, "PaLM MFU reporting is disabled: %s.", "; ".join(unsupported))
+            return
+
+        self._flops_profile = ModelFlopsProfile(
+            matmul_params=float(count.matmul_params),
+            output_head_params=float(count.output_head_params),
+            attention_layers=attention_layers,
+        )
+        self._peak_flops_per_device = None if peak_tflops is None else float(peak_tflops) * 1e12
+        checkpoint_mode = getattr(getattr(self.trainer.config, "activation_checkpoint", None), "mode", None)
+        self._recompute_all_layers = checkpoint_mode == "full"
+        extra_tflops = mfu_config.hfu_extra_tflops_per_step
+        self._hfu_extra_flops_per_step = 0.0 if extra_tflops is None else float(extra_tflops) * 1e12
+        self._target_specs = self._build_target_specs(mfu_config)
+        if self._recompute_all_layers and extra_tflops is not None:
+            hfu_note = f"adds the full-recompute forward and {extra_tflops:g} declared extra TFLOPs/step"
+        elif self._recompute_all_layers:
+            hfu_note = "adds the full-recompute forward"
+        elif extra_tflops is not None:
+            hfu_note = f"adds {extra_tflops:g} declared extra TFLOPs/step"
+        else:
+            hfu_note = "is not reported"
+        linear_layers = sum(isinstance(layer, DeltaRuleLayer) for layer in attention_layers)
+        self._log_rank_zero(
+            logging.INFO,
+            "PaLM MFU reporting: N=%.6e active matmul parameters per token (output head %.6e), "
+            "%d softmax-attention and %d delta-rule layers%s, peak %s TFLOPS per device; HFU %s.",
+            self._flops_profile.matmul_params,
+            self._flops_profile.output_head_params,
+            len(attention_layers) - linear_layers,
+            linear_layers,
+            f", decoder only ({float(count.vision_params):.6e} vision-encoder parameters excluded)"
+            if count.vision_params else "",
+            "not set (MFU not reported)" if peak_tflops is None else f"{peak_tflops:g}",
+            hfu_note,
+        )
+        for label, _, threshold, higher in self._target_specs:
+            self._log_rank_zero(logging.INFO, "MFU target registered: %s %s %.6g.",
+                                label, ">=" if higher else "<=", threshold)
+
+    def _validate_mfu_targets(self, mfu_config: Any) -> None:
+        """Reject impossible target configurations before training starts."""
+        for name in ("hfu_extra_tflops_per_step", "target_mfu_percent", "target_hfu_percent",
+                     "target_tokens_per_s_per_device", "target_step_time_s"):
+            value = getattr(mfu_config, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"training.mfu.{name} must be positive, but got {value}")
+        has_peak = mfu_config.peak_tflops_per_device is not None
+        if not has_peak and (mfu_config.target_mfu_percent is not None
+                             or mfu_config.target_hfu_percent is not None):
+            raise ValueError("training.mfu utilization targets require peak_tflops_per_device")
+        if mfu_config.target_hfu_percent is not None and mfu_config.hfu_extra_tflops_per_step is None:
+            checkpoint_mode = getattr(getattr(self.trainer.config, "activation_checkpoint", None), "mode", None)
+            if checkpoint_mode != "full":
+                raise ValueError("training.mfu.target_hfu_percent requires full activation recompute "
+                                 "or hfu_extra_tflops_per_step; HFU would never be measured")
+
+    @staticmethod
+    def _build_target_specs(mfu_config: Any) -> list[tuple[str, str, float, bool]]:
+        """Collect the configured targets as (label, metric key, threshold, higher-is-better)."""
+        candidates = (
+            ("MFU %", "performance/mfu_percent", mfu_config.target_mfu_percent, True),
+            ("HFU %", "performance/hfu_percent", mfu_config.target_hfu_percent, True),
+            ("tokens/s/device", "performance/tokens_per_s_per_device",
+             mfu_config.target_tokens_per_s_per_device, True),
+            ("step time s", "step_time", mfu_config.target_step_time_s, False),
+        )
+        return [(label, key, float(value), higher)
+                for label, key, value, higher in candidates if value is not None]
+
+    def _track_targets(self, metrics: dict[str, float], step_time: float) -> None:
+        """Judge each configured target against this logged step."""
+        for label, key, threshold, higher in self._target_specs:
+            value = step_time if key == "step_time" else metrics.get(key)
+            if value is None:
+                continue
+            stats = self._target_stats.setdefault(
+                label, {"sum": 0.0, "steps": 0, "met": 0, "threshold": threshold, "higher": higher})
+            stats["sum"] += value
+            stats["steps"] += 1
+            if (value >= threshold) if higher else (value <= threshold):
+                stats["met"] += 1
+
+    def on_train_end(self, state: TrainerState, **kwargs: Any) -> None:
+        """Log one verdict line per configured target: mean, met count, met/missed."""
+        del state, kwargs
+        for label, stats in self._target_stats.items():
+            mean = stats["sum"] / stats["steps"]
+            higher = bool(stats["higher"])
+            met_by_mean = (mean >= stats["threshold"]) if higher else (mean <= stats["threshold"])
+            self._log_rank_zero(
+                logging.INFO,
+                "MFU target summary — %s: required %s %.6g, mean %.6g over %d logged steps "
+                "(met in %d), verdict %s.",
+                label, ">=" if higher else "<=", stats["threshold"], mean,
+                int(stats["steps"]), int(stats["met"]), "MET" if met_by_mean else "MISSED",
+            )
+
+    def _flops_metrics(self, model_tokens: float, sequence_squares: float, step_time: float) -> dict[str, float]:
+        """Return achieved model TFLOPS per device and the PaLM utilizations.
+
+        The input geometry is shared with the TFLOP/s meter. The
+        token-weighted sequence length preserves full-attention work over
+        variable lengths and equals the sequence length on fixed batches.
+        """
+        if self._flops_profile is None or sequence_squares <= 0 or model_tokens <= 0 or step_time <= 0:
+            return {}
+        seq_len = sequence_squares / model_tokens
+        tokens_per_second = model_tokens / step_time
+        flops_per_token = self._flops_profile.flops_per_token(seq_len)
+        if not self._flops_per_token_logged:
+            self._log_rank_zero(
+                logging.INFO, "PaLM MFU: sequence length %.6g, model FLOPs per token %.6e.", seq_len, flops_per_token
+            )
+            self._flops_per_token_logged = True
+        world_size = max(get_world_size_safe(), 1)
+        model_flops_per_device = flops_per_token * tokens_per_second / world_size
+        metrics = {
+            "performance/model_tflops_per_device": model_flops_per_device / 1e12,
+            "performance/tokens_per_s_per_device": tokens_per_second / world_size,
+        }
+        if self._peak_flops_per_device is not None:
+            metrics["performance/mfu_percent"] = model_flops_per_device / self._peak_flops_per_device * 100.0
+            if self._recompute_all_layers or self._hfu_extra_flops_per_step:
+                recompute_flops = (self._flops_profile.recompute_flops_per_token(seq_len)
+                                   if self._recompute_all_layers else 0.0)
+                hardware_flops_per_device = (
+                    (flops_per_token + recompute_flops) * tokens_per_second / world_size
+                    + self._hfu_extra_flops_per_step / step_time
+                )
+                metrics["performance/hfu_percent"] = hardware_flops_per_device / self._peak_flops_per_device * 100.0
+        self._track_targets(metrics, step_time)
+        return metrics
+
     def state_dict(self) -> dict[str, int]:
         """Return cumulative metric state for future checkpoint integration."""
         return {
@@ -447,6 +657,7 @@ class EnvironMeterCallback(Callback):
             "data/consumed_tokens": float(self._consumed_tokens),
             "data/step_samples": float(global_samples),
             "data/consumed_samples": float(self._consumed_samples),
+            **self._flops_metrics(global_input_tokens, global_seq_len_sq, global_step_time),
             **self._memory_metrics(),
         }
 

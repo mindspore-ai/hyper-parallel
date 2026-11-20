@@ -21,6 +21,38 @@ from hyper_parallel.components.quantization.config import LowPrecisionConfig
 
 
 @dataclass
+class MfuConfig:
+    """Opt-in model-FLOPs utilization reporting with the PaLM formula.
+
+    ``enabled`` adds per-device achieved model TFLOPS to the step metrics and
+    the progress line. MFU — and HFU, when every decoder layer is recomputed
+    and/or an extra executed-work term is declared — is reported only when
+    ``peak_tflops_per_device`` states the device's dense peak for the
+    training precision; no peak is assumed.
+
+    ``hfu_extra_tflops_per_step`` is an operator-derived per-device estimate
+    of additional executed work per step (optimizer Newton–Schulz iterations,
+    router fix-ups, selective recompute), in TFLOPs, added to the HFU
+    numerator; record its derivation wherever the run is reported.
+
+    The ``target_*`` fields turn acceptance requirements into verdicts:
+    utilizations and throughput are met at or above their target, step time
+    at or below. Every logged step is judged, and the training-end summary
+    states each target's mean, met-step count, and verdict. Utilization
+    targets require the peak; an HFU target additionally requires full
+    recompute or the extra term, or it could never be measured.
+    """
+
+    enabled: bool = False
+    peak_tflops_per_device: Optional[float] = None
+    hfu_extra_tflops_per_step: Optional[float] = None
+    target_mfu_percent: Optional[float] = None
+    target_hfu_percent: Optional[float] = None
+    target_tokens_per_s_per_device: Optional[float] = None
+    target_step_time_s: Optional[float] = None
+
+
+@dataclass
 class TrainingConfig:
     """Training-loop parameters exposed by the initial YAML schema."""
 
@@ -54,6 +86,7 @@ class TrainingConfig:
     attention over the real sequence boundaries.
     """
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
+    mfu: MfuConfig = field(default_factory=MfuConfig)
 
 
 @dataclass

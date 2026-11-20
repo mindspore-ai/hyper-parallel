@@ -138,6 +138,36 @@ class TestTqdmCallback(unittest.TestCase):
         self.assertNotIn("TFLOP/s", output, f"disabled metric must not render, got={output!r}")
         self.assertIn("tokens/s=128.125", output, f"existing metric missing from postfix, got={output!r}")
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_progress_shows_flops_utilization_when_published(self) -> None:
+        """Show model TFLOPS, MFU and HFU only when the environment meter publishes them.
+
+        Feature: Trainer progress output for PaLM MFU.
+        Description: Build the progress postfix with and without utilization metrics.
+        Expectation: Published metrics appear with percent formatting; absent ones add no columns.
+        """
+        trainer = self._build_trainer()
+        callback = TqdmCallback(trainer)
+        build_postfix = getattr(callback, "_postfix")
+        postfix = build_postfix()
+        for label in ("tflops/device", "mfu", "hfu"):
+            self.assertNotIn(label, postfix, f"case: {label}_absent_without_metric, got={postfix}")
+
+        trainer.step_env_metrics = {
+            "performance/model_tflops_per_device": 49.1834,
+            "performance/mfu_percent": 12.29585,
+            "performance/hfu_percent": 16.12,
+        }
+        postfix = build_postfix()
+        expected = {"tflops/device": "49.18", "mfu": "12.30%", "hfu": "16.12%"}
+        for label, value in expected.items():
+            self.assertEqual(postfix.get(label), value, f"case: {label}_formatted, got={postfix}")
+
 
 if __name__ == "__main__":
     unittest.main()

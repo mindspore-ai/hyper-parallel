@@ -1,0 +1,18 @@
+{
+  "schema": "bringup-bench/trial-meta/v1",
+  "model_id": "smollm2-360m",
+  "assets_ref": "<40-hex-commit>",
+  "agent_model": "<model name the trial agent ran on>",
+  "started": "2026-11-03T00:00:00Z",
+  "ended": "2026-11-03T02:10:00Z",
+  "stages": {"S0": "done", "S1": "done", "S2": "partial", "S3": "blocked"},
+  "gates": [
+    {"name": "s0_spec_card", "verdict": "pass", "evidence": "s0_survey/s0_migration_spec.md"},
+    {"name": "layout_contract", "verdict": "pass", "evidence": "logs/s1_layout_check.log"},
+    {"name": "forward_parity", "verdict": "pass", "evidence": "s2_correctness/s2_load_generate_parity.json"},
+    {"name": "training_smoke", "verdict": "env_stop", "evidence": "logs/s2_training_smoke.log"},
+    {"name": "equivalence_matrix", "verdict": "blocked", "evidence": "needs accelerator"}
+  ],
+  "env_stops": 1,
+  "inventions": 1
+}

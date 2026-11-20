@@ -1,0 +1,3 @@
+{"id": "G1", "category": "missing", "stage": "S1", "indicted_file": ".agent/skills/hf-model-integration/references/bringup-field-checklist.md", "summary": "checklist names a handoff file no zero-registration tool produces", "evidence": "logs/s1_parity_attempt.log"}
+{"id": "G2", "category": "wrong", "stage": "S2", "indicted_file": "examples/training_demo/hf_text_bringup/run_hf_text.sh", "summary": "launcher assumes a libuv-enabled torch build", "evidence": "logs/s2_training_smoke.log"}
+{"id": "G3", "category": "contradictory", "stage": "S0", "indicted_file": ".agent/skills/hf-model-integration/SKILL.md", "summary": "two assets disagree on which stage owns the environment profile", "evidence": "s0_survey/environment-profile.filled.md"}

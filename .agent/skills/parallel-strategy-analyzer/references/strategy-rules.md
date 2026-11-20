@@ -195,7 +195,7 @@ tp_size <= devices_per_node
 # CP bandwidth reality:
 #   On 8-die nodes: tp already occupies most/all intra-node slots,
 #   so cp > 1 almost always requires cross-node communication.
-#   Only 16-die nodes (A3/950DT) can fit both tp and cp intra-node.
+#   Only 16-die nodes (950DT) can fit both tp and cp intra-node.
 cp_intra = devices_per_node / tp_size        # max CP that stays intra-node
 # If cp > cp_intra → effective_bw = bw_inter (not bw_intra)
 # For GQA/MLA this is acceptable (low KV volume); for MHA it's costly.
@@ -233,7 +233,8 @@ FSDP level2 + TP=8 + PP=2 + DP=N/16 + recompute   # add PP for very large
 ```
 FSDP level2 + TP=8 + PP=4 + DP=N/32 + recompute
 FSDP level3 + TP=8 + PP=8 + DP=N/64 + recompute   # level3 if needed
-# A3/950DT: FSDP level2 + TP=16 + PP=4 + swap + recompute
+# A3 (8 dies/node): FSDP level2 + TP=8 + PP=4 + swap + recompute
+# 950DT (16 dies/node): FSDP level2 + TP=16 + PP=4 + swap + recompute
 ```
 
 ## Common Strategy Templates (Long Sequence)
