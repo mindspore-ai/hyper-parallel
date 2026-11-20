@@ -194,6 +194,8 @@ norm = RMSNorm(hidden_size=128, eps=1e-6)
 
 ## 注册新算子族或后端
 
+完整开发流程、两层精度基线、测试接入和交付标准见 [OpSelect 算子开发流程与验收标准](../contributing/op_select_development.zh.md)。下面介绍注册接口与目录约定。
+
 1. **从参考实现确定契约。** 在 `components/ops/families/<配置键>.py` 同时维护契约与实现，文件名与 YAML 键一致。用 `Protocol` 描述参考实现所需的入参、返回值和梯度语义，用 `OpSpec` 指定族名和变体名。同族可以有多个变体。内核专有的参数由实现绑定，例如 Grouped Matmul 的 NPU 分组编码。[Grouped Matmul 契约与适配](../../hyper_parallel/components/ops/families/grouped_matmul.py)
 2. **登记实现。** 用 `register_family` 一次登记族内全部变体，再对每个变体调用 `register_impl`。`load` 是无参加载器，可返回函数、实现了 `__call__` 的对象或 `nn.Module`。可在实现内部封装 `torch.autograd.Function` 来定义反向。训练参数由模型模块持有，在调用时传入。`check_compatibility(x)` 根据主输入的设备和 dtype 判断兼容性，返回 `None` 表示可用，返回字符串给出拒绝原因。形状、布局及多个输入之间的约束由公共入口检查，并把候选限制纳入解析缓存。可选包或算子缺失时，加载器使用 `ImplementationUnavailable` 告知自动选择继续检查下一候选。[注册接口](../../hyper_parallel/components/ops/registry.py) · [依赖检查](../../hyper_parallel/components/ops/_dependency.py)
 3. **设置默认顺序并导出。** 新族在 `catalog.py` 中组装，目录封存前用 `auto_policy.py` 的 `set_auto_order` 设置每个变体和设备的默认顺序。新变体的函数从包入口导出，简单契约可用 `_dispatch(SPEC)`。只新增同一变体的后端时，复用现有入口。[包入口](../../hyper_parallel/components/ops/__init__.py) · [自动选择策略](../../hyper_parallel/components/ops/auto_policy.py)

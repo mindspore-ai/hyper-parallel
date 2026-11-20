@@ -50,6 +50,7 @@
 |------|------|
 | [开发环境搭建](./contributing/dev_environment.zh.md) | 开发环境配置、依赖安装 |
 | [测试流程规范](./contributing/testing.zh.md) | 测试框架、标记规范、分布式测试 |
+| [OpSelect 算子开发与验收](./contributing/op_select_development.zh.md) | 计算契约、后端接入、native 精度基线及模块和性能验收 |
 | [发布流程规范](./contributing/release.zh.md) | 版本发布流程、文档更新规范 |
 
 ## 其他
