@@ -24,7 +24,7 @@ import textwrap
 
 from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
 from hyper_parallel.codegen.astkit.index import build_source_index
-from hyper_parallel.codegen.inline.ir import ImportPatch, InlinePatchSet
+from hyper_parallel.codegen.inline.ir import ImportPatch, InlinePatchSet, ModuleSnippetPatch
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 
 
@@ -56,9 +56,11 @@ def materialize_method_hosts(source: str, records: dict) -> str:
             if isinstance(argument, ast.arg):
                 argument.annotation = None
         ast.fix_missing_locations(function)
-        alias = f"_Native{name}"
-        imports.append(ImportPatch(module, (), raw=f"from {module} import {name} as {alias}"))
-        source += f"\n\nclass {name}({alias}):\n" + textwrap.indent(ast.unparse(function), "    ") + "\n"
+        declaration = f"class {name}({module}.{name}):\n" + textwrap.indent(ast.unparse(function), "    ") + "\n"
+        source = apply_patch_set(source, InlinePatchSet(
+            imports=[ImportPatch(module, (), raw=f"import {module}")],
+            module_snippets=[ModuleSnippetPatch(declaration)],
+        ))
         names.add(name)
     return apply_patch_set(source, InlinePatchSet(imports=imports))
 
@@ -102,9 +104,10 @@ def materialize_observed_methods(source: str, records: dict) -> str:
         module, name = identity.split(":", 1)
         index = build_source_index(source)
         if name not in index.classes:
-            alias = f"_Native{name}"
-            imports.append(ImportPatch(module, (), raw=f"from {module} import {name} as {alias}"))
-            source += f"\n\nclass {name}({alias}):\n    pass\n"
+            source = apply_patch_set(source, InlinePatchSet(
+                imports=[ImportPatch(module, (), raw=f"import {module}")],
+                module_snippets=[ModuleSnippetPatch(f"class {name}({module}.{name}):\n    pass\n")],
+            ))
             index = build_source_index(source)
         host = index.classes[name]
         additions = []
