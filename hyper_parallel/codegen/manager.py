@@ -121,6 +121,7 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
         mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
         preinstalled_components=preinstalled,
         parallel_forwards=dict(frozen_plan.get("parallel_forwards") or {}),
+        materialized_methods=dict(frozen_plan.get("materialized_methods") or {}),
         emission_patches=emission_patches,
     )
 

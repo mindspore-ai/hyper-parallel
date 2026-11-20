@@ -44,6 +44,7 @@ from hyper_parallel.codegen.emit.family_forwards import (
 )
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
+from hyper_parallel.codegen.emit.methods import materialize_observed_methods
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_plan
 from hyper_parallel.codegen.inline.construction import (
     construction_sites,
@@ -354,6 +355,7 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
         ),
     )
     text = materialize_parallel_family_forwards(text, getattr(meta, "parallel_forwards", {}))
+    text = materialize_observed_methods(text, getattr(meta, "materialized_methods", {}))
     text = _lower_forward_boundaries(text, emission_meta, module_name)
     text = materialize_module_constructions(text, getattr(meta, "preinstalled_components", ()))
     _verify_recorded_patch_materialization(
