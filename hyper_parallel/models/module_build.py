@@ -30,6 +30,7 @@ from hyper_parallel.components.modules.module_family import (
     FamilyBoundary, FamilyBuildInfo, _build_family_member, _context_from_mesh, collect_family_modules, resolve_family,
     validate_family_context,
 )
+from hyper_parallel.components.quantization.config import LowPrecisionConfig
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.registry import _normalize_family_key, get_model_adapter
 from hyper_parallel.models.replacement import (
@@ -316,12 +317,15 @@ def model_weight_mapping(model: nn.Module) -> list:
 def _validate_low_precision_targets(
     model: nn.Module, plan: ModuleReplacementPlan, context: Mapping[str, Any],
 ) -> None:
-    """Validate a policy after direct members and model-owned defaults are known."""
-    if context.get("low_precision") is None:
+    """Validate an implicit policy after direct members and defaults are known."""
+    low_precision = context.get("low_precision")
+    if low_precision is None:
         return
     if context.get("legacy_low_precision_targets"):
         return
     if context.get("module_replacement_requests") is None and context.get("module_replacements"):
+        return
+    if isinstance(low_precision, LowPrecisionConfig) and low_precision.dtype_schemes:
         return
     if any(boundary.info.resolved.selectors.get("precision", "inherit") != "inherit"
            for boundary in collect_family_modules(model)):
