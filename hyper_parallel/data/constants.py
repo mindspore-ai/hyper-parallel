@@ -93,13 +93,13 @@ OMNI_CONCAT_FIELDS = {
     "pixel_values_videos",
     "video_grid_thw",
 }
-OMNI_LOSS_INPUT_FIELDS = {"labels", "loss_mask", "stream_loss_mask"}
-OMNI_INTERNAL_FIELDS = {"loss_mask", "stream_loss_mask", "cu_seq_lens", "packing_length"}
+OMNI_LOSS_INPUT_FIELDS = {"labels", "shift_labels", "loss_mask", "stream_loss_mask"}
+OMNI_INTERNAL_FIELDS = {"shift_labels", "loss_mask", "stream_loss_mask", "cu_seq_lens", "packing_length"}
 OMNI_CP_TOKEN_FIELDS = frozenset({
-    "input_ids", "labels", "loss_mask", "stream_loss_mask", "attention_mask", "position_ids",
+    "input_ids", "labels", "shift_labels", "loss_mask", "stream_loss_mask", "attention_mask", "position_ids",
     "text_position_ids", "router_attention_mask", "mm_token_type_ids", "token_types",
 })
-OMNI_CP_PAD_VALUES = {"labels": -100, "token_types": -1, "mm_token_type_ids": -1}
+OMNI_CP_PAD_VALUES = {"labels": -100, "shift_labels": -100, "token_types": -1, "mm_token_type_ids": -1}
 
 # Indexed dataset storage and object-store paths.
 INDEX_HEADER = b"MMIDIDX\x00\x00"

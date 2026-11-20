@@ -28,6 +28,7 @@ from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
 )
 from hyper_parallel.data.constants import (
+    IGNORE_INDEX,
     OMNI_CP_TOKEN_FIELDS,
     OMNI_INTERNAL_FIELDS,
     OMNI_LOSS_INPUT_FIELDS,
@@ -57,6 +58,7 @@ class OmniParallelBatch:
             runtime_input_adapter: RuntimeInputAdapter | None = None,
             dataloader_context: DataLoaderParallelContext | None = None,
             data_config: Mapping[str, Any] | None = None,
+            shift_labels_for_loss: bool = False,
     ) -> None:
         """Create the DataLoader ownership and TP/CP transport context.
 
@@ -67,6 +69,7 @@ class OmniParallelBatch:
             runtime_input_adapter: Provider of additional forward inputs.
             data_config: Dataset cache settings used by DataLoader ownership.
             dataloader_context: Shared ownership and transport policy from the Trainer.
+            shift_labels_for_loss: Align unshifted labels and loss masks before CP for chunked loss.
         """
         # if encoder_dp:
         #     raise NotImplementedError("OmniParallelBatch encoder_dp image-bucket distribution is not implemented")
@@ -91,6 +94,7 @@ class OmniParallelBatch:
         self.device = device
         self.sequence_parallel = bool(mesh_context.sequence_parallel)
         self.runtime_input_adapter = runtime_input_adapter
+        self.shift_labels_for_loss = shift_labels_for_loss
         self.cp_sharder = CPBatchSharder(self.parallel_context, token_fields=OMNI_CP_TOKEN_FIELDS)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
         self.batch_transport = None
@@ -112,6 +116,8 @@ class OmniParallelBatch:
                 raise TypeError("Omni DataLoader must yield a mapping batch")
 
             normalized_batch = self._normalize_source_batch(source_batch)
+            if self.shift_labels_for_loss:
+                self._align_chunk_loss(normalized_batch)
             local_batch = self.cp_sharder.shard(normalized_batch)
             logger.debug(
                 "Omni get_batch: batch=%d source_ready global_shape=%s local_shape=%s tp=%d cp=%d cp_rank=%d",
@@ -156,6 +162,22 @@ class OmniParallelBatch:
         if "cu_seq_lens" in batch:
             batch["cu_seq_lens"] = batch["cu_seq_lens"].reshape(-1)
         return batch
+
+    @staticmethod
+    def _align_chunk_loss(batch: dict[str, Any]) -> None:
+        """Align the loss targets on the full sequence before taking CP slices."""
+        if "shift_labels" in batch:
+            return
+        labels, mask = batch["labels"], batch["loss_mask"]
+        if labels.ndim != 2 or labels.shape != mask.shape:
+            raise ValueError("Omni chunk loss requires a [batch, sequence] label and loss mask")
+        batch["shift_labels"] = torch.nn.functional.pad(labels[:, 1:], (0, 1), value=IGNORE_INDEX)
+        batch["loss_mask"] = torch.nn.functional.pad(mask[:, 1:], (0, 1), value=0)
+        boundaries = batch.get("cu_seq_lens")
+        if boundaries is not None:
+            document_ends = boundaries[1:-1].to(device=labels.device, dtype=torch.long) - 1
+            batch["shift_labels"].view(-1).index_fill_(0, document_ends, IGNORE_INDEX)
+            batch["loss_mask"].view(-1).index_fill_(0, document_ends, 0)
 
     def _build_runtime_inputs(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Call the configured model hook after TP/CP batch transport."""

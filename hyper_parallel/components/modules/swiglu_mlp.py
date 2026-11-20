@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import lru_cache
 from math import isfinite
 from typing import Any
 
@@ -64,6 +65,33 @@ def swiglu_activation(gate: torch.Tensor, up: torch.Tensor, *, limit: float = 0.
     if limit > 0:
         gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
     return F.silu(gate) * up
+
+
+
+@lru_cache(maxsize=1)
+def _load_fused_clamped_swiglu():
+    """Resolve the optional Triton backend only for supported accelerators."""
+    try:
+        from hyper_parallel.components.functional._triton.v41_fusions import FusedClampedSwiGLU  # pylint: disable=C0415
+    except ImportError:
+        return None
+    return FusedClampedSwiGLU.apply
+
+
+def shared_swiglu_activation(
+        gate: torch.Tensor, up: torch.Tensor, limit: float, activation_dtype: str, output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply the shared-expert activation at the down-projection dtype boundary."""
+    if (
+            gate.device.type == "npu" and gate.dtype == up.dtype == output_dtype == torch.bfloat16
+            and gate.shape == up.shape and gate.numel() > 0 and activation_dtype == "float32"
+            and limit > 0 and isfinite(limit) and type(gate) is torch.Tensor and type(up) is torch.Tensor
+            and not torch.compiler.is_compiling()
+    ):
+        fused = _load_fused_clamped_swiglu()
+        if fused is not None:
+            return fused(gate, up, limit)
+    return swiglu_activation(gate, up, limit=limit, activation_dtype=activation_dtype).to(output_dtype)
 
 
 def local_swiglu(x: torch.Tensor, *, limit: float = 0.0, activation_dtype: str | None = None) -> torch.Tensor:

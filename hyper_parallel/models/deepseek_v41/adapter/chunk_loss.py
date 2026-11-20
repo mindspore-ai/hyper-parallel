@@ -74,7 +74,14 @@ def _chunk_loss_forward(
         chunk_size=chunk_loss_chunk_size,
         ignore_index=chunk_loss_ignore_index,
     )
+    aux_loss = None
+    if getattr(model, "dspark", None) is not None and model_inputs.get("input_ids") is not None:
+        aux_loss, model.pending_extra_metrics = model.compute_dspark_loss(
+            model_inputs["input_ids"], chunk_loss_targets, model_inputs.get("packed_seq_params"),
+        )
     return ChunkedCausalLMOutput(
+        aux_loss=aux_loss,
+        aux_loss_coef=model.dspark_loss_coeff if aux_loss is not None else None,
         loss_sum=loss_sum,
         valid_token_count=chunk_loss_targets.ne(chunk_loss_ignore_index).sum(),
         logits=None,

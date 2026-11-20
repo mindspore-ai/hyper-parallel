@@ -874,6 +874,21 @@ def select_candidate_block_indices(
     return top.indices.masked_fill(top.values == float("-inf"), -1).to(torch.int32)
 
 
+
+def _complete_candidate_blocks(
+        visible: torch.Tensor, minimum: torch.Tensor | None, key_length: int, block_size: int,
+) -> torch.Tensor:
+    """Enumerate reachable blocks when the configured pool can hold them all."""
+    block_count = (key_length + block_size - 1) // block_size
+    blocks = torch.arange(block_count, device=visible.device).view(1, 1, -1)
+    visible = visible.unsqueeze(-1)
+    reachable = blocks * block_size < visible
+    if minimum is not None:
+        reachable = reachable & (((blocks + 1) * block_size).clamp_max(key_length) > minimum.unsqueeze(-1))
+    pinned = blocks == (visible - 1) // block_size
+    return torch.where(reachable | pinned, blocks, -1).to(torch.int32)
+
+
 def compressed_causal_candidates(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -1581,6 +1596,42 @@ class SharedCompressedDSAIndexer(nn.Module):
             )
         return topk_indices, candidate_blocks
 
+    def _select_complete_pool(
+            self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
+            candidate_blocks: torch.Tensor | None, query_offset: int,
+            reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
+            minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
+            causal_upper: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use native causal selection when candidate selection cannot prune valid keys."""
+        block_size = self.candidate_block_size
+        if block_size <= 0:
+            raise ValueError("Fused candidate-pool Indexer requires a positive candidate block size")
+        key_length = key.shape[1]
+        block_count = (key_length + block_size - 1) // block_size
+        if self.candidate_topk_blocks <= 0 or self.candidate_topk_blocks < block_count:
+            raise NotImplementedError("Fused candidate-pool Indexer requires coverage of the complete key bank")
+        if self.uses_candidates:
+            if candidate_blocks is None:
+                raise RuntimeError("a hierarchical Reindex layer requires candidate block ids")
+            if candidate_blocks.shape != (*query.shape[:2], block_count):
+                raise ValueError("Complete candidate pool must retain every key-bank block slot")
+        topk_indices = compressed_causal_topk(
+            query, key, merge_weight, compress_ratio=self.compress_ratio, sparse_count=self.index_topk,
+            query_offset=query_offset, query_chunk_size=self.query_chunk_size, reduce_sum=reduce_sum,
+            minimum_key_indices=minimum_key_indices, query_segments=query_segments, use_fused=True,
+        )
+        if self.is_candidate_source:
+            visible, minimum = _causal_key_bounds(
+                query, self.compress_ratio, query_offset, minimum_key_indices, query_segments, causal_upper,
+            )
+            candidate_blocks = _complete_candidate_blocks(visible, minimum, key_length, block_size)
+            candidate_blocks = candidate_blocks.expand(*query.shape[:2], block_count)
+        else:
+            width = min(self.index_topk, block_count * block_size)
+            topk_indices = torch.nn.functional.pad(topk_indices, (0, width - topk_indices.shape[-1]), value=-1)
+        return topk_indices, candidate_blocks
+
     def _select_indices(
             self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
             candidate_blocks: torch.Tensor | None, query_offset: int,
@@ -1590,7 +1641,10 @@ class SharedCompressedDSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Select the requested implementation without changing candidate policies."""
         if self.use_fused and (self.is_candidate_source or self.uses_candidates):
-            raise NotImplementedError("V4.1 fused Indexer does not support candidate-pool selection")
+            return self._select_complete_pool(
+                query, key, merge_weight, candidate_blocks, query_offset,
+                reduce_sum, minimum_key_indices, query_segments, causal_upper,
+            )
         if self.is_candidate_source:
             topk_indices, candidate_blocks = compressed_causal_topk_and_candidates(
                 query,

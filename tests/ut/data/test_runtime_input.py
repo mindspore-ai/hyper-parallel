@@ -23,6 +23,8 @@ from unittest.mock import patch
 import torch
 
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch, TextParallelBatch
+from hyper_parallel.data.constants import OMNI_CP_TOKEN_FIELDS
+from hyper_parallel.data.parallel import CPBatchSharder
 from hyper_parallel.data.batching.runtime_input import (
     AttentionRuntime,
     PackedAttentionRuntime,
@@ -86,6 +88,25 @@ class TestRuntimeInputAdapter(unittest.TestCase):
         batch_runtime.parallel_context = TestRuntimeInputAdapter._parallel_context()
         batch_runtime.sequence_parallel = False
         return batch_runtime
+
+    def test_omni_chunk_targets_preserve_cp_boundaries(self):
+        """Preserve a cross-shard target in the same document and mask document ends."""
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]),
+            "labels": torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]),
+            "loss_mask": torch.tensor([[1, 1, 0, 1, 1, 1, 0, 1]]),
+            "cu_seq_lens": torch.tensor([0, 3, 8]),
+        }
+        OmniParallelBatch._align_chunk_loss(batch)  # pylint: disable=protected-access
+        for rank, targets in enumerate(([[11, 12, -100, 14]], [[15, 16, 17, -100]])):
+            context = SimpleNamespace(cp_rank=rank, cp_world_size=2, tp_world_size=1)
+            local_batch = CPBatchSharder(context, token_fields=OMNI_CP_TOKEN_FIELDS).shard(batch)
+            model_inputs, loss_inputs = OmniParallelBatch._split_model_and_loss_inputs(  # pylint: disable=protected-access
+                local_batch
+            )
+            self.assertNotIn("shift_labels", model_inputs)
+            torch.testing.assert_close(loss_inputs["shift_labels"], torch.tensor(targets))
+        torch.testing.assert_close(batch["loss_mask"], torch.tensor([[1, 0, 0, 1, 1, 0, 1, 0]]))
 
     def test_omni_batch_merges_non_attention_runtime_inputs(self):
         """Exercise a model-owned extension of an Omni batch.

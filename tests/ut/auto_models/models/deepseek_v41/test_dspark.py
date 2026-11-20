@@ -31,7 +31,7 @@ from torch import nn
 from hyper_parallel import init_empty_weights
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
-from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
+from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark, _PrecomputedVocabLoss
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
 
 
@@ -115,6 +115,33 @@ class DSparkComponentTest(unittest.TestCase):
                      "dspark_supervised_tokens"):
             self.assertIn(name, metrics, f"missing metric {name}")
             self.assertTrue(torch.isfinite(metrics[name].float()).item(), f"{name} must be finite")
+
+    def test_packed_targets_stop_at_document_boundaries(self):
+        """Draft supervision stays within each packed document and the local shard."""
+        config = _small_config()
+        dspark, head = _build(config)
+        input_ids, _, targets, embeds = _batch(config, batch=1, seq=6)
+        starts = torch.tensor([[0, 0, 0, 3, 3, 3]])
+        _, metrics = dspark(targets, input_ids, None, embeds, head, segment_starts=starts)
+        self.assertEqual(metrics["dspark_supervised_tokens"].item(), 6)
+
+    def test_precomputed_vocabulary_loss_matches_eager_derivatives(self):
+        """The frozen backbone head stays detached while both DSpark paths get gradients."""
+        generator = torch.Generator().manual_seed(11)
+        hidden = torch.randn(5, 3, generator=generator, requires_grad=True)
+        markov = torch.randn(5, 2, generator=generator, requires_grad=True)
+        head = torch.randn(9, 3, generator=generator)
+        markov_head = torch.randn(9, 2, generator=generator, requires_grad=True)
+        targets = torch.tensor([1, IGNORE_INDEX, 3, 4, 0])
+        logits = nn.functional.linear(hidden, head) + nn.functional.linear(markov, markov_head)
+        expected = nn.functional.cross_entropy(logits, targets, ignore_index=IGNORE_INDEX, reduction="sum")
+        actual, hits = _PrecomputedVocabLoss.apply(hidden, markov, head, markov_head, targets)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(hits, (logits.argmax(dim=-1) == targets) & (targets != IGNORE_INDEX))
+        inputs = (hidden, markov, markov_head)
+        for actual_grad, expected_grad in zip(torch.autograd.grad(actual, inputs),
+                                               torch.autograd.grad(expected, inputs), strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
 
     def test_requires_detached_target_hiddens(self):
         """Grad-carrying backbone hiddens are rejected up front."""
