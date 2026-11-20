@@ -7,7 +7,7 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 | Category | Modules |
 | --- | --- |
-| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
+| Attention | `GroupedQueryAttention`, `GatedGroupedQueryAttention`, `MultiLatentAttention`, `GatedMultiLatentAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
@@ -27,6 +27,29 @@ output = norm(hidden_states)
 
 Registered module families select an implementation from explicit configuration rules before model construction.
 See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, rule semantics, and extension guidance.
+
+## Attention families
+
+Choose an attention family for the model's mathematical variant:
+
+| Family | Features and guide |
+| --- | --- |
+| [GroupedQueryAttention](attention/grouped_query_attention/README.md) | GQA with fused or separate QKV; Ulysses, KV AllGather and hybrid CP with input overlap |
+| [GatedGroupedQueryAttention](attention/gated_grouped_query_attention/README.md) | Qwen3.5 full attention with RoPE and a sigmoid output gate |
+| [MultiLatentAttention](attention/multi_latent_attention/README.md) | MLA with expanded or latent KV communication and supported forward/backward overlap |
+| [GatedMultiLatentAttention](attention/gated_multi_latent_attention/README.md) | NoPE MLA with an independent output gate and gate-aware CP scheduling |
+
+Each guide includes a YAML fragment, configuration choices, file responsibilities, the execution flow and support limits.
+Families support direct `config=` construction or `module=` conversion from a compatible source.
+Trainer YAML selects the family through `replace.implementation._target_`; `accelerator.cp_size` selects its local or CP member.
+
+```text
+YAML / config → family selection and layout → framework binding → shared attention forward
+```
+
+The algorithm owns the math and shared forward; the CP member handles input exchange and output restoration.
+TP/SP uses the framework's existing layout redistribution. Model/runtime inputs must provide the position information
+and document boundaries required by the selected attention family. Full training recipes are linked from the guides.
 
 ## Install custom operators
 
@@ -96,7 +119,7 @@ plan_overrides:
       source_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
       exact_type: true
       implementation:
-        _target_: hyper_parallel.components.modules.GQAAttention
+        _target_: hyper_parallel.components.modules.GroupedQueryAttention
 
   - match: "*.language_model.layers.*.mlp.experts"
     replace:

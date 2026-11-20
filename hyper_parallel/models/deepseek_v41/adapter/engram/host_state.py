@@ -32,7 +32,7 @@ from hyper_parallel.core.utils.clip_grad import (
     dense_grad_norm_sq_and_refs,
     scale_grad_refs_,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.host_sparse_grad import (
+from hyper_parallel.components.modules.engram.parallel_engram import (
     sparse_sum_same_ep,
     stage_check,
     stage_reduce_scalar,
@@ -53,7 +53,7 @@ from hyper_parallel.models.deepseek_v41.adapter.checkpoint.host_sidecar import (
     before_checkpoint_save,
 )
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_source import materialize_owner_rows
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.adapter.optim.host_sparse import (
     HostSparseOptimizerCoordinator,
 )

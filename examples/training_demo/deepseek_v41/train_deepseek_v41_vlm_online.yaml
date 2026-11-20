@@ -92,7 +92,8 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
+        _target_: hyper_parallel.components.modules.engram.engram.Engram
+        engram_storage_backend: host
   - match: "model.layers.*.self_attn"
     replace:
       kind: module

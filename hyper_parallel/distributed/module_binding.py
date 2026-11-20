@@ -26,7 +26,7 @@ from typing import Any
 from torch import nn
 
 from hyper_parallel.components.modules.module_family import _same_mesh, get_family_build_info
-from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed.context_parallel.cp_context import CPContext
 from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
 
@@ -122,14 +122,27 @@ def validate_parallel_module(module: nn.Module, parallel: ParallelModuleSpec, sh
         inspect.signature(module.bind_parallel).bind(None)
     if getattr(sharding, "_ep_stack", None):
         raise ValueError("explicit expert stages cannot inherit legacy whole-MoE stacking")
-    if sharding.in_src != sharding.in_dst:
-        raise ValueError("explicit stage modules must receive their declared computation layout directly")
-    if sharding.out_dst is not None and sharding.out_src != sharding.out_dst:
-        raise ValueError("explicit stage modules must restore their declared output layout themselves")
+    _validate_parallel_ports(sharding)
     if parallel.binding_kind == "ep":
         _validate_expert_ownership(module, parallel, sharding, context)
     if parallel.validate is not None:
         parallel.validate(module=module, sharding=sharding, context=context)
+
+
+def _validate_parallel_ports(sharding):
+    """Allow original TP boundaries while explicit CP/EP restores its own ownership."""
+    # CP/EP own their internal exchanges; the original boundary executor may
+    # still redistribute TP ports around the member's local computation.
+    for source, destination in ((sharding.in_src, sharding.in_dst), (sharding.out_src, sharding.out_dst)):
+        if source == destination or destination is None:
+            continue
+        if not sharding.is_boundary or source is None or set(source) != set(destination):
+            raise ValueError("explicit stage modules require complete TP boundary ports")
+        for port, begin in source.items():
+            end = destination[port]
+            if any(begin.get(axis, Replicate()) != end.get(axis, Replicate())
+                   for axis in (set(begin) | set(end)) - {"tp"}):
+                raise ValueError("explicit stages must restore non-TP ownership themselves")
 
 
 def _validate_expert_ownership(module, parallel, sharding, context):

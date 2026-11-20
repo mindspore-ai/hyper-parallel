@@ -44,6 +44,9 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.modules.shared_expert import SharedExpertModule
+from hyper_parallel.components.modules.swiglu_mlp import swiglu_activation
+from hyper_parallel.components.modules.router import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
@@ -70,7 +73,7 @@ from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE_START,
 )
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -79,11 +82,11 @@ from hyper_parallel.models.materialization import register_rebuildable_buffer
 
 # Native model replacements are optional; an installed package's own failures propagate.
 try:
-    from hyper_multicore import MegaGate
+    from hyper_multicore import MegaGate as CORE_MEGA_GATE
 except ModuleNotFoundError as error:
     if error.name != "hyper_multicore":
         raise
-    MegaGate = None
+    CORE_MEGA_GATE = None
 
 _FULL_MODEL_MODE = "full"
 _VALIDATION_CROP_MODE = "validation_crop"
@@ -198,13 +201,9 @@ class DeepseekV41Engram(nn.Module):
 
 def _router_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
     """Convert router logits to the released nonnegative expert scores."""
-    if scoring_func == "sqrtsoftplus":
-        return functional.softplus(logits).sqrt()  # pylint: disable=not-callable
-    if scoring_func == "softmax":
-        return logits.softmax(dim=-1)
-    if scoring_func == "sigmoid":
-        return logits.sigmoid()
-    raise ValueError(f"Unsupported V4.1 router scoring function: {scoring_func!r}")
+    if scoring_func not in ("sqrtsoftplus", "softmax", "sigmoid"):
+        raise ValueError(f"Unsupported V4.1 router scoring function: {scoring_func!r}")
+    return routing_scores(logits, scoring_func)
 
 
 def _apply_router_training_state(
@@ -326,11 +325,10 @@ class DeepseekV41TopKRouter(nn.Module):
                     self.bias_vl.unsqueeze(0),
                     self.bias.unsqueeze(0),
                 )
-        indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
-        weights = scores.gather(1, indices)
-        if self.top_k > 1:
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)
-        weights = weights * self.routed_scaling_factor
+        weights, indices = select_topk_scores(
+            scores, top_k=self.top_k, correction_bias=correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor, normalize_topk=self.top_k > 1,
+        )
         weights = _apply_router_training_state(
             self,
             hidden_states,
@@ -377,12 +375,7 @@ def deepseek_v41_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> t
         FP32 activation. The caller restores its projection input dtype before
         the down projection, keeping this math shared by routed and shared experts.
     """
-    gate = gate.float()
-    up = up.float()
-    if limit > 0:
-        gate = gate.clamp(max=limit)
-        up = up.clamp(min=-limit, max=limit)
-    return functional.silu(gate) * up
+    return swiglu_activation(gate, up, limit=limit, activation_dtype="float32")
 
 
 def _v41_shared_expert_forward(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -601,7 +594,8 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
     if isinstance(module, (DeepseekV41Engram, EngramModule)):
         module.q_weight.fill_(1.0)
         module.k_weight.fill_(1.0)
-    elif isinstance(module, DeepseekV41TopKRouter) or (MegaGate is not None and isinstance(module, MegaGate)):
+    elif (isinstance(module, DeepseekV41TopKRouter)
+          or (CORE_MEGA_GATE is not None and isinstance(module, CORE_MEGA_GATE))):
         nn.init.normal_(module.weight, mean=0.0, std=std)
         tokens_per_expert = getattr(module, "tokens_per_expert", None)
         if tokens_per_expert is not None:
@@ -842,7 +836,10 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             layer.self_attn = DeepseekV41Attention(config, layer_idx)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
             layer.mlp.gate = DeepseekV41TopKRouter(config)
-            bind_shared_expert_forward(layer.mlp.shared_experts)
+            layer.mlp.shared_experts = SharedExpertModule(
+                module=layer.mlp.shared_experts, preserve_source_layout=True,
+                activation_dtype="float32", swiglu_limit=layer.mlp.shared_experts.limit,
+            )
             layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in getattr(config, "v41_engram_layer_ids", assets["layer_ids"]):
             self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)

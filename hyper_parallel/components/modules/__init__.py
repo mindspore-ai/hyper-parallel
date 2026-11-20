@@ -25,20 +25,55 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from hyper_parallel.components.modules.attention.multi_latent_attention import (
+        MultiLatentAttention, MultiLatentAttentionModule,
+    )
+    from hyper_parallel.components.modules.attention.gated_multi_latent_attention import (
+        GatedMultiLatentAttention, GatedMultiLatentAttentionModule,
+    )
     from hyper_parallel.components.modules.mtp import (
         MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
     )
     from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
-    from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
+    from hyper_parallel.components.modules.attention.grouped_query_attention import (
+        GroupedQueryAttention,
+    )
+    from hyper_parallel.components.modules.attention.gated_grouped_query_attention import (
+        GatedGroupedQueryAttention,
+    )
     from hyper_parallel.components.modules.grouped_experts import GroupedExperts
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
-    from hyper_parallel.components.modules.mla_attention import MLAAttention
     from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.shared_expert import SharedExpert
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
+    "Gate": "gate",
+    "GateModule": "gate",
+    "MegaMhc": "mhc.mhc",
+    "MegaMhcModule": "mhc.mega_mhc",
+    "SpatialMergeProjector": "spatial_merge_projector",
+    "SpatialMergeProjectorModule": "spatial_merge_projector",
+    "RotaryEmbedding": "rotary_embedding",
+    "RotaryEmbeddingModule": "rotary_embedding",
+    "HostEngramModule": "engram.host_engram",
+    "HostEngramTable": "engram.host_engram_table",
+    "Engram": "engram",
+    "MHCPre": "mhc",
+    "MHCPost": "mhc",
+    "PipelinedMhc": "mhc",
+    "TokenChoiceTopKRouter": "router",
+    "SwiGLUMLPModule": "swiglu_mlp",
+    "SwiGLUMLP": "swiglu_mlp",
+    "SharedExpertModule": "shared_expert",
+    "SharedExpert": "shared_expert",
+    "RMSNormModule": "rms_norm",
+    "NativeRMSNormModule": "rms_norm",
+    "NativeOffsetRMSNormModule": "rms_norm",
+    "RMSNorm": "rms_norm",
+    "OffsetRMSNormModule": "rms_norm",
+    "OffsetRMSNorm": "rms_norm",
     "TritonGDN": "gdn_triton",
     "build_mtp": "mtp",
     "MTPLayer": "mtp",
@@ -46,8 +81,8 @@ _EXPORT_TO_MODULE = {
     "MTPOutput": "mtp",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
-    "GQAAttention": "gqa_attention",
-    "GatedGQAAttention": "gqa_attention",
+    "GroupedQueryAttention": "attention.grouped_query_attention.grouped_query_attention_family",
+    "GatedGroupedQueryAttention": "attention.gated_grouped_query_attention.gated_grouped_query_attention_family",
     "EngramModule": "engram",
     "GroupedExperts": "grouped_experts",
     "Linear": "linear",
@@ -57,17 +92,16 @@ _EXPORT_TO_MODULE = {
     "MhcPreModule": "mhc",
     "NgramHashMapping": "engram",
     "PipelinedMhcModule": "mhc",
-    "MLAAttention": "mla_attention",
-    "OffsetRMSNorm": "rms_norm",
-    "RMSNorm": "rms_norm",
-    "SharedExpert": "shared_expert",
+    "MultiLatentAttention": "attention.multi_latent_attention",
+    "MultiLatentAttentionModule": "attention.multi_latent_attention",
+    "GatedMultiLatentAttention": "attention.gated_multi_latent_attention",
+    "GatedMultiLatentAttentionModule": "attention.gated_multi_latent_attention",
     "SharedCompressedAttentionCPContext": "shared_compressed_dsa_attention",
     "SharedCompressedAttentionState": "shared_compressed_dsa_attention",
     "SharedCompressedPackedSequence": "shared_compressed_dsa_attention",
     "SharedCompressedAttentionTPContext": "shared_compressed_dsa_attention",
     "SharedCompressedDSAAttention": "shared_compressed_dsa_attention",
     "SharedCompressedDSAIndexer": "shared_compressed_dsa_attention",
-    "SwiGLUMLP": "swiglu_mlp",
 }
 _EXPORT_TO_MODULE.update({name: "module_family" for name in (
     "ModuleFamily", "SelectorSpec", "VariantRule", "FamilyRequest", "ResolvedFamily",

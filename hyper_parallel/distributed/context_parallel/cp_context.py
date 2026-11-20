@@ -16,44 +16,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from torch import Tensor
 
 from hyper_parallel.distributed.context_parallel.collectives import (
-    AsyncCPCollective, async_cp_allgather_launch, ulysses_head_to_seq, ulysses_seq_to_head,
+    AsyncCPCollective, _build_hybrid_cp_submeshes, async_cp_allgather_launch,
+    async_ulysses_seq_to_head_launch, ulysses_head_to_seq, ulysses_seq_to_head,
 )
-
-
-@dataclass(frozen=True)
-class SequencePartition:
-    """Contiguous, equal-length sequence shards in process-group rank order."""
-
-    lengths: tuple[int, ...]
-    rank: int
-
-    @property
-    def offset(self) -> int:
-        """Global sequence coordinate of the first local token."""
-        return sum(self.lengths[:self.rank])
-
-    @property
-    def global_length(self) -> int:
-        """Number of tokens represented by this partition."""
-        return sum(self.lengths)
-
-
-@dataclass
-class PendingSequence:
-    """Per-call pending output; consumers obtain tensors only through wait()."""
-
-    collective: AsyncCPCollective
-    partition: SequencePartition
-
-    def wait(self) -> tuple[Tensor, SequencePartition]:
-        """Wait before exposing the gathered tensor and its coordinate receipt."""
-        return self.collective.wait(), self.partition
+from hyper_parallel.distributed.context_parallel.cp_types import PendingSequence, SequencePartition
 
 
 class CPContext:
@@ -61,7 +32,7 @@ class CPContext:
 
     def __init__(self, mesh: Any) -> None:
         """Borrow a one-dimensional CP mesh without creating process groups."""
-        if mesh is None or mesh.ndim != 1:
+        if mesh is None or getattr(mesh, "ndim", 1) != 1:
             raise ValueError("CPContext requires an existing one-dimensional HP mesh")
         self.mesh = mesh
         self.size = mesh.size()
@@ -115,3 +86,38 @@ class CPContext:
             head_dim: Head dimension.
         """
         return ulysses_head_to_seq(tensor, seq_dim=seq_dim, head_dim=head_dim, cp_mesh=self.mesh)
+
+    def launch_sequence_to_head(self, tensor: Tensor, *, seq_dim: int = 1,
+                                head_dim: int = 2) -> AsyncCPCollective:
+        """Launch the existing differentiable A2A; wait before consuming its output.
+
+        Args:
+            tensor: Input in sequence-partitioned layout.
+            seq_dim: Sequence axis.
+            head_dim: Head axis.
+        """
+        return async_ulysses_seq_to_head_launch(tensor, seq_dim, head_dim, self.mesh)
+
+    def launch_head_to_sequence(self, tensor: Tensor, *, seq_dim: int = 1,
+                                head_dim: int = 2) -> AsyncCPCollective:
+        """Launch the inverse A2A without changing its existing autograd contract.
+
+        Args:
+            tensor: Input in head-partitioned layout.
+            seq_dim: Sequence axis.
+            head_dim: Head axis.
+        """
+        return async_ulysses_seq_to_head_launch(tensor, head_dim, seq_dim, self.mesh)
+
+    def split(self, ulysses_degree: int) -> tuple[CPContext, CPContext]:
+        """Borrow cached Ulysses/query-owner submeshes at bind time, never in forward.
+
+        Args:
+            ulysses_degree: Number of CP ranks partitioning attention heads.
+        """
+        if ulysses_degree < 1 or self.size % ulysses_degree:
+            raise ValueError("Ulysses degree must divide the CP mesh size")
+        if ulysses_degree in (1, self.size):
+            return self, self
+        heads, queries = _build_hybrid_cp_submeshes(self.mesh, ulysses_degree)
+        return CPContext(heads), CPContext(queries)

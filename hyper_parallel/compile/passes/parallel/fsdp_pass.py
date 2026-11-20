@@ -49,13 +49,13 @@ All DP logic (which parameters, the collectives, and the sharding itself)
 lives in this pass; the trainer simply feeds ``model.parameters()``.
 """
 
-__all__ = ["FSDPPass"]
+__all__ = ["FSDPPass", "FsdpParamSpec", "FsdpPlan"]
 
 import logging
 import operator
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -74,6 +74,39 @@ _LOG = logging.getLogger(__name__)
 
 _GETITEM = operator.getitem
 _DEFAULT_GRADIENT_REDUCTION = GradientReduction()
+
+
+@dataclass(frozen=True)
+class FsdpParamSpec:
+    """How ``FSDPPass`` handles one parameter.
+
+    ``mode`` selects the top-level policy; ``pad_policy`` only applies when
+    ``mode == "shard"`` and dim 0 is not divisible by ``degree``.
+    """
+
+    group_name: str
+    degree: int
+    mode: str = "shard"
+    pad_policy: str = "pad"
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("shard", "replicate", "skip"):
+            raise ValueError(f"Invalid FSDP shard mode: {self.mode!r}")
+        if self.pad_policy not in ("pad", "error", "replicate"):
+            raise ValueError(f"Invalid FSDP pad policy: {self.pad_policy!r}")
+        if isinstance(self.degree, bool) or not isinstance(self.degree, int) or self.degree < 1:
+            raise ValueError(f"FSDP shard degree must be a positive integer, got {self.degree!r}")
+
+
+@dataclass(frozen=True)
+class FsdpPlan:
+    """Per-parameter overrides; unlisted parameters use the pass default."""
+
+    params: Mapping[str, FsdpParamSpec] = field(default_factory=dict)
+
+    def spec(self, fqn: str) -> Optional[FsdpParamSpec]:
+        """Return the override for ``fqn`` or ``None`` when unlisted."""
+        return self.params.get(fqn)
 
 
 def tag_gradient_identity(wait: fx.Node, param_name: str, state_idx: int) -> None:
@@ -330,12 +363,10 @@ class FSDPPass(GraphPass):
         # ``run`` entry; left as ``None`` here so a stray access before
         # ``run`` fails loudly instead of silently using a wrong default.
         self._fsdp_degree: Optional[int] = None
-        self._expert_param_names: Set[str] = set()
-        self._expert_fsdp_group_name = "fsdp_expert"
-        self._expert_fsdp_degree: Optional[int] = None
+        self._fsdp_plan: Optional[FsdpPlan] = None
+        self._default_spec: Optional[FsdpParamSpec] = None
         self._gradient_reductions: Dict[str, GradientReduction] = {}
         self._source_gradient_groups: Dict[str, str] = {}
-        self._parameter_groups: Dict[str, tuple[str, int]] = {}
         # Data-parallel mode ("fsdp" | "ddp" | "hsdp") and the replicate-axis
         # group/degree used by DDP / HSDP gradient reduction.
         self._dp_mode = "fsdp"
@@ -465,20 +496,10 @@ class FSDPPass(GraphPass):
         configured = pass_config.fsdp_degree
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
-        self._expert_param_names = set(kwargs.get("expert_param_names", ()))
+        self._fsdp_plan = kwargs.get("fsdp_plan")
         self._gradient_reductions = dict(kwargs.get("gradient_reductions", {}))
         self._source_gradient_groups = dict(kwargs.get("source_gradient_groups", {}))
-        self._parameter_groups = dict(kwargs.get("parameter_groups", {}))
-        if not self._expert_param_names.issubset(self._gradient_reductions):
-            raise ValueError("Expert parameters require explicit gradient reduction policies")
-        self._expert_fsdp_group_name = kwargs.get(
-            "expert_fsdp_group_name", self._expert_fsdp_group_name
-        )
-        self._expert_fsdp_degree = (
-            dist.get_world_size(_resolve_process_group(self._expert_fsdp_group_name))
-            if self._expert_param_names
-            else None
-        )
+        self._default_spec = FsdpParamSpec(self._fsdp_group_name, self._fsdp_degree)
         self._dp_replicate_group_name = kwargs.get(
             "dp_replicate_group_name", self._dp_replicate_group_name
         )
@@ -570,13 +591,20 @@ class FSDPPass(GraphPass):
 
         return graph_module
 
+    def _param_spec(self, name: str) -> FsdpParamSpec:
+        """Return the shard policy for one parameter."""
+        if self._fsdp_plan is not None:
+            spec = self._fsdp_plan.spec(name)
+            if spec is not None:
+                return spec
+        if self._default_spec is None:
+            raise RuntimeError("FSDPPass default shard spec is not initialized")
+        return self._default_spec
+
     def _param_group(self, name: str) -> tuple[str, int]:
-        """Choose the expert or dense shard axis for one parameter."""
-        if name in self._parameter_groups:
-            return self._parameter_groups[name]
-        if name in self._expert_param_names:
-            return self._expert_fsdp_group_name, self._expert_fsdp_degree
-        return self._fsdp_group_name, self._fsdp_degree
+        """Choose the shard group and degree for one parameter."""
+        spec = self._param_spec(name)
+        return spec.group_name, spec.degree
 
     def _classify_dp_params(
         self,
@@ -631,8 +659,12 @@ class FSDPPass(GraphPass):
             if skip:
                 continue
 
+            spec = self._param_spec(fqn)
+            if spec.mode == "skip":
+                continue
             _, degree = self._param_group(fqn)
-            if fqn in self._expert_param_names and degree == 1:
+            if spec.mode == "replicate":
+                replicated_indices.add(idx)
                 continue
 
             fallback = self._unmarked_disposition(fqn, param, model)
@@ -739,22 +771,30 @@ class FSDPPass(GraphPass):
         """
         if self._dp_mode == "ddp" or param is None:
             return False
+        spec = self._param_spec(fqn)
         _, degree = self._param_group(fqn)
         shape = param.shape
-        if fqn in self._expert_param_names and (not shape or shape[0] % degree):
-            raise ValueError(
-                f"Graph FSDP+EP expert parameter {fqn} with shape {tuple(shape)} "
-                f"cannot shard across edp_shard degree {degree}"
-            )
-        if shape and shape[0] % degree == 0:
-            return False
+        if spec.pad_policy == "replicate":
+            return True
         if not shape:
+            if spec.pad_policy == "error":
+                raise ValueError(
+                    f"Parameter {fqn} with shape {tuple(shape)} cannot be sharded "
+                    f"across group {spec.group_name!r} degree {degree}"
+                )
             _LOG.info(
                 "Scalar param %s stays replicated: 0-dim cannot be "
                 "pad-sharded; its gradient will be all-reduced",
                 fqn,
             )
             return True
+        if shape[0] % degree == 0:
+            return False
+        if spec.pad_policy == "error":
+            raise ValueError(
+                f"Parameter {fqn} with shape {tuple(shape)} cannot be sharded "
+                f"across group {spec.group_name!r} degree {degree}"
+            )
         n = int(shape[0])
         n_pad = -(-n // degree) * degree
         self._padded_params[fqn] = _PaddedParam(
@@ -807,9 +847,10 @@ class FSDPPass(GraphPass):
             if not param.requires_grad:
                 continue
 
-            group_name, degree = self._param_group(name)
-            if name in self._expert_param_names and degree == 1:
+            spec = self._param_spec(name)
+            if spec.mode != "shard" or spec.pad_policy == "replicate":
                 continue
+            group_name, degree = spec.group_name, spec.degree
 
             # Same plan gate as ``_classify_dp_params``: only parameters inside
             # FSDP-marked modules are sharded. Skipping the gate here would
@@ -1101,11 +1142,17 @@ class FSDPPass(GraphPass):
 
             state_idx = trainable_state_indices[i - 1]
             fqn = state_fqns[state_idx]
-            group_name, degree = self._param_group(fqn)
+            spec = self._param_spec(fqn)
+            if spec.mode == "skip":
+                continue
+            group_name, degree = spec.group_name, spec.degree
             if state_idx in sharded_param_indices:
                 replicated = False
                 pad_info = self._padded_params.get(fqn)
             elif state_idx in replicated_param_indices:
+                replicated = True
+                pad_info = None
+            elif spec.mode == "replicate":
                 replicated = True
                 pad_info = None
             elif degree == 1 and fqn in self._gradient_reductions:

@@ -18,6 +18,8 @@ Parallel Passes - Parallel Partitioning Passes
 
 __all__ = [
     "FSDPPass",
+    "FsdpParamSpec",
+    "FsdpPlan",
     "PpPass",
     "PipelineScheduleBase",
     "ScheduleGPipe",
@@ -27,7 +29,7 @@ __all__ = [
     "get_schedule_class",
 ]
 
-from .fsdp_pass import FSDPPass
+from .fsdp_pass import FSDPPass, FsdpParamSpec, FsdpPlan
 from .pp_pass import PpPass
 from .pp_schedule import (
     SCHEDULE_REGISTRY,

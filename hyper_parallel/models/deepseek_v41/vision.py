@@ -17,10 +17,15 @@
 from __future__ import annotations
 
 from typing import Any
+from types import SimpleNamespace
 
 import torch
 from torch import nn
 from torch.nn import functional
+
+from hyper_parallel.components.modules.spatial_merge_projector import SpatialMergeProjectorModule
+from hyper_parallel.components.modules.rms_norm import NativeRMSNormModule
+from hyper_parallel.components.modules.swiglu_mlp import W1W2SwiGLUMLPModule
 
 
 def _vision_cos_sin(
@@ -113,26 +118,13 @@ def _vision_attention(
     return output.squeeze(0).transpose(0, 1)
 
 
-class DeepseekV41VisionRMSNorm(nn.Module):
-    """The FP32-weight RMSNorm used by the released V4.1 vision tower."""
+class DeepseekV41VisionRMSNorm(NativeRMSNormModule):
+    """Compatibility constructor for the ordinary FP32-weight vision norm."""
 
     def __init__(self, hidden_size: int, eps: float = 1.0e-6) -> None:
-        """Create a vision RMSNorm.
-
-        Args:
-            hidden_size: Vision hidden dimension.
-            eps: Numerical stability constant.
-        """
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalize a patch sequence while retaining its activation dtype."""
-        data_type = hidden_states.dtype
-        hidden_fp32 = hidden_states.float()
-        normalized = hidden_fp32 * torch.rsqrt(hidden_fp32.square().mean(-1, keepdim=True) + self.eps)
-        return (self.weight * normalized).to(data_type)
+        """Declare the vision scale and final cast policy explicitly."""
+        super().__init__(config=SimpleNamespace(hidden_size=hidden_size, eps=eps),
+                         cast_order="after_weight", fp32_weight=True)
 
 
 class DeepseekV41VisionPatchEmbed(nn.Module):
@@ -188,33 +180,19 @@ class DeepseekV41VisionAttention(nn.Module):
         return self.wo(attention_output.reshape(token_count, -1))
 
 
-class DeepseekV41VisionMLP(nn.Module):
-    """SwiGLU vision MLP matching the released parameter layout."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
-        """Create the fused gate/up and down projections."""
-        super().__init__()
-        # ``w1`` is a fused gate/up matrix and ``w2`` projects back to the
-        # vision hidden size, matching ``inference/vision.py``.
-        self.w1 = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
-        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the vision SwiGLU MLP."""
-        gate, up = self.w1(hidden_states).chunk(2, dim=-1)
-        return self.w2(functional.silu(gate) * up)
-
-
 class DeepseekV41VisionBlock(nn.Module):
     """One pre-normalized full-attention vision Transformer block."""
 
     def __init__(self, hidden_size: int, num_attention_heads: int, intermediate_size: int) -> None:
         """Create a released V4.1 vision block."""
         super().__init__()
-        self.norm1 = DeepseekV41VisionRMSNorm(hidden_size)
+        self.norm1 = NativeRMSNormModule(config=SimpleNamespace(hidden_size=hidden_size, eps=1e-6),
+                                   cast_order="after_weight", fp32_weight=True)
         self.attn = DeepseekV41VisionAttention(hidden_size, num_attention_heads)
-        self.norm2 = DeepseekV41VisionRMSNorm(hidden_size)
-        self.mlp = DeepseekV41VisionMLP(hidden_size, intermediate_size)
+        self.norm2 = NativeRMSNormModule(config=SimpleNamespace(hidden_size=hidden_size, eps=1e-6),
+                                   cast_order="after_weight", fp32_weight=True)
+        self.mlp = W1W2SwiGLUMLPModule(config=SimpleNamespace(
+            hidden_size=hidden_size, intermediate_size=intermediate_size, bias=False))
 
     def forward(
             self,
@@ -253,7 +231,8 @@ class DeepseekV41VisionTower(nn.Module):
             )
             for _ in range(int(config.v41_vision_num_hidden_layers))
         ])
-        self.norm = DeepseekV41VisionRMSNorm(self.hidden_size)
+        self.norm = NativeRMSNormModule(config=SimpleNamespace(hidden_size=self.hidden_size, eps=1e-6),
+                                  cast_order="after_weight", fp32_weight=True)
 
     def forward(self, patches: torch.Tensor, grid_height: int, grid_width: int) -> torch.Tensor:
         """Encode one image's raster-order ViT patches.
@@ -279,29 +258,15 @@ class DeepseekV41VisionTower(nn.Module):
         return self.norm(hidden_states)
 
 
-class DeepseekV41VisionAligner(nn.Module):
+class DeepseekV41VisionAligner(SpatialMergeProjectorModule):
     """Pixel-unshuffle 3x3 (or configured) ViT features into LLM hidden rows."""
 
     def __init__(self, config: Any) -> None:
         """Create the released two-layer aligner."""
-        super().__init__()
-        self.downsample_ratio = int(config.v41_vision_downsample_ratio)
-        vision_hidden_size = int(config.v41_vision_hidden_size)
-        llm_hidden_size = int(config.hidden_size)
-        if self.downsample_ratio <= 0:
-            raise ValueError("V4.1 vision downsample_ratio must be positive")
-        self.w1 = nn.Linear(vision_hidden_size * self.downsample_ratio ** 2, llm_hidden_size)
-        self.w2 = nn.Linear(llm_hidden_size, llm_hidden_size)
-
-    def forward(self, hidden_states: torch.Tensor, grid_height: int, grid_width: int) -> torch.Tensor:
-        """Downsample one image's ViT grid to the LLM image-token grid."""
-        if hidden_states.ndim != 2 or hidden_states.shape[0] != grid_height * grid_width:
-            raise ValueError("aligner features must be [grid_height * grid_width, vision_hidden]")
-        ratio = self.downsample_ratio
-        feature_grid = hidden_states.view(grid_height, grid_width, -1).permute(2, 0, 1)
-        feature_grid = functional.pad(feature_grid, (0, -grid_width % ratio, 0, -grid_height % ratio))
-        unshuffled = functional.unfold(feature_grid.unsqueeze(0), ratio, stride=ratio).squeeze(0).transpose(0, 1)
-        return self.w2(functional.gelu(self.w1(unshuffled)))  # pylint: disable=not-callable
+        super().__init__(config=SimpleNamespace(
+            input_size=int(config.v41_vision_hidden_size), hidden_size=int(config.hidden_size),
+            output_size=int(config.hidden_size), downsample_ratio=int(config.v41_vision_downsample_ratio), bias=True,
+        ))
 
 
 __all__ = [

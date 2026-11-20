@@ -27,6 +27,7 @@ class SourceObservation:
     match: tuple[str, ...]
     module_type: Optional[str] = None
     replace_target: Optional[str] = None
+    construction_kwargs: tuple[str, ...] = ()
     inner_wrapper_target: Optional[str] = None
     local_compute_target: Optional[str] = None
 
@@ -67,6 +68,7 @@ class ConstructorReplacePatch:
     keyword_args: tuple[str, ...] = ()
     scope_attrs: tuple[str, ...] = ()
     scope_fqns: tuple[str, ...] = ()
+    defer_to_fqns: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,7 @@ class ReplacementSpec:
     snippets: tuple[ModuleSnippetPatch, ...] = ()
     remove_class: bool = True
     replacement_note: str | None = None
+    defer_to_fqns: bool = False
 
 
 @dataclass(frozen=True)

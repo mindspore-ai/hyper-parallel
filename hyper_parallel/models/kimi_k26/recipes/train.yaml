@@ -86,6 +86,7 @@ plan_overrides:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.RMSNorm
+        use_fused_ops: true
 
   # 文本塔 MoE 走 EP（deepseekv3 archetype；排除 first_k_dense_replace=1 的稠密 layer0）
   - match: "model.language_model.layers.[123456789]*.mlp.forward"

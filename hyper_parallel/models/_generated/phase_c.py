@@ -58,6 +58,18 @@ class _GeneratedTPOperators:
         to_local = getattr(tensor, "to_local", None)
         return to_local() if callable(to_local) else tensor
 
+    def local_shard(self, tensor: Any, dim: int) -> Any:
+        """Select a local TP shard with native slice backward.
+
+        Args:
+            tensor: Replicated local input tensor.
+            dim: Tensor dimension to shard across TP ranks.
+
+        Returns:
+            Local shard with native zero-padded slice gradients.
+        """
+        return self._execute("local_shard", tensor, tensor_dim=dim)
+
     def all_gather(self, tensor: Any, dim: int) -> Any:
         """Run differentiable TP all-gather."""
         return self._execute("all_gather", tensor, tensor_dim=dim)

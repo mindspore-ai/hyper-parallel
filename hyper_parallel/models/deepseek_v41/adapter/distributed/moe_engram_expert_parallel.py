@@ -469,7 +469,7 @@ def deepseek_v41_engram_compute_fn(
             segment_starts: Optional packed sequence boundaries.
             token_mask: CP-local mask selecting Engram updates.
         """
-        from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import (  # pylint: disable=C0415
+        from hyper_parallel.components.modules.engram.host_engram_table import (  # pylint: disable=C0415
             HostEngramTable,
         )
         if isinstance(module.embed, HostEngramTable):
