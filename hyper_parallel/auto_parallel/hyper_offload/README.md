@@ -60,11 +60,14 @@ for step in range(10):
         loss.backward()
     optimizer.step()
     optimizer.zero_grad()
+
+session.close()
 ```
 
 ## 4. Key Features
 
-- **Automatic memory budget enforcement** — Peak device memory stays below `max_resident_activation_mb`.
+- **Activation residency budget** — `max_resident_activation_mb` budgets managed activations;
+  parameters, optimizer state, collective buffers and allocator fragmentation also consume device memory.
 - **Greedy offline planner** — Selects eviction candidates by access distance and tensor size.
 - **Asynchronous copy streams** — D2H / H2D transfers overlap with computation on a dedicated stream.
 - **ShadowTensor** — A `torch.Tensor` subclass that lazily resolves from device or host storage.
@@ -78,7 +81,7 @@ for step in range(10):
 |-------|------|---------|-------------|
 | `max_resident_activation_mb` | `int` | `1024` | Device-side activation memory budget (MiB). |
 | `max_offload_activation_mb` | `int` | `65536` | Pinned host memory pool size (MiB). |
-| `planner` | `ResidencyPlanner \| None` | `None` | Pluggable planner; defaults to `GreedyResidencyPlanner`. |
+| `planner` | `ResidencyPlanner \| None` | `None` | Pluggable planner; defaults to `PeakResidencyPlanner`. |
 
 ### `OffloadSession`
 
@@ -95,6 +98,17 @@ with session:
 with session:
     loss = model(x); loss.backward()
 ```
+
+Call `session.close()` outside the context after finishing optimizer work to release
+its allocator policy. A later context entry can reuse the session.
+
+### Native autograd replay
+
+HyperOffload automatically uses native autograd replay for supported static
+forward/backward steps and operator replay for other plans. No additional switch
+is required. Keep tensor save/use order and view metadata consistent across entries,
+and complete backward before leaving the session. Create a new session when the
+graph changes.
 
 ### `skip_offload`
 
@@ -154,5 +168,5 @@ hyper_offload/
 
 ## 8. References
 
-- PyTorch `TorchDispatchMode`: https://pytorch.org/docs/stable/notes/extending.html
+- [PyTorch `TorchDispatchMode`](https://pytorch.org/docs/stable/notes/extending.html)
 - HyperParallel activation checkpoint swap: `hyper_parallel.core.activation_memory`

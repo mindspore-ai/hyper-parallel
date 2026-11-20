@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from hyper_parallel.auto_parallel.hyper_offload.planning.base import ResidencyPlanner
+    from hyper_parallel.auto_parallel.hyper_offload.planning.base import (
+        ResidencyPlanner,
+    )
 
 
 @dataclass
@@ -31,7 +33,8 @@ class OffloadConfig:
         max_resident_activation_mb: Maximum resident activation memory on device, in MiB.
         max_offload_activation_mb:  Maximum pinned host memory for offload buffers, in MiB.
             Defaults to 65536 (64 GiB).
-        planner: Optional residency planner implementation.
+        planner: Optional residency planner implementation. Defaults to peak planning
+            with communication masking.
 
     """
 
