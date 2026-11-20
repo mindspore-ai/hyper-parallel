@@ -20,8 +20,10 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from hyper_parallel.components.functional.mhc_post import mhc_post
+from tests.common.mark_utils import arg_mark
 
 B, S, N, C = 2, 3, 4, 128
 
@@ -34,34 +36,68 @@ def _fake_npu_device():
 class TestMhcPost(unittest.TestCase):
     """Check the fused CANN operator receives the expected stream contract."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_cann_post_passes_stream_contract(self):
         """
-        Feature: CANN MHC post contract.
-        Description: Invoke mhc_post with the default CANN backend on NPU.
-        Expectation: Pass residual streams, residual matrix, block output and
-            post coefficients in the operator order, and return the flattened
-            mixed streams.
+        Feature: CANN MHC forward dispatcher.
+        Description: Invoke BF16 post through a mocked NPU dispatcher.
+        Expectation: Preserve operand order, stream shape and output values.
         """
-        block_output = torch.randn(B, S, C)
-        residual = torch.randn(B, S, N * C)
+        block_output = torch.randn(B, S, C, dtype=torch.bfloat16)
+        residual = torch.randn(B, S, N * C, dtype=torch.bfloat16)
         h_post = torch.randn(B, S, N)
         h_res = torch.randn(B, S, N, N)
-        mixed = torch.randn(B, S, N, C)
-        ops = ModuleType("cann_ops_transformer.ops")
-        ops.mhc_post = Mock(return_value=mixed)
-        package = ModuleType("cann_ops_transformer")
-        package.ops = ops
-        with patch.dict(sys.modules, {"cann_ops_transformer": package, "cann_ops_transformer.ops": ops}), \
+        mixed = torch.randn(B, S, N, C, dtype=torch.bfloat16)
+        ops = Mock()
+        ops.mhc_post.default.return_value = mixed
+        with patch("hyper_parallel.components.functional.mhc_post.import_module"), \
+                patch.object(torch.ops, "cann_ops_transformer", ops, create=True), \
                 _fake_npu_device():
             result = mhc_post(block_output, residual, h_post, h_res, N)
-
-        args = ops.mhc_post.call_args.args
+        args = ops.mhc_post.default.call_args.args
         self.assertEqual(args[0].shape, (B, S, N, C))
         self.assertIs(args[1], h_res)
         self.assertIs(args[2], block_output)
         self.assertIs(args[3], h_post)
-        self.assertEqual(result.shape, (B, S, N * C))
+        torch.testing.assert_close(result, mixed.flatten(2))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_cann_backward_dispatches_saved_inputs(self):
+        """
+        Feature: CANN MHC backward dispatcher.
+        Description: Run autograd with distinct gradients returned by the CANN dispatcher.
+        Expectation: Map every gradient back to its original input and use contiguous grad output.
+        """
+        inputs = (
+            torch.randn(B, S, C, dtype=torch.bfloat16, requires_grad=True),
+            torch.randn(B, S, N * C, dtype=torch.bfloat16, requires_grad=True),
+            torch.randn(B, S, N, requires_grad=True),
+            torch.randn(B, S, N, N, requires_grad=True),
+        )
+        expected = tuple(torch.full_like(value, index + 1) for index, value in enumerate(inputs))
+        ops = Mock()
+        ops.mhc_post.default.return_value = torch.randn(B, S, N, C, dtype=torch.bfloat16)
+        ops.mhc_post_backward.default.return_value = (
+            expected[1].reshape(B, S, N, C), expected[3], expected[0], expected[2],
+        )
+        with patch("hyper_parallel.components.functional.mhc_post.import_module"), \
+                patch.object(torch.ops, "cann_ops_transformer", ops, create=True), \
+                _fake_npu_device():
+            result = mhc_post(*inputs, N)
+            actual = torch.autograd.grad(result.sum(), inputs)
+        for value, reference in zip(actual, expected):
+            torch.testing.assert_close(value, reference)
+        args = ops.mhc_post_backward.default.call_args.args
+        self.assertTrue(args[0].is_contiguous())
+        self.assertEqual(args[1].shape, (B, S, N, C))
+        self.assertIs(args[2], inputs[3])
+        self.assertIs(args[3], inputs[0])
+        self.assertIs(args[4], inputs[2])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_cpu_eager_matches_formula(self):
         """
         Feature: Eager MHC post fallback.
@@ -79,6 +115,59 @@ class TestMhcPost(unittest.TestCase):
         )
         torch.testing.assert_close(result, expected.flatten(2))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_fp32_npu_uses_differentiable_formula(self):
+        """
+        Feature: FP32 MHC tensor formula.
+        Description: Evaluate post and gradients on the mocked NPU path with FP32 tensors.
+        Expectation: Avoid vendor imports and match CPU reference values and gradients.
+        """
+        inputs = (
+            torch.randn(B, S, C, requires_grad=True),
+            torch.randn(B, S, N * C, requires_grad=True),
+            torch.randn(B, S, N, requires_grad=True),
+            torch.randn(B, S, N, N, requires_grad=True),
+        )
+        with patch("hyper_parallel.components.functional.mhc_post.import_module") as load_vendor, \
+                _fake_npu_device():
+            result = mhc_post(*inputs, N)
+            grads = torch.autograd.grad(result.sum(), inputs)
+        expected = mhc_post(*inputs, N)
+        expected_grads = torch.autograd.grad(expected.sum(), inputs)
+        torch.testing.assert_close(result, expected)
+        for actual, reference in zip(grads, expected_grads):
+            torch.testing.assert_close(actual, reference)
+        load_vendor.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_fake_joint_graph_replays_forward_and_backward(self):
+        """
+        Feature: MHC joint graph replay.
+        Description: Capture forward and backward with FakeTensor inputs on CPU.
+        Expectation: Replay the captured graph with matching output and all input gradients.
+        """
+        inputs = (
+            torch.randn(B, S, C, requires_grad=True),
+            torch.randn(B, S, N * C, requires_grad=True),
+            torch.randn(B, S, N, requires_grad=True),
+            torch.randn(B, S, N, N, requires_grad=True),
+        )
+
+        def _joint(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Return the mixed streams and gradients of their sum."""
+            result = mhc_post(*args, N)
+            return (result, *torch.autograd.grad(result.sum(), args))
+
+        expected = _joint(*inputs)
+        graph = make_fx(_joint, tracing_mode="fake")(*inputs)
+        actual = graph(*inputs)
+        for value, reference in zip(actual, expected):
+            torch.testing.assert_close(value, reference)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_omni_backend_is_deprecated(self):
         """
         Feature: Legacy omni MHC post backend.
@@ -109,6 +198,8 @@ class TestMhcPost(unittest.TestCase):
         self.assertIs(args[2], block_output)
         self.assertIs(args[3], h_post)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_rejects_unknown_backend(self):
         """
         Feature: MHC post backend validation.

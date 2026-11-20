@@ -14,6 +14,8 @@ randomly initializes weights; pretrained checkpoints must be supplied separately
 ## Resources and Launch
 
 Install the project and its compatible PyTorch, torch_npu, and CANN/HCCL dependencies.
+BF16 eager/graph execution requires a CANN installation providing `aclnnMhcPost`;
+FP32 MHC uses the tensor formula because that fused kernel requires FP16/BF16.
 Run the following commands from the repository root and check that the import
 points to this checkout:
 
