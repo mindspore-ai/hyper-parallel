@@ -1685,6 +1685,35 @@ def reference_sparse_attention(
     return torch.matmul(probabilities[..., :-1].to(key_value.dtype), key_value).transpose(1, 2)
 
 
+class _GroupedProj8x2DFunction(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Grouped output projection using contiguous 2D ``torch.mm`` per group on NPU."""
+
+    @staticmethod
+    def forward(ctx, grouped: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # grouped: [N, G, H], weight: [G, O, H]
+        ctx.save_for_backward(grouped, weight)
+        g_cnt = weight.shape[0]
+        wt = weight.transpose(1, 2)
+        return torch.stack([torch.mm(grouped[:, g, :], wt[g]) for g in range(g_cnt)], dim=1)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        grouped, weight = ctx.saved_tensors
+        g_cnt = weight.shape[0]
+        grad_in = grad_w = None
+        if ctx.needs_input_grad[0]:
+            grad_in = torch.stack(
+                [torch.mm(grad_out[:, g, :], weight[g]) for g in range(g_cnt)],
+                dim=1,
+            )
+        if ctx.needs_input_grad[1]:
+            grad_w = torch.stack(
+                [torch.mm(grad_out[:, g, :].t(), grouped[:, g, :]) for g in range(g_cnt)],
+                dim=0,
+            )
+        return grad_in, grad_w
+
+
 class SharedCompressedDSAAttentionBase(nn.Module):
     """Shared V4.1 attention semantics with selectable reference execution."""
 
@@ -2180,9 +2209,14 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         output_per_group = self.o_a_proj.weight.shape[0] // self.num_groups
         projection = self.o_a_proj.weight.view(
             self.num_groups, output_per_group, hidden_per_group
-        ).transpose(1, 2)
-        flattened = grouped.reshape(-1, self.num_groups, hidden_per_group).transpose(0, 1)
-        projected = torch.bmm(flattened, projection).transpose(0, 1)
+        )
+        flattened = grouped.reshape(-1, self.num_groups, hidden_per_group)
+        if flattened.device.type == "npu" and projection.dtype == flattened.dtype:
+            projected = _GroupedProj8x2DFunction.apply(flattened, projection)
+        else:
+            projected = torch.bmm(
+                flattened.transpose(0, 1), projection.transpose(1, 2)
+            ).transpose(0, 1)
         projected = projected.reshape(batch_size, sequence_length, -1)
         return self.o_b_proj(projected)
 

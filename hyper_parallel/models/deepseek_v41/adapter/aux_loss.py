@@ -25,6 +25,27 @@ from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch, di
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
 
 
+class _PackedAuxAllReduceFn(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Coalesce non-differentiable counts and differentiable prob_sum all_reduce."""
+
+    @staticmethod
+    def forward(ctx, counts: torch.Tensor, prob_sum: torch.Tensor, group):
+        ctx.group = group
+        ctx.rows = counts.shape[0]
+        buf = torch.cat([counts.detach(), prob_sum.detach()], dim=0).contiguous()
+        dist.all_reduce(buf, group=group)
+        return buf[:ctx.rows], buf[ctx.rows:]
+
+    @staticmethod
+    def backward(ctx, grad_counts, grad_prob_sum):
+        del grad_counts
+        if grad_prob_sum is None:
+            return None, None, None
+        grad = grad_prob_sum.contiguous()
+        dist.all_reduce(grad, group=ctx.group)
+        return None, grad, None
+
+
 def sequence_load_balancing_loss(
         scores: torch.Tensor,
         selected_experts: torch.Tensor,
@@ -73,8 +94,7 @@ def sequence_load_balancing_loss(
         0, sequence_ids, probabilities * valid.unsqueeze(-1),
     )
     for group in sequence_partition_groups:
-        dist.all_reduce(counts, group=group)
-        probability_sum = differentiable_all_reduce(probability_sum, "sum", group)
+        counts, probability_sum = _PackedAuxAllReduceFn.apply(counts, probability_sum, group)
     assignments = counts.sum(dim=-1, keepdim=True)
     token_count = (assignments / top_k).clamp_min(1.0)
     losses = num_experts * ((counts / assignments.clamp_min(1.0)) * (probability_sum / token_count)).sum(-1)
