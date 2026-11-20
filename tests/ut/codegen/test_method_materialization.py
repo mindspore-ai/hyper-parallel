@@ -20,7 +20,7 @@ import unittest
 import torch
 from torch import nn
 
-from hyper_parallel.codegen.emit.methods import materialize_observed_methods
+from hyper_parallel.codegen.emit.methods import materialize_observed_methods, verify_observed_methods
 from hyper_parallel.codegen.plan.methods import observe_local_methods
 from hyper_parallel.distributed.mesh import LogicalDeviceMesh, MeshContext
 from hyper_parallel.distributed.recipe_spec import local_compute
@@ -89,6 +89,8 @@ class TestMethodMaterialization(unittest.TestCase):
             fsdp_moe_mesh=LogicalDeviceMesh(("edp", "ep"), (1, 2)), ep_size=2,
         )
         records = observe_local_methods(plan, model, topology)
+        self.assertEqual(model.block.experts.scale, 1)
+        self.assertNotIn("forward", model.block.experts.__dict__)
         source = (
             f"from {__name__} import MethodExperts\n"
             "class MethodBlock:\n"
@@ -101,11 +103,18 @@ class TestMethodMaterialization(unittest.TestCase):
             "        return self.experts(value)\n"
         )
         rendered = materialize_observed_methods(source, records)
+        verify_observed_methods(rendered, records)
+        with self.assertRaisesRegex(ValueError, "was not materialized"):
+            verify_observed_methods(source, records)
         namespace = {}
         exec(rendered, namespace)
         generated = namespace["MethodBlock"]()
         generated._hp_ep_group = object()
-        self.assertEqual(generated.forward(torch.tensor(3)).item(), 6)
+        value = torch.tensor(3.0, requires_grad=True)
+        output = generated.forward(value)
+        self.assertEqual(output.item(), 6)
+        output.backward()
+        self.assertEqual(value.grad.item(), 2)
         self.assertNotIn("forward", generated.experts.__dict__)
         self.assertNotIn("method_factory", generated.__dict__)
         self.assertTrue(generated.ep_enable)

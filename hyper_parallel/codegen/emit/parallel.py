@@ -853,10 +853,9 @@ def _render_local_compute(
 ) -> str:
     """Local-region boundary (shape 2, EP MoE): compute fn on local tensors, then exit.
 
-    The factory-named attribute is ``functools.partial(compute_fn, module)``
-    bound by the emitted constructor patch. The applier calls it as ``compute_fn(*args,
-    **kwargs)`` (``_wrap_local_region_forward``), so the generated forward
-    forwards its own re-distributed ``*args, **kwargs`` through.  The local
+    The factory-named class method contains the native resolved compute body.
+    The generated forward passes its redistributed local arguments to that
+    method; runtime preparation supplies communication resources. The local
     Production keeps the compute output local so the lowered boundary
     operations can run on plain tensors. If a transition cannot be lowered, the
     installed boundary owns the necessary fallback wrapping.
@@ -873,7 +872,7 @@ def _render_local_compute(
         *_ordered_notes(form.in_notes),
         input_redist,
         "        # [HYPER LOCAL REGION] run the region compute fn on local tensors",
-        f"        # {compute_name} is bound to self by generated source.",
+        f"        # Native compute from {compute_name}, materialized as a class method.",
         f"        outputs = self.{binding_name}(*args, **kwargs)",
         "",
         "        # [HYPER LOCAL REGION] boundary exit",

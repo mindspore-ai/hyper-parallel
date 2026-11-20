@@ -220,11 +220,11 @@ def test_unmatched_rule_fails_before_preparation_publishes_a_manifest():
         get_preparation_manifest(model)
 
 
-def test_missing_constructor_replay_is_rejected_at_exact_fqn():
-    """Do not infer a constructor when any recorded module cannot be replayed."""
+def test_missing_constructor_inputs_are_rejected_at_exact_fqn():
+    """A factory identity alone does not describe the final model construction."""
     payload = {"replacements": {"applications": [
         {"primary_fqn": "layers.0.attention", "replay": {"constructor": "demo:Attention"}},
         {"primary_fqn": "layers.0.experts"},
     ]}}
-    with pytest.raises(ValueError, match=r"no importable replay record.*layers\.0\.experts"):
+    with pytest.raises(ValueError, match=r"no concrete construction inputs.*layers\.0\.experts"):
         _preinstalled_records(payload)

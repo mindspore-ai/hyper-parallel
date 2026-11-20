@@ -22,9 +22,8 @@ appended layers:
   strategies lowered into the copied source at their semantic sites.
 
 Boundary forwards are then lowered at the boundary classes. The artifact is
-both an auditable source export and a directly executable model training entry.
-Training still derives its live plan from the supplied YAML through the native
-Trainer; preflight validates syntax and the recorded generation contract.
+a source export for review. Runtime resources remain external; developer tests
+instantiate the generated classes without reinstalling model or method patches.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ from hyper_parallel.codegen.emit.family_forwards import (
 )
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
-from hyper_parallel.codegen.emit.methods import materialize_observed_methods
+from hyper_parallel.codegen.emit.methods import materialize_observed_methods, verify_observed_methods
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_plan
 from hyper_parallel.codegen.inline.construction import (
     construction_sites,
@@ -358,42 +357,11 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     text = materialize_observed_methods(text, getattr(meta, "materialized_methods", {}))
     text = _lower_forward_boundaries(text, emission_meta, module_name)
     text = materialize_module_constructions(text, getattr(meta, "preinstalled_components", ()))
+    verify_observed_methods(text, getattr(meta, "materialized_methods", {}))
     _verify_recorded_patch_materialization(
         text, emission_meta, patch_plan=patch_plan
     )
     return _banner(meta) + text
-
-
-def _emit_module_constructors(text: str, records: Any) -> str:
-    """Show the applied replacement calls alongside the generated model."""
-    if not records:
-        return text
-    imports, constructors = _emitted_constructors(records)
-    return (
-        text.rstrip() + "\n\n\ndef _hp_module_constructors():\n"
-        '    """Return the observed module replacement calls by module path."""\n'
-        f"{imports}    return {{\n{constructors}    }}\n"
-    )
-
-
-def _constructor_symbol(record: dict[str, Any]) -> str:
-    """Select the source-visible constructor for a captured replacement."""
-    if record.get("family_request", {}).get("selection"):
-        return "hyper_parallel.models.prepared_family:build_prepared_family_replacement"
-    return record["replay"]["constructor"]
-
-
-def _emitted_constructors(records):
-    """Emit a direct executable factory call for every prepared module path."""
-    imports = {}
-    calls = []
-    for record in records:
-        fqn = record["primary_fqn"]
-        module, name = _constructor_symbol(record).split(":", 1)
-        alias = imports.setdefault(module, f"_hp_constructor_module_{len(imports)}")
-        calls.append(f"        {fqn!r}: lambda **kwargs: {alias}.{name}(**kwargs),\n")
-    statements = [f"    import {module} as {alias}\n" for module, alias in imports.items()]
-    return "".join(statements), "".join(calls)
 
 
 def _verify_recorded_patch_materialization(
@@ -569,25 +537,6 @@ def _has_source_constructor(tree: ast.AST, record: dict, expected: str) -> bool:
         if not isinstance(value, ast.Call) or _call_name(value.func) != expected:
             return False
     return True
-
-
-def _module_constructor_calls(tree: ast.Module) -> dict[str, str]:
-    """Read the executable replacement calls declared in the generated source."""
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_hp_module_constructors":
-            result = node.body[-1]
-            if isinstance(result, ast.Return) and isinstance(result.value, ast.Dict):
-                return _constructor_call_map(result.value)
-    return {}
-
-
-def _constructor_call_map(mapping: ast.Dict) -> dict[str, str]:
-    """Read direct calls keyed by module path."""
-    return {
-        key.value: _call_name(value.body.func)
-        for key, value in zip(mapping.keys, mapping.values)
-        if isinstance(key, ast.Constant) and isinstance(value, ast.Lambda) and isinstance(value.body, ast.Call)
-    }
 
 
 def _wrapper_identity(record: Any) -> tuple[Any, str, str]:

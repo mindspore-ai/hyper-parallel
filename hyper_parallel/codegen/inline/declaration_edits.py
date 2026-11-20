@@ -59,7 +59,7 @@ def _render_imports(
     lines: list[str] = []
     for patch in imports:
         if patch.raw:
-            if patch.raw not in source_text:
+            if patch.raw not in source_text and patch.raw not in lines:
                 lines.append(patch.raw)
             continue
         grouped[patch.module].update(patch.names)

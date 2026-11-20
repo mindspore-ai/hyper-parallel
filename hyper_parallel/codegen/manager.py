@@ -127,11 +127,14 @@ def _build_emission_context(snapshot: CodegenSnapshot) -> EmissionContext:
 
 
 def _preinstalled_records(payload: dict) -> list:
-    """Use only replayable constructors captured by shared preparation."""
+    """Require concrete construction inputs captured by shared preparation."""
     applications = payload["replacements"]["applications"]
-    unsupported = [item["primary_fqn"] for item in applications if not item.get("replay")]
+    unsupported = [item["primary_fqn"] for item in applications
+                   if not item.get("source_type") or not item.get("replacement_type")
+                   or ("resolved_arguments" not in item.get("family_request", {}).get("selection", {})
+                       and "constructor_arguments" not in item.get("replay", {}))]
     if unsupported:
-        raise ValueError(f"Codegen replacement has no importable replay record at {unsupported!r}")
+        raise ValueError(f"Codegen replacement has no concrete construction inputs at {unsupported!r}")
     return list(applications)
 
 

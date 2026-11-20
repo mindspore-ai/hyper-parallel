@@ -25,6 +25,26 @@ from hyper_parallel.codegen.inline.ir import ImportPatch, InlinePatchSet
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 
 
+def verify_observed_methods(source: str, records: dict) -> None:
+    """Reject a local-compute body whose methods still need runtime installation."""
+    classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+    for path, record in records.items():
+        name = record["type"].split(":", 1)[-1]
+        host = classes.get(name)
+        methods = {} if host is None else {
+            node.name: node for node in host.body if isinstance(node, ast.FunctionDef)
+        }
+        for method_name, expected in record["methods"].items():
+            actual = methods.get(method_name)
+            if method_name == "forward" and "_forward_impl" in methods:
+                actual = methods["_forward_impl"]
+            wanted = ast.parse(expected).body[0]
+            if actual is None or ast.dump(ast.Module(body=actual.body, type_ignores=[])) != ast.dump(
+                ast.Module(body=wanted.body, type_ignores=[])
+            ):
+                raise ValueError(f"Codegen native method {path}.{method_name} was not materialized")
+
+
 def materialize_observed_methods(source: str, records: dict) -> str:
     """Write observed methods into the classes actually used by the model."""
     grouped = {}
@@ -51,7 +71,7 @@ def materialize_observed_methods(source: str, records: dict) -> str:
             if old is None:
                 additions.append(text)
             else:
-                edits.append(TextEdit(old.def_offset, old.body_end, text.lstrip(" ")))
+                edits.append(TextEdit(old.def_offset, old.body_end, text))
         fields = record["fields"]
         if fields:
             statements = "\n".join(f"        self.{key} = {value}" for key, value in fields.items())

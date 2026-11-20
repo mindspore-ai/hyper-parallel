@@ -120,12 +120,26 @@ def observe_local_methods(plan: Any, model: Any, mesh_context: Any) -> dict[str,
     expert_mesh = _MethodMesh(expert.mesh_dim_names, expert.shape) if expert is not None else None
     modules = dict(model.named_modules(remove_duplicate=False))
     before = {path: dict(module.__dict__) for path, module in modules.items()}
-    resolved = {}
-    for path, spec in entries:
-        function = _resolve_local_compute_fn(modules[path], spec, mesh, plan.mesh_dim_names, expert_mesh)
-        factory = spec.local_compute_fn
-        factory = getattr(factory, "_target_", factory)
-        resolved.setdefault(path, {})[factory.__name__] = function
+    try:
+        resolved = {}
+        for path, spec in entries:
+            function = _resolve_local_compute_fn(modules[path], spec, mesh, plan.mesh_dim_names, expert_mesh)
+            factory = spec.local_compute_fn
+            factory = getattr(factory, "_target_", factory)
+            resolved.setdefault(path, {})[factory.__name__] = function
+        return _describe_methods(modules, before, resolved)
+    finally:
+        for path, module in modules.items():
+            module.__dict__.clear()
+            module.__dict__.update(before[path])
+
+
+def _describe_methods(modules: dict, before: dict, resolved: dict) -> dict[str, dict]:
+    for path in resolved:
+        expected = {key for key, module in modules.items() if type(module) is type(modules[path])}
+        selected = {key for key in resolved if type(modules[key]) is type(modules[path])}
+        if selected != expected:
+            raise ValueError(f"Codegen cannot apply one native local method to a partially selected class at {path!r}")
     result = {}
     for path, module in modules.items():
         methods = dict(resolved.get(path, {}))

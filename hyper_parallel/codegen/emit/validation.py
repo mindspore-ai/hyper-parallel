@@ -32,6 +32,8 @@ def verify_generated_source_structure(files: Mapping[str, str]) -> None:
         except SyntaxError as exc:
             errors.append(f"{filename}: invalid Python source ({exc.msg})")
             continue
+        if any(isinstance(node, ast.FunctionDef) and node.name == "_hp_module_constructors" for node in tree.body):
+            errors.append(f"{filename}: detached module constructor table cannot represent a patched model")
         for class_node in (
             node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
         ):
