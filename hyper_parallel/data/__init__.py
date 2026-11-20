@@ -16,7 +16,7 @@
 """data: dataset building, batching, and parallel batch primitives.
 
 Stage 6 (05 §15.10) final layout: ``text`` (LLM builders/transforms/chat
-templates), ``online`` (mapping/iterable raw sources), ``indexed``
+templates), ``online`` (mapping/iterable raw sources), ``offline``
 (``.idx``/``.bin`` datasets and the native helpers), ``batching``
 (collators, dataloaders, get-batch),
 ``parallel`` (DP samplers and CP/TP batch distribution),

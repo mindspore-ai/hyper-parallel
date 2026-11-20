@@ -27,11 +27,11 @@ from typing import Any
 import unittest
 from unittest.mock import Mock, patch
 
-from hyper_parallel.data import indexed
+from hyper_parallel.data import offline
 
 
-_CPP_MODULE_NAME = "hyper_parallel.data.indexed._indexed_helpers_cpp"
-_HELPER_SOURCE = Path(indexed.__file__).with_name("indexed_helpers.py")
+_CPP_MODULE_NAME = "hyper_parallel.data.offline._indexed_helpers_cpp"
+_HELPER_SOURCE = Path(offline.__file__).with_name("helpers.py")
 
 
 class _MissingThenAvailableImporter:
@@ -70,8 +70,8 @@ def _make_cpp_module():
 
 
 def _execute_helper_module(importer):
-    """Execute indexed_helpers.py under an isolated module name."""
-    spec = importlib.util.spec_from_file_location("_indexed_helpers_under_test", _HELPER_SOURCE)
+    """Execute helpers.py under an isolated module name."""
+    spec = importlib.util.spec_from_file_location("_helpers_under_test", _HELPER_SOURCE)
     module = importlib.util.module_from_spec(spec)
     with patch("builtins.__import__", side_effect=importer):
         spec.loader.exec_module(module)
@@ -90,16 +90,16 @@ class TestIndexedPackagePath(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
-            package_file = repository / "hyper_parallel/data/indexed/__init__.py"
+            package_file = repository / "hyper_parallel/data/offline/__init__.py"
             package_file.parent.mkdir(parents=True)
             package_file.touch()
             (repository / "setup.py").touch()
-            native = repository / "build/native/payload/hyper_parallel/data/indexed"
+            native = repository / "build/native/payload/hyper_parallel/data/offline"
             native.mkdir(parents=True)
             package_path = []
 
-            indexed._extend_native_path(str(package_file), package_path)
-            indexed._extend_native_path(str(package_file), package_path)
+            offline._extend_native_path(str(package_file), package_path)
+            offline._extend_native_path(str(package_file), package_path)
 
         self.assertEqual(package_path, [str(native)])
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Indexed token and prepared-record datasets, with native sampling helpers.
+"""Offline token and prepared-record datasets, with native sampling helpers.
 
 Prepared Arrow datasets share the Indexed split and sampling pipeline.
 Offline indexed I/O tools live in ``hyper_parallel.data.tools.io``.
@@ -20,7 +20,7 @@ Offline indexed I/O tools live in ``hyper_parallel.data.tools.io``.
 
 from pathlib import Path
 
-from hyper_parallel.data.indexed.indexed_pretrain_dataset import SFTFromMRDataset
+from hyper_parallel.data.offline.dataset import SFTFromMRDataset
 
 __all__ = ["SFTFromMRDataset"]
 
@@ -28,7 +28,7 @@ __all__ = ["SFTFromMRDataset"]
 def _extend_native_path(package_file: str, package_path: list[str]) -> None:
     """Make the source-build helper visible without copying binaries into source."""
     repository = Path(package_file).resolve().parents[3]
-    native = repository / "build/native/payload/hyper_parallel/data/indexed"
+    native = repository / "build/native/payload/hyper_parallel/data/offline"
     if (repository / "setup.py").is_file() and native.is_dir() and str(native) not in package_path:
         package_path.append(str(native))
 

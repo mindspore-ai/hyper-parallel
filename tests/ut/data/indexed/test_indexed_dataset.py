@@ -22,10 +22,9 @@ import unittest
 import numpy as np
 import torch
 
-from hyper_parallel.data.indexed.indexed_blended_dataset import BlendedDataset
-from hyper_parallel.data.indexed.indexed_dataset import build_indexed_dataset
-from hyper_parallel.data.indexed.indexed_lazy_dataset import LazyDatasetProxy
-from hyper_parallel.data.indexed.indexed_pretrain_dataset import GPTDataset, GPTFromMRDataset, MockGPTDataset
+from hyper_parallel.data.offline.blended_dataset import BlendedDataset
+from hyper_parallel.data.offline.build_dataset import LazyDatasetProxy, build_indexed_dataset
+from hyper_parallel.data.offline.dataset import GPTDataset, GPTFromMRDataset, MockGPTDataset
 from hyper_parallel.data.tools.io import IndexedDatasetBuilder
 
 

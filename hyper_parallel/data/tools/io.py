@@ -23,7 +23,7 @@ pairs, plus optional streaming readers for object storage (S3 and MSC).
 
 All three calls below are equivalent for local data:
 
-    from hyper_parallel.data.indexed.io import IndexedDataset
+    from hyper_parallel.data.tools.io import IndexedDataset
 
     ds = IndexedDataset("/path/to/shard_00_text_document")
     print(len(ds), ds[0][:20])

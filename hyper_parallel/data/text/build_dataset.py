@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_dataset import (
+from hyper_parallel.data.offline.build_dataset import (
     build_indexed_dataset as _build_indexed_dataset,
 )
 from hyper_parallel.data.online import (

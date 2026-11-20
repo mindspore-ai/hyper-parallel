@@ -97,7 +97,7 @@ dataset:
     mock_data: false
     distributed_walk: true
     low_level_dataset:
-      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
+      _target_: hyper_parallel.data.offline.dataset.GPTDataset
     simple_blend: "no"
     data_lazy_load: true
     skip_data_check: true

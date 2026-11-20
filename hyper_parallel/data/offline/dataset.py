@@ -30,8 +30,8 @@ from numpy.random import RandomState
 
 from hyper_parallel.data.constants import IGNORE_INDEX, PAD_TOKEN_ID
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
-from hyper_parallel.data.indexed.indexed_data_reader import ArrowDataReader, IndexedDataReader
+from hyper_parallel.data.offline.data_config import GPTDatasetConfig
+from hyper_parallel.data.offline.data_reader import ArrowDataReader, IndexedDataReader
 
 logger = get_dataset_logger(__name__)
 
@@ -444,7 +444,7 @@ class GPTDataset(_IndexedPretrainDataset):
 
         # Convert the shuffled token stream into fixed-length sample boundaries in C++.
         # Keep the optional C++ extension out of the pre-packed MindRecord path.
-        from hyper_parallel.data.indexed.indexed_helpers import build_sample_index  # pylint: disable=C0415
+        from hyper_parallel.data.offline.helpers import build_sample_index  # pylint: disable=C0415
 
         sample_index = build_sample_index(
             self.dataset.sequence_lengths,

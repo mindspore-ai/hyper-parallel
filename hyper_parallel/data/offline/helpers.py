@@ -29,7 +29,7 @@ import numpy as np
 
 
 try:
-    from hyper_parallel.data.indexed._indexed_helpers_cpp import (
+    from hyper_parallel.data.offline._indexed_helpers_cpp import (
         build_blending_indices as _build_blending_indices_cpp,
         build_sample_index_int32,
         build_sample_index_int64,
@@ -59,7 +59,7 @@ except ImportError as error:
             time.sleep(0.1)
 
     importlib.invalidate_caches()
-    from hyper_parallel.data.indexed._indexed_helpers_cpp import (
+    from hyper_parallel.data.offline._indexed_helpers_cpp import (
         build_blending_indices as _build_blending_indices_cpp,
         build_sample_index_int32,
         build_sample_index_int64,

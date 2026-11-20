@@ -81,7 +81,7 @@ dataset:
   data_config:
     max_seq_len: 8  # 必填：每条完整记录的 token 数，不是内部子文档长度
     low_level_dataset:
-      _target_: hyper_parallel.data.indexed.SFTFromMRDataset
+      _target_: hyper_parallel.data.offline.SFTFromMRDataset
     simple_blend: intra
     split: "1,0,0"
 
