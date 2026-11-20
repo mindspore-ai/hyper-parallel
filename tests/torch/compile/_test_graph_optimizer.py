@@ -16,14 +16,15 @@
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch_npu
 from torch import nn
 
-from hyper_parallel.compile.optimizer import GraphOptimizer
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.dtensor.layout import Layout
@@ -84,13 +85,23 @@ def _run_case(mesh: DeviceMesh, dtype: torch.dtype, shape: tuple[int, int],
     layout.set_tensor_meta(shape, (shape[1], 1), dtype)
 
     def slice_full(full: torch.Tensor) -> torch.Tensor:
-        """Select the valid rows and columns owned by this rank."""
+        """Select this rank's valid rows and columns from the reference matrix.
+
+        Args:
+            full: Global reference matrix.
+        """
         if tp_dim is not None:
             full = full.narrow(tp_dim, tp_start, tp_size)
         return full.narrow(0, start, valid_rows)
 
-    def make_optimizer(local: torch.Tensor) -> tuple[nn.Module, GraphOptimizer]:
-        """Build a Muon optimizer bound to this rank's physical shard."""
+    def make_optimizer(
+        local: torch.Tensor,
+    ) -> tuple[nn.Module, Union[ChainedOptimizer, Float16OptimizerWithFloat16Params]]:
+        """Bind this rank's physical parameter to its global matrix layout.
+
+        Args:
+            local: Initial values of the padded local shard.
+        """
         model = nn.Module()
         model.weight = nn.Parameter(local.clone())
         model.weight.model_name = 'weight'
@@ -100,9 +111,10 @@ def _run_case(mesh: DeviceMesh, dtype: torch.dtype, shape: tuple[int, int],
         })
         if headwise:
             raw.optimizers_dict['muon'].reshape_fn = lambda name, inp: [inp.view(-1, 2, inp.shape[-1])]
-        optimizer = GraphOptimizer(raw, model, fp32_main_params=dtype == torch.bfloat16)
+        raw.defer_parameter_binding()
+        optimizer = Float16OptimizerWithFloat16Params(raw, model) if dtype == torch.bfloat16 else raw
         specs = {model.weight: (layout, local_shape)}
-        optimizer.bind(specs)
+        optimizer.bind_parameter_layouts(specs)
         return model, optimizer
 
     model, optimizer = make_optimizer(physical)

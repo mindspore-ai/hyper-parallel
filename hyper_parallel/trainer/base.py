@@ -49,7 +49,6 @@ from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
 from hyper_parallel.compile.compiler import GraphCompiler
-from hyper_parallel.compile.optimizer import GraphOptimizer
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
@@ -549,9 +548,12 @@ class BaseTrainer(Stateful, ABC):
         self.train_steps = train_steps
         self.train_epochs = (self.train_iters + self.train_steps - 1) // self.train_steps
 
+    _optimizer_needs_layouts = False
+
     def _build_optimizer(self) -> None:
         """Build the configured optimizer with the runtime model context."""
         config: TrainerConfig = self.config
+        self._optimizer_needs_layouts = False
         external = get_model_external_state(self.model)
         if external is not None:
             def wrap_dense(dense_raw: Any) -> Any:
@@ -574,13 +576,12 @@ class BaseTrainer(Stateful, ABC):
         if config.compile.selects_graph_compiler() and (
                 config.optimizer.fp32_main_params
                 or any(getattr(leaf, "is_muon", False) for leaf in optimizer.chained_optimizers)):
-            self.optimizer = GraphOptimizer(optimizer, self.model, fp32_main_params=config.optimizer.fp32_main_params)
-        else:
-            self.optimizer = (
-                Float16OptimizerWithFloat16Params(optimizer, self.model)
-                if config.optimizer.fp32_main_params
-                else optimizer
-            )
+            optimizer.defer_parameter_binding()
+            self._optimizer_needs_layouts = True
+        self.optimizer = (
+            Float16OptimizerWithFloat16Params(optimizer, self.model)
+            if config.optimizer.fp32_main_params else optimizer
+        )
         # Swap is attached after the fp32 main-parameter wrap so leaf optimizers
         # already reference their final parameters, and the lr scheduler built
         # right after reads the wrapped ``self.optimizer.param_groups``.
@@ -1041,8 +1042,8 @@ class BaseTrainer(Stateful, ABC):
         Returns:
             Normalized loss and the global gradient norm before clipping.
         """
-        if isinstance(self.optimizer, GraphOptimizer):
-            self.optimizer.bind(self.graph_compiler.optimizer_parameter_layouts)
+        if self._optimizer_needs_layouts:
+            self.optimizer.bind_parameter_layouts(self.graph_compiler.optimizer_parameter_layouts)
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)

@@ -16,19 +16,21 @@
 
 from types import SimpleNamespace
 import unittest
+from typing import Callable, Optional
 from unittest.mock import PropertyMock, patch
 
 import torch
 from torch import nn
 
 from hyper_parallel.compile.compiler import GraphCompiler
-from hyper_parallel.compile.optimizer import GraphOptimizer
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from tests.common.mark_utils import arg_mark
 
 
 class _LocalMomentum(torch.optim.SGD):
@@ -36,12 +38,12 @@ class _LocalMomentum(torch.optim.SGD):
 
     is_muon = True
 
-    def reset_optimizer_parameters(self):
+    def reset_optimizer_parameters(self) -> None:
         """The unit test does not build distributed owner/communication plans."""
 
     @torch.no_grad()
-    def step(self, closure=None):
-        """Apply a local momentum update while retaining DTensor state."""
+    def step(self, closure: Optional[Callable] = None) -> None:
+        """Apply one local SGD update with momentum."""
         for group in self.param_groups:
             for param in group["params"]:
                 if param.grad is None:
@@ -72,17 +74,25 @@ def _optimizer(dtype=torch.float32, fp32_main_params=False):
     model.weight.model_name = "weight"
     leaf = _LocalMomentum(model.parameters(), lr=0.1)
     chain = ChainedOptimizer(model, {"muon": leaf})
-    return model, leaf, GraphOptimizer(chain, model, fp32_main_params=fp32_main_params)
+    chain.defer_parameter_binding()
+    optimizer = Float16OptimizerWithFloat16Params(chain, model) if fp32_main_params else chain
+    return model, leaf, optimizer
 
 
 class TestGraphOptimizer(unittest.TestCase):
     """Binding must preserve matrix semantics without cloning FP32 weights."""
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_shared_storage_and_two_step_gradient_lifecycle(self):
-        """Verify repeated updates reuse the FP32 storage alias and clear both gradients."""
+        """Feature: FP32 graph views.
+
+        Description: Accumulate two gradients on the same parameter view.
+        Expectation: Weights and momentum match the reference and gradients clear.
+        """
         model, leaf, optimizer = _optimizer()
         layouts = {model.weight: (_layout((4, 3)), (2, 3))}
-        optimizer.bind(layouts)
+        optimizer.bind_parameter_layouts(layouts)
         view = optimizer.optimizer_param_by_model_param[model.weight]
         self.assertIsInstance(view, DTensor)
         self.assertEqual(tuple(view.shape), (4, 3))
@@ -94,7 +104,7 @@ class TestGraphOptimizer(unittest.TestCase):
             model.weight.grad = torch.full_like(model.weight, value)
             momentum.mul_(0.5).add_(value)
             expected.add_(momentum, alpha=-0.1)
-            optimizer.bind(layouts)
+            optimizer.bind_parameter_layouts(layouts)
             optimizer.step()
             optimizer.zero_grad()
             torch.testing.assert_close(model.weight, expected)
@@ -106,11 +116,17 @@ class TestGraphOptimizer(unittest.TestCase):
         self.assertEqual(tuple(state.shape), (4, 3))
         torch.testing.assert_close(state.to_local(), momentum)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_strided_shard_retains_logical_shape(self):
-        """Check that a strided shard preserves global metadata in both weights and momentum."""
+        """Feature: Strided sharding.
+
+        Description: Bind two axes that shard the row dimension.
+        Expectation: Optimizer parameter and momentum preserve the placements.
+        """
         model, leaf, optimizer = _optimizer()
         layout = _layout((8, 3), (StridedShard(0, 2), Shard(0)))
-        optimizer.bind({model.weight: (layout, (2, 3))})
+        optimizer.bind_parameter_layouts({model.weight: (layout, (2, 3))})
         model.weight.grad = torch.ones_like(model.weight)
         optimizer.step()
         view = optimizer.optimizer_param_by_model_param[model.weight]
@@ -118,12 +134,18 @@ class TestGraphOptimizer(unittest.TestCase):
         self.assertEqual(tuple(view.placements), tuple(layout.placements))
         self.assertEqual(tuple(leaf.state[view]["momentum_buffer"].shape), (8, 3))
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_fp32_main_is_created_from_final_local_shard(self):
-        """Check FP32 main weights use the final local shard and write back to the model dtype."""
+        """Feature: FP32 main weights.
+
+        Description: Bind a BF16 shard after compilation.
+        Expectation: Only the final local shard is copied into main storage.
+        """
         model, _, optimizer = _optimizer(torch.bfloat16, fp32_main_params=True)
         layouts = {model.weight: (_layout((4, 3)), (2, 3))}
         self.assertFalse(optimizer.model_param_by_optimizer_param)
-        optimizer.bind(layouts)
+        optimizer.bind_parameter_layouts(layouts)
         main = optimizer.optimizer_param_by_model_param[model.weight]
         self.assertEqual(main.dtype, torch.float32)
         self.assertEqual(tuple(main.to_local().shape), (2, 3))
@@ -138,12 +160,18 @@ class TestGraphOptimizer(unittest.TestCase):
             self.assertIs(model.weight, main)
         self.assertIs(model.weight, original)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_padding_is_excluded_and_empty_shards_are_retained(self):
-        """Check padding stays out of optimizer state even when a rank owns no valid rows."""
+        """Feature: Padded graph weights.
+
+        Description: Run updates with one or zero valid rows.
+        Expectation: Padding stays zero and optimizer state uses valid rows.
+        """
         for valid_rows in (0, 1):
             with self.subTest(valid_rows=valid_rows):
                 model, leaf, optimizer = _optimizer()
-                optimizer.bind({model.weight: (_layout((1, 3)), (valid_rows, 3))})
+                optimizer.bind_parameter_layouts({model.weight: (_layout((1, 3)), (valid_rows, 3))})
                 model.weight.grad = torch.ones_like(model.weight)
                 optimizer.step()
                 view = optimizer.optimizer_param_by_model_param[model.weight]
@@ -152,37 +180,82 @@ class TestGraphOptimizer(unittest.TestCase):
                 self.assertEqual(leaf.state[view]["momentum_buffer"].to_local().shape[0], valid_rows)
                 torch.testing.assert_close(model.weight[valid_rows:], torch.zeros((2 - valid_rows, 3)))
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_changed_storage_or_layout_is_rejected(self):
-        """Reject layout changes and replacement of aliased storage after binding."""
+        """Feature: Binding invalidation.
+
+        Description: Change layout identity and then replace physical storage.
+        Expectation: Each invalidation is detected before an update.
+        """
         model, _, optimizer = _optimizer()
         layouts = {model.weight: (_layout((4, 3)), (2, 3))}
-        optimizer.bind(layouts)
+        optimizer.bind_parameter_layouts(layouts)
         with self.assertRaisesRegex(RuntimeError, "layout changed"):
-            optimizer.bind(dict(layouts))
+            optimizer.bind_parameter_layouts(dict(layouts))
         with torch.no_grad():
             model.weight.data = torch.clone(model.weight)
         model.weight.grad = torch.ones_like(model.weight)
         with self.assertRaisesRegex(RuntimeError, "storage changed"):
             optimizer.step()
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_binding_requires_an_uninitialized_optimizer(self):
-        """Reject binding after the leaf optimizer has initialized state."""
+        """Feature: First binding.
+
+        Description: Populate leaf state before registering layouts.
+        Expectation: Binding rejects initialized leaf state.
+        """
         model, leaf, optimizer = _optimizer()
         leaf.state[model.weight]["momentum_buffer"] = torch.ones_like(model.weight)
         with self.assertRaisesRegex(RuntimeError, "before initializing optimizer state"):
-            optimizer.bind({model.weight: (_layout((4, 3)), (2, 3))})
+            optimizer.bind_parameter_layouts({model.weight: (_layout((4, 3)), (2, 3))})
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_incomplete_layout_can_be_retried_without_replacing_groups(self):
+        """Feature: Retryable layout binding.
+
+        Description: Omit the second layout, then retry with both.
+        Expectation: The failed bind preserves original parameters and scheduler groups.
+        """
+        model, leaf, optimizer = _optimizer()
+        model.second = nn.Parameter(torch.zeros_like(model.weight))
+        model.second.model_name = "second"
+        group = leaf.param_groups[0]
+        group["params"].append(model.second)
+        layout = (_layout((4, 3)), (2, 3))
+        with self.assertRaisesRegex(ValueError, "Missing graph parameter layout for second"):
+            optimizer.bind_parameter_layouts({model.weight: layout})
+        self.assertIs(group["params"][0], model.weight)
+        optimizer.bind_parameter_layouts({model.weight: layout, model.second: layout})
+        self.assertIs(optimizer.param_groups[0], group)
+        self.assertIs(group["params"][1], optimizer.optimizer_param_by_model_param[model.second])
+
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_unsharded_graph_keeps_original_parameters(self):
-        """Update the original parameter directly when there is no distributed layout."""
+        """Feature: Local graph execution.
+
+        Description: Bind a graph without distributed layouts.
+        Expectation: The optimizer updates the original parameter.
+        """
         model, _, optimizer = _optimizer()
-        optimizer.bind(None)
+        optimizer.bind_parameter_layouts(None)
         self.assertIs(optimizer.optimizer_param_by_model_param[model.weight], model.weight)
         model.weight.grad = torch.ones_like(model.weight)
         optimizer.step()
         torch.testing.assert_close(model.weight, torch.full((2, 3), 0.9))
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_adam_fallback_keeps_padded_local_shape_with_fp32_main(self):
-        """Check the AdamW fallback uses plain FP32 main weights with the physical shard shape."""
+        """Feature: AdamW fallback.
+
+        Description: Bind a mixed chain over BF16 parameters.
+        Expectation: AdamW uses local main weights and Muon keeps its matrix layout.
+        """
         model = nn.Module()
         model.weight = nn.Parameter(torch.ones((2, 3), dtype=torch.bfloat16))
         model.scale = nn.Parameter(torch.ones((2,), dtype=torch.bfloat16))
@@ -192,8 +265,9 @@ class TestGraphOptimizer(unittest.TestCase):
         # Keep the CPU test independent of NPU capability discovery.
         adam = torch.optim.AdamW([model.scale], lr=0.1, weight_decay=0.0, foreach=False)
         chain = ChainedOptimizer(model, {"muon": muon, "adamw": adam}, flatten=True)
-        optimizer = GraphOptimizer(chain, model, fp32_main_params=True)
-        optimizer.bind({model.weight: (_layout((4, 3)), (2, 3))})
+        chain.defer_parameter_binding()
+        optimizer = Float16OptimizerWithFloat16Params(chain, model)
+        optimizer.bind_parameter_layouts({model.weight: (_layout((4, 3)), (2, 3))})
         main = optimizer.optimizer_param_by_model_param[model.scale]
         self.assertNotIsInstance(main, DTensor)
         self.assertEqual(tuple(main.shape), (2,))
@@ -206,10 +280,16 @@ class TestGraphOptimizer(unittest.TestCase):
         self.assertIsNone(model.scale.grad)
         self.assertIsNone(main.grad)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_checkpoint_round_trip_preserves_fqn_and_main_weights(self):
-        """Restore the model-name mapping, FP32 main weights, and momentum into a fresh optimizer."""
+        """Feature: Optimizer checkpoint.
+
+        Description: Load moments and FP32 main weights into another bound optimizer.
+        Expectation: State and model parameter associations survive the round trip.
+        """
         model, leaf, optimizer = _optimizer(torch.bfloat16, fp32_main_params=True)
-        optimizer.bind({model.weight: (_layout((4, 3)), (2, 3))})
+        optimizer.bind_parameter_layouts({model.weight: (_layout((4, 3)), (2, 3))})
         model.weight.grad = torch.ones_like(model.weight)
         optimizer.step()
         optimizer.zero_grad()
@@ -217,7 +297,7 @@ class TestGraphOptimizer(unittest.TestCase):
         saved_main = optimizer.optimizer_param_by_model_param[model.weight].to_local().clone()
         saved_momentum = to_local_if_dtensor(next(iter(leaf.state.values()))["momentum_buffer"]).clone()
         model2, leaf2, restored = _optimizer(torch.bfloat16, fp32_main_params=True)
-        restored.bind({model2.weight: (_layout((4, 3)), (2, 3))})
+        restored.bind_parameter_layouts({model2.weight: (_layout((4, 3)), (2, 3))})
         restored.load_state_dict(state)
         view = restored.optimizer_param_by_model_param[model2.weight]
         torch.testing.assert_close(view.to_local(), saved_main)
@@ -228,8 +308,14 @@ class TestGraphOptimizer(unittest.TestCase):
 class TestOptimizerParameterLayouts(unittest.TestCase):
     """Matrix layouts must describe unpadded logical shapes and ceil chunks."""
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_compiler_preserves_storage_layout_and_removes_logical_padding(self):
-        """Describe the logical optimizer shape while preserving the padded storage layout."""
+        """Feature: Compiler layout metadata.
+
+        Description: Query logical layouts for a physically padded parameter.
+        Expectation: Logical rows exclude padding and storage metadata is preserved.
+        """
         model = nn.Module()
         model.weight = nn.Parameter(torch.ones((2, 3)))
         storage_layout = _layout((4, 3))
