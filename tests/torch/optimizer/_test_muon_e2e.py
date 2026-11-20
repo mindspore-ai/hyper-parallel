@@ -23,6 +23,7 @@ computed in the same worker.
 """
 # pylint: disable=W0611,C0413,C0412,W0613,W0612
 import os
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -30,7 +31,7 @@ import torch_npu
 import torch.distributed as dist
 from torch import nn
 
-from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh, distribute_tensor
+from hyper_parallel import DTensor, Shard, SkipDTensorDispatch, init_device_mesh, distribute_tensor
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.optimizer import get_hyper_optimizer
@@ -330,6 +331,50 @@ def test_muon_e2e_full_shard_8p():
     Expectation: Every step matches the single-card reference within tolerance.
     """
     _run_sharding_parity_case(_shard_full_8p)
+
+
+def _make_overlap_optimizer(mesh, group_count, overlap):
+    """Create one sharded matrix and one independent local matrix in each group."""
+    model = nn.ParameterList()
+    for index in range(group_count):
+        initial = torch.arange(32, device="npu", dtype=torch.float32).view(8, 4) * 0.01 + index
+        model.append(nn.Parameter(distribute_tensor(initial, mesh, (Shard(0),))))
+        model.append(nn.Parameter(initial[:4].clone()))
+    groups = [{"params": [model[index], model[index + 1]]} for index in range(0, len(model), 2)]
+    return model, Muon(groups, lr=_LR, weight_decay=_WEIGHT_DECAY, fsdp_overlap=overlap)
+
+
+def _assert_overlap_trajectory(mesh, group_count):
+    """Compare overlap with serial execution and verify the intended path ran."""
+    reference, serial = _make_overlap_optimizer(mesh, group_count, False)
+    candidate, overlap = _make_overlap_optimizer(mesh, group_count, True)
+    with patch.object(torch.profiler, "record_function", wraps=torch.profiler.record_function) as scopes:
+        for step in range(3):
+            gradients = _full_grads(step, reference)
+            for model, optimizer in ((reference, serial), (candidate, overlap)):
+                _assign_gradients(model, gradients)
+                _optimizer_step(optimizer)
+            for expected, actual in zip(reference, candidate):
+                if isinstance(expected, DTensor):
+                    torch.testing.assert_close(actual.to_local(), expected.to_local(), rtol=0, atol=0)
+                else:
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    stages = {invocation.args[0] for invocation in scopes.call_args_list}
+    assert "muon.pipeline.local_ns" in stages, f"local NS missing with {group_count} groups: {stages}"
+    used_pipeline = "muon.pipeline.gather" in stages
+    assert used_pipeline == (group_count > 1), f"unexpected pipeline={used_pipeline} for {group_count} groups"
+
+
+def test_muon_e2e_fsdp_overlap_2p():
+    """Feature: Muon single-axis FSDP communication and computation overlap.
+
+    Description: Compare serial Muon with a single communication batch and a two-batch pipeline on two NPUs.
+    Expectation: Both schedules run their intended overlap paths and update parameters identically to serial Muon.
+    """
+    init_dist()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2,), mesh_dim_names=("dp",))
+    for group_count in (1, 2):
+        _assert_overlap_trajectory(mesh, group_count)
 
 
 def test_muon_e2e_hybrid_shard_replicate_8p():

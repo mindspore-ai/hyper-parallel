@@ -35,6 +35,18 @@ def test_muon_e2e_full_shard_8p():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_muon_e2e_fsdp_overlap_2p():
+    """Feature: Muon communication and computation overlap under single-axis FSDP.
+
+    Description: Exercise both communication schedules on two NPUs.
+    Expectation: Both produce the same parameter updates as serial Muon.
+    """
+    parallel_run([
+        TorchCase(_TEST_MUON_E2E, "test_muon_e2e_fsdp_overlap_2p", None, 2),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_muon_e2e_hybrid_shard_replicate_8p():
     """
     Feature: Muon e2e precision self-consistency under hybrid sharding with replica dedup.
