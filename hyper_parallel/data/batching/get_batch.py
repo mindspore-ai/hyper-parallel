@@ -281,12 +281,14 @@ class TextParallelBatch:
         self.reset_position_ids = (
             reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
             or source_type == "packed_text"
+            or bool(self.data_config.get("inter_document_masking", False))
         )
         resolved_reset_attention_mask = (
             reset_attention_mask
             or bool(self.data_config.get("reset_attention_mask", False))
             or source_type in {"online", "packed_text"}
             or self.is_sft_dataset
+            or bool(self.data_config.get("inter_document_masking", False))
         )
         self.attention_runtime = AttentionRuntime(
             mode=attention_mode,
@@ -497,7 +499,9 @@ class TextParallelBatch:
 
         if self.eod_mask_loss:
             eod_token_id = getattr(self.tokenizer, "eod", None)
-            loss_mask = loss_mask.masked_fill(parallel_batch["input_ids"] == eod_token_id, 0)
+
+            if eod_token_id is not None:
+                loss_mask = loss_mask.masked_fill(parallel_batch["input_ids"] == eod_token_id, 0)
 
         return loss_mask
 

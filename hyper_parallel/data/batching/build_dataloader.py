@@ -207,14 +207,17 @@ def _trainer_model_batch_spec(target: Any, collate_fn: Any, data_config: Mapping
     configured = getattr(target, "model_batch_spec", None)
 
     if configured is not None:
+
         return configured.build() if callable(getattr(configured, "build", None)) else configured
 
     declared = getattr(collate_fn, "model_batch_spec", None)
 
     if declared is not None:
+
         return declared
 
     if isinstance(collate_fn, TextPackingCollator):
+
         return {
             "input_ids": TensorFieldSpec((1, None), torch.int64),
             "labels": TensorFieldSpec((1, None), torch.int64),
@@ -223,8 +226,12 @@ def _trainer_model_batch_spec(target: Any, collate_fn: Any, data_config: Mapping
 
     # Instruction and multimodal providers may emit additional model-owned fields.
     # Their layouts must be configured explicitly rather than guessed from a sample.
+
     if collate_fn is default_collate and not data_config.get("is_instruction_dataset", False):
         spec = {name: TensorFieldSpec((None, None), torch.int64) for name in ("input_ids", "labels")}
+
+        if data_config.get("inter_document_masking", False):
+            spec["cu_seq_lens"] = TensorFieldSpec((None, None), torch.int32)
 
         if data_config.get("create_ltor_fields_in_dataloader", False):
             spec.update({
