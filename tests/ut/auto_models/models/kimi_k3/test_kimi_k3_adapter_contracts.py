@@ -29,6 +29,9 @@ from torch import nn
 from hyper_parallel.components.modules import KimiDeltaAttention
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
+    _apply_resolved_inner_wrapper,
+    _commit_forward_rewrite,
+    _rollback_inner_rewrite,
 )
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.context_parallel import kimi_delta_attention_state as state_cp
@@ -68,6 +71,24 @@ class _FakeMesh:
     def size(self) -> int:
         """Return the configured mesh size."""
         return self._size
+
+    @property
+    def ndim(self) -> int:
+        """Expose a one-dimensional metadata mesh."""
+        return 1
+
+    @property
+    def rank_list(self) -> tuple[int, ...]:
+        """Describe chronological peers without creating a process group."""
+        return tuple(range(self._size))
+
+    def get_local_rank(self) -> int:
+        """Use one representative rank for constructor validation."""
+        return 0
+
+    def get_group(self) -> None:
+        """No collective is executed by these lifecycle tests."""
+        return None
 
 
 class _RecordingExecutor(nn.Module):
@@ -241,6 +262,42 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
                 parameters = inspect.signature(wrapper).parameters
                 self.assertEqual(parameters["backend"].default, "eager")
                 self.assertEqual(parameters["chunk_size"].default, 64)
+
+    def test_real_executor_installation_preserves_module_tree_and_rollback(self):
+        """Real CP executors remain closure-owned through commit and failed validation."""
+        for name in (*_WRAPPER_NAMES, "kimi_delta_attention_cp_wrapper"):
+            with self.subTest(wrapper=name):
+                target = KimiDeltaAttention(hidden_size=32, num_heads=4, head_k_dim=4, head_v_dim=4, chunk_size=4)
+                original_forward = target.forward
+                parameters = {key: id(value) for key, value in target.named_parameters()}
+                state_keys = set(target.state_dict())
+                request = getattr(adapter_context_parallel, name)(
+                    target, None, None, _FakeMesh(2), None, backend="eager",
+                )
+                executor = inspect.getclosurevars(request.forward).nonlocals["executor"]
+                saved = _commit_forward_rewrite(request)
+                self.assertIs(executor.module, target)
+                self.assertNotIn("_hp_kda_cp_executor", target._modules)
+                target.eval()
+                self.assertFalse(executor.module.training)
+                target.train()
+                self.assertEqual(set(target.state_dict()), state_keys)
+                self.assertEqual({key: id(value) for key, value in target.named_parameters()}, parameters)
+                _rollback_inner_rewrite(target, saved, ())
+                self.assertIs(target.forward.__func__, original_forward.__func__)
+                self.assertFalse(hasattr(target, "_hp_kda_cp_config"))
+                with patch("hyper_parallel.distributed._builder.forward_rewriter.validate_wrapped_forward",
+                           side_effect=ValueError("forced validation failure")):
+                    with self.assertRaisesRegex(ValueError, "forced validation failure"):
+                        _apply_resolved_inner_wrapper(
+                            target, (name, target, lambda: request), SimpleNamespace(),
+                            None, (), False, "attention",
+                        )
+                self.assertFalse(hasattr(target, "_hp_kda_cp_config"))
+                self.assertFalse(hasattr(target, "_hp_kda_cp_executor"))
+                self.assertIs(target.forward.__func__, original_forward.__func__)
+                target.train()
+                self.assertEqual(set(target.state_dict()), state_keys)
 
     def test_wrappers_return_atomic_request_without_mutating_target(self):
         """The generic rewriter, rather than the family adapter, owns mutation."""

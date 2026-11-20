@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import inspect
 import os
+import symtable
 import sys
 import textwrap
 from typing import Any
@@ -413,6 +414,17 @@ def _cp_mesh_assignment_attr(tree: ast.AST) -> str | None:
     return None
 
 
+def _captured_forward_names(tree: ast.AST, name: str) -> set[str]:
+    """Read lexical captures without importing or executing the wrapper."""
+    pending = list(symtable.symtable(ast.unparse(tree), "<codegen wrapper>", "exec").get_children())
+    while pending:
+        scope = pending.pop()
+        if scope.get_name() == name and scope.get_type() == "function":
+            return set(scope.get_frees())
+        pending.extend(scope.get_children())
+    return set()
+
+
 def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | None:
     """Lower a closure-backed rewrite into an imported-host dispatch body.
 
@@ -440,6 +452,7 @@ def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | N
     original_forward = _original_forward_binding(tree)
     if original_forward is None:
         return None
+    captured = _captured_forward_names(tree, replacement_name)
 
     class ClosureBindings(ast.NodeTransformer):
         """Rewrite captured closure bindings to generated-instance state."""
@@ -484,6 +497,14 @@ def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | N
     lowered = [ClosureBindings().visit(ast.fix_missing_locations(node)) for node in body]
     if not lowered:
         return None
+    unresolved = sorted(captured & {
+        node.id for statement in lowered for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    })
+    if unresolved:
+        raise RuntimeError(
+            f"codegen: cannot inline {replacement_name!r}; unresolved captured state {unresolved}"
+        )
     active = "\n".join(ast.unparse(node) for node in lowered)
     return (
         "if self.cp_enable:\n"

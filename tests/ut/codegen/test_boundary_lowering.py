@@ -107,26 +107,20 @@ def test_inline_meta_normalization_does_not_mutate_native_observation():
 
 
 @pytest.mark.parametrize(
-    ("factory", "helper"),
+    "factory",
     (
-        (
-            "hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel."
-            "kimi_delta_attention_ulysses_cp_wrapper",
-            "kimi_delta_attention_cp_forward",
-        ),
-        (
-            "hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel."
-            "qwen3_5_gdn_ulysses_cp_wrapper",
-            "qwen3_5_gdn_cp_forward",
-        ),
+        "hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_ulysses_cp_wrapper",
+        "hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_p2p_cp_wrapper",
+        "hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper",
+        "hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_ulysses_cp_wrapper",
+        "hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper",
+        "hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_packed_local_wrapper",
     ),
 )
-def test_delegating_cp_wrapper_exposes_source_visible_helper(factory, helper):
-    """Delegating wrappers retain a module-level helper for code generation."""
-    target = inner_wrapper_target(factory)
-
-    assert target is not None
-    assert target.helper_name == helper
+def test_unbound_executor_closure_is_rejected_before_source_emission(factory):
+    """Native closure ownership must not be changed to make unresolved code emit."""
+    with pytest.raises(RuntimeError, match="unresolved captured state.*executor"):
+        inner_wrapper_target(factory)
 
 
 def test_framework_inner_wrapper_resolves_without_model_adapter_path():

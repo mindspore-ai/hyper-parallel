@@ -16,6 +16,7 @@
 # pylint: disable=wrong-import-position
 
 import os
+import inspect
 import tempfile
 import unittest
 from copy import deepcopy
@@ -36,6 +37,9 @@ from hyper_parallel.components.modules.gated_delta_net import (
 )
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
+    _apply_resolved_inner_wrapper,
+    _commit_forward_rewrite,
+    _rollback_inner_rewrite,
 )
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.recipe_spec import (
@@ -66,6 +70,24 @@ class _FakeMesh:
     def size(self) -> int:
         """Return the synthetic mesh size."""
         return self._size
+
+    @property
+    def ndim(self) -> int:
+        """Return the dimensionality needed by real executor constructors."""
+        return 1
+
+    @property
+    def rank_list(self) -> tuple[int, ...]:
+        """Return chronological metadata peers."""
+        return tuple(range(self._size))
+
+    def get_local_rank(self) -> int:
+        """Use one representative rank without distributed setup."""
+        return 0
+
+    def get_group(self) -> None:
+        """No collective is executed during module lifecycle validation."""
+        return None
 
 
 class _Target(nn.Module):
@@ -135,6 +157,44 @@ class _TinyQwen35Model(nn.Module):
 
 class TestQwen35GdnCpContracts(unittest.TestCase):
     """Pin the public Qwen3.5 GDN adapter and eager numerical oracle."""
+
+    def test_real_executor_installation_preserves_module_tree_and_rollback(self):
+        """Both native CP modes retain parameter identity and atomic rollback."""
+        for mode in ("ulysses", "p2p"):
+            with self.subTest(mode=mode):
+                target = _TinyGatedDeltaNet()
+                for name, value in {"num_k_heads": 2, "num_v_heads": 2, "head_k_dim": 4,
+                                    "head_v_dim": 4, "key_dim": 8, "value_dim": 8, "conv_dim": 24}.items():
+                    setattr(target, name, value)
+                original_forward = target.forward
+                parameters = {key: id(value) for key, value in target.named_parameters()}
+                state_keys = set(target.state_dict())
+                name = f"qwen3_5_gdn_{mode}_cp_wrapper"
+                request = getattr(adapter_context_parallel, name)(
+                    target, None, None, _FakeMesh(2), None, backend="eager",
+                )
+                executor = inspect.getclosurevars(request.forward).nonlocals["executor"]
+                saved = _commit_forward_rewrite(request)
+                self.assertIs(executor.module, target)
+                self.assertNotIn("_hp_gdn_cp_executor", target._modules)
+                target.eval()
+                self.assertFalse(executor.module.training)
+                target.train()
+                self.assertEqual(set(target.state_dict()), state_keys)
+                self.assertEqual({key: id(value) for key, value in target.named_parameters()}, parameters)
+                _rollback_inner_rewrite(target, saved, ())
+                self.assertIs(target.forward.__func__, original_forward.__func__)
+                with patch("hyper_parallel.distributed._builder.forward_rewriter.validate_wrapped_forward",
+                           side_effect=ValueError("forced validation failure")):
+                    with self.assertRaisesRegex(ValueError, "forced validation failure"):
+                        _apply_resolved_inner_wrapper(
+                            target, (name, target, lambda: request), SimpleNamespace(),
+                            None, (), False, "linear_attn",
+                        )
+                self.assertFalse(hasattr(target, "_hp_gdn_cp_config"))
+                self.assertFalse(hasattr(target, "_hp_gdn_cp_executor"))
+                self.assertIs(target.forward.__func__, original_forward.__func__)
+                self.assertEqual(set(target.state_dict()), state_keys)
 
     def test_gated_attention_matches_native_source_and_gradients(self):
         """Feature: Real Qwen3.5 dense/MoE full attention uses the gated GQA family.
