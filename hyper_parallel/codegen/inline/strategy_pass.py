@@ -167,7 +167,10 @@ def _materialize_cp_forward(
                 class_name=host_class,
                 method_name=spec.method_name,
                 body=spec.subclass_shell,
-                merge_original_body=True,
+                merge_original_body=(
+                    spec.subclass_shell.count("self._forward_impl(") == 1
+                    and spec.subclass_shell.rstrip().endswith("return self._forward_impl(__hp_forward_args__)")
+                ),
             )
         )
 

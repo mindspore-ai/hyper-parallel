@@ -105,15 +105,27 @@ def _bind_hidden_arg(body: str, func: FunctionInfo) -> str:
 def _bind_forward_args(body: str, func: FunctionInfo) -> str:
     """Bind a dispatch shell's argument token to the original signature."""
     token = "__hp_forward_args__"
-    if token not in body:
-        return body
     args = list(func.param_names)
     if func.vararg_name:
         args.append(f"*{func.vararg_name}")
     args.extend(f"{name}={name}" for name in func.kwonly_names)
     if func.kwarg_name:
         args.append(f"**{func.kwarg_name}")
-    return body.replace(token, ", ".join(args))
+    positional = list(func.param_names)
+    if func.vararg_name:
+        positional.append(f"*{func.vararg_name}")
+    keywords = [f"{name!r}: {name}" for name in func.kwonly_names]
+    if func.kwarg_name:
+        keywords.append(f"**{func.kwarg_name}")
+    positional_text = ", ".join(positional) + ("," if positional else "")
+    bindings = []
+    if "__hp_forward_positional__" in body:
+        bindings.append(f"forward_args = ({positional_text})")
+        body = body.replace("__hp_forward_positional__", "forward_args")
+    if "__hp_forward_keywords__" in body:
+        bindings.append("forward_kwargs = {" + ", ".join(keywords) + "}")
+        body = body.replace("__hp_forward_keywords__", "forward_kwargs")
+    return "\n".join([*bindings, body.replace(token, ", ".join(args))])
 
 
 def _forward_impl_fallback(func: FunctionInfo) -> str:

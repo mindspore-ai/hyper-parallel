@@ -184,7 +184,7 @@ def kernel(module, value, *, enabled=None, **kwargs):
     attention.cp_enable = False
     calls.clear()
     assert attention.forward(3, token=7) == 4
-    assert calls == []
+    assert not calls
 
 
 @pytest.mark.parametrize("override", [None, False, True])
@@ -289,6 +289,122 @@ def test_framework_inner_wrapper_resolves_without_model_adapter_path():
     assert spec.imports[0].names == ("sdpa_hf_cp_forward",)
 
 
+
+def test_identity_wrapper_keeps_existing_no_rewrite_contract(monkeypatch):
+    """A wrapper with no replacement closure does not acquire a new failure."""
+    monkeypatch.setattr("hyper_parallel.codegen.inline.recognition._module_source_tree",
+                        lambda _: ast.parse("def identity(target_module):\n    return target_module.forward\n"))
+    assert inner_wrapper_target("demo.identity") is None
+
+
+@pytest.mark.parametrize("imported", [False, True])
+def test_closure_preserves_original_override_and_finally(monkeypatch, tmp_path, imported):
+    """A saved forward refers to this class's override and keeps cleanup on failure."""
+    wrapper_source = """
+def wrapper(target_module):
+    original_forward = target_module.forward
+    def patched(*args, **kwargs):
+        saved = target_module.marker
+        target_module.marker = 9
+        kwargs["delta"] = kwargs.get("delta", 0) + 1
+        def invoke():
+            return original_forward(*args, **kwargs)
+        try:
+            return invoke()
+        finally:
+            target_module.marker = saved
+    return _ForwardRewriteRequest(target_module, patched)
+"""
+    monkeypatch.setattr("hyper_parallel.codegen.inline.recognition._module_source_tree",
+                        lambda _: ast.parse(wrapper_source))
+    spec = _cp_strategy_spec("demo.wrapper")
+    assert "cp_enable" not in spec.subclass_shell
+    assert "target_module" not in spec.subclass_shell
+    assert "self._forward_impl(*__hp_forward_positional__, **__hp_forward_keywords__)" in spec.subclass_shell
+    source = """
+class Base:
+    def forward(self, value, **kwargs):
+        raise AssertionError("the saved method is not this inherited forward")
+
+class Host(Base):
+    marker = 2
+    cp_enable = False
+    def forward(self, value, *, extra=4, **kwargs):
+        if kwargs.get("fail"):
+            raise ValueError("original failure")
+        return value + self.marker + extra + kwargs["delta"]
+"""
+    def load(name, text):
+        path = tmp_path / f"{name}.py"
+        path.write_text(text, encoding="utf-8")
+        module_spec = util.spec_from_file_location(name, path)
+        module = util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        return module
+
+    patches = build_strategy_patches(
+        (SourceObservation(match=("host",), inner_wrapper_target="demo.wrapper"),),
+        boundary_classes={"host": "Host"},
+    )
+    if imported:
+        base = load("native_host", source)
+        monkeypatch.setitem(sys.modules, "demo", base)
+        patches.imports.append(ImportPatch("demo", ("Host",)))
+        _materialize_imported_forward_hosts("", patches)
+        source = ""
+    module = load("generated_host", apply_patch_set(source, patches))
+    host = module.Host()
+    assert host.forward(3) == 17
+    assert host.forward(value=3, extra=8) == 21
+    assert host.marker == 2
+    with pytest.raises(ValueError, match="original failure"):
+        host.forward(3, fail=True)
+    assert host.marker == 2
+
+
+def test_native_packed_decoder_lowering_runs_at_cp1(tmp_path):
+    """The actual Qwen packed branch must work without CP or an inherited forward."""
+    target = "hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_packed_decoder_wrapper"
+    patches = build_strategy_patches(
+        (SourceObservation(match=("layer",), inner_wrapper_target=target),),
+        boundary_classes={"layer": "Layer"},
+    )
+    source = """
+class Layer:
+    cp_enable = False
+    def forward(self, hidden_states, position_embeddings=None, attention_mask=None,
+                position_ids=None, past_key_values=None, **kwargs):
+        return hidden_states + 100
+"""
+    rendered = apply_patch_set(source, patches)
+    assert "target_module" not in rendered
+    assert "if self.cp_enable" not in rendered
+    path = tmp_path / "packed_decoder.py"
+    path.write_text(rendered, encoding="utf-8")
+    module_spec = util.spec_from_file_location("packed_decoder", path)
+    module = util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    layer = module.Layer()
+    calls = []
+
+    def linear_attn(hidden_states, **kwargs):
+        calls.append(kwargs)
+        return hidden_states * 3
+
+    linear_attn._hp_gdn_cp_config = {"mode": "packed_local"}
+    layer.linear_attn = linear_attn
+    layer.input_layernorm = lambda value: value + 1
+    layer.post_attention_layernorm = lambda value: value + 2
+    layer.mlp = lambda value: value * 2
+    assert layer.forward(3) == 103
+    assert not calls
+    packed = object()
+    assert layer.forward(3, packed_sequence_info=packed) == 49
+    assert calls[0]["packed_sequence_info"] is packed
+    with pytest.raises(NotImplementedError, match="recurrent cache"):
+        layer.forward(3, packed_sequence_info=packed, use_cache=True)
+
+
 def test_closure_cp_wrapper_exposes_source_visible_forward():
     """Closure state published by a rewrite request lowers into its host."""
     factory = (
@@ -302,10 +418,10 @@ def test_closure_cp_wrapper_exposes_source_visible_forward():
     assert target is not None
     assert target.helper_name is None
     assert target.inline_body is not None
-    assert "if self.cp_enable:" in target.inline_body
+    assert "self.cp_enable" not in target.inline_body
     assert "self._hyper_v41_shared_attention_cp_context" in target.inline_body
     assert "self._hyper_v41_shared_attention_tp_context" in target.inline_body
-    assert "super().forward(*args, **call_kwargs)" in target.inline_body
+    assert "self._forward_impl(*__hp_forward_positional__, **call_kwargs)" in target.inline_body
 
 
 def test_closure_cp_wrapper_materializes_imported_replacement_host(monkeypatch):
@@ -332,9 +448,10 @@ def test_closure_cp_wrapper_materializes_imported_replacement_host(monkeypatch):
 
     ast.parse(rendered)
     assert "class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):" in rendered
-    assert "if self.cp_enable:" in rendered
+    assert "if self.cp_enable:" not in rendered
     assert "self._hyper_v41_shared_attention_cp_context" in rendered
-    assert "return super().forward(*args, **call_kwargs)" in rendered
+    assert "return original_forward(*args, **call_kwargs)" in rendered
+    assert "original_forward = super().forward" in rendered
 
 VARIADIC_SOURCE_TEXT = '''\
 import torch
@@ -867,7 +984,8 @@ def test_imported_cp_host_is_rendered_as_same_name_class():
     assert "class MLAAttention(_MLAAttentionBase):" in rendered
     assert "class HPCodegen" not in rendered
     assert "if self.cp_enable:" in rendered
-    assert "return super().forward(*args, **kwargs)" in rendered
+    assert "return original_forward(*args, **kwargs)" in rendered
+    assert "original_forward = super().forward" in rendered
     assert "def _forward_impl" not in rendered
 
 
@@ -986,7 +1104,8 @@ def test_imported_cp_host_and_boundary_share_one_forward_impl():
     assert methods.count("_forward_impl") == 1
     assert methods.count("forward") == 1
     assert "return mla_cp_forward(self, *args, **kwargs)" in rendered
-    assert "return super().forward(*args, **kwargs)" in rendered
+    assert "return original_forward(*args, **kwargs)" in rendered
+    assert "original_forward = super().forward" in rendered
     assert "return self._forward_impl(*args, **kwargs)" not in rendered
 
 
