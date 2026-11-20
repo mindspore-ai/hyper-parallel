@@ -400,7 +400,9 @@ def _prepare_kda_wy(
         torch.eye(chunk_size, dtype=torch.bool, device=query.device)
     )
 
-    gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
+    # Future-position differences can overflow before the final causal mask,
+    # leaving NaNs in backward even when the forward result is finite.
+    gate_pair = (gate.unsqueeze(-2) - gate.unsqueeze(-3)).masked_fill(~causal.unsqueeze(-1), -torch.inf)
     key_pair = torch.einsum(
         "...ik,...jk,...ijk->...ij",
         key,
@@ -438,7 +440,7 @@ def _run_kda_chunks(
         w_i = w[:, :, chunk_idx]
         u_i = u[:, :, chunk_idx]
 
-        relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
+        relative_gate = (gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)).masked_fill(~causal.unsqueeze(-1), -torch.inf)
         qk = torch.einsum(
             "bhik,bhjk,bhijk->bhij",
             query_i,

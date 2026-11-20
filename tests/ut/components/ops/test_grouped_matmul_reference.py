@@ -18,11 +18,16 @@ import unittest
 
 import torch
 
-from hyper_parallel.components.ops import grouped_matmul
+from hyper_parallel.components.ops import grouped_matmul, ops
 
 
 class TestGroupedMatmulReference(unittest.TestCase):
     """Verify grad propagation for expert-major rows and unused experts."""
+
+    def setUp(self) -> None:
+        """Pin the baseline independently of other tests' process-wide settings."""
+        self.addCleanup(ops.set_backends, ops.get_backends())
+        ops.set_backends({"grouped_matmul": "native"})
 
     def test_reference_keeps_empty_expert_gradients(self) -> None:
         """Include an all-empty batch and a nonempty batch with unused experts."""
