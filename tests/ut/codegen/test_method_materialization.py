@@ -68,8 +68,12 @@ def method_factory(*, module, mesh, tp_mesh, cp_mesh, ep_mesh):
     module.experts.scale = 2
     module.experts.forward = MethodType(_expert_forward, module.experts)
 
+    def combine(target, value):
+        result = target.experts(value)
+        return _with_group(result, group)
+
     def compute(module, hidden_states):
-        return _with_group(module.experts(hidden_states), group)
+        return combine(module, hidden_states)
 
     return compute
 

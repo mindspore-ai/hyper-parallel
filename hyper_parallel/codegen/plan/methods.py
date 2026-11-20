@@ -73,10 +73,33 @@ def _expression(value: Any, imports: set[str]) -> str:
             imports.add(f"import {module} as {alias}")
             return f"{alias}.{name}"
         tree = ast.parse(textwrap.dedent(inspect.getsource(value)))
+        if len(tree.body) == 1 and isinstance(tree.body[0], ast.FunctionDef):
+            function = tree.body[0]
+            if function.decorator_list:
+                raise ValueError(f"Codegen cannot express decorated closure {name!r}")
+            closure = inspect.getclosurevars(value)
+            alias = "_native_" + module.replace(".", "_")
+            imports.add(f"import {module} as {alias}")
+            expressions = {key: f"{alias}.{key}" for key in closure.globals}
+            for key, item in closure.nonlocals.items():
+                expression = _expression(item, imports)
+                if isinstance(item, _GroupReference):
+                    if not function.args.args:
+                        raise ValueError(f"Codegen closure {name!r} has no resource owner argument")
+                    expression = expression.replace("self.", function.args.args[0].arg + ".", 1)
+                expressions[key] = expression
+            function = _MethodNames(expressions).visit(function)
+            function.name = "_native_" + name.replace(".<locals>.", "_").replace(".", "_")
+            function.returns = None
+            for argument in ast.walk(function.args):
+                if isinstance(argument, ast.arg):
+                    argument.annotation = None
+            imports.add(ast.unparse(function))
+            return function.name
         lambdas = [node for node in ast.walk(tree) if isinstance(node, ast.Lambda)]
         if len(lambdas) == 1 and not inspect.getclosurevars(value).nonlocals:
             return ast.unparse(lambdas[0])
-    raise ValueError(f"Codegen cannot express native method state {type(value).__name__}")
+    raise ValueError(f"Codegen cannot express native method state {type(value).__name__}: {getattr(value, '__qualname__', '')}")
 
 
 def _method_source(function: Any, name: str, imports: set[str]) -> str:
