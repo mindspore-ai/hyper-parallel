@@ -46,3 +46,24 @@ def test_ragged_fsdp_joint_graph(dtype):
     """
     worker = str(Path(__file__).with_name("_test_ragged_graph_ep.py"))
     torchrun_case(file_name=worker, case_name=f"test_ragged_fsdp_joint_graph[{dtype}]", num_proc=4)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+def test_ragged_tp_ep_fsdp_joint_graph(dtype):
+    """
+    Feature: Native EP+TP graph FSDP with TP != EP.
+    Description: Run DP(4)+TP(2)+EP(4) with two EDP shards and a shared dp*cp*tp divisor.
+    Expectation: Expert and dense gradients still match eager training.
+    """
+    worker = str(Path(__file__).with_name("_test_ragged_graph_ep.py"))
+    torchrun_case(
+        file_name=worker,
+        case_name=f"test_ragged_tp_ep_fsdp_joint_graph[{dtype}]",
+        num_proc=8,
+    )
