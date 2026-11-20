@@ -27,7 +27,7 @@
  #
  # Unless required by applicable law or agreed to in writing, software
  # distributed under the License is distributed on an "AS IS" BASIS,
-@@ -26,22 +40,35 @@
+@@ -26,22 +40,32 @@
  import torch.nn as nn
  import torch.nn.functional as F
 
@@ -64,31 +64,19 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +
-+from hyper_parallel.components.modules import DeepseekV32DSAAttention, GroupedExperts, RMSNorm
++from hyper_parallel.components.modules import DeepseekV32DSAAttention, GroupedExperts
++from hyper_parallel.components.modules.rms_norm import RMSNorm
 +
 +
 +
-+
-+# Codegen replacement: RMSNorm wraps DeepseekV32RMSNorm; the original class is kept as the wrapper input.
 +
 +# Codegen replacement: DeepseekV32DSAAttention wraps DeepseekV32Attention; the original class is kept as the wrapper input.
-+
-+# Codegen replacement: GroupedExperts wraps DeepseekV32Experts; the original class is kept as the wrapper input.
 +
 +from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 
 
  @use_kernel_forward_from_hub("RMSNorm")
-@@ -580,7 +607,7 @@
-     def __init__(self, config: DeepseekV32Config):
-         super().__init__()
-         self.config = config
--        self.experts = DeepseekV32Experts(config)
-+        self.experts = GroupedExperts(module=DeepseekV32Experts(config), module_fqn='', context=None)
-         self.gate = DeepseekV32TopkRouter(config)
-         self.shared_experts = DeepseekV32MLP(
-             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
-@@ -600,15 +627,15 @@
+@@ -600,7 +624,7 @@
      def __init__(self, config: DeepseekV32Config, layer_idx: int):
          super().__init__()
          self.hidden_size = config.hidden_size
@@ -97,26 +85,34 @@
 
          if config.mlp_layer_types[layer_idx] == "sparse":
              self.mlp = DeepseekV32MoE(config)
-         else:
-             self.mlp = DeepseekV32MLP(config)
+@@ -765,6 +789,26 @@
 
--        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
--        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
-+        self.input_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
-+        self.post_attention_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
+         # Initialize weights and apply final processing
+         self.post_init()
++        _hp_replacement_cache = {}
++        for _hp_fqn in ('model.layers.0.input_layernorm', 'model.layers.0.post_attention_layernorm', 'model.layers.1.input_layernorm', 'model.layers.1.post_attention_layernorm', 'model.layers.2.input_layernorm', 'model.layers.2.post_attention_layernorm', 'model.layers.3.input_layernorm', 'model.layers.3.post_attention_layernorm', 'model.norm'):
++            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
++            _hp_parent = self.get_submodule(_hp_parent_fqn)
++            _hp_source = getattr(_hp_parent, _hp_name)
++            _hp_key = id(_hp_source)
++            if _hp_key not in _hp_replacement_cache:
++                _hp_replacement_cache[_hp_key] = RMSNorm(
++                    module=_hp_source, module_fqn=_hp_fqn, cast_order=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1}, fp32_weight=None, use_fused_ops=True)
++            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
++        _hp_replacement_cache = {}
++        for _hp_fqn in ('model.layers.3.mlp.experts',):
++            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
++            _hp_parent = self.get_submodule(_hp_parent_fqn)
++            _hp_source = getattr(_hp_parent, _hp_name)
++            _hp_key = id(_hp_source)
++            if _hp_key not in _hp_replacement_cache:
++                _hp_replacement_cache[_hp_key] = GroupedExperts(
++                    module=_hp_source, module_fqn=_hp_fqn, context=None)
++            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
-     def forward(
-         self,
-@@ -685,7 +712,7 @@
-         self.layers = nn.ModuleList(
-             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-         )
--        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-+        self.norm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context=None)
-         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
-         self.gradient_checkpointing = False
-
-@@ -826,3 +853,4 @@
+     @can_return_tuple
+     @auto_docstring
+@@ -826,3 +870,4 @@
 
 
  __all__ = ["DeepseekV32PreTrainedModel", "DeepseekV32Model", "DeepseekV32ForCausalLM"]
