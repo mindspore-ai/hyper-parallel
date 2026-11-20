@@ -17,6 +17,8 @@
 import pytest
 
 from hyper_parallel.codegen.emit.validation import verify_generated_source_structure
+from hyper_parallel.codegen.inline.ir import ImportPatch, InlinePatchSet
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 
 
 def test_structure_check_accepts_unseen_class_and_strategy_name():
@@ -35,6 +37,14 @@ class FutureModelBlock:
 """
 
     verify_generated_source_structure({"modeling_future.py": source})
+
+
+def test_inline_imports_preserve_future_import_position():
+    """Inserting component dependencies must not precede the future-import block."""
+    source = '"""Generated source."""\nfrom __future__ import annotations\n\nclass FutureBlock:\n    pass\n'
+    rendered = apply_patch_set(source, InlinePatchSet(imports=[ImportPatch("math", ("sqrt",))]))
+    compile(rendered, "modeling_future.py", "exec")
+    assert rendered.index("from __future__") < rendered.index("from math import sqrt")
 
 
 def test_structure_check_rejects_duplicate_forward_impl():
