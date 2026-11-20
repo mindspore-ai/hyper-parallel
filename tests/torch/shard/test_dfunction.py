@@ -79,7 +79,7 @@ def test_dfunction_group4():
     ])
 
 
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dfunction_group4_gloo():
     """
     Feature: DFunction with custom ReLU and column-parallel Linear
