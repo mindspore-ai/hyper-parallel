@@ -32,19 +32,22 @@ from hyper_parallel.codegen.inline.ir import (
 )
 
 
-def apply_patch_set(source_text: str, patch_set: InlinePatchSet) -> str:
+def apply_patch_set(
+    source_text: str, patch_set: InlinePatchSet, *, root_class_name: str | None = None,
+) -> str:
     """Apply imports, constructor edits, class removals, markers, and forward bodies.
 
     Args:
         source_text: Modeling source the patches are applied to.
         patch_set: Edits emitted by the inline passes.
+        root_class_name: Observed root model class, disambiguating composed source.
 
     Returns:
         The patched source text.
     """
 
     text, hits = _apply_source_declarations(source_text, patch_set)
-    text = _apply_constructor_followups(text, patch_set, hits)
+    text = _apply_constructor_followups(text, patch_set, hits, root_class_name)
     return _apply_forward_patches(text, patch_set.forward_extracts)
 
 
@@ -76,12 +79,14 @@ def _apply_constructor_followups(
     source_text: str,
     patch_set: InlinePatchSet,
     hits: dict[str, int],
+    root_class_name: str | None,
 ) -> str:
     """Apply deferred replacements, validate scopes, and remove replaced classes."""
     deferred_edits = _deferred_replacement_edits(
         source_text,
         patch_set.constructor_replaces,
         hits,
+        root_class_name,
     )
     if deferred_edits:
         source_text = apply_edits(source_text, deferred_edits)
@@ -263,6 +268,7 @@ def _deferred_replacement_edits(
     source_text: str,
     patches: Iterable[ConstructorReplacePatch],
     hits: dict[str, int],
+    root_class_name: str | None,
 ) -> list[TextEdit]:
     """Install observed wrappers after an imported owner built its subtree.
 
@@ -288,7 +294,7 @@ def _deferred_replacement_edits(
         if patch.mode != "wrap_source":
             continue
         root_attr = patch.scope_fqns[0].split(".", 1)[0]
-        constructors = _root_constructors(tree, root_attr)
+        constructors = _root_constructors(tree, root_attr, root_class_name)
         if len(constructors) != 1:
             continue
         function = constructors[0]
@@ -301,11 +307,15 @@ def _deferred_replacement_edits(
     ]
 
 
-def _root_constructors(tree: ast.Module, root_attr: str) -> list[ast.FunctionDef]:
+def _root_constructors(
+    tree: ast.Module, root_attr: str, root_class_name: str | None,
+) -> list[ast.FunctionDef]:
     """Return constructors that establish the first segment of an observed FQN."""
     constructors = []
     for node in tree.body:
         if not isinstance(node, ast.ClassDef):
+            continue
+        if root_class_name is not None and node.name != root_class_name:
             continue
         for child in node.body:
             if not isinstance(child, ast.FunctionDef) or child.name != "__init__":

@@ -101,7 +101,9 @@ def render_inline_modeling_with_plan(
     )
     _add_recorded_forward_host_imports(source_text, patch_set, patch_plan)
     _materialize_imported_forward_hosts(source_text, patch_set)
-    rendered = apply_patch_set(source_text, patch_set)
+    model_class = (getattr(meta, "source", None) or {}).get("model_class")
+    root_class_name = model_class.rsplit(":", 1)[-1].rsplit(".", 1)[-1] if model_class else None
+    rendered = apply_patch_set(source_text, patch_set, root_class_name=root_class_name)
     # The copied modeling source brings its own decorated helpers that share
     # names with the library functions the artifact imports, and a local
     # definition wins over the import: the native path calls the library

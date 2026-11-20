@@ -845,10 +845,18 @@ def test_imported_cp_host_and_boundary_share_one_forward_impl():
     assert "return self._forward_impl(*args, **kwargs)" not in rendered
 
 
-def test_imported_replacement_owner_is_lowered_after_root_construction():
+@pytest.mark.parametrize("composed_source", [False, True])
+def test_imported_replacement_owner_is_lowered_after_root_construction(composed_source):
     """An observed wrapper needs no constructor call in the copied source."""
     source = """\
 class Root(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.model = ImportedDecoder(config)
+"""
+    if composed_source:
+        source += """\
+class OtherCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.model = ImportedDecoder(config)
@@ -870,13 +878,21 @@ class Root(nn.Module):
         ],
     )
 
-    rendered = apply_patch_set(source, patches)
+    if composed_source:
+        for root_class_name in (None, "MissingRoot"):
+            with pytest.raises(RuntimeError, match="ImportedExperts"):
+                apply_patch_set(source, patches, root_class_name=root_class_name)
+    rendered = apply_patch_set(source, patches, root_class_name="Root")
 
     ast.parse(rendered)
     assert "self.model = ImportedDecoder(config)" in rendered
     assert "for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts')" in rendered
     assert "WrappedExperts(" in rendered
     assert "module=_hp_source, module_fqn=_hp_fqn, context={}" in rendered
+    if composed_source:
+        other_class = next(node for node in ast.parse(rendered).body
+                           if isinstance(node, ast.ClassDef) and node.name == "OtherCausalLM")
+        assert ast.dump(other_class) == ast.dump(ast.parse(source).body[-1])
 
 
 def test_tp_collective_boundary_renders_static_operators():
