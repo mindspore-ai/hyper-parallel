@@ -59,7 +59,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-IS_CUDA_AVAILABLE = torch.cuda.is_available()
+def _cuda_is_available() -> bool:
+    """Ignore NPU shims that redirect CUDA availability without a CUDA build."""
+    return torch.backends.cuda.is_built() and torch.cuda.is_available()
+
+
+IS_CUDA_AVAILABLE = _cuda_is_available()
 # ``torch_npu`` can be importable yet leave ``torch.npu`` unregistered
 # (an x86 CI host with the wheel installed but no CANN runtime), so probe
 # the attribute before touching it.
