@@ -27,7 +27,7 @@ from torch import nn
 
 from hyper_parallel.codegen.emit.context import EmissionContext
 from hyper_parallel.codegen.emit.modeling import emit_modeling_file, _verify_recorded_patch_materialization
-from hyper_parallel.codegen.inline.construction import materialize_module_constructions
+from hyper_parallel.codegen.inline.construction import _constructor_expression, materialize_module_constructions
 
 
 class SourceBlock(nn.Module):
@@ -66,6 +66,23 @@ class PathSensitiveBlock(FinalBlock):
         self.instance_path = module_fqn
 
 
+
+class ContextSensitiveBlock(FinalBlock):
+    """Retain context consumed before an explicit discard."""
+
+    def __init__(self, *, module, context=None, config=None):
+        super().__init__(module=module)
+        self.axis = context["ep_size"]
+        del context
+
+
+class RequiredDiscardBlock(FinalBlock):
+    """A required argument cannot be omitted even when discarded."""
+
+    def __init__(self, *, module, context):
+        super().__init__()
+        del context
+
 def _replacement_record():
     return {
         "primary_fqn": "block",
@@ -91,6 +108,20 @@ def _patch_plan():
 
 class TestConstructorMaterialization(unittest.TestCase):
     """Inspect the model actually built by the generated source."""
+
+    def test_constructor_omits_only_safely_discarded_optional_context(self):
+        record = _replacement_record()
+        record["replay"]["context"] = {"mapping": {"ep_size": 2}}
+        for constructor, expected_context in (
+            (FinalBlock, False), (ContextSensitiveBlock, True), (RequiredDiscardBlock, True),
+        ):
+            with self.subTest(constructor=constructor.__name__):
+                record["replacement_type"] = f"{__name__}:{constructor.__name__}"
+                expression = _constructor_expression(record, [], set(), "SourceBlock()", None)
+                keywords = {item.arg for item in ast.parse(expression, mode="eval").body.keywords}
+                self.assertEqual("context" in keywords, expected_context)
+                self.assertIn("module", keywords)
+                self.assertNotIn("config", keywords)
 
     def test_native_owner_loop_preserves_required_instance_paths(self):
         source = (f"from {__name__} import SourceBlock\n"

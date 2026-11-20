@@ -249,6 +249,32 @@ def _source_expression(source: str, record: dict, records: list[dict], imports: 
     return f'{alias}(__source_arguments__)'
 
 
+
+def _discarded_constructor_parameters(member: Any) -> set[str]:
+    """Recognize explicit argument discards before constructor-specific work.
+
+    Only the leading discard convention is supported. Unknown, decorated or
+    inherited behavior remains unchanged rather than inferring argument usage.
+    """
+    constructor = member.__init__
+    if inspect.unwrap(constructor) is not constructor:
+        return set()
+    try:
+        function = ast.parse(textwrap.dedent(inspect.getsource(constructor))).body[0]
+    except (OSError, TypeError, SyntaxError):
+        return set()
+    body = function.body[1:] if ast.get_docstring(function) else function.body
+    discarded = set()
+    for statement in body:
+        if isinstance(statement, ast.Delete):
+            discarded.update(target.id for target in statement.targets if isinstance(target, ast.Name))
+        elif (isinstance(statement, ast.Expr)
+              and ast.dump(statement.value) == ast.dump(ast.parse("super().__init__()", mode="eval").body)):
+            continue
+        else:
+            break
+    return discarded
+
 def _constructor_expression(
     record: dict, imports: list[ImportPatch], classes: set[str], source: str, fqn: str | None,
 ) -> str:
@@ -269,8 +295,18 @@ def _constructor_expression(
     context = selection.get("construction_context", record.get("replay", {}).get("context", {"mapping": {}}))
     # The concrete source-conversion constructor owns parameter reuse and conversion.
     # The generated module neither selects a family nor installs a replacement.
-    runtime = {"module": source, "config": "None", "context": _value_expression(context, imports)}
-    kwargs = [f"{key}={value}" for key, value in runtime.items() if key in signature.parameters]
+    runtime = {"module": source, "config": "None", "context": None}
+    discarded = _discarded_constructor_parameters(member)
+    kwargs = []
+    for key, value in runtime.items():
+        parameter = signature.parameters.get(key)
+        if parameter is None:
+            continue
+        if key != "module" and parameter.default is not inspect.Parameter.empty:
+            if key in discarded or (value == "None" and parameter.default is None):
+                continue
+        expression = _value_expression(context, imports) if key == "context" else value
+        kwargs.append(f"{key}={expression}")
     if fqn is not None:
         kwargs.append(f"module_fqn={fqn}")
     if set(arguments) != {"mapping"}:
