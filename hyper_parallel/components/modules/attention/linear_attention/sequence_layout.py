@@ -12,21 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Packed token metadata and causal convolution shared by linear attention."""
+"""Document intervals, local packed execution and chunk plans for linear attention.
 
+This dependency leaf is shared with functional adapters and model runtimes.
+Keep it independent of module-family registration, backends and collectives.
+"""
 from __future__ import annotations
-
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 import torch
-from torch import nn
-from torch.nn import functional as F
-
-from hyper_parallel.components.functional.linear_attention_convolution import (
-    fused_causal_conv1d, validate_conv_backend,
-)
 
 
 # Bound retained interval views and their materialized chunk indices. Evicted
@@ -155,7 +151,12 @@ class PackedSequenceInfo:
         return self.start - self.global_offsets[self._head_index]
 
     def interval(self, start: int, end: int) -> PackedSequenceInfo:
-        """Describe another contiguous interval without retaining artificial cuts."""
+        """Describe another contiguous interval without retaining artificial cuts.
+
+        Args:
+            start: Inclusive start of the token interval.
+            end: Exclusive end of the token interval.
+        """
         key = (start, end)
         if key == (self.start, self.end):
             return self
@@ -166,14 +167,24 @@ class PackedSequenceInfo:
         return self._intervals[key]
 
     def ulysses(self, degree: int, local_rank: int) -> PackedSequenceInfo:
-        """Describe the token interval after consecutive-rank AllToAll."""
+        """Describe the token interval after consecutive-rank AllToAll.
+
+        Args:
+            degree: Number of ranks participating in the head/sequence exchange.
+            local_rank: Rank index in the Ulysses group.
+        """
         if degree < 1 or not 0 <= local_rank < degree:
             raise ValueError("Invalid Ulysses degree or local rank.")
         start = self.start - local_rank * self.length
         return self.interval(start, start + degree * self.length)
 
     def materialize(self, device: torch.device, chunk_size: int) -> PackedChunkPlan:
-        """Prepare immutable indices once per batch, layout, device and chunk size."""
+        """Prepare immutable indices once per batch, layout, device and chunk size.
+
+        Args:
+            device: Device on which to materialize sequence metadata.
+            chunk_size: Number of tokens in a recurrence chunk.
+        """
         device = torch.device(device)
         cache_key = (device, chunk_size)
         if cache_key in self._plans:
@@ -199,7 +210,11 @@ class PackedSequenceInfo:
         return plan
 
     def first_state(self, state: torch.Tensor | None) -> torch.Tensor | None:
-        """Expand only a continued first fragment's state for a varlen kernel."""
+        """Expand only a continued first fragment's state for a varlen kernel.
+
+        Args:
+            state: State tensor at the invocation boundary, or None for zero input.
+        """
         if state is None or not self.continues_previous:
             return None
         if self.num_sequences == 1:
@@ -207,7 +222,11 @@ class PackedSequenceInfo:
         return torch.cat((state, state.new_zeros((self.num_sequences - 1, *state.shape[1:]))))
 
     def last_state(self, state: torch.Tensor | None) -> torch.Tensor | None:
-        """Expand a terminal state gradient into the last fragment slot."""
+        """Expand a terminal state gradient into the last fragment slot.
+
+        Args:
+            state: State tensor at the invocation boundary, or None for zero input.
+        """
         if state is None or not self.continues_next:
             return None
         if self.num_sequences == 1:
@@ -248,6 +267,12 @@ def resolve_packed_sequence(
     Kernel-level cu_seqlens is derived from the returned local interval. Prefer
     a prebuilt packed_sequence_info from the runtime adapter to avoid host reads
     or per-layer validation of device metadata.
+
+    Args:
+        arguments: Per-forward keyword arguments carrying document boundaries.
+        local_length: Number of tokens owned by this CP rank.
+        cp_rank: Rank index within the CP mesh.
+        cp_size: Number of ranks in the CP mesh.
     """
     info = arguments.get("packed_sequence_info")
     aliases = [
@@ -275,114 +300,33 @@ def resolve_packed_sequence(
     return info
 
 
-class _PackedConvTap(torch.autograd.Function):
-    """Recreate a masked tap in backward instead of retaining its FP32 copy."""
-
-    @staticmethod
-    def forward(
-        ctx: Any, extended: torch.Tensor, weight: torch.Tensor, valid: torch.Tensor, offset: int, length: int,
-    ) -> torch.Tensor:
-        """Save shared input storage while preserving the eager product precision."""
-        ctx.save_for_backward(extended, weight, valid)
-        ctx.offset, ctx.length = offset, length
-        values = extended[:, offset : offset + length].to(weight.dtype)
-        values = torch.where(valid[None, :, None], values, 0.0)
-        return values * weight[None, None, :]
-
-    @staticmethod
-    def backward(
-        ctx: Any, grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None]:
-        """Rebuild only this tap; differentiable Torch operations retain higher derivatives."""
-        extended, weight, valid = ctx.saved_tensors
-        grad_extended = grad_weight = None
-        if ctx.needs_input_grad[0]:
-            grad_values = grad_output * weight[None, None, :]
-            grad_values = torch.where(valid[None, :, None], grad_values, 0.0).to(extended.dtype)
-            grad_extended = F.pad(grad_values, (0, 0, ctx.offset, extended.shape[1] - ctx.offset - ctx.length))
-        if ctx.needs_input_grad[1]:
-            values = extended[:, ctx.offset : ctx.offset + ctx.length].to(weight.dtype)
-            values = torch.where(valid[None, :, None], values, 0.0)
-            grad_weight = (grad_output * values).sum(dim=(0, 1))
-        return grad_extended, grad_weight, None, None, None
-
-
-def packed_causal_conv1d(
-    inputs: torch.Tensor,
-    convolution: nn.Conv1d,
-    info: PackedSequenceInfo,
-    halo: torch.Tensor | None = None,
-    *,
-    weight: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
-    backend: str = "eager",
-) -> torch.Tensor:
-    """Apply depthwise causal SiLU convolution with exact sample isolation.
-
-    Vectorize over tokens rather than loop over samples. Accumulate low-precision
-    products in FP32; keep FP32/FP64 reference inputs at their original precision.
-    Masking taps also masks their autograd contribution to an exchanged halo.
-    Backward reconstructs each masked tap from the shared input rather than
-    retaining a full accumulation-precision input for every window position.
+def local_sequence_offsets(
+    cu_seqlens: torch.Tensor | Sequence[int], tokens: int, *, require_cpu: bool = False,
+) -> tuple[int, ...]:
+    """Validate local document offsets without constructing a CP interval.
 
     Args:
-        inputs: Local projected tokens with shape ``[1, T, C]``.
-        convolution: Source depthwise, stride-one convolution attributes and parameters.
-        info: True document boundaries and the current local token interval.
-        halo: Optional already exchanged causal history; this function adds no communication.
-        weight: Optional local parameter view with shape ``[C, 1, W]``.
-        bias: Optional local bias; used with an explicit weight override.
-        backend: ``eager`` by default, or explicitly ``triton`` / ``ascendc``
-            for optional NPU kernels. The selected backend never silently falls back.
-
-    Returns:
-        SiLU output with the input shape and dtype.
-
-    Raises:
-        ValueError: If metadata, depthwise shape, or the selected kernel contract is invalid.
-        ImportError: If an explicitly selected optional kernel package is unavailable.
+        cu_seqlens: Local cumulative document boundaries.
+        tokens: Local packed token count.
+        require_cpu: Reject device metadata when the native ABI requires host offsets.
     """
-    validate_conv_backend(backend)
-    if inputs.ndim != 3 or inputs.shape[:2] != (1, info.length):
-        raise ValueError("Packed convolution expects [1,T,C] matching its token interval.")
-    channels = inputs.shape[-1]
-    if (
-        convolution.groups != convolution.in_channels
-        or convolution.out_channels != convolution.in_channels
-        or convolution.stride != (1,)
-    ):
-        raise ValueError("Packed convolution requires a stride-one depthwise Conv1d.")
-    if weight is None:
-        weight, bias = convolution.weight, convolution.bias
-    width, dilation = convolution.kernel_size[0], convolution.dilation[0]
-    if weight.shape != (channels, 1, width):
-        raise ValueError("Packed convolution weight must match the local head channels.")
-    halo_width = (width - 1) * dilation
-    if halo is not None and halo.shape != (1, halo_width, channels):
-        raise ValueError("Packed convolution halo has an incompatible shape.")
-    if backend != "eager":
-        return fused_causal_conv1d(
-            inputs, weight, bias, info, halo, backend=backend, dilation=dilation,
-        )
-    if halo is None:
-        halo = inputs.new_zeros((1, halo_width, channels))
-    extended = torch.cat((halo, inputs), dim=1)
-    positions = torch.arange(info.start, info.end, device=inputs.device)
-    boundaries = torch.tensor(info.global_offsets, device=inputs.device)
-    sample_indices = torch.bucketize(positions, boundaries[1:], right=True)
-    starts = boundaries[sample_indices]
-    dtype = torch.float32 if inputs.dtype in (torch.bfloat16, torch.float16) else inputs.dtype
-    output = torch.zeros_like(inputs, dtype=dtype)
-    weights = weight[:, 0].to(dtype)
-    for tap in range(width):
-        valid = positions - (width - 1 - tap) * dilation >= starts
-        output = output + _PackedConvTap.apply(extended, weights[:, tap], valid, tap * dilation, info.length)
-    if bias is not None:
-        output = output + bias.to(dtype)
-    return F.silu(output.to(inputs.dtype))
+    if isinstance(cu_seqlens, torch.Tensor):
+        if require_cpu and cu_seqlens.device.type != "cpu":
+            raise ValueError("Native cu_seqlens must be a CPU integer tensor or sequence.")
+        if cu_seqlens.ndim != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("cu_seqlens must be a one-dimensional integer tensor.")
+        cu_seqlens = cu_seqlens.detach().cpu().tolist()
+    offsets = tuple(cu_seqlens)
+    if (len(offsets) < 2 or offsets[0] != 0
+            or any(not isinstance(value, int) or isinstance(value, bool) for value in offsets)
+            or any(left >= right for left, right in zip(offsets, offsets[1:]))):
+        raise ValueError("Packed sample offsets must be strictly increasing integers starting at zero.")
+    if offsets[-1] != tokens:
+        raise ValueError("Local cumulative offsets must end at the input token count.")
+    return offsets
 
 
-def packed_reference(
+def packed_eager(
     operator: Callable[..., tuple[torch.Tensor, torch.Tensor | None]],
     inputs: tuple[torch.Tensor, ...],
     cu_seqlens: torch.Tensor | Sequence[int],
@@ -391,16 +335,22 @@ def packed_reference(
     output_final_state: bool = False,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Evaluate the portable reference independently per sample fragment."""
+    """Evaluate the local eager recurrence independently per sample fragment.
+
+    Args:
+        operator: Local recurrence callable to evaluate for each document.
+        inputs: Token-aligned recurrence operands.
+        cu_seqlens: Cumulative document boundaries for packed tokens.
+        initial_state: Optional incoming-state slot for each local sample fragment.
+        output_final_state: Whether to return one outgoing state per local sample fragment.
+    """
     if inputs[0].shape[0] != 1:
-        raise ValueError("Packed reference requires batch dimension one.")
-    info = PackedSequenceInfo(_offset_tuple(cu_seqlens), 0, inputs[0].shape[1])
-    if info.global_offsets[-1] != info.length:
-        raise ValueError("Local cumulative offsets must end at the input token count.")
-    if initial_state is not None and initial_state.shape[0] != info.num_sequences:
+        raise ValueError("Packed eager requires batch dimension one.")
+    offsets = local_sequence_offsets(cu_seqlens, inputs[0].shape[1])
+    if initial_state is not None and initial_state.shape[0] != len(offsets) - 1:
         raise ValueError("Packed initial_state requires one slot per local sample fragment.")
     outputs, finals = [], []
-    for index, (start, end) in enumerate(zip(info.local_offsets, info.local_offsets[1:])):
+    for index, (start, end) in enumerate(zip(offsets, offsets[1:])):
         state = None if initial_state is None else initial_state[index : index + 1]
         output, final = operator(
             *(tensor[:, start:end] for tensor in inputs),
@@ -412,3 +362,26 @@ def packed_reference(
         if output_final_state:
             finals.append(final)
     return torch.cat(outputs, dim=1), torch.cat(finals) if output_final_state else None
+
+
+def local_chunk_metadata(
+    cu_seqlens: torch.Tensor | Sequence[int] | None, tokens: int, chunk_size: int = 64,
+) -> dict[str, tuple[int, ...]]:
+    """Build host offsets and flattened document/chunk pairs for local operators.
+
+    Args:
+        cu_seqlens: Host document offsets, or None for dense input.
+        tokens: Number of tokens in this invocation.
+        chunk_size: Number of tokens in a kernel chunk.
+
+    Returns:
+        Local cu_seqlens and flattened chunk_indices, or an empty dense descriptor.
+    """
+    if cu_seqlens is None:
+        return {}
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive.")
+    offsets = local_sequence_offsets(cu_seqlens, tokens, require_cpu=True)
+    indices = tuple(value for seq, (begin, end) in enumerate(zip(offsets, offsets[1:]))
+                    for chunk in range((end - begin + chunk_size - 1) // chunk_size) for value in (seq, chunk))
+    return {"cu_seqlens": offsets, "chunk_indices": indices}

@@ -16,16 +16,18 @@
 import copy
 from datetime import timedelta
 import os
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from hyper_parallel.distributed.context_parallel.cp_context import CPContext
+from hyper_parallel.components.modules import GatedDeltaNet
 import hyper_parallel as hp
-from hyper_parallel.components.modules.kimi_delta_attention import KimiDeltaAttention, KimiRMSNormGated
-from hyper_parallel.distributed.context_parallel.gated_delta_net import GatedDeltaNetP2PCP, GatedDeltaNetUlyssesCP
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention import KimiDeltaAttentionLayerCP
+from hyper_parallel.components.modules.attention.kimi_delta_attention import KimiDeltaAttention
+from hyper_parallel.components.modules.attention.kimi_delta_attention.kimi_delta_attention import KimiRMSNormGated
 
 
 class _GDN(nn.Module):
@@ -62,14 +64,21 @@ def _model(kind, npu):
     return model
 
 
+def _bind_family(factory, mesh, **options):
+    """Use the factory's topology request, then borrow the existing CP context."""
+    layer = factory(context={"cp_size": mesh.size()}, **options)
+    if mesh.size() > 1:
+        layer.bind_parallel(SimpleNamespace(cp_context=CPContext(mesh)))
+    return layer
+
+
 def _wrapper(model, kind, mesh, npu, degree=1, method="p2p"):
     options = {"backend": "triton" if npu else "eager", "chunk_size": 64 if npu else 4}
     if kind == "kda":
-        return KimiDeltaAttentionLayerCP(
-            model, mesh, ulysses_degree=degree, state_cp_method=method,
+        return _bind_family(KimiDeltaAttention, mesh,
+            module=model, ulysses_degree=degree, state_cp_method=method,
             allgather_group_size=2 if method == "grouped_allgather_p2p" else 1, **options)
-    cls = GatedDeltaNetUlyssesCP if degree > 1 else GatedDeltaNetP2PCP
-    return cls(model, mesh, **options)
+    return _bind_family(GatedDeltaNet, mesh, module=model, ulysses_degree=None if degree > 1 else 1, **options)
 
 
 def _execute(model, wrapper, inputs, gradients, boundaries, *, live=False):
@@ -146,6 +155,8 @@ def _isolation(wrapper, inputs, grad, offsets, rank, length):
 
 def _protocol_options(kind, npu, size):
     """Select the existing backend-qualified combinations for this worker."""
+    if not npu:
+        return [(size, "p2p")]
     options = [(1, "p2p"), (size, "p2p")]
     if kind == "kda":
         options.insert(1, (2, "p2p"))

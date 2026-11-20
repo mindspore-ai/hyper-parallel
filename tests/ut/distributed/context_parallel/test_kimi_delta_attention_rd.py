@@ -16,23 +16,26 @@
 from dataclasses import FrozenInstanceError
 import importlib.util
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import torch
+from tests.common.mark_utils import arg_mark
 
-from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
-from hyper_parallel.distributed.context_parallel import kimi_delta_attention_rd as rd
+from hyper_parallel.components.modules.attention.linear_attention.sequence_layout import (
+    PackedSequenceInfo,
+)
+from hyper_parallel.components.modules.attention.kimi_delta_attention import cp_recursive_doubling as rd
+
 
 
 def _make_protocol(rank, size, ranks=None):
     """Mock only the transport device; keep the executor and exchange logic real."""
-    exchange = object.__new__(rd.RoundExchange)
+    exchange = object.__new__(rd._RoundExchange)
     exchange.group, exchange.rank, exchange.size = None, rank, size
     exchange.peers, exchange.device = ranks or tuple(range(size)), torch.device("cpu")
-    with patch.object(rd, "RoundExchange", return_value=exchange):
+    with patch.object(rd, "_RoundExchange", return_value=exchange):
         return rd.KDAStateRecursiveDoubling(None, rank, exchange.peers)
 
 
@@ -51,16 +54,13 @@ def _finish_state_reference(product, previous, save_m):
 
 def _load_summary_functional():
     """Load the actual producer helper without importing optional Triton kernels."""
-    source = Path(rd.__file__).resolve().parents[2] / "components/functional/kimi_delta_attention.py"
-    package = "hyper_parallel.components.functional"
+    root = Path(importlib.util.find_spec("hyper_parallel").origin).parent
+    source = root / "components/modules/attention/kimi_delta_attention/cp_kimi_delta_attention.py"
+    package = "hyper_parallel.components.modules.attention.kimi_delta_attention"
     spec = importlib.util.spec_from_file_location(f"{package}._kda_summary_cpu_regression", source)
     module = importlib.util.module_from_spec(spec)
-    backend = SimpleNamespace(**{name: Mock() for name in (
-        "apply_kda_state_gradient_summary", "apply_kda_state_summary",
-        "kda_state_gradient_summary_from_prepared", "kda_state_summary_forward_from_prepared",
-    )})
-    with patch.dict(sys.modules, {f"{package}.kimi_delta_attention_state_summary": backend}):
-        spec.loader.exec_module(module)
+    spec.loader.exec_module(module)
+    module.kda_state_summary_forward_from_prepared = Mock()
     return module
 
 
@@ -74,6 +74,8 @@ class TestCachedDoubling(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_invalid_inputs_fail_before_exchange(self):
         """Feature: RD input validation.
 
@@ -83,9 +85,9 @@ class TestCachedDoubling(unittest.TestCase):
         with patch.object(rd.dist, "get_backend", return_value="gloo"), \
                 patch.object(rd.dist, "get_process_group_ranks", return_value=[0, 2, 4]):
             with self.assertRaisesRegex(ValueError, "HCCL"):
-                rd.RoundExchange(None, 2, (0, 2, 4))
+                rd._RoundExchange(None, 2, (0, 2, 4))
             with self.assertRaisesRegex(ValueError, "group order"):
-                rd.RoundExchange(None, 0, (2, 0, 4))
+                rd._RoundExchange(None, 0, (2, 0, 4))
         protocol = _make_protocol(2, 3, (0, 2, 4))
         state = torch.zeros(1, 2, 128, 128)
         with patch.object(protocol, "exchange") as exchange:
@@ -100,6 +102,8 @@ class TestCachedDoubling(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside"):
             protocol.exchange(state, 3, None)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_dense_rounds_keep_peer_order_and_transfer_lifetimes(self):
         """Feature: Rank-local dense RD planning.
 
@@ -119,6 +123,8 @@ class TestCachedDoubling(unittest.TestCase):
                 actual = tuple((step.stage, step.destination, step.source, step.save_matrix) for step in rounds)
                 self.assertEqual(actual, expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_mixed_reset_flags_and_invocation_binding(self):
         """Feature: Reset-aware RD invocation metadata.
 
@@ -158,6 +164,8 @@ class TestCachedDoubling(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             call_a.plan.size = 6
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_empty_plan_omits_packing_and_rounds(self):
         """Feature: RD execution for an empty reset plan.
 
@@ -195,6 +203,8 @@ class TestCachedDoubling(unittest.TestCase):
                 for allocation in (pack, zero, allocate, allocate_like):
                     allocation.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_early_receive_keeps_latest_state_for_later_sends(self):
         """Feature: RD state lifetime after an early final receive.
 
@@ -217,6 +227,8 @@ class TestCachedDoubling(unittest.TestCase):
             torch.testing.assert_close(item.args[0], torch.full_like(state, 8.0), rtol=0, atol=0)
         torch.testing.assert_close(incoming, preceding, rtol=0, atol=0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_reset_stops_transfer_copies_after_last_receive(self):
         """Feature: Reset-aware transfer copy pruning.
 
@@ -238,6 +250,8 @@ class TestCachedDoubling(unittest.TestCase):
         self.assertFalse(finish.call_args.kwargs["save_m"])
         torch.testing.assert_close(exchange.call_args.args[0], torch.full_like(state, 8.0), rtol=0, atol=0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_batch_plan_reuse_preserves_layout_and_invocation_identity(self):
         """Feature: Immutable packed plans shared across layers.
 
@@ -268,6 +282,8 @@ class TestCachedDoubling(unittest.TestCase):
             rd.build_reset_plan(PackedSequenceInfo((0, stop), 0, stop).documents, stop, 1, 0)
         self.assertIsNot(_make_protocol(1, 8).bind_sequence(info).plan, first.plan)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_producer_skips_dead_s_and_m_but_retains_head_gradient(self):
         """Feature: Independent forward summary and backward gradient consumers.
 
@@ -314,6 +330,8 @@ class TestCachedDoubling(unittest.TestCase):
         kernel.assert_not_called()
         zero.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_receive_shape_is_independent_of_optional_send(self):
         """Feature: Receive-only RD transport.
 
@@ -344,6 +362,8 @@ class TestCachedDoubling(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires a shape"):
             exchange(None, None, 0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_optional_boundaries_keep_independent_head_and_tail_consumers(self):
         """Feature: Independent optional H and D boundaries.
 
@@ -375,6 +395,8 @@ class TestCachedDoubling(unittest.TestCase):
                         call.backward(None, ())
                 exchange.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_bound_shape_validates_supplied_summaries_and_cache(self):
         """Feature: Optional RD input validation.
 
@@ -411,6 +433,8 @@ class TestCachedDoubling(unittest.TestCase):
                 dead.backward(None, (state,))
             exchange.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_bound_shapes_survive_reverse_backward_of_two_live_calls(self):
         """Feature: Invocation-owned shape and cache lifetimes.
 

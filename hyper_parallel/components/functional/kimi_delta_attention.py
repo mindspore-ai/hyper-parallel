@@ -12,565 +12,777 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Dense Triton-Ascend KDA execution helpers for Torch training."""
+"""Local KDA math, state application and explicit backend selection."""
 from __future__ import annotations
-
-
-__all__ = ["fused_chunk_kda", "fused_chunk_kda_p2p"]
-
-from typing import Any, Optional
+from collections.abc import Sequence
+from typing import Optional
 
 import torch
-import torch.distributed as dist
+from torch.nn import functional as F
 
-from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo, resolve_packed_sequence
-
-from .kimi_delta_attention_fla_adapter import get_fla_kda_staged_ops, run_fla_chunk_kda
-from .kimi_delta_attention_state_summary import (
-    apply_kda_state_gradient_summary,
-    apply_kda_state_summary,
-    kda_state_gradient_summary_from_prepared,
-    kda_state_summary_forward_from_prepared,
-)
+from hyper_parallel.components.modules.attention.linear_attention.sequence_layout import packed_eager
+from .kimi_delta_attention_ascendc import ascendc_chunk_kda
+from .kimi_delta_attention_triton import fused_chunk_kda, is_fla_triton_kda_available
 
 
-def _validate_local_shapes(
+def _validate_kda_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
-) -> tuple[int, int, int, int]:
-    """Validate local KDA tensor shapes and return dimensions used by later checks."""
-    if (query.ndim, key.ndim, value.ndim, gate.ndim) != (4, 4, 4, 4):
-        raise ValueError("Fused KDA expects rank-4 query/key/value/gate tensors.")
-    if beta.ndim != 3:
-        raise ValueError("Fused KDA expects a rank-3 beta tensor.")
+) -> tuple[int, int, int, int, int, int]:
+    """Validate dense token-first KDA inputs and return their dimensions."""
+    if (query.dim(), key.dim(), value.dim(), gate.dim()) != (4, 4, 4, 4):
+        raise ValueError("query, key, value, and gate must be rank-4 tensors.")
+    if beta.dim() != 3:
+        raise ValueError("beta must be a rank-3 tensor.")
     if query.shape != key.shape:
-        raise ValueError("Fused KDA query and key must have identical shapes.")
-    batch, sequence_length, num_query_heads, key_dim = query.shape
-    num_value_heads, value_dim = value.shape[2:]
-    if value.shape[:2] != (batch, sequence_length):
-        raise ValueError("Fused KDA value must match query batch and sequence dimensions.")
-    if gate.shape != (batch, sequence_length, num_value_heads, key_dim):
-        raise ValueError("Fused KDA gate has an incompatible shape.")
-    if beta.shape != (batch, sequence_length, num_value_heads):
-        raise ValueError("Fused KDA beta has an incompatible shape.")
-    if num_value_heads % num_query_heads:
-        raise ValueError("Fused KDA value heads must be divisible by query heads.")
-    return sequence_length, key_dim, value_dim, num_value_heads
+        raise ValueError("query and key must have identical shapes.")
 
-
-def _validate_local_inputs(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    a_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    chunk_size: int,
-    lower_bound: float,
-) -> None:
-    """Validate the fixed-shape local KDA backend before compiling kernels."""
-    _, key_dim, value_dim, num_value_heads = _validate_local_shapes(
-        query, key, value, gate, beta
-    )
-    if not (
-        query.dtype == key.dtype == value.dtype == gate.dtype == beta.dtype
-        == torch.bfloat16
-    ):
-        raise TypeError("Fused KDA requires q/k/v/gate/beta tensors in bfloat16.")
-    if a_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
-        raise TypeError("Fused KDA requires a_log and dt_bias tensors in float32.")
-    if key_dim != 128 or value_dim != 128 or chunk_size != 64:
-        raise NotImplementedError(
-            "Fused KDA currently requires key_dim=value_dim=128 and chunk_size=64."
+    batch_size, sequence_length, num_k_heads, k_head_dim = query.shape
+    value_batch, value_sequence, num_v_heads, v_head_dim = value.shape
+    if (value_batch, value_sequence) != (batch_size, sequence_length):
+        raise ValueError("value batch and sequence dimensions must match query.")
+    if gate.shape != (batch_size, sequence_length, num_v_heads, k_head_dim):
+        raise ValueError(
+            "gate must have shape [B, S, num_v_heads, k_head_dim], got "
+            f"{tuple(gate.shape)}."
         )
-    if a_log.numel() != num_value_heads:
-        raise ValueError("Fused KDA a_log must contain one value per value head.")
-    if dt_bias.numel() != num_value_heads * key_dim:
-        raise ValueError("Fused KDA dt_bias must contain one value per gate channel.")
-    if not -5.0 <= lower_bound < 0:
-        raise ValueError("Fused KDA lower_bound must lie in [-5, 0).")
-    if not query.is_npu:
-        raise RuntimeError("The fused KDA backend requires Ascend NPU tensors.")
-    if any(
-        tensor.device != query.device
-        for tensor in (key, value, gate, beta, a_log, dt_bias)
-    ):
-        raise ValueError("Fused KDA inputs must reside on the same NPU device.")
-    get_fla_kda_staged_ops()
-
-
-def _validate_p2p_inputs(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    a_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    chunk_size: int,
-    lower_bound: float,
-    cp_rank: int,
-    cp_size: int,
-) -> None:
-    """Validate the fixed-shape KDA P2P backend before communication starts."""
-    _validate_local_inputs(
-        query,
-        key,
-        value,
-        gate,
-        beta,
-        a_log,
-        dt_bias,
-        chunk_size=chunk_size,
-        lower_bound=lower_bound,
+    if beta.shape != (batch_size, sequence_length, num_v_heads):
+        raise ValueError(
+            "beta must have shape [B, S, num_v_heads], got "
+            f"{tuple(beta.shape)}."
+        )
+    if num_v_heads % num_k_heads != 0:
+        raise ValueError("num_v_heads must be divisible by num_k_heads.")
+    return (
+        batch_size,
+        sequence_length,
+        num_k_heads,
+        num_v_heads,
+        k_head_dim,
+        v_head_dim,
     )
-    if cp_size <= 0 or not 0 <= cp_rank < cp_size:
-        raise ValueError(f"Invalid KDA P2P rank {cp_rank} for cp_size {cp_size}.")
 
 
-def fused_chunk_kda(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    *,
+def _reshape_gate_bias(
+    parameter: torch.Tensor,
+    num_v_heads: int,
+    k_head_dim: int,
+    name: str,
+) -> torch.Tensor:
+    """Return a gate parameter as ``[num_v_heads, k_head_dim]``."""
+    if parameter.numel() != num_v_heads * k_head_dim:
+        raise ValueError(
+            f"{name} must contain {num_v_heads * k_head_dim} elements, "
+            f"got {parameter.numel()}."
+        )
+    return parameter.reshape(num_v_heads, k_head_dim)
+
+
+def torch_kda_gate(
+    gate_logits: torch.Tensor,
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
-    scale: Optional[float] = None,
-    lower_bound: float = -5.0,
-    chunk_size: int = 64,
-    safe_gate: bool = True,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    *,
+    lower_bound: Optional[float] = None,
 ) -> torch.Tensor:
-    """Run the local Triton-Ascend KDA backend without CP communication.
+    """Activate KDA log-decay logits.
+
+    ``lower_bound`` selects the Kimi K3 parameterization
+    ``g_min * sigmoid(exp(a_log) * (logits + bias))``. With no lower bound,
+    this function implements the earlier Kimi Linear negative-Softplus gate.
 
     Args:
-        query: Local query tensor [B,T,H,K].
-        key: Matching local key tensor.
-        value: Local value tensor [B,T,HV,V].
-        gate: Per-token gate logits [B,T,HV,K].
-        beta: Per-token beta logits [B,T,HV].
-        a_log: Decay parameter with one value per value head.
-        dt_bias: Learned bias with one value per gate channel.
-        scale: Optional attention scaling factor.
-        lower_bound: Lower bound for the activated gate.
-        chunk_size: Tokens per local recurrence chunk.
-        safe_gate: Use the staged lower-bounded gate implementation.
+        gate_logits: Untransformed per-key decay logits.
+        a_log: Log decay-rate parameter.
+        dt_bias: Per-key time-step bias.
+        lower_bound: Negative lower bound of the safe decay gate.
     """
-    _validate_local_inputs(
-        query,
-        key,
-        value,
-        gate,
-        beta,
-        a_log,
-        dt_bias,
-        chunk_size=chunk_size,
-        lower_bound=lower_bound,
+    if gate_logits.dim() != 4:
+        raise ValueError("gate_logits must have shape [B, S, H, K].")
+    num_v_heads, k_head_dim = gate_logits.shape[-2:]
+    if a_log.numel() != num_v_heads:
+        raise ValueError(
+            f"a_log must contain {num_v_heads} elements, got {a_log.numel()}."
+        )
+    bias = _reshape_gate_bias(dt_bias, num_v_heads, k_head_dim, "dt_bias")
+    scale = a_log.float().exp().reshape(1, 1, num_v_heads, 1)
+    preactivation = gate_logits.float() + bias.float().reshape(
+        1, 1, num_v_heads, k_head_dim
     )
-    output, _ = run_fla_chunk_kda(
+    if lower_bound is None:
+        return -scale * F.softplus(preactivation)  # pylint: disable=not-callable
+    if lower_bound >= 0:
+        raise ValueError(f"lower_bound must be negative, got {lower_bound}.")
+    return float(lower_bound) * torch.sigmoid(scale * preactivation)
+
+
+def _prepare_kda_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    a_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    scale: Optional[float],
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    use_beta_sigmoid_in_kernel: bool,
+    lower_bound: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Apply the common KDA input transformations in FP32."""
+    _, _, num_k_heads, num_v_heads, k_head_dim, _ = _validate_kda_inputs(
+        query, key, value, gate, beta
+    )
+    if use_qk_l2norm_in_kernel:
+        query = query * torch.rsqrt(
+            (query.float() * query.float()).sum(dim=-1, keepdim=True) + 1e-6
+        ).to(query.dtype)
+        key = key * torch.rsqrt(
+            (key.float() * key.float()).sum(dim=-1, keepdim=True) + 1e-6
+        ).to(key.dtype)
+    if use_gate_in_kernel:
+        if a_log is None or dt_bias is None:
+            raise ValueError("a_log and dt_bias are required when gate activation is enabled.")
+        gate = torch_kda_gate(
+            gate,
+            a_log,
+            dt_bias,
+            lower_bound=lower_bound,
+        )
+    if use_beta_sigmoid_in_kernel:
+        beta = beta.float().sigmoid()
+
+    value_groups = num_v_heads // num_k_heads
+    query = query.float().repeat_interleave(value_groups, dim=2)
+    key = key.float().repeat_interleave(value_groups, dim=2)
+    value = value.float()
+    gate = gate.float()
+    beta = beta.float()
+    effective_scale = k_head_dim ** -0.5 if scale is None else scale
+    return query, key, value, gate, beta, float(effective_scale)
+
+
+def _initial_kda_state(
+    value: torch.Tensor,
+    k_head_dim: int,
+    initial_state: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Build or validate a KDA state in FP32."""
+    expected_shape = (value.shape[0], value.shape[2], k_head_dim, value.shape[3])
+    if initial_state is None:
+        return value.new_zeros(expected_shape, dtype=torch.float32)
+    if tuple(initial_state.shape) != expected_shape:
+        raise ValueError(
+            f"initial_state must have shape {expected_shape}, got "
+            f"{tuple(initial_state.shape)}."
+        )
+    return initial_state.float()
+
+
+def torch_recurrent_kda(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Evaluate the exact token-recurrent KDA equations with eager ops.
+
+    Args:
+        query: Query tensor in batch, token, head, key-dimension order.
+        key: Key tensor with the same token and key-head axes as query.
+        value: Value tensor in batch, token, head, value-dimension order.
+        gate: Decay gate or output gate required by this stage.
+        beta: Delta-rule update strengths, or logits when sigmoid fusion is enabled.
+        a_log: Log decay-rate parameter.
+        dt_bias: Per-key time-step bias.
+        scale: Query scaling factor; None selects the head-dimension default.
+        initial_state: Optional state entering the first local chunk.
+        output_final_state: Whether to return the state after the final chunk.
+        use_qk_l2norm_in_kernel: Whether this operator normalizes query and key.
+        use_gate_in_kernel: Whether this operator transforms raw decay logits.
+        use_beta_sigmoid_in_kernel: Whether this operator transforms beta logits with sigmoid.
+        lower_bound: Negative lower bound of the safe decay gate.
+    """
+    output_dtype = value.dtype
+    query, key, value, gate, beta, scale = _prepare_kda_inputs(
         query,
         key,
         value,
         gate,
         beta,
         a_log=a_log,
-        dt_bias=dt_bias.reshape(-1),
+        dt_bias=dt_bias,
         scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         lower_bound=lower_bound,
-        chunk_size=chunk_size,
-        safe_gate=safe_gate,
-        cu_seqlens=cu_seqlens,
     )
-    return output
+    state = _initial_kda_state(value, key.shape[-1], initial_state)
+    outputs = []
+    for token_idx in range(query.shape[1]):
+        query_i = query[:, token_idx]
+        key_i = key[:, token_idx]
+        value_i = value[:, token_idx]
+        gate_i = gate[:, token_idx]
+        beta_i = beta[:, token_idx]
 
-
-def _prepare_packed_kda_summary(kg, w, u, gate, sequence_info, state_cp, send_next, chunk_size):
-    """Skip summaries with no consumer when the invocation supports absent tensors."""
-    if state_cp is None and not send_next:
-        return None, None
-    state_shape = (kg.shape[0], u.shape[2], kg.shape[-1], u.shape[-1])
-    transition = None
-    if getattr(state_cp, "needs_state_summary", True):
-        tail = sequence_info.tail
-        state, transition = kda_state_summary_forward_from_prepared(
-            kg[:, tail], w[:, tail], u[:, tail], gate[:, tail], chunk_size=chunk_size,
-            output_transition=(sequence_info.transfer_active
-                               and getattr(state_cp, "needs_transition_summary", True)),
+        state = state * gate_i.exp().unsqueeze(-1)
+        state_value = torch.einsum("bhk,bhkv->bhv", key_i, state)
+        residual = value_i - state_value
+        state = state + torch.einsum(
+            "bhk,bhv->bhkv",
+            key_i * beta_i.unsqueeze(-1),
+            residual,
         )
-    elif getattr(state_cp, "allows_absent_summaries", False):
-        return None, None
-    else:
-        state = kg.new_zeros(state_shape, dtype=torch.float32)
-    if state_cp is not None and transition is None:
-        # Shape placeholders preserve existing collective validation; no M kernel runs.
-        transition = kg.new_zeros((*state_shape[:-1], kg.shape[-1]), dtype=torch.float32)
-    return state, transition
+        outputs.append(torch.einsum("bhk,bhkv->bhv", query_i * scale, state))
+
+    output = torch.stack(outputs, dim=1).to(output_dtype)
+    return output, state if output_final_state else None
 
 
-class _KDAStateP2PFunction(torch.autograd.Function):
-    """Run shared local KDA and autograd with the selected state exchange."""
-
-    @staticmethod
-    def forward(  # pylint: disable=arguments-differ,too-many-arguments,too-many-locals
-        ctx: Any,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        gate_raw: torch.Tensor,
-        beta_raw: torch.Tensor,
-        a_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        scale: float,
-        lower_bound: float,
-        chunk_size: int,
-        safe_gate: bool,
-        cp_group: Any,
-        prev_rank: int,
-        next_rank: int,
-        cp_rank: int,
-        cp_size: int,
-        state_cp: Any,
-        sequence_info: Optional[PackedSequenceInfo],
-    ) -> torch.Tensor:
-        """Prepare local KDA, propagate its state, and produce token outputs.
-
-        Args:
-            ctx: Autograd context holding tensors and communication metadata.
-            query: Local query tensor [B,T,H,K].
-            key: Matching local key tensor.
-            value: Local value tensor [B,T,HV,V].
-            gate_raw: Unactivated per-token gate logits.
-            beta_raw: Unactivated per-token beta logits.
-            a_log: Decay parameter with one value per value head.
-            dt_bias: Learned bias with one value per gate channel.
-            scale: Optional attention scaling factor.
-            lower_bound: Lower bound for the activated gate.
-            chunk_size: Tokens per local recurrence chunk.
-            safe_gate: Use the staged lower-bounded gate implementation.
-            cp_group: Precreated chronological CP process group.
-            prev_rank: Global rank of the preceding sequence partition.
-            next_rank: Global rank of the following sequence partition.
-            cp_rank: Chronological index within the CP group.
-            cp_size: Number of state partitions.
-            state_cp: Executor returning an invocation cache; None selects P2P.
-        """
-        ops = get_fla_kda_staged_ops()
-        bind_sequence = getattr(state_cp, "bind_sequence", None)
-        if sequence_info is not None and bind_sequence is not None:
-            state_cp = bind_sequence(
-                sequence_info, state_shape=(query.shape[0], value.shape[2], query.shape[-1], value.shape[-1]))
-        plan = None if sequence_info is None else sequence_info.materialize(query.device, chunk_size)
-        varlen = {} if plan is None else plan.kwargs()
-        recurrent_varlen = dict(varlen)
-        if plan is not None:
-            recurrent_varlen["chunk_offsets"] = plan.chunk_offsets
-
-        # FLA consumes base-2 log gates: exp(x) = exp2(x / ln(2)).
-        # Use the same conversion when recomputing gates in backward.
-        rcp_ln2 = 1.4426950408889634
-
-        query, key, value, gate_raw, beta_raw = (
-            tensor.contiguous()
-            for tensor in (query, key, value, gate_raw, beta_raw)
-        )
-        query, query_rstd = ops.l2norm_fwd(query)
-        key, key_rstd = ops.l2norm_fwd(key)
-        beta = ops.fused_beta_sigmoid(beta_raw)
-        gate = ops.kda_gate_chunk_cumsum(
-            g=gate_raw, A_log=a_log, dt_bias=dt_bias, scale=rcp_ln2, chunk_size=chunk_size,
-            lower_bound=lower_bound,
-            **varlen,
-        )
-
-        state_shape = (query.shape[0], value.shape[2], query.shape[-1], value.shape[-1])
-        receive_previous = cp_rank > 0 and (sequence_info is None or sequence_info.continues_previous)
-        send_next = cp_rank < cp_size - 1 and (sequence_info is None or sequence_info.continues_next)
-        initial_state = None
-        recv_handle = None
-        if state_cp is None and receive_previous:
-            initial_state = torch.empty(state_shape, device=query.device, dtype=torch.float32)
-            recv_handle = dist.irecv(initial_state, src=prev_rank, group=cp_group)
-
-        w, u, _, kg, attention_qk, attention_kk = ops.chunk_kda_fwd_intra(
-            q=query, k=key, v=value, gk=gate, beta=beta, scale=scale, chunk_size=chunk_size, safe_gate=safe_gate,
-            disable_recompute=True,
-            **varlen,
-        )
-        # The gated query is unused here and is recomputed in backward.
-        del _
-        state_ext = None
-        transition = None
-        if sequence_info is not None:
-            state_ext, transition = _prepare_packed_kda_summary(
-                kg, w, u, gate, sequence_info, state_cp, send_next, chunk_size,
+def _inverse_unit_lower_triangular(strict_lower: torch.Tensor) -> torch.Tensor:
+    """Invert ``I + strict_lower`` using differentiable forward substitution."""
+    chunk_size = strict_lower.shape[-1]
+    rows = []
+    for row_idx in range(chunk_size):
+        base = -strict_lower[..., row_idx, :]
+        if rows:
+            previous = torch.stack(rows, dim=-2)
+            row = torch.einsum(
+                "...i,...ij->...j",
+                base[..., :row_idx],
+                previous,
             )
         else:
-            if state_cp is None and cp_rank == 0 and cp_size > 1:
-                # Zero entry uses S directly, and rank 0 has no reverse-state recipient.
-                state_ext, transition = kda_state_summary_forward_from_prepared(
-                    kg, w, u, gate, chunk_size=chunk_size, output_transition=False,
-                )
-            elif state_cp is not None or cp_rank < cp_size - 1:
-                state_ext, transition = kda_state_summary_forward_from_prepared(kg, w, u, gate, chunk_size=chunk_size)
-        # A reset makes the outgoing summary independent of the incoming state.
-        # Wait before apply only when it actually reads that state; local h still waits below.
-        if recv_handle is not None and (sequence_info is None or sequence_info.transfer_active):
-            recv_handle.wait()
-            recv_handle = None
-
-        send_handle = None
-        send_state = None
-        state_cache = (transition,) if transition is not None else ()
-        if state_cp is not None:
-            initial_state, state_cache = state_cp.forward(state_ext, transition)
-            transition = None
-        elif send_next:
-            summary_initial = initial_state if transition is not None else None
-            final_state = apply_kda_state_summary(state_ext, transition, summary_initial)
-            send_state = final_state.contiguous()
-            send_handle = dist.isend(send_state, dst=next_rank, group=cp_group)
-
-        if recv_handle is not None:
-            recv_handle.wait()
-        kernel_initial_state = initial_state if sequence_info is None else sequence_info.first_state(initial_state)
-        states, value_new, _ = ops.chunk_gated_delta_rule_fwd_h(
-            k=kg, w=w, u=u, gk=gate, initial_state=kernel_initial_state,
-            output_final_state=False, chunk_size=chunk_size,
-            **recurrent_varlen,
-        )
-        # Local h was their last forward consumer on this stream.
-        del w, u, kg, _
-        output = ops.chunk_gla_fwd_o_gk(
-            q=query, v=value_new, g=gate, A=attention_qk, h=states, scale=scale, chunk_size=chunk_size,
-            **varlen,
-        )
-        if send_handle is not None:
-            send_handle.wait()
-
-        saved_initial_state = initial_state
-        if saved_initial_state is None:
-            saved_initial_state = query.new_empty(0, dtype=torch.float32)
-        packed_tensors = () if plan is None else (
-            plan.cu_seqlens, plan.chunk_indices, plan.chunk_offsets)
-        ctx.save_for_backward(
-            query, query_rstd, key, key_rstd, value, gate_raw, beta_raw, a_log, dt_bias, attention_qk,
-            attention_kk, saved_initial_state, *state_cache, *packed_tensors,
-        )
-        ctx.scale = scale
-        ctx.lower_bound = lower_bound
-        ctx.chunk_size = chunk_size
-        ctx.safe_gate = safe_gate
-        ctx.cp_group = cp_group
-        ctx.prev_rank = prev_rank
-        ctx.next_rank = next_rank
-        ctx.cp_rank = cp_rank
-        ctx.cp_size = cp_size
-        ctx.state_cp = state_cp
-        ctx.state_cache_count = len(state_cache)
-        ctx.receive_previous = receive_previous
-        ctx.send_next = send_next
-        ctx.sequence_info = sequence_info
-        return output.to(value.dtype)
-
-    @staticmethod
-    def backward(  # pylint: disable=arguments-differ,too-many-locals
-        ctx: Any,
-        grad_output: torch.Tensor,
-    ) -> tuple[Any, ...]:
-        """Reverse the state wavefront, then finish the fused local backward.
-
-        Args:
-            ctx: Autograd context holding tensors and communication metadata.
-            grad_output: Upstream gradient for the local token output.
-        """
-        ops = get_fla_kda_staged_ops()
-
-        # FLA consumes base-2 log gates: exp(x) = exp2(x / ln(2)).
-        # Use the same conversion when recomputing gates in backward.
-        rcp_ln2 = 1.4426950408889634
-
-        (
-            query, query_rstd, key, key_rstd, value, gate_raw, beta_raw, a_log, dt_bias,
-            attention_qk, attention_kk, saved_initial_state, *saved_tail,
-        ) = ctx.saved_tensors
-        state_cache = tuple(saved_tail[:ctx.state_cache_count])
-        packed_tensors = saved_tail[ctx.state_cache_count:]
-        sequence_info = ctx.sequence_info
-        cu_seqlens = chunk_indices = chunk_offsets = None
-        if sequence_info is not None:
-            cu_seqlens, chunk_indices, chunk_offsets = packed_tensors
-        varlen = {} if sequence_info is None else {"cu_seqlens": cu_seqlens, "chunk_indices": chunk_indices}
-        recurrent_varlen = dict(varlen)
-        if sequence_info is not None:
-            recurrent_varlen["chunk_offsets"] = chunk_offsets
-        initial_state = saved_initial_state if saved_initial_state.numel() else None
-        kernel_initial_state = initial_state if sequence_info is None else sequence_info.first_state(initial_state)
-        grad_output = grad_output.contiguous()
-
-        grad_final_state = None
-        recv_handle = None
-        if ctx.state_cp is None and ctx.send_next:
-            grad_final_state = torch.empty(
-                (query.shape[0], value.shape[2], query.shape[-1], value.shape[-1]), device=query.device,
-                dtype=torch.float32,
-            )
-            recv_handle = dist.irecv(grad_final_state, src=ctx.next_rank, group=ctx.cp_group)
-
-        beta = ops.fused_beta_sigmoid(beta_raw)
-        gate = ops.kda_gate_chunk_cumsum(
-            g=gate_raw, A_log=a_log, dt_bias=dt_bias, scale=rcp_ln2, chunk_size=ctx.chunk_size,
-            lower_bound=ctx.lower_bound,
-            **varlen,
-        )
-        w, u, query_gated, key_gated = ops.recompute_w_u_fwd(
-            q=query, k=key, v=value, beta=beta, A=attention_kk, gk=gate,
-            **varlen,
-        )
-        states, value_new, _ = ops.chunk_gated_delta_rule_fwd_h(
-            k=key_gated, w=w, u=u, gk=gate, initial_state=kernel_initial_state, output_final_state=False,
-            chunk_size=ctx.chunk_size,
-            **recurrent_varlen,
-        )
-        grad_attention_qk, grad_value_local = ops.chunk_kda_bwd_dav(
-            q=query, k=key, v=value_new, do=grad_output, A=attention_qk, scale=ctx.scale,
-            chunk_size=ctx.chunk_size,
-            **varlen,
-        )
-        grad_state_ext = None
-        if ctx.state_cp is not None or ctx.receive_previous:
-            if sequence_info is not None and not sequence_info.continues_previous:
-                if not getattr(ctx.state_cp, "allows_absent_summaries", False):
-                    grad_state_ext = query.new_zeros(
-                        (query.shape[0], value.shape[2], query.shape[-1], value.shape[-1]), dtype=torch.float32)
-            else:
-                head = slice(None) if sequence_info is None else sequence_info.head
-                grad_state_ext = kda_state_gradient_summary_from_prepared(
-                    query_gated[:, head], key_gated[:, head], w[:, head], gate[:, head],
-                    grad_output[:, head], grad_value_local[:, head], ctx.scale, chunk_size=ctx.chunk_size,
-                )
-        if recv_handle is not None and (sequence_info is None or sequence_info.transfer_active):
-            recv_handle.wait()
-            recv_handle = None
-        send_handle = None
-        send_state_gradient = None
-        if ctx.state_cp is not None:
-            grad_final_state = ctx.state_cp.backward(grad_state_ext, state_cache)
-        elif ctx.receive_previous:
-            transition = state_cache[0] if state_cache else None
-            summary_final_gradient = grad_final_state if transition is not None else None
-            grad_initial_state = apply_kda_state_gradient_summary(grad_state_ext, transition, summary_final_gradient)
-            send_state_gradient = grad_initial_state.contiguous()
-            send_handle = dist.isend(send_state_gradient, dst=ctx.prev_rank, group=ctx.cp_group)
-
-        if recv_handle is not None:
-            recv_handle.wait()
-        kernel_grad_final = grad_final_state if sequence_info is None else sequence_info.last_state(grad_final_state)
-        grad_states, _, grad_value = ops.chunk_gated_delta_rule_bwd_dhu(
-            q=query_gated, k=key_gated, w=w, gk=gate, h0=kernel_initial_state, dht=kernel_grad_final, do=grad_output,
-            dv=grad_value_local, scale=ctx.scale, chunk_size=ctx.chunk_size,
-            **recurrent_varlen,
-        )
-        # These recomputed tensors have no consumers after dhu. Dropping local
-        # references lets the allocator reuse their storage on this stream.
-        del query_gated, key_gated, w, u, grad_value_local, _
-        (
-            grad_query, grad_key, grad_value, grad_beta, grad_gate, grad_attention_kk,
-        ) = ops.chunk_kda_bwd_wy_dqkg_fused(
-            q=query, k=key, v=value, v_new=value_new, g=gate, beta=beta, A=attention_kk, h=states, do=grad_output,
-            dh=grad_states, dv=grad_value, scale=ctx.scale, chunk_size=ctx.chunk_size,
-            **varlen,
-        )
-        # Release recomputed states before intra backward allocates its outputs.
-        del states, grad_states, value_new
-        grad_query, grad_key, grad_beta, grad_gate = ops.chunk_kda_bwd_intra(
-            q=query, k=key, g=gate, beta=beta, dAqk=grad_attention_qk, dAkk=grad_attention_kk, dq=grad_query,
-            dk=grad_key, db=grad_beta, dg=grad_gate, chunk_size=ctx.chunk_size, safe_gate=ctx.safe_gate,
-            **varlen,
-        )
-
-        num_query_heads = query.shape[2]
-        num_value_heads = value.shape[2]
-        if num_value_heads > num_query_heads:
-            groups = num_value_heads // num_query_heads
-            grad_query = grad_query.view(*grad_query.shape[:2], num_query_heads, groups, grad_query.shape[-1]).sum(
-                dim=3,
-            )
-            grad_key = grad_key.view(*grad_key.shape[:2], num_query_heads, groups, grad_key.shape[-1]).sum(dim=3)
-
-        grad_gate = ops.chunk_local_cumsum(grad_gate, chunk_size=ctx.chunk_size, reverse=True, **varlen)
-        grad_gate, grad_a_log, grad_dt_bias = ops.kda_gate_bwd(
-            g=gate_raw, A_log=a_log, dt_bias=dt_bias, dyg=grad_gate, lower_bound=ctx.lower_bound,
-        )
-        grad_beta = ops.fused_beta_sigmoid_bwd(beta_raw, grad_beta)
-        grad_query = ops.l2norm_bwd(query, query_rstd, grad_query)
-        grad_key = ops.l2norm_bwd(key, key_rstd, grad_key)
-        if send_handle is not None:
-            send_handle.wait()
-
-        return (
-            grad_query, grad_key, grad_value, grad_gate, grad_beta, grad_a_log, grad_dt_bias, None, None, None,
-            None, None, None, None, None, None, None, None,
-        )
+            row = torch.zeros_like(base)
+        diagonal = F.one_hot(  # pylint: disable=not-callable
+            torch.tensor(row_idx, device=strict_lower.device),
+            num_classes=chunk_size,
+        ).to(strict_lower.dtype)
+        rows.append(row + diagonal)
+    return torch.stack(rows, dim=-2)
 
 
-@torch.compiler.disable
-def fused_chunk_kda_p2p(
+def _prepare_kda_wy(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the cumulative gate, causal mask, and chunkwise WY factors."""
+    gate = gate.cumsum(dim=-2)
+    causal = torch.ones(
+        chunk_size,
+        chunk_size,
+        dtype=torch.bool,
+        device=query.device,
+    ).tril()
+    strict_causal = causal.logical_xor(
+        torch.eye(chunk_size, dtype=torch.bool, device=query.device)
+    )
+
+    gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
+    key_pair = torch.einsum(
+        "...ik,...jk,...ijk->...ij",
+        key,
+        key,
+        gate_pair.exp(),
+    )
+    strict_lower = (
+        key_pair * beta.unsqueeze(-1)
+    ).masked_fill(~strict_causal, 0)
+    inverse = _inverse_unit_lower_triangular(strict_lower)
+    transform = inverse * beta.unsqueeze(-2)
+    w = transform @ (key * gate.exp())
+    u = transform @ value
+
+    return gate, causal, w, u
+
+
+def _run_kda_chunks(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    gate: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    state: torch.Tensor,
+    causal: torch.Tensor,
+    scale: float,
+    num_chunks: int,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Apply chunk WY factors to the recurrent state in sequence order."""
+    output_chunks = []
+    for chunk_idx in range(num_chunks):
+        query_i = query[:, :, chunk_idx]
+        key_i = key[:, :, chunk_idx]
+        gate_i = gate[:, :, chunk_idx]
+        w_i = w[:, :, chunk_idx]
+        u_i = u[:, :, chunk_idx]
+
+        relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
+        qk = torch.einsum(
+            "bhik,bhjk,bhijk->bhij",
+            query_i,
+            key_i,
+            relative_gate.exp(),
+        ).masked_fill(~causal, 0)
+        value_new = u_i - w_i @ state
+        output_inter = (query_i * gate_i.exp()) @ state
+        output_chunks.append(output_inter * scale + qk @ value_new * scale)
+
+        last_gate = gate_i[:, :, -1]
+        key_decay = key_i * (last_gate.unsqueeze(-2) - gate_i).exp()
+        state = state * last_gate.exp().unsqueeze(-1)
+        state = state + key_decay.transpose(-1, -2) @ value_new
+
+    return output_chunks, state
+
+
+def torch_chunk_kda(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
     *,
-    a_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    cp_group: Any,
-    prev_rank: int,
-    next_rank: int,
-    cp_rank: int,
-    cp_size: int,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
-    lower_bound: float = -5.0,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
     chunk_size: int = 64,
-    safe_gate: bool = True,
-    state_cp: Any = None,
-    sequence_info: Optional[PackedSequenceInfo] = None,
-) -> torch.Tensor:
-    """Run one sequence-sharded KDA segment with a selected state CP executor.
+    cu_seqlens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Evaluate chunkwise KDA using the UT/WY representation.
 
-    The historical P2P entry name is retained for existing callers; passing
-    state_cp selects gathered or recursive state exchange with the same local ops.
+    This implementation is algebraically independent from
+    :func:`torch_recurrent_kda`; comparing the two catches errors in the
+    chunk transform that a second token loop would hide.
 
     Args:
-        query: Query input [B,T,H,K].
-        key: Matching key input.
-        value: Value input [B,T,HV,V].
-        gate: Per-token gate logits.
-        beta: Per-token beta logits.
-        a_log: FP32 decay parameter per value head.
-        dt_bias: FP32 gate-channel bias.
-        cp_group: Existing chronological state process group.
-        prev_rank: Global predecessor rank for P2P.
-        next_rank: Global successor rank for P2P.
-        cp_rank: Chronological index within the state group.
-        cp_size: Number of state partitions.
-        scale: Optional attention scale.
-        lower_bound: Lower bound for the activated gate.
-        chunk_size: Tokens per local chunk.
-        safe_gate: Enable the staged safe-gate path.
-        state_cp: State executor returning an invocation cache; None selects existing P2P.
+        query: Query tensor in batch, token, head, key-dimension order.
+        key: Key tensor with the same token and key-head axes as query.
+        value: Value tensor in batch, token, head, value-dimension order.
+        gate: Decay gate or output gate required by this stage.
+        beta: Delta-rule update strengths, or logits when sigmoid fusion is enabled.
+        a_log: Log decay-rate parameter.
+        dt_bias: Per-key time-step bias.
+        scale: Query scaling factor; None selects the head-dimension default.
+        initial_state: Optional state entering the first local chunk.
+        output_final_state: Whether to return the state after the final chunk.
+        use_qk_l2norm_in_kernel: Whether this operator normalizes query and key.
+        use_gate_in_kernel: Whether this operator transforms raw decay logits.
+        use_beta_sigmoid_in_kernel: Whether this operator transforms beta logits with sigmoid.
+        lower_bound: Negative lower bound of the safe decay gate.
+        chunk_size: Number of tokens in a recurrence chunk.
+        cu_seqlens: Cumulative document boundaries for packed tokens.
+    """
+    if cu_seqlens is not None:
+        return packed_eager(
+            torch_chunk_kda, (query, key, value, gate, beta), cu_seqlens,
+            initial_state=initial_state, output_final_state=output_final_state,
+            a_log=a_log, dt_bias=dt_bias, scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel, lower_bound=lower_bound, chunk_size=chunk_size,
+        )
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+    output_dtype = value.dtype
+    sequence_length = query.shape[1]
+    query, key, value, gate, beta, scale = _prepare_kda_inputs(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        lower_bound=lower_bound,
+    )
+    batch_size, _, num_heads, k_head_dim = query.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, 0, 0, pad_size))
+    gate = F.pad(gate, (0, 0, 0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, 0, 0, pad_size))
+    num_chunks = query.shape[1] // chunk_size
+
+    def chunk_view(tensor: torch.Tensor) -> torch.Tensor:
+        """Rearrange a token-first tensor to head-first chunks.
+
+        Args:
+            tensor: Tensor to reshape or redistribute without changing token order.
+        """
+        shape = tensor.shape
+        return tensor.reshape(
+            shape[0], num_chunks, chunk_size, shape[2], *shape[3:]
+        ).permute(0, 3, 1, 2, *range(4, tensor.dim() + 1))
+
+    query, key, value, gate, beta = [
+        chunk_view(tensor) for tensor in (query, key, value, gate, beta)
+    ]
+    gate, causal, w, u = _prepare_kda_wy(query, key, value, gate, beta, chunk_size)
+
+    state = _initial_kda_state(
+        value.permute(0, 2, 3, 1, 4).reshape(
+            batch_size, num_chunks * chunk_size, num_heads, v_head_dim
+        ),
+        k_head_dim,
+        initial_state,
+    )
+    output_chunks, state = _run_kda_chunks(query, key, gate, w, u, state, causal, scale, num_chunks)
+
+    output = torch.stack(output_chunks, dim=2)
+    output = output.permute(0, 2, 3, 1, 4).reshape(
+        batch_size,
+        num_chunks * chunk_size,
+        num_heads,
+        v_head_dim,
+    )
+    output = output[:, :sequence_length].to(output_dtype)
+    return output, state if output_final_state else None
+
+
+def _chunk_kda_summary_inputs(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Pad and convert token-first KDA tensors into head-first chunks."""
+    sequence_length = key.shape[1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    key = F.pad(key, (0, 0, 0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, 0, 0, pad_size))
+    gate = F.pad(gate, (0, 0, 0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, 0, 0, pad_size))
+    num_chunks = key.shape[1] // chunk_size
+
+    def chunk_view(tensor: torch.Tensor) -> torch.Tensor:
+        """Rearrange one token-first tensor to head-first chunks.
+
+        Args:
+            tensor: Tensor to reshape or redistribute without changing token order.
+        """
+        shape = tensor.shape
+        return tensor.reshape(
+            shape[0], num_chunks, chunk_size, shape[2], *shape[3:]
+        ).permute(0, 3, 1, 2, *range(4, tensor.dim() + 1))
+
+    key, value, gate, beta = (
+        chunk_view(tensor) for tensor in (key, value, gate, beta)
+    )
+    return key, value, gate, beta, num_chunks
+
+
+def torch_kda_state_summary(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Summarize a local KDA segment as ``H_out = M @ H_in + S``.
+
+    The implementation follows the same chunkwise WY equations as
+    :func:`torch_chunk_kda`, but computes only the state-independent affine
+    transition. ``S`` has shape ``[B, HV, K, V]`` and ``M`` has shape
+    ``[B, HV, K, K]``. Query is accepted to share KDA input preprocessing and
+    grouped-value validation; the state transition itself is independent of
+    query and output scale.
+
+    Args:
+        query: Query tensor in batch, token, head, key-dimension order.
+        key: Key tensor with the same token and key-head axes as query.
+        value: Value tensor in batch, token, head, value-dimension order.
+        gate: Decay gate or output gate required by this stage.
+        beta: Delta-rule update strengths, or logits when sigmoid fusion is enabled.
+        a_log: Log decay-rate parameter.
+        dt_bias: Per-key time-step bias.
+        scale: Query scaling factor; None selects the head-dimension default.
+        use_qk_l2norm_in_kernel: Whether this operator normalizes query and key.
+        use_gate_in_kernel: Whether this operator transforms raw decay logits.
+        use_beta_sigmoid_in_kernel: Whether this operator transforms beta logits with sigmoid.
+        lower_bound: Negative lower bound of the safe decay gate.
+        chunk_size: Number of tokens in a recurrence chunk.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+    _, key, value, gate, beta, _ = _prepare_kda_inputs(
+        query, key, value, gate, beta,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        lower_bound=lower_bound,
+    )
+    key, value, gate, beta, num_chunks = _chunk_kda_summary_inputs(
+        key, value, gate, beta, chunk_size,
+    )
+    gate = gate.cumsum(dim=-2)
+    strict_causal = torch.ones(
+        chunk_size, chunk_size, dtype=torch.bool, device=key.device,
+    ).tril(diagonal=-1)
+    gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
+    key_pair = torch.einsum(
+        "...ik,...jk,...ijk->...ij", key, key, gate_pair.exp(),
+    )
+    strict_lower = (key_pair * beta.unsqueeze(-1)).masked_fill(
+        ~strict_causal,
+        0,
+    )
+    inverse = _inverse_unit_lower_triangular(strict_lower)
+    transform = inverse * beta.unsqueeze(-2)
+    w = transform @ (key * gate.exp())
+    u = transform @ value
+
+    batch_size, num_heads, _, _, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    eye = torch.eye(
+        k_head_dim, dtype=torch.float32, device=key.device,
+    ).reshape(1, 1, k_head_dim, k_head_dim)
+    state_ext = torch.zeros(
+        batch_size,
+        num_heads,
+        k_head_dim,
+        v_head_dim,
+        dtype=torch.float32,
+        device=key.device,
+    )
+    transition = eye.expand(batch_size, num_heads, -1, -1).clone()
+
+    for chunk_idx in range(num_chunks):
+        key_i = key[:, :, chunk_idx]
+        gate_i = gate[:, :, chunk_idx]
+        w_i = w[:, :, chunk_idx]
+        u_i = u[:, :, chunk_idx]
+        last_gate = gate_i[:, :, -1]
+        key_decay = key_i * (last_gate.unsqueeze(-2) - gate_i).exp()
+        transition_i = torch.diag_embed(last_gate.exp())
+        transition_i = transition_i - key_decay.transpose(-1, -2) @ w_i
+        state_ext_i = key_decay.transpose(-1, -2) @ u_i
+        state_ext = transition_i @ state_ext + state_ext_i
+        transition = transition_i @ transition
+
+    return state_ext.float(), transition.float()
+
+
+def torch_apply_kda_state_summary(
+    state_ext: torch.Tensor,
+    transition: torch.Tensor,
+    initial_state: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Apply a KDA affine state summary to an incoming state.
+
+    Args:
+        state_ext: State produced from a zero initial state.
+        transition: Linear state transition matrix.
+        initial_state: Optional state entering the first local chunk.
+    """
+    if initial_state is None:
+        return state_ext.float()
+    return (transition @ initial_state.to(transition) + state_ext).float()
+
+
+def torch_compose_kda_state_summaries(
+    first_state_ext: torch.Tensor,
+    first_transition: torch.Tensor,
+    second_state_ext: torch.Tensor,
+    second_transition: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compose two chronological KDA summaries, first then second.
+
+    Args:
+        first_state_ext: Zero-input state of the earlier sequence interval.
+        first_transition: Transition matrix of the earlier sequence interval.
+        second_state_ext: Zero-input state of the later sequence interval.
+        second_transition: Transition matrix of the later sequence interval.
+    """
+    state_ext = second_transition @ first_state_ext + second_state_ext
+    transition = second_transition @ first_transition
+    return state_ext, transition
+
+
+def apply_kda_state_summary(
+    state_ext: torch.Tensor,
+    transition: Optional[torch.Tensor],
+    initial_state: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Apply a prepared KDA state summary in FP32.
+
+    Args:
+        state_ext: Local zero-entry state S.
+        transition: Local transfer M; may be omitted for a zero entry.
+        initial_state: Incoming FP32 state, or None for a zero entry.
 
     Returns:
-        Output tokens in the local sequence layout.
+        The outgoing FP32 state.
     """
-    _validate_p2p_inputs(
+    if initial_state is None:
+        return state_ext
+    # Model autocast must not silently quantize a communicated FP32 state.
+    with torch.autocast(device_type=state_ext.device.type, enabled=False):
+        return torch.matmul(transition.float(), initial_state.float()) + state_ext
+
+
+def apply_kda_state_gradient_summary(
+    grad_state_ext: torch.Tensor,
+    transition: torch.Tensor,
+    grad_final_state: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Apply the adjoint summary to a gradient from the next rank.
+
+    Args:
+        grad_state_ext: Local gradient contribution G.
+        transition: Forward transfer M used by this backend's existing adjoint.
+        grad_final_state: Incoming terminal-state gradient, or None for zero exit.
+    """
+    if grad_final_state is None:
+        return grad_state_ext
+    with torch.autocast(device_type=grad_state_ext.device.type, enabled=False):
+        return (
+            torch.matmul(transition.float().transpose(-2, -1), grad_final_state.float())
+            + grad_state_ext
+        )
+
+
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
+_TRITON_KDA_HEAD_DIM = 128
+_TRITON_KDA_CHUNK_SIZE = 64
+
+
+def _has_triton_kda_shapes(
+    query: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    chunk_size: int,
+) -> bool:
+    """Check the fixed dense shapes accepted by the Triton KDA path."""
+    batch_size, sequence_length, num_query_heads, key_dim = query.shape
+    num_value_heads, value_dim = value.shape[2:]
+    return all((
+        value.shape[:2] == (batch_size, sequence_length),
+        gate.shape == (batch_size, sequence_length, num_value_heads, key_dim),
+        beta.shape == (batch_size, sequence_length, num_value_heads),
+        num_value_heads % num_query_heads == 0,
+        a_log.numel() == num_value_heads,
+        dt_bias.numel() == num_value_heads * key_dim,
+        key_dim == value_dim == _TRITON_KDA_HEAD_DIM,
+        chunk_size == _TRITON_KDA_CHUNK_SIZE,
+    ))
+
+
+def _is_triton_kda_input_supported(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    gate: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    a_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    *,
+    chunk_size: int,
+    lower_bound: Optional[float],
+) -> bool:
+    """Check the fixed Kimi K3 contract validated by the fused backend."""
+    operands = (key, value, gate, beta, a_log, dt_bias)
+    if any(tensor is None for tensor in operands):
+        return False
+    if lower_bound is None:
+        return False
+
+    basic_contract = (
+        query.device.type == "npu",
+        all(tensor.dtype == torch.bfloat16 for tensor in (query, key, value, gate, beta)),
+        all(tensor.dtype == torch.float32 for tensor in (a_log, dt_bias)),
+        all(tensor.ndim == 4 for tensor in (query, key, value, gate)),
+        beta.ndim == 3,
+        query.shape == key.shape,
+    )
+    if not all(basic_contract):
+        return False
+
+    shape_supported = _has_triton_kda_shapes(
+        query, value, gate, beta, a_log, dt_bias, chunk_size,
+    )
+    lower_bound_supported = -5.0 <= lower_bound < 0
+    if not (shape_supported and lower_bound_supported):
+        return False
+    return all(tensor.device == query.device for tensor in operands)
+
+
+def is_triton_kda_available(
+    query: Optional[torch.Tensor] = None,
+    key: Optional[torch.Tensor] = None,
+    value: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    beta: Optional[torch.Tensor] = None,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    *,
+    chunk_size: int = _TRITON_KDA_CHUNK_SIZE,
+    lower_bound: Optional[float] = -5.0,
+) -> bool:
+    """Return whether the validated Triton-Ascend KDA backend is available.
+
+    Args:
+        query: Query tensor in batch, token, head, key-dimension order.
+        key: Key tensor with the same token and key-head axes as query.
+        value: Value tensor in batch, token, head, value-dimension order.
+        gate: Decay gate or output gate required by this stage.
+        beta: Delta-rule update strengths, or logits when sigmoid fusion is enabled.
+        a_log: Log decay-rate parameter.
+        dt_bias: Per-key time-step bias.
+        chunk_size: Number of tokens in a recurrence chunk.
+        lower_bound: Negative lower bound of the safe decay gate.
+    """
+    if chunk_size != _TRITON_KDA_CHUNK_SIZE:
+        return False
+    if query is not None and not _is_triton_kda_input_supported(
         query,
         key,
         value,
@@ -580,32 +792,133 @@ def fused_chunk_kda_p2p(
         dt_bias,
         chunk_size=chunk_size,
         lower_bound=lower_bound,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
+    ):
+        return False
+    return is_fla_triton_kda_available()
+
+
+def _normalize_kda_backend(backend: str) -> str:
+    """Normalize the selected backend and reject unsupported names."""
+    backend = backend.lower()
+    if backend not in _KDA_BACKENDS:
+        raise ValueError(
+            f"unsupported KDA backend {backend!r}; "
+            f"expected one of {sorted(_KDA_BACKENDS)}."
+        )
+    return backend
+
+
+def _validate_fused_state_contract(initial_state, output_final_state, qk_norm, gate, beta, backend) -> None:
+    """Keep raw-input dispatch separate from the stateful CP backend contract."""
+    if initial_state is not None or output_final_state:
+        raise NotImplementedError(
+            f"KDA backend={backend!r} currently supports zero initial state without "
+            "returning a final state; stateful execution is owned by the CP backend."
+        )
+    if not (qk_norm and gate and beta):
+        raise NotImplementedError(
+            f"KDA backend={backend!r} requires fused Q/K normalization, gate activation, "
+            "and beta sigmoid."
+        )
+
+
+def chunk_kda(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
+    chunk_size: int = 64,
+    backend: str = "eager",
+    cu_seqlens: Optional[torch.Tensor | Sequence[int]] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Dispatch dense or packed KDA to the explicitly selected local backend.
+
+    Args:
+        query: Query tensor in batch, token, head, key-dimension order.
+        key: Key tensor with the same token and key-head axes as query.
+        value: Value tensor in batch, token, head, value-dimension order.
+        gate: Decay gate or output gate required by this stage.
+        beta: Delta-rule update strengths, or logits when sigmoid fusion is enabled.
+        a_log: Log decay-rate parameter.
+        dt_bias: Per-key time-step bias.
+        scale: Query scaling factor; None selects the head-dimension default.
+        initial_state: Optional state entering the first local chunk.
+        output_final_state: Whether to return the state after the final chunk.
+        use_qk_l2norm_in_kernel: Whether this operator normalizes query and key.
+        use_gate_in_kernel: Whether this operator transforms raw decay logits.
+        use_beta_sigmoid_in_kernel: Whether this operator transforms beta logits with sigmoid.
+        lower_bound: Negative lower bound of the safe decay gate.
+        chunk_size: Number of tokens in a recurrence chunk.
+        backend: Explicit local operator implementation to dispatch.
+        cu_seqlens: Cumulative document boundaries for packed tokens.
+    """
+    if query.ndim == 3:
+        output, final = chunk_kda(
+            *(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
+            a_log=a_log, dt_bias=dt_bias, scale=scale, initial_state=initial_state,
+            output_final_state=output_final_state, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel, use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            lower_bound=lower_bound, chunk_size=chunk_size, backend=backend, cu_seqlens=cu_seqlens)
+        return output.squeeze(0), final
+    backend = _normalize_kda_backend(backend)
+    if backend == "eager":
+        return torch_chunk_kda(
+            query, key, value, gate, beta,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            lower_bound=lower_bound,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+        )
+    _validate_fused_state_contract(initial_state, output_final_state, use_qk_l2norm_in_kernel,
+                                  use_gate_in_kernel, use_beta_sigmoid_in_kernel, backend)
+    if backend == "ascendc":
+        output = ascendc_chunk_kda(
+            query, key, value, gate, beta,
+            a_log=a_log.float() if a_log is not None else None,
+            dt_bias=dt_bias.float() if dt_bias is not None else None,
+            scale=scale, lower_bound=lower_bound, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
+        )
+        return output, None
+    triton_a_log = a_log.float() if a_log is not None else None
+    triton_dt_bias = dt_bias.float() if dt_bias is not None else None
+    if not _is_triton_kda_input_supported(
+        query, key, value, gate, beta, triton_a_log, triton_dt_bias,
+        chunk_size=chunk_size,
+        lower_bound=lower_bound,
+    ):
+        raise RuntimeError(
+            "KDA backend='triton' received an unsupported input contract; it requires "
+            "q/k/v/gate/beta=bf16, a_log/dt_bias=fp32, "
+            "head_k_dim=head_v_dim=128, chunk_size=64, and a supported safe gate."
+        )
+
+
+    output = fused_chunk_kda(
+        query, key, value, gate, beta,
+        a_log=triton_a_log,
+        dt_bias=triton_dt_bias,
+        scale=scale,
+        lower_bound=lower_bound,
+        chunk_size=chunk_size,
+        safe_gate=True,
+        cu_seqlens=cu_seqlens,
     )
-    if sequence_info is not None:
-        if query.shape[0] != 1:
-            raise ValueError("Packed state CP requires batch dimension one.")
-        resolve_packed_sequence({"packed_sequence_info": sequence_info}, query.shape[1],
-                                cp_rank=cp_rank, cp_size=cp_size)
-    effective_scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
-    return _KDAStateP2PFunction.apply(
-        query,
-        key,
-        value,
-        gate,
-        beta,
-        a_log,
-        dt_bias.reshape(-1),
-        effective_scale,
-        float(lower_bound),
-        chunk_size,
-        safe_gate,
-        cp_group,
-        prev_rank,
-        next_rank,
-        cp_rank,
-        cp_size,
-        state_cp,
-        sequence_info,
-    )
+    return output, None

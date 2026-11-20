@@ -16,33 +16,44 @@
 
 from dataclasses import FrozenInstanceError
 from typing import Any
+from unittest.mock import patch
+from types import SimpleNamespace
 import unittest
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from hyper_parallel.components.functional.linear_attention_packed import (
-    PackedDocumentInfo,
-    PackedSequenceInfo,
-    packed_causal_conv1d,
-    packed_reference,
-    resolve_packed_sequence,
+from hyper_parallel.components.modules.attention.linear_attention.sequence_layout import (
+    PackedDocumentInfo, PackedSequenceInfo, resolve_packed_sequence,
 )
-from hyper_parallel.components.modules.kimi_delta_attention import KimiDeltaAttention
-from hyper_parallel.components.modules.gated_delta_net import chunk_gated_delta_rule
+from hyper_parallel.components.functional.linear_attention_convolution import (
+    packed_causal_conv1d,
+)
+from hyper_parallel.components.modules.attention.linear_attention.sequence_layout import (
+    packed_eager,
+)
+from hyper_parallel.components.modules.attention.kimi_delta_attention import KimiDeltaAttention
+from hyper_parallel.components.functional.gated_delta_net import chunk_gated_delta_rule
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
 from hyper_parallel.models.qwen3_5.adapter.data.runtime import Qwen35PackedRuntime
 from hyper_parallel.models.kimi_k3.adapter.data.runtime import KimiK3PackedRuntime
-from hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel import qwen3_5_packed_decoder_wrapper
+from hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder import qwen3_5_linear_attention_decoder_wrapper
 from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
+from tests.common.mark_utils import arg_mark
 
 
 class TestLinearAttentionPacked(unittest.TestCase):
     """Check real reset semantics independently of device and transport."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_global_offsets_survive_local_cuts_and_mutation(self):
-        """Ulysses removes artificial CP cuts while retaining true sample starts."""
+        """Feature: Packed document snapshots.
+
+        Description: Slice CP intervals and mutate the original offset tensor.
+        Expectation: Snapshots preserve true document boundaries independently of artificial CP cuts.
+        """
         offsets = torch.tensor([0, 6000, 13000, 16384], dtype=torch.int32)
         info = resolve_packed_sequence({"cu_seq_lens": offsets}, 4096, cp_rank=1, cp_size=4)
         self.assertEqual(info.local_offsets, (0, 1904, 4096))
@@ -55,8 +66,14 @@ class TestLinearAttentionPacked(unittest.TestCase):
         self.assertEqual(plan.chunk_offsets.tolist(), [0, 30, 65])
         self.assertIs(info.materialize(torch.device("cpu"), 64), plan)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_interval_views_share_snapshot_and_preserve_reset_edges(self):
-        """All local cuts preserve document identity without sharing mutable states."""
+        """Feature: Packed interval views.
+
+        Description: Construct local interval views from one immutable document snapshot.
+        Expectation: Views share metadata and preserve reset edges without sharing recurrent states.
+        """
         offsets = [0, 3, 8, 13, 20]
         documents = PackedDocumentInfo(offsets)
         root = PackedSequenceInfo(documents, 0, 20)
@@ -82,8 +99,14 @@ class TestLinearAttentionPacked(unittest.TestCase):
         self.assertIsNot(first.materialize(torch.device("cpu"), 64),
                          expanded.materialize(torch.device("cpu"), 64))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_aliases_fail_instead_of_silently_disagreeing(self):
-        """Conflicting or ambiguous metadata is rejected before any communication."""
+        """Feature: Packed argument validation.
+
+        Description: Supply conflicting or ambiguous document metadata aliases.
+        Expectation: Invalid aliases are rejected before communication.
+        """
         with self.assertRaisesRegex(ValueError, "disagree"):
             resolve_packed_sequence({"cu_seq_lens": [0, 3, 8], "cu_seqlens": [0, 4, 8]}, 8)
         with self.assertRaisesRegex(ValueError, "strictly increasing"):
@@ -91,8 +114,14 @@ class TestLinearAttentionPacked(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported"):
             resolve_packed_sequence({"seq_idx": torch.zeros(8)}, 8)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_segmented_conv_halo_and_all_gradients(self):
-        """Fragment execution equals independent sample Conv1d, including halo gradients."""
+        """Feature: Segmented convolution halos.
+
+        Description: Compare fragment convolution and halo gradients with independent full documents.
+        Expectation: Outputs and all gradients match the per-document convolution reference.
+        """
         torch.manual_seed(82)
         offsets = (0, 5, 17, 23)
         conv = nn.Conv1d(3, 3, 4, groups=3, padding=3, bias=True).double()
@@ -118,8 +147,14 @@ class TestLinearAttentionPacked(unittest.TestCase):
         for actual_grad, expected_grad in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual_grad, expected_grad, atol=1e-12, rtol=1e-12)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_kda_layer_tnd_and_cross_sample_gradient(self):
-        """The model entry consumes its aliases and isolates both convolution and state."""
+        """Feature: Packed KDA sample isolation.
+
+        Description: Run the layer through packed aliases and backpropagate one sample.
+        Expectation: Convolution and recurrent state do not leak gradients between samples.
+        """
         torch.manual_seed(31)
         module = KimiDeltaAttention(
             hidden_size=16, num_heads=2, head_k_dim=4, head_v_dim=4, conv_kernel_size=3, chunk_size=4
@@ -137,8 +172,14 @@ class TestLinearAttentionPacked(unittest.TestCase):
         for actual_grad, expected_grad in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual_grad, expected_grad, atol=8e-6, rtol=1e-5)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_gdn_tnd_core_and_initial_state_slots(self):
-        """Packed GDN preserves separate initial/final states and all input gradients."""
+        """Feature: Packed GDN document states.
+
+        Description: Compare packed evaluation with independent local sample recurrences.
+        Expectation: Outputs, gradients and initial-state slots follow document boundaries.
+        """
         torch.manual_seed(73)
         query, key, value = [torch.randn(13, 2, 4, requires_grad=True) for _ in range(3)]
         gate = (-torch.rand(13, 2)).requires_grad_()
@@ -159,10 +200,16 @@ class TestLinearAttentionPacked(unittest.TestCase):
         for actual_grad, expected_grad in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
         with self.assertRaisesRegex(ValueError, "token count"):
-            packed_reference(lambda *args: args, (query.unsqueeze(0),), (0, 14))
+            packed_eager(lambda *args: args, (query.unsqueeze(0),), (0, 14))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_model_runtime_and_decoder_keep_invocation_metadata(self):
-        """Model-owned runtime must survive the HF linear decoder's kwargs boundary."""
+        """Feature: Packed invocation metadata ownership.
+
+        Description: Exercise runtime packing and decoder forwarding for multiple calls.
+        Expectation: Each call retains its own document offsets through the module-family entry.
+        """
 
         class Mixer(nn.Module):
             """Record metadata at the decoder mixer boundary."""
@@ -171,7 +218,6 @@ class TestLinearAttentionPacked(unittest.TestCase):
                 """Build a minimal decoder fixture with stable parameter ownership."""
                 super().__init__()
                 self.weight = nn.Parameter(torch.ones(()))
-                self._hp_gdn_cp_config = {"mode": "packed_local"}
                 self.seen = None
 
             def forward(self, hidden_states: torch.Tensor, **kwargs: Any) -> torch.Tensor:
@@ -205,9 +251,11 @@ class TestLinearAttentionPacked(unittest.TestCase):
         self.assertEqual(inputs["packed_sequence_info"].local_offsets, (0, 3, 8))
         decoder = Decoder()
         parameters = {name: id(parameter) for name, parameter in decoder.named_parameters()}
-        _commit_forward_rewrite(qwen3_5_packed_decoder_wrapper(decoder, None, None, None, None))
+        _commit_forward_rewrite(qwen3_5_linear_attention_decoder_wrapper(decoder, None, None, None, None))
         values = torch.randn(1, 8, 4, requires_grad=True)
-        decoder(values, **inputs).sum().backward()
+        family = SimpleNamespace(resolved=SimpleNamespace(family=SimpleNamespace(name="gated_delta_net")))
+        with patch("hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.get_family_build_info", return_value=family):
+            decoder(values, **inputs).sum().backward()
         self.assertIs(decoder.linear_attn.seen, inputs["packed_sequence_info"])
         self.assertEqual(parameters, {name: id(parameter) for name, parameter in decoder.named_parameters()})
         self.assertIs(decoder(values), values)

@@ -17,7 +17,9 @@
 from collections.abc import Mapping
 from typing import Any
 
-from hyper_parallel.components.functional.linear_attention_packed import resolve_packed_sequence
+from hyper_parallel.components.modules.attention.linear_attention.sequence_layout import (
+    resolve_packed_sequence,
+)
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
 
 

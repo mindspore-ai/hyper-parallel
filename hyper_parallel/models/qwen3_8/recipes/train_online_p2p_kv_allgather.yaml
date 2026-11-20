@@ -54,16 +54,10 @@ plan_overrides:
       source_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
       exact_type: true
       implementation:
-        _target_: hyper_parallel.components.modules.TritonGDN
-  - match: "*.linear_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
+        _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: triton
-        chunk_size: 64
-  # The family selects local/CP itself; do not also wrap self_attn.forward.
+        conv_backend: eager
+        ulysses_degree: 1
   - match: "*.self_attn"
     replace:
       kind: module
