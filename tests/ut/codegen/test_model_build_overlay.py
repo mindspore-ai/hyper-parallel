@@ -59,6 +59,28 @@ class _MethodModel(nn.Module):
         return self.stage(inputs)
 
 
+class _TiedModel(nn.Module):
+    """Expose the native tied-weight contract without a Transformers dependency."""
+
+    def __init__(self, config, *, context):
+        super().__init__()
+        del context
+        self.config = config
+        self.embedding = nn.Embedding(4, 3)
+        self.lm_head = nn.Linear(3, 4, bias=False)
+        self.all_tied_weights_keys = {"lm_head.weight": "embedding.weight"}
+
+    def tie_weights(self, *, recompute_mapping: bool) -> None:
+        """Establish the declared parameter alias using the existing mapping."""
+        if recompute_mapping:
+            raise ValueError("The native helper must reuse the declared mapping")
+        self.lm_head.weight = self.embedding.weight
+
+    def get_parameter_or_buffer(self, name: str) -> nn.Parameter:
+        """Resolve a declared alias endpoint for the native identity check."""
+        return self.get_parameter(name)
+
+
 class TestModelBuildOverlay(unittest.TestCase):
     """Exercise real module identities, meta construction and snapshot contents."""
 
@@ -130,6 +152,25 @@ class TestModelBuildOverlay(unittest.TestCase):
                 apply_module_replacements(model, plan)
         self.assertEqual(applications, [])
         self.assertEqual(tuple(model), original)
+
+    def test_observation_ties_weights_before_freezing_and_planning(self):
+        """The observation planner sees native parameter aliases and their frozen state."""
+        def _check_plan(model, *args):
+            self.assertIs(model.lm_head.weight, model.embedding.weight)
+            self.assertFalse(model.lm_head.weight.requires_grad)
+            _observe_plan(model, *args)
+
+        with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
+                patch("hyper_parallel.codegen.model_build_overlay._observe_plan", side_effect=_check_plan) as plan, \
+                use_codegen_model_build_overlay(CodegenBuildSession()):
+            model = HyperAutoModelForCausalLM.from_config(
+                FamilyModelConfig(), model_factory=_TiedModel, distributed_setup=DistributedSetup(),
+                torch_dtype=torch.float32, freeze_config=("lm_head",),
+            )
+
+        plan.assert_called_once()
+        self.assertIs(model.lm_head.weight, model.embedding.weight)
+        self.assertEqual(model.lm_head.weight.device.type, "meta")
 
     def test_observation_does_not_keep_replaced_sources_alive(self):
         """Codegen observation releases source modules after the shared installer replaces them."""

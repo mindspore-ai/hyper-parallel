@@ -317,6 +317,7 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
             load_base_model,
             session,
         )
+        model_builder._tie_model_weights_before_parallelism(model)  # pylint: disable=protected-access
         if freeze_config is not None:
             model_builder._apply_parameter_freezing(  # pylint: disable=protected-access
                 model,
