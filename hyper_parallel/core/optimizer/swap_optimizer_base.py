@@ -1615,14 +1615,21 @@ class StateSwapAdapter:
             if not saved_state:
                 continue
             exported_state = {}
-            for key in self._state_keys_for_param(param):
+            swappable_keys = self._state_keys_for_param(param)
+            for key in swappable_keys:
                 slot = self._slots.get((id(param), key))
                 if self.has_host_mirror(slot, key, saved_state):
                     local_copy = slot.cpu_tensor.detach().clone()
                     exported_state[key] = _restore_dtensor_metadata(param, local_copy)
             for key, value in saved_state.items():
                 if key not in exported_state:
-                    exported_state[key] = self._copy_checkpoint_value(value)
+                    copied_value = self._copy_checkpoint_value(value)
+                    # Non-owner HSDP checkpoint receivers are plain local CPU tensors.
+                    # Restore the parameter layout before DCP consumes their metadata.
+                    if (key in swappable_keys and isinstance(copied_value, torch.Tensor)
+                            and not self.runtime.is_distributed_tensor(copied_value)):
+                        copied_value = _restore_dtensor_metadata(param, copied_value)
+                    exported_state[key] = copied_value
             exported["state"][param_id] = exported_state
         return exported
 
