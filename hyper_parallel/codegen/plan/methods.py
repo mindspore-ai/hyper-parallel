@@ -104,7 +104,7 @@ def _expression(value: Any, imports: set[str]) -> str:
                 if "self." in expression:
                     if not function.args.args:
                         raise ValueError(f"Codegen closure {name!r} has no resource owner argument")
-                    expression = expression.replace("self.", function.args.args[0].arg + ".", 1)
+                    expression = expression.replace("self.", function.args.args[0].arg + ".")
                 expressions[key] = expression
             function = _MethodNames(expressions).visit(function)
             local_name = name.replace(".<locals>.", "_").replace(".", "_")
@@ -229,5 +229,6 @@ def _describe_methods(modules: dict, before: dict, resolved: dict) -> dict[str, 
             "fields": fields,
             "imports": sorted(imports),
             "local_compute": path in resolved,
+            "dispatch": getattr(before[path].get("forward"), "__name__", None) if path in resolved else None,
         }
     return result

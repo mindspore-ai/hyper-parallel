@@ -17,12 +17,49 @@
 from __future__ import annotations
 
 import ast
+from importlib import import_module
+import inspect
 import textwrap
 
 from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
 from hyper_parallel.codegen.astkit.index import build_source_index
 from hyper_parallel.codegen.inline.ir import ImportPatch, InlinePatchSet
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+
+
+def materialize_method_hosts(source: str, records: dict) -> str:
+    """Expose imported local-region classes before the existing forward lowering pass."""
+    names = {node.name for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+    imports = []
+    for record in records.values():
+        module, name = record["type"].split(":", 1)
+        if not record["local_compute"] or name in names:
+            continue
+        member = getattr(import_module(module), name)
+        function = ast.parse(textwrap.dedent(inspect.getsource(member.forward))).body[0]
+        arguments = function.args
+        positional = [ast.Name(id=argument.arg, ctx=ast.Load())
+                      for argument in arguments.posonlyargs + arguments.args][1:]
+        if arguments.vararg is not None:
+            positional.append(ast.Starred(value=ast.Name(id=arguments.vararg.arg, ctx=ast.Load()), ctx=ast.Load()))
+        keywords = [ast.keyword(arg=argument.arg, value=ast.Name(id=argument.arg, ctx=ast.Load()))
+                    for argument in arguments.kwonlyargs]
+        if arguments.kwarg is not None:
+            keywords.append(ast.keyword(arg=None, value=ast.Name(id=arguments.kwarg.arg, ctx=ast.Load())))
+        call = ast.Call(func=ast.Attribute(value=ast.Call(func=ast.Name(id="super", ctx=ast.Load()),
+                                                       args=[], keywords=[]), attr="forward", ctx=ast.Load()),
+                        args=positional, keywords=keywords)
+        function.body = [ast.Return(value=call)]
+        function.name, function.returns, function.decorator_list = "forward", None, []
+        for argument in ast.walk(arguments):
+            if isinstance(argument, ast.arg):
+                argument.annotation = None
+        ast.fix_missing_locations(function)
+        alias = f"_Native{name}"
+        imports.append(ImportPatch(module, (), raw=f"from {module} import {name} as {alias}"))
+        source += f"\n\nclass {name}({alias}):\n" + textwrap.indent(ast.unparse(function), "    ") + "\n"
+        names.add(name)
+    return apply_patch_set(source, InlinePatchSet(imports=imports))
 
 
 def verify_observed_methods(source: str, records: dict) -> None:
@@ -96,10 +133,20 @@ def materialize_observed_methods(source: str, records: dict) -> str:
             class_node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
             flags = [node for node in class_node.body if isinstance(node, ast.Assign)
                      and any(isinstance(target, ast.Name) and target.id == "ep_enable" for target in node.targets)]
-            if len(flags) != 1:
+            dispatch = record.get("dispatch")
+            bound = next((node for node in tree.body if isinstance(node, ast.FunctionDef)
+                          and node.name == dispatch), None)
+            if not flags and bound is not None and any(
+                isinstance(node, ast.Attribute) and node.attr == "ep_enable"
+                and isinstance(node.value, ast.Name) and node.value.id == "self"
+                for node in ast.walk(bound)
+            ):
+                additions.insert(0, "    ep_enable = True\n")
+            elif len(flags) == 1:
+                flag = flags[0]
+                edits.append(TextEdit(offsets[flag.lineno - 1], offsets[flag.end_lineno], "    ep_enable = True\n"))
+            else:
                 raise ValueError(f"Codegen native local-compute class {name!r} has no unique source dispatch")
-            flag = flags[0]
-            edits.append(TextEdit(offsets[flag.lineno - 1], offsets[flag.end_lineno], "    ep_enable = True\n"))
         if additions:
             edits.append(TextEdit(host.end_offset, host.end_offset, "\n" + "\n".join(additions)))
         source = apply_edits(source, edits)

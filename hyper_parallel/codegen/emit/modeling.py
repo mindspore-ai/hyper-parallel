@@ -43,7 +43,9 @@ from hyper_parallel.codegen.emit.family_forwards import (
 )
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
-from hyper_parallel.codegen.emit.methods import materialize_observed_methods, verify_observed_methods
+from hyper_parallel.codegen.emit.methods import (
+    materialize_method_hosts, materialize_observed_methods, verify_observed_methods,
+)
 from hyper_parallel.codegen.emit.frozen import materialize_frozen_modules
 from hyper_parallel.codegen.emit.primitives import materialize_primitive_boundaries
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_plan
@@ -342,6 +344,7 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     text = rewrite_relative_imports(text, module_name)
     text = compose_nested_model_sources(text, meta)
     text, emission_meta = _apply_inline_modeling(text, meta, patch_plan=patch_plan)
+    text = materialize_method_hosts(text, getattr(meta, "materialized_methods", {}))
     source_path = (
         meta.source.get("file_path")
         if isinstance(meta.source, dict)

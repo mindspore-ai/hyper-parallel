@@ -56,8 +56,16 @@ def compose_nested_model_sources(source_text: str, meta: Any) -> str:
             class_name=class_name,
         )
         if replaced is None:
-            continue
-        rendered = replaced
+            tree = ast.parse(rendered)
+            imported = any(isinstance(node, ast.ImportFrom) and node.module == module_name
+                           and any(alias.name == class_name and alias.asname in (None, class_name)
+                                   for alias in node.names) for node in tree.body)
+            constructed = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                              and node.func.id == class_name for node in ast.walk(tree))
+            if not imported or not constructed:
+                continue
+        else:
+            rendered = replaced
         if module_name not in included_modules:
             nested_source = _read_module_source(module_name)
             rendered = _append_source_module(rendered, nested_source, module_name)

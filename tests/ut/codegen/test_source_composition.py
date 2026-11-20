@@ -55,6 +55,24 @@ class DeepseekV3Model:
 class TestSourceComposition(unittest.TestCase):
     """Validate one-file composition for a nested AutoModel text tower."""
 
+    @patch("hyper_parallel.codegen.source.composition._read_module_source", return_value=_NESTED_SOURCE)
+    def test_imported_component_constructed_directly_is_composed(self, mock_read):
+        """Observed direct constructors need their editable classes in the same source unit."""
+        module = "transformers.models.deepseek_v3.modeling_deepseek_v3"
+        source = (f"from {module} import DeepseekV3Model\n"
+                  "class Model:\n    def __init__(self, config):\n"
+                  "        self.layers = [DeepseekV3Model(config) for index in range(2)]\n")
+        meta = SimpleNamespace(nested_components=[{
+            "fqn": "layers.0", "type": module + ":DeepseekV3Model", "owner_module": module,
+        }, {
+            "fqn": "layers.1", "type": module + ":DeepseekV3Model", "owner_module": module,
+        }])
+        rendered = compose_nested_model_sources(source, meta)
+        ast.parse(rendered)
+        self.assertIn("class DeepseekV3Model", rendered)
+        self.assertEqual(rendered.count("class DeepseekV3MoE"), 1)
+        mock_read.assert_called_once_with(module)
+
     @patch(
         "hyper_parallel.codegen.source.composition._read_module_source",
         return_value=_NESTED_SOURCE,

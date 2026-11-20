@@ -501,6 +501,28 @@ def test_frozen_local_compute_rewrites_class_without_live_record():
     }]
 
 
+def test_recorded_and_declared_local_regions_are_both_materialized():
+    """A legacy record for one class must not hide another final-plan declaration."""
+    alpha_type = type("Alpha", (), {"forward": _recorded_alpha_forward})
+    record = SimpleNamespace(module_fqn="alpha", module_type=alpha_type,
+                             original_forward=alpha_type.forward, factory="demo.ep.factory")
+    meta = SimpleNamespace(
+        param_plan={"alpha": _identity_entry(), "beta": _identity_entry()},
+        boundary_classes={"alpha": "Alpha", "beta": "Beta"}, external_state_classes=[],
+        mesh_dim_names=("ep",), materialized_patches=[],
+        injections=[{"match": name, "local_compute_fn": {"_target_": "demo.ep.compute"}}
+                    for name in ("alpha", "beta")],
+    )
+    rendered = materialize_recorded_forwards(SOURCE_TEXT, meta, patch_plan=SimpleNamespace(local_computes=(record,)))
+    tree = ast.parse(rendered)
+    for name in ("Alpha", "Beta"):
+        host = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
+        methods = [node.name for node in host.body if isinstance(node, ast.FunctionDef)]
+        assert methods.count("_forward_impl") == 1
+        assert methods.count("forward") == 1
+    assert all(entry["skip_source_lowering"] for entry in meta.param_plan.values())
+
+
 def test_cp_dispatch_rewrites_same_class_without_constructor_swap():
     """CP dispatch is an in-place forward rewrite with the original signature."""
     patches = InlinePatchSet(

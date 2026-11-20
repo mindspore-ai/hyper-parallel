@@ -20,7 +20,9 @@ import unittest
 import torch
 from torch import nn
 
-from hyper_parallel.codegen.emit.methods import materialize_observed_methods, verify_observed_methods
+from hyper_parallel.codegen.emit.methods import (
+    materialize_method_hosts, materialize_observed_methods, verify_observed_methods,
+)
 from hyper_parallel.codegen.plan.methods import observe_local_methods
 from hyper_parallel.distributed.mesh import LogicalDeviceMesh, MeshContext
 from hyper_parallel.distributed.recipe_spec import local_compute
@@ -60,6 +62,11 @@ def _with_group(value, group):
     return value
 
 
+def bound_forward(self, hidden_states):
+    """Represent a model-owned method bound during ordinary model construction."""
+    return self.experts(hidden_states)
+
+
 @local_compute
 def method_factory(*, module, mesh, tp_mesh, cp_mesh, ep_mesh):
     """Use the same stateful factory contract as native EP recipes."""
@@ -83,7 +90,7 @@ def ranked_factory(*, module, mesh, tp_mesh, cp_mesh, ep_mesh):
     """Capture rank-dependent resources without freezing the export process's rank."""
     del module, mesh, cp_mesh
     rank = tp_mesh.get_local_rank()
-    groups = (ep_mesh.get_group("ep"),)
+    groups = (ep_mesh.get_group("ep"), tp_mesh.get_group())
 
     def combine(target, value):
         return _with_group(value, groups) + rank + tp_mesh.get_local_rank()
@@ -96,6 +103,17 @@ def ranked_factory(*, module, mesh, tp_mesh, cp_mesh, ep_mesh):
 
 class TestMethodMaterialization(unittest.TestCase):
     """Validate the emitted parent method and the factory's child-side patch."""
+
+    def test_imported_local_region_has_a_source_forward_before_lowering(self):
+        records = {"block": {"type": f"{__name__}:MethodBlock", "local_compute": True}}
+        source = materialize_method_hosts("", records)
+        namespace = {}
+        exec(source, namespace)
+        value = torch.ones(2)
+        generated = namespace["MethodBlock"]()
+        self.assertIs(generated.forward(value), value)
+        self.assertIsNot(type(generated), MethodBlock)
+        self.assertEqual(source, materialize_method_hosts(source, records))
 
     def test_native_factory_result_is_a_class_method(self):
         model = nn.Module()
@@ -143,6 +161,29 @@ class TestMethodMaterialization(unittest.TestCase):
     def test_no_injection_does_not_require_any_mesh(self):
         self.assertEqual(observe_local_methods(SimpleNamespace(modules={}), nn.Module(), None), {})
 
+    def test_native_instance_dispatch_gets_the_materialized_class_flag(self):
+        model = nn.Module()
+        model.block = MethodBlock()
+        model.block.forward = MethodType(bound_forward, model.block)
+        plan = SimpleNamespace(
+            modules={"block": SimpleNamespace(local_compute_fn=method_factory, region_dispatch=False)},
+            mesh_dim_names=("tp", "cp"),
+        )
+        topology = MeshContext(device_mesh=LogicalDeviceMesh(("tp", "cp"), (1, 1)),
+                               fsdp_moe_mesh=LogicalDeviceMesh(("edp", "ep"), (1, 2)), ep_size=2)
+        records = observe_local_methods(plan, model, topology)
+        source = (f"from {__name__} import MethodExperts\n"
+                  "class MethodBlock:\n    def __init__(self):\n        self.experts = MethodExperts()\n"
+                  "def bound_forward(self, hidden_states):\n"
+                  "    if self.ep_enable:\n        return self.method_factory(hidden_states)\n"
+                  "    return self.experts(hidden_states)\n")
+        namespace = {}
+        exec(materialize_observed_methods(source, records), namespace)
+        generated = namespace["MethodBlock"]()
+        generated._hp_ep_group = object()
+        self.assertTrue(generated.ep_enable)
+        self.assertEqual(namespace["bound_forward"](generated, 3), 6)
+
     def test_mesh_rank_and_group_tuple_remain_runtime_resources(self):
         model = nn.Module()
         model.block = MethodBlock()
@@ -162,6 +203,7 @@ class TestMethodMaterialization(unittest.TestCase):
         exec(rendered, namespace)
         generated = namespace["MethodBlock"]()
         generated._hp_ep_group = object()
+        generated._hp_tp_group = object()
         for rank in (0, 1):
             generated._hp_tp_mesh = SimpleNamespace(get_local_rank=lambda: rank)
             self.assertEqual(generated.forward(3), 3 + 2 * rank)
