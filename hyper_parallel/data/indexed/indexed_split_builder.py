@@ -144,16 +144,25 @@ class IndexedDatasetSplitBuilder:
         """Build mock, shared-blend, or independent-blend Dataset splits."""
         if train_valid_test_num_samples is None:
             raise ValueError("train_valid_test_num_samples must be configured for indexed Datasets")
+
         if len(train_valid_test_num_samples) != len(_Split):
             raise ValueError("train_valid_test_num_samples must contain exactly three values")
+
         if any(size < 0 for size in train_valid_test_num_samples):
             raise ValueError("train_valid_test_num_samples must be non-negative")
+
         if blend_mode not in {"no", "inter", "intra"}:
             raise ValueError(f"Unsupported blend mode: {blend_mode!r}")
+
         if config.mock != (dataset_type is MockGPTDataset):
             raise ValueError("mock_data must match the selected MockGPTDataset class")
+
         if not config.mock and (blend_mode == "no") != (dataset_type is GPTDataset):
             raise ValueError("simple_blend='no' is only for GPTDataset; other Datasets require inter/intra")
+
+        if dataset_type is GPTDataset:
+            # Reject invalid options before cache builders and readers can diverge.
+            GPTDataset.validate_config(config)
 
         logger.debug(
             "Building indexed splits: dataset=%s, num_samples=%s, mock=%s, blend_mode=%s, lazy=%s",
@@ -169,6 +178,7 @@ class IndexedDatasetSplitBuilder:
         if config.blend:
             if config.split_matrix is None:
                 raise ValueError("A shared blend requires blend and split_matrix")
+
             return self._build_splits_from_blend(
                 dataset_type, config.blend, config.split_matrix, train_valid_test_num_samples, config, blend_mode
             )

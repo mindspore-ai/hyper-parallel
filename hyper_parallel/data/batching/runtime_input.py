@@ -37,50 +37,106 @@ class OnlineBoundaryResolver:
 
 
 class IndexedBoundaryResolver:
-    """Recover global cumulative sequence boundaries from Indexed input IDs."""
+    """Resolve global cumulative sequence boundaries for Indexed batches."""
 
     def __init__(self, eod_token_id: int | None) -> None:
         """Store the token separating packed Indexed sequences."""
         self.eod_token_id = eod_token_id
 
-    def resolve(self, canonical_batch: Mapping[str, Any]) -> Any:
-        """Recover leading-zero ``cu_seq_lens`` from Indexed tokens."""
+    def resolve(self, canonical_batch: Mapping[str, Any]) -> torch.Tensor:
+        """Read explicit boundaries or recover them from EOD tokens."""
         input_ids = canonical_batch["input_ids"]
         batch_size, seq_len = input_ids.shape
-        if "cu_seq_lens" in canonical_batch:
-            rows = canonical_batch["cu_seq_lens"]
-            if isinstance(rows, torch.Tensor) and rows.ndim == 1:
-                return rows.to(torch.int32)
-            if len(rows) != batch_size:
-                raise ValueError("cu_seq_lens must have one boundary array per batch row")
-            # Only metadata is flattened; tokens and labels remain [B, S].
-            ends = [end + row_idx * seq_len for row_idx, row in enumerate(rows) for end in row[1:]]
-            return torch.tensor([0, *ends], dtype=torch.int32)
-        token_indices = torch.arange(seq_len, dtype=input_ids.dtype, device=input_ids.device)
 
+        if "cu_seq_lens" in canonical_batch:
+            cu_seq_lens = self._merge_cu_seqlens_across_micro_batch(
+                canonical_batch["cu_seq_lens"], batch_size, seq_len
+            )
+            return cu_seq_lens
+
+        token_indices = torch.arange(seq_len, dtype=input_ids.dtype, device=input_ids.device)
         seq_ends = []
+
         for batch_idx in range(batch_size):
             if self.eod_token_id is None:
                 eod_indices = token_indices[:0]
             else:
                 eod_indices = token_indices[input_ids[batch_idx] == self.eod_token_id]
 
-            prev_eod_idx = -1
             for eod_idx in eod_indices:
-                eod_idx = int(eod_idx.item())
-                if eod_idx == prev_eod_idx:
-                    break
-
-                seq_end = batch_idx * seq_len + eod_idx + 1
+                seq_end = batch_idx * seq_len + int(eod_idx.item()) + 1
                 seq_ends.append(seq_end)
-                prev_eod_idx = eod_idx + 1
 
             row_end = (batch_idx + 1) * seq_len
             if not seq_ends or seq_ends[-1] != row_end:
                 seq_ends.append(row_end)
 
         cu_seq_lens = torch.tensor([0, *seq_ends], dtype=torch.int32)
+
         return cu_seq_lens
+
+    @staticmethod
+    def _merge_cu_seqlens_across_micro_batch(
+            cu_seqlens: Sequence[Any] | torch.Tensor, micro_batch_size: int, seq_length: int
+    ) -> torch.Tensor:
+        """Merge per-sample boundaries into offsets over the entire batch.
+
+        Adapted from Megatron-LM's megatron/core/utils.py. See MEGATRON_LICENSE.txt.
+        """
+        if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.ndim == 1:
+            merged_cu_seqlens = cu_seqlens.to(torch.int32)
+
+            return merged_cu_seqlens
+
+        if len(cu_seqlens) != micro_batch_size:
+            raise ValueError("cu_seq_lens must have one boundary array per batch row")
+
+        if micro_batch_size == 0:
+            merged_cu_seqlens = torch.zeros(1, dtype=torch.int32, device="cpu")
+
+            return merged_cu_seqlens
+
+        def _strip_padding(row: torch.Tensor) -> torch.Tensor:
+            """Return the valid prefix ending at the first occurrence of seq_length."""
+            hits = (row == seq_length).nonzero(as_tuple=True)[0]
+
+            if hits.numel() > 0:
+                valid = row[:hits[0].item() + 1]
+
+                return valid
+
+            return row
+
+        def _prepare_row(row: Any) -> torch.Tensor:
+            """Validate the sample boundaries and remove terminal padding."""
+            row = torch.as_tensor(row, device="cpu")
+
+            if row.ndim != 1 or row.dtype not in (torch.int32, torch.int64) or row.numel() < 2:
+                raise ValueError("Each cu_seq_lens row must be a 1D integer array with at least two entries")
+
+            if row[0] != 0 or row[-1] != seq_length:
+                raise ValueError("Each cu_seq_lens row must start at zero and end at the sequence length")
+
+            valid = _strip_padding(row)
+
+            if torch.any(valid[1:] <= valid[:-1]) or torch.any(row[valid.numel():] != seq_length):
+                raise ValueError("cu_seq_lens must strictly increase before terminal padding")
+
+            return valid
+
+        if micro_batch_size == 1:
+            merged_cu_seqlens = _prepare_row(cu_seqlens[0]).to(dtype=torch.int32, copy=True)
+            return merged_cu_seqlens
+
+        parts = [_prepare_row(cu_seqlens[0])]
+        for i in range(1, micro_batch_size):
+            offset = i * seq_length
+            valid = _prepare_row(cu_seqlens[i])
+            parts.append(valid[1:] + offset)
+
+        merged_cu_seqlens = torch.cat(parts).to(torch.int32)
+
+        return merged_cu_seqlens
 
 
 @dataclass(frozen=True)

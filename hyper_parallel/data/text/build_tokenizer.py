@@ -43,24 +43,29 @@ class _DatasetTokenizer:
         Args:
             *tokenizer_paths: Tokenizer source paths recorded in the cache identity.
             vocab_size: Pretokenized-corpus vocabulary size.
-            eod_token_id: Pretokenized-corpus end-of-document token ID.
+            eod_token_id: Pretokenized-corpus end-of-document token ID, when one exists.
             pad_token_id: Pretokenized-corpus padding token ID, when one exists.
             **tokenizer_options: Extra options recorded in the cache identity.
 
         Raises:
-            ValueError: If the special token configuration is incomplete or out of range.
+            ValueError: If the vocabulary size is invalid or a special token ID is out of range.
         """
-        if (vocab_size is None) != (eod_token_id is None):
-            raise ValueError("vocab_size and eod_token_id must be provided together")
-        if vocab_size is not None and eod_token_id is not None:
+
+        if vocab_size is not None:
             if vocab_size <= 0:
                 raise ValueError("vocab_size must be positive")
-            if not 0 <= eod_token_id < vocab_size:
+
+            if eod_token_id is not None and not 0 <= eod_token_id < vocab_size:
                 raise ValueError("eod_token_id must be within the tokenizer vocabulary")
+
             if pad_token_id is not None and not 0 <= pad_token_id < vocab_size:
                 raise ValueError("pad_token_id must be within the tokenizer vocabulary")
+
             tokenizer_options["vocab_size"] = vocab_size
-            tokenizer_options["eod_token_id"] = eod_token_id
+
+            if eod_token_id is not None:
+                tokenizer_options["eod_token_id"] = eod_token_id
+
             if pad_token_id is not None:
                 tokenizer_options["pad_token_id"] = pad_token_id
 
@@ -70,7 +75,8 @@ class _DatasetTokenizer:
         for option, value in tokenizer_options.items():
             self.unique_identifiers[option] = str(value)
         self.unique_description = json.dumps(self.unique_identifiers, indent=4)
-        if vocab_size is not None and eod_token_id is not None:
+
+        if vocab_size is not None:
             self.vocab_size = vocab_size
             self.eod = eod_token_id
             self.eos_token_id = eod_token_id
@@ -81,8 +87,8 @@ class _DatasetTokenizer:
         return self.vocab_size
 
     @property
-    def eos(self) -> int:
-        """Return the end-of-sequence token ID."""
+    def eos(self) -> int | None:
+        """Return the end-of-sequence token ID when one exists."""
         return self.eos_token_id
 
     @property
@@ -201,7 +207,7 @@ class AutoTokenizer:
             trust_remote_code: Whether to trust remote code when loading config
             tokenizer_type: Use ``hf`` to load a Hugging Face tokenizer or ``pretokenized`` for metadata only.
             vocab_size: Pretokenized-corpus vocabulary size; required when tokenizer_type is pretokenized.
-            eod_token_id: Pretokenized-corpus end-of-document token ID; required when tokenizer_type is pretokenized.
+            eod_token_id: Pretokenized-corpus end-of-document token ID, when one exists.
             pad_token_id: Pretokenized-corpus padding token ID, when one exists.
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
 
@@ -215,8 +221,8 @@ class AutoTokenizer:
             if pretrained_model_name_or_path is None:
                 raise ValueError("pretrained_model_name_or_path is required for a pretokenized Dataset")
 
-            if vocab_size is None or eod_token_id is None:
-                raise ValueError("tokenizer_type='pretokenized' requires both vocab_size and eod_token_id")
+            if vocab_size is None:
+                raise ValueError("tokenizer_type='pretokenized' requires vocab_size")
 
             tokenizer = _DatasetTokenizer(
                 pretrained_model_name_or_path,

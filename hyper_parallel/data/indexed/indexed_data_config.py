@@ -97,12 +97,17 @@ class BlendedMegatronDatasetConfig:
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
-    """Configuration required to build indexed GPT Dataset splits."""
+    """Configuration required to build indexed GPT Dataset splits.
+
+    ``inter_document_masking`` preserves packed GPT document boundaries from
+    Indexed sequence lengths, including corpora without EOD tokens.
+    """
 
     reset_position_ids: bool = False
     reset_attention_mask: bool = False
     eod_mask_loss: bool = False
     create_ltor_fields: bool = False
+    inter_document_masking: bool = False
     drop_last_partial_validation_sequence: bool = True
     add_extra_token_to_sequence: bool = True
     allow_ambiguous_pad_tokens: bool = False
@@ -284,6 +289,7 @@ def build_gpt_dataset_config(
     try:
         mock_data = bool(data_config.get("mock_data", False))
         tokenizer = data_config.get("tokenizer")
+
         if tokenizer is None and not mock_data:
             raise ValueError("tokenizer is required when mock_data is false")
 
@@ -303,6 +309,7 @@ def build_gpt_dataset_config(
             reset_attention_mask=data_config.get("reset_attention_mask", False),
             eod_mask_loss=data_config.get("eod_mask_loss", False),
             create_ltor_fields=data_config.get("create_ltor_fields_in_dataloader", False),
+            inter_document_masking=data_config.get("inter_document_masking", False),
             drop_last_partial_validation_sequence=data_config.get("drop_last_partial_validation_sequence", True),
             add_extra_token_to_sequence=data_config.get("add_extra_token_to_sequence", True),
             allow_ambiguous_pad_tokens=data_config.get("allow_ambiguous_pad_tokens", False),
@@ -319,6 +326,7 @@ def build_gpt_dataset_config(
         raise ValueError(f"Missing indexed Dataset build option: {error.args[0]}") from error
     source_paths = list(data_paths) if len(data_paths) <= 1 else list(data_paths[1::2])
     logger.debug("Resolved indexed sources=%d, first four=%s", len(source_paths), source_paths[:4])
+
     return config
 
 
