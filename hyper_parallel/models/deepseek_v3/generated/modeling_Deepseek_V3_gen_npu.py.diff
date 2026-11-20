@@ -61,13 +61,49 @@
 
 
  @use_kernel_forward_from_hub("RMSNorm")
-@@ -715,3 +729,33 @@
+@@ -479,7 +493,7 @@
+         super().__init__()
+         self.hidden_size = config.hidden_size
+
+-        self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)
++        self.self_attn = CPMultiLatentAttentionModule(module=_SourceDeepseekV3Attention_0(config=config, layer_idx=layer_idx), config=None, context={'tp_size': 1, 'cp_size': 4, 'ep_size': 1, 'pp_size': 1, 'tp': False, 'cp': True, 'ep': False, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, strategy='expanded_ulysses', overlap=False, ulysses_degree=None, kv_exchange='all_gather')
+
+         if layer_idx >= config.first_k_dense_replace:
+             self.mlp = DeepseekV3MoE(config)
+@@ -559,7 +573,7 @@
+         self.padding_idx = config.pad_token_id
+         self.vocab_size = config.vocab_size
+
+-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
++        self.embed_tokens = ParallelEmbedding_1(config.vocab_size, config.hidden_size, self.padding_idx)
+         self.layers = nn.ModuleList(
+             [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+         )
+@@ -636,7 +650,7 @@
+         super().__init__(config)
+         self.model = DeepseekV3Model(config)
+         self.vocab_size = config.vocab_size
+-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
++        self.lm_head = ParallelLinear_0(config.hidden_size, config.vocab_size, bias=False)
+
+         # Initialize weights and apply final processing
+         self.post_init()
+@@ -715,3 +729,41 @@
      "DeepseekV3ForSequenceClassification",
      "DeepseekV3ForTokenClassification",
  ]
 +
 +
 +from hyper_parallel.components.modules.attention.multi_latent_attention.cp_multi_latent_attention import CPMultiLatentAttentionModule as _hp_parallel_base_0
++
++
++from torch.nn.modules.linear import Linear as _NativeLinear_1
++from torch.nn.modules.sparse import Embedding as _NativeEmbedding_2
++
++
++from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention as _SourceDeepseekV3Attention_0
++
++
 +
 +
 +class CPMultiLatentAttentionModule(_hp_parallel_base_0):
@@ -85,13 +121,12 @@
 +        return (self.project_output(output, hidden_states, output_state), weights)
 +
 +
-+def _hp_module_constructors():
-+    """Return the observed module replacement calls by module path."""
-+    import hyper_parallel.models.prepared_family as _hp_constructor_module_0
-+    return {
-+        'model.layers.0.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-+        'model.layers.1.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-+        'model.layers.2.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-+        'model.layers.3.self_attn': lambda **kwargs: _hp_constructor_module_0.build_prepared_family_replacement(**kwargs),
-+    }
++class ParallelLinear_0(_NativeLinear_1):
++    def forward(self, input):
++        return super().forward(input)
++
++
++class ParallelEmbedding_1(_NativeEmbedding_2):
++    def forward(self, input):
++        return super().forward(input)
 +# codespell:ignore-end

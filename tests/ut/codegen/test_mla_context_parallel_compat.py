@@ -27,35 +27,17 @@ import torch
 from hyper_parallel.components.modules.attention.multi_latent_attention import (
     cp_multi_latent_attention as context_parallel,
 )
-from hyper_parallel.codegen.ir.construction import ir_value_to_data
 from hyper_parallel.codegen.project import project_model_build, publish_codegen_ir
 from hyper_parallel.components.modules import MultiLatentAttention
-from hyper_parallel.components.modules.module_family import get_family_build_info
-from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.models import HyperAutoModelForCausalLM
-from hyper_parallel.models.deepseek_v3.generated import modeling_Deepseek_V3_gen_npu as tracked_modeling
 from hyper_parallel.models.deepseek_v3.generated.modeling_Deepseek_V3_gen_npu import (
     DeepseekV3ForCausalLM as BundledDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models._transformers import auto_model
 from hyper_parallel.models.build_capture import capture_model_build_plan
-from hyper_parallel.models.module_build import build_module_context, prepare_model_components
-from hyper_parallel.models.preinstalled import install_prepared_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest
 from tests.common.mla_cp_utils import make_deepseek_model, make_mla
-
-
-def _install_observed_replacements(model, module, capture):
-    """Exercise the visible constructors with records from the same native build."""
-    build = project_model_build(capture)
-    records = ir_value_to_data(build.replacements)
-    for record in records:
-        if record.get("family_request", {}).get("selection"):
-            record["source_family_builder"] = True
-    install_prepared_components(
-        model, records, build.plan["parallel_dims"], vars(module), constructors=module._hp_module_constructors(),
-    )
 
 
 class TestMLAContextParallelCompatibility(unittest.TestCase):
@@ -169,8 +151,9 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
             self.assertIsInstance(actual, context_parallel.CPMultiLatentAttentionModule)
             self.assertEqual(actual.cp_plan, expected.cp_plan)
             self.assertEqual(actual.cp_plan.overlap, bool(index))
+
     def test_tracked_deepseek_bundle_uses_recipe_topology(self) -> None:
-        """Construct the four-layer artifact with CP4 and compare its native layout."""
+        """Direct construction materializes the tracked CP4 member and its native plan."""
         config = make_deepseek_model().config
         config.num_hidden_layers = 4
         config.first_k_dense_replace = 4
@@ -184,26 +167,19 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
         )
         setup = DistributedSetup(mesh_context=mesh, module_replacement_requests=(request,))
         with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
-                capture_model_build_plan() as capture:
+                capture_model_build_plan():
             native = HyperAutoModelForCausalLM.from_config(
                 config, distributed_setup=setup, torch_dtype=torch.float32,
             )
         with torch.device("meta"):
             bundled = BundledDeepseekV3ForCausalLM(config)
-        _install_observed_replacements(bundled, tracked_modeling, capture)
         self.assertEqual(set(bundled.state_dict()), set(native.state_dict()))
-        for layer in bundled.model.layers:
-            resolved = get_family_build_info(layer.self_attn).resolved
-            self.assertEqual(resolved.variant, "cp")
-            self.assertEqual(resolved.axis_sizes["cp"], 4)
-            self.assertEqual(resolved.axis_sizes["tp"], 1)
-
-        bundled, _ = prepare_model_components(bundled, build_module_context(setup))
-        planner = ShardingPlanner()
-        expected = planner.plan(native, mesh.device_mesh, tp_size=1, cp_size=4)
-        actual = planner.plan(bundled, mesh.device_mesh, tp_size=1, cp_size=4)
-        boundaries = {f"model.layers.{index}.self_attn" for index in range(config.num_hidden_layers)}
-        self.assertEqual(set(actual.parallel_modules), boundaries)
-        self.assertEqual(actual.parallel_modules, expected.parallel_modules)
-        for name in boundaries:
-            self.assertEqual(actual.modules[name].params, expected.modules[name].params)
+        for expected, actual in zip(native.model.layers, bundled.model.layers):
+            self.assertIsInstance(actual.self_attn, context_parallel.CPMultiLatentAttentionModule)
+            self.assertEqual(actual.self_attn.cp_plan, expected.self_attn.cp_plan)
+            self.assertEqual(actual.self_attn.cp_plan.tp_degree, 1)
+            self.assertEqual(actual.self_attn.cp_plan.ulysses_degree, 4)
+        for name, parameter in bundled.named_parameters():
+            expected = native.get_parameter(name)
+            self.assertEqual(parameter.shape, expected.shape)
+            self.assertEqual(parameter.requires_grad, expected.requires_grad)

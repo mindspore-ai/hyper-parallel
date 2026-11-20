@@ -72,7 +72,15 @@
 
 
  @auto_docstring(
-@@ -578,7 +592,7 @@
+@@ -462,6 +476,7 @@
+         self.layers = nn.ModuleList([Kimi_K25VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+         self.final_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-05)
+         self.post_init()
++        self.requires_grad_(False)
+
+     def temporal_patch_merger(
+         self,
+@@ -578,7 +593,7 @@
      def __init__(self, config: Kimi_K25Config):
          super().__init__(config)
          self.vision_tower = Kimi_K25VisionModel._from_config(config.vision_config)
@@ -81,7 +89,7 @@
          self.mm_projector = Kimi_K25MultimodalProjection(config)
          self.post_init()
 
-@@ -902,3 +916,789 @@
+@@ -902,3 +917,613 @@
 
 
  __all__ = ["Kimi_K25ForConditionalGeneration", "Kimi_K25Model", "Kimi_K25PreTrainedModel", "Kimi_K25VisionModel"]
@@ -131,6 +139,35 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
++
++
++def _native_hyper_parallel_distributed_expert_parallel_routing_make_balanced_router_balanced_router(module, hidden_states):
++    """Run ``real_router`` and replace its destinations round-robin."""
++    topk_idx, topk_w = _native_hyper_parallel_distributed_expert_parallel_routing._sigmoid_group_router(module, hidden_states)
++    token_count, experts_per_token = topk_idx.shape
++    balanced_idx = _native_hyper_parallel_distributed_expert_parallel_routing._balanced_expert_indices(int(token_count), int(experts_per_token), _native_hyper_parallel_distributed_expert_parallel_routing._global_expert_count(module), int(getattr(getattr(module, 'experts', None), 'local_expert_count', None) or 1), device=topk_idx.device)
++    return (balanced_idx.to(topk_idx.dtype), topk_w)
++def _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_combine(module, hidden_states, routed, overlapped=None):
++    """Merge the routed branch with the shared-experts branch."""
++    shared = module.shared_experts(hidden_states) if overlapped is None else overlapped
++    return routed + shared
++def _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_overlap_shared(module, hidden_states):
++    """Shared-experts branch, evaluated while the dispatch exchange is in flight."""
++    return module.shared_experts(hidden_states)
++import hyper_parallel.distributed.expert_parallel.recipes as _native_hyper_parallel_distributed_expert_parallel_recipes
++import hyper_parallel.distributed.expert_parallel.routing as _native_hyper_parallel_distributed_expert_parallel_routing
++import hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute as _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute
++import hyper_parallel.distributed.expert_parallel.experts as _native_hyper_parallel_distributed_expert_parallel_experts
++
++
++from torch.nn.modules.sparse import Embedding as _NativeEmbedding_1
++
++
++from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3RMSNorm as _SourceDeepseekV3RMSNorm_0
++from hyper_parallel.components.modules.rms_norm import RMSNormModule
++
++
++
 +
 +@use_kernel_forward_from_hub('RMSNorm')
 +class DeepseekV3RMSNorm(nn.Module):
@@ -264,25 +301,60 @@
 +        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
 +        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
 +        self.act_fn = ACT2FN[config.hidden_act]
++        self.local_expert_count = 3
++        self._ep_apply_gate = None
++        self._ep_use_grouped_gemm = True
 +
-+    def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-+        final_hidden_states = torch.zeros_like(hidden_states)
-+        with torch.no_grad():
-+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-+            expert_mask = expert_mask.permute(2, 1, 0)
-+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-+        for expert_idx in expert_hit:
-+            expert_idx = expert_idx[0]
-+            if expert_idx == self.num_experts:
-+                continue
-+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-+            current_state = hidden_states[token_idx]
-+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-+            current_hidden_states = self.act_fn(gate) * up
-+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-+        return final_hidden_states
++    def forward(self, dispatched_states, local_expert_indices):
++        """Compute dispatched tokens with the local stacked SwiGLU experts.
++
++        This function is installed as ``experts.forward`` for the HF-native EP
++        path. Calling the expert module, instead of indexing its parameters from
++        the parent MoE forward, allows nested FSDP forward hooks to unshard and
++        reshard expert parameters around the local computation.
++        """
++        token_order = _native_hyper_parallel_distributed_expert_parallel_experts._argsort_keys(local_expert_indices, bound=self.local_expert_count)
++        sorted_states = dispatched_states[token_order]
++        local_expert_counts = _native_hyper_parallel_distributed_expert_parallel_experts._expert_token_counts(local_expert_indices, self.local_expert_count)
++        if getattr(self, '_ep_use_grouped_gemm', False):
++            grouped_forward = getattr(self, 'forward_expert_major', None)
++            if callable(grouped_forward):
++                sorted_output = grouped_forward(sorted_states, local_expert_counts)
++            else:
++                gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
++                if up_weight is not None:
++                    raise ValueError('EP grouped GEMM currently requires packed gate_up_proj weights')
++                sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.npu_grouped_swiglu(sorted_states, gate_weight, down_weight, local_expert_counts)
++            output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
++            output[token_order] = sorted_output
++            return output
++        gate_weight, up_weight, down_weight = _native_hyper_parallel_distributed_expert_parallel_experts.resolve_swiglu_weights(self)
++        expert_token_counts = local_expert_counts.tolist()
++        sorted_outputs = []
++        token_start = 0
++        for local_expert_index in range(self.local_expert_count):
++            expert_token_count = expert_token_counts[local_expert_index]
++            expert_states = sorted_states[token_start:token_start + expert_token_count]
++            if up_weight is None:
++                gate_up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
++                apply_gate = getattr(self, '_ep_apply_gate', None)
++                if apply_gate is None:
++                    gate_states, up_states = gate_up_states.chunk(2, dim=-1)
++                    activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
++                    activated_states = activation(gate_states) * up_states
++                else:
++                    activated_states = apply_gate(gate_up_states)
++            else:
++                gate_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, gate_weight[local_expert_index])
++                up_states = _native_hyper_parallel_distributed_expert_parallel_experts.F.linear(expert_states, up_weight[local_expert_index])
++                activation = getattr(self, '_ep_act_fn', _native_hyper_parallel_distributed_expert_parallel_experts.F.silu)
++                activated_states = activation(gate_states) * up_states
++            sorted_outputs.append(_native_hyper_parallel_distributed_expert_parallel_experts.F.linear(activated_states, down_weight[local_expert_index]))
++            token_start += expert_token_count
++        sorted_output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.cat(sorted_outputs)
++        output = _native_hyper_parallel_distributed_expert_parallel_experts.torch.empty_like(sorted_output)
++        output[token_order] = sorted_output
++        return output
 +
 +class DeepseekV3MoE(nn.Module):
 +    """
@@ -296,7 +368,7 @@
 +        self.gate = DeepseekV3TopkRouter(config)
 +        self.shared_experts = DeepseekV3MLP(config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
 +
-+    ep_enable = False
++    ep_enable = True
 +
 +    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
 +        residuals = hidden_states
@@ -313,12 +385,19 @@
 +                ((hidden_states,), {}),
 +            )
 +            # [HYPER LOCAL REGION] run the region compute fn on local tensors
-+            # hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute.kimi_k26_ep_compute_fn is bound to self by generated source.
++            # Native compute from hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute.kimi_k26_ep_compute_fn, materialized as a class method.
 +            outputs = self.kimi_k26_ep_compute_fn(*args, **kwargs)
 +            # [HYPER LOCAL REGION] boundary exit
 +            outputs = self._hp_boundary.redistribute_outputs(outputs)
 +            return outputs
 +        return self._forward_impl(hidden_states)
++
++    def kimi_k26_ep_compute_fn(self, hidden_states):
++        """Dispatch, run ``overlap_fn`` against the in-flight exchange, then finish."""
++        state = _native_hyper_parallel_distributed_expert_parallel_recipes.ep_routed_dispatch(self, hidden_states, router_fn=_native_hyper_parallel_distributed_expert_parallel_routing_make_balanced_router_balanced_router, ep_group=self._hp_ep_group)
++        overlapped = _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_overlap_shared(self, hidden_states)
++        routed = _native_hyper_parallel_distributed_expert_parallel_recipes.ep_routed_experts_and_combine(self, state, self._hp_ep_group)
++        return _native_hyper_parallel_models_kimi_k26_adapter_distributed_ep_compute_kimi_k26_ep_compute_fn_combine(self, hidden_states, routed, overlapped)
 +def _hp_nested_rotate_half(x):
 +    """Rotates half the hidden dims of the input."""
 +    x1 = x[..., :x.shape[-1] // 2]
@@ -434,10 +513,10 @@
 +            self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
 +        else:
 +            self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-+            self.q_a_layernorm = DeepseekV3RMSNorm(config.q_lora_rank)
++            self.q_a_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.q_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 +            self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
 +        self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=config.attention_bias)
-+        self.kv_a_layernorm = DeepseekV3RMSNorm(self.kv_lora_rank)
++        self.kv_a_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(self.kv_lora_rank), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 +        self.kv_b_proj = nn.Linear(self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
 +        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias)
 +        self.scaling = self.qk_head_dim ** (-0.5)
@@ -493,8 +572,8 @@
 +            self.mlp = DeepseekV3MoE(config)
 +        else:
 +            self.mlp = DeepseekV3MLP(config)
-+        self.input_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-+        self.post_attention_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.input_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
++        self.post_attention_layernorm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 +
 +    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None=None, position_ids: torch.LongTensor | None=None, past_key_values: Cache | None=None, use_cache: bool | None=False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None=None, **kwargs: Unpack[TransformersKwargs]) -> torch.Tensor:
 +        residual = hidden_states
@@ -540,9 +619,9 @@
 +        super().__init__(config)
 +        self.padding_idx = config.pad_token_id
 +        self.vocab_size = config.vocab_size
-+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
++        self.embed_tokens = ParallelEmbedding_0(config.vocab_size, config.hidden_size, self.padding_idx)
 +        self.layers = nn.ModuleList([DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-+        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.norm = RMSNormModule(module=_SourceDeepseekV3RMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': True, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 +        self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
 +        self.gradient_checkpointing = False
 +        self.post_init()
@@ -620,254 +699,7 @@
 +_hp_nested___all__ = ['DeepseekV3PreTrainedModel', 'DeepseekV3Model', 'DeepseekV3ForCausalLM', 'DeepseekV3ForSequenceClassification', 'DeepseekV3ForTokenClassification']
 +
 +
-+def _hp_module_constructors():
-+    """Return the observed module replacement calls by module path."""
-+    import hyper_parallel.components.modules.rms_norm as _hp_constructor_module_0
-+    return {
-+        'model.language_model.layers.0.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.0.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.0.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.0.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.1.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.1.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.1.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.1.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.2.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.2.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.2.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.2.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.3.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.3.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.3.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.3.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.4.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.4.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.4.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.4.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.5.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.5.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.5.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.5.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.6.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.6.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.6.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.6.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.7.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.7.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.7.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.7.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.8.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.8.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.8.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.8.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.9.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.9.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.9.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.9.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.10.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.10.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.10.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.10.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.11.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.11.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.11.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.11.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.12.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.12.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.12.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.12.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.13.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.13.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.13.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.13.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.14.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.14.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.14.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.14.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.15.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.15.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.15.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.15.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.16.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.16.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.16.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.16.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.17.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.17.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.17.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.17.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.18.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.18.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.18.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.18.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.19.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.19.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.19.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.19.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.20.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.20.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.20.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.20.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.21.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.21.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.21.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.21.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.22.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.22.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.22.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.22.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.23.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.23.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.23.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.23.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.24.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.24.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.24.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.24.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.25.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.25.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.25.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.25.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.26.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.26.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.26.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.26.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.27.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.27.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.27.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.27.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.28.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.28.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.28.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.28.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.29.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.29.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.29.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.29.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.30.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.30.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.30.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.30.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.31.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.31.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.31.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.31.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.32.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.32.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.32.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.32.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.33.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.33.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.33.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.33.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.34.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.34.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.34.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.34.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.35.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.35.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.35.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.35.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.36.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.36.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.36.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.36.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.37.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.37.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.37.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.37.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.38.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.38.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.38.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.38.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.39.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.39.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.39.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.39.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.40.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.40.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.40.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.40.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.41.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.41.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.41.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.41.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.42.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.42.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.42.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.42.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.43.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.43.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.43.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.43.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.44.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.44.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.44.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.44.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.45.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.45.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.45.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.45.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.46.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.46.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.46.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.46.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.47.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.47.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.47.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.47.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.48.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.48.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.48.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.48.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.49.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.49.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.49.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.49.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.50.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.50.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.50.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.50.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.51.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.51.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.51.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.51.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.52.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.52.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.52.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.52.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.53.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.53.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.53.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.53.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.54.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.54.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.54.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.54.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.55.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.55.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.55.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.55.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.56.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.56.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.56.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.56.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.57.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.57.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.57.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.57.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.58.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.58.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.58.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.58.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.59.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.59.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.59.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.59.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.60.self_attn.q_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.60.self_attn.kv_a_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.60.input_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.layers.60.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+        'model.language_model.norm': lambda **kwargs: _hp_constructor_module_0.RMSNorm(**kwargs),
-+    }
++class ParallelEmbedding_0(_NativeEmbedding_1):
++    def forward(self, input):
++        return super().forward(input)
 +# codespell:ignore-end

@@ -58,6 +58,15 @@ from transformers.utils.output_capturing import capture_outputs
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 
 
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32RMSNorm as _SourceDeepseekV32RMSNorm_0
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32Attention as _SourceDeepseekV32Attention_1
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32Experts as _SourceDeepseekV32Experts_2
+from hyper_parallel.components.modules.dsa_attention import DeepseekV32DSAAttention
+from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.modules.rms_norm import RMSNormModule
+
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class DeepseekV32RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -594,7 +603,7 @@ class DeepseekV32MoE(nn.Module):
     def __init__(self, config: DeepseekV32Config):
         super().__init__()
         self.config = config
-        self.experts = DeepseekV32Experts(config)
+        self.experts = GroupedExperts(module=_SourceDeepseekV32Experts_2(config), context={'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'})
         self.gate = DeepseekV32TopkRouter(config)
         self.shared_experts = DeepseekV32MLP(
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
@@ -614,15 +623,15 @@ class DeepseekV32DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: DeepseekV32Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = DeepseekV32Attention(config, layer_idx)
+        self.self_attn = DeepseekV32DSAAttention(module=_SourceDeepseekV32Attention_1(config, layer_idx), context={'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'})
 
         if config.mlp_layer_types[layer_idx] == "sparse":
             self.mlp = DeepseekV32MoE(config)
         else:
             self.mlp = DeepseekV32MLP(config)
 
-        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = RMSNormModule(module=_SourceDeepseekV32RMSNorm_0(config.hidden_size, config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': False, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
+        self.post_attention_layernorm = RMSNormModule(module=_SourceDeepseekV32RMSNorm_0(config.hidden_size, config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': False, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
 
     def forward(
         self,
@@ -699,7 +708,7 @@ class DeepseekV32Model(DeepseekV32PreTrainedModel):
         self.layers = nn.ModuleList(
             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNormModule(module=_SourceDeepseekV32RMSNorm_0(config.hidden_size, eps=config.rms_norm_eps), config=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'tp': False, 'cp': False, 'ep': False, 'pp': False, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': ('dp', 'cp', 'tp'), 'device_type': 'npu', 'dtype': 'bfloat16'}, cast_order=None, fp32_weight=None)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -840,25 +849,4 @@ class DeepseekV32ForCausalLM(DeepseekV32PreTrainedModel, GenerationMixin):
 
 
 __all__ = ["DeepseekV32PreTrainedModel", "DeepseekV32Model", "DeepseekV32ForCausalLM"]
-
-
-def _hp_module_constructors():
-    """Return the observed module replacement calls by module path."""
-    import hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement as _hp_constructor_module_0
-    return {
-        'model.layers.0.input_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.0.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.1.input_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.1.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.2.input_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.2.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.3.input_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.3.post_attention_layernorm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.norm': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_rms_norm(**kwargs),
-        'model.layers.0.self_attn': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_dsa_attention(**kwargs),
-        'model.layers.1.self_attn': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_dsa_attention(**kwargs),
-        'model.layers.2.self_attn': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_dsa_attention(**kwargs),
-        'model.layers.3.self_attn': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_dsa_attention(**kwargs),
-        'model.layers.3.mlp.experts': lambda **kwargs: _hp_constructor_module_0.replace_deepseek_v32_grouped_experts(**kwargs),
-    }
 # codespell:ignore-end
