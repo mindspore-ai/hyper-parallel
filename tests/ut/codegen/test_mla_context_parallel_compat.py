@@ -31,6 +31,7 @@ from hyper_parallel.codegen.ir.construction import ir_value_to_data
 from hyper_parallel.codegen.project import project_model_build, publish_codegen_ir
 from hyper_parallel.components.modules import MultiLatentAttention
 from hyper_parallel.components.modules.module_family import get_family_build_info
+from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.deepseek_v3.generated import modeling_Deepseek_V3_gen_npu as tracked_modeling
