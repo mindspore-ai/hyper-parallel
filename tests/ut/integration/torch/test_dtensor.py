@@ -259,3 +259,74 @@ class TestTorchLayoutCompatibility(unittest.TestCase):
             compatibility.to_torch_view(value)
         self.assertEqual(factory.call_args.kwargs["shape"], (4, 3))
         self.assertEqual(factory.call_args.kwargs["stride"], (3, 1))
+
+    def test_torch_view_cache_reuses_only_mesh_not_gradient_storage(self):
+        """Fresh gradients share a mesh descriptor but retain their own live storage."""
+        first = _reference(torch.ones(2, 3))
+        second = _reference(torch.full((2, 3), 2.0))
+        first.device_mesh.device_type = "cpu"
+        first.device_mesh.mesh = torch.tensor([0, 1])
+        first.device_mesh.mesh_dim_names = ("dp",)
+        second.device_mesh = first.device_mesh
+        cache = {}
+        with patch.object(TorchMesh, "from_group") as mesh, patch.object(TorchDTensor, "from_local") as factory:
+            compatibility.to_torch_view(first, mesh_cache=cache)
+            compatibility.to_torch_view(second, mesh_cache=cache)
+        mesh.assert_called_once()
+        self.assertEqual(cache, {first.device_mesh: mesh.return_value})
+        for call, value in zip(factory.call_args_list, (first, second)):
+            self.assertEqual(call.args[0].data_ptr(), value.to_local().data_ptr())
+            self.assertIs(call.args[1], mesh.return_value)
+        self.assertNotEqual(factory.call_args_list[0].args[0].data_ptr(),
+                            factory.call_args_list[1].args[0].data_ptr())
+
+    def test_torch_view_cache_keeps_distinct_meshes_separate(self):
+        """Do not pool descriptors merely because gradient shapes match."""
+        values = [_reference(torch.ones(2, 3)), _reference(torch.ones(2, 3))]
+        for value in values:
+            value.device_mesh.device_type = "cpu"
+            value.device_mesh.mesh = torch.tensor([0, 1])
+            value.device_mesh.mesh_dim_names = ("dp",)
+        cache = {}
+        with patch.object(TorchMesh, "from_group") as mesh, patch.object(TorchDTensor, "from_local"):
+            for value in values:
+                compatibility.to_torch_view(value, mesh_cache=cache)
+        self.assertEqual(mesh.call_count, 2)
+        self.assertEqual(len(cache), 2)
+
+    def test_detached_spec_cache_reuses_metadata_with_fresh_storage(self):
+        """Same-layout clipping views reuse specs, not a previous gradient tensor."""
+        first = _reference(torch.ones(2, 3, requires_grad=True))
+        second = _reference(torch.full((2, 3), 2.0, requires_grad=True))
+        second.device_mesh = first.device_mesh
+        first.device_mesh.mesh = torch.tensor([0, 1])
+        mesh_cache, spec_cache = {}, {}
+        specification = object()
+        with patch.object(TorchMesh, "from_group") as mesh, patch.object(compatibility, "TorchDTensor") as factory:
+            mesh.return_value.get_coordinate.return_value = [0]
+            factory.from_local.return_value._spec = specification  # pylint: disable=protected-access
+            compatibility.to_torch_view(first, mesh_cache=mesh_cache, detached_spec_cache=spec_cache)
+            compatibility.to_torch_view(second, mesh_cache=mesh_cache, detached_spec_cache=spec_cache)
+        factory.from_local.assert_called_once()
+        factory.assert_called_once()
+        local, actual_spec = factory.call_args.args
+        self.assertIs(actual_spec, specification)
+        self.assertEqual(local.data_ptr(), second.to_local().data_ptr())
+        self.assertNotEqual(local.data_ptr(), first.to_local().data_ptr())
+        self.assertFalse(local.requires_grad)
+        self.assertEqual(factory.call_args.kwargs, {"requires_grad": False})
+        self.assertEqual(list(spec_cache.values()), [specification])
+
+    def test_detached_spec_cache_separates_gradient_dtypes(self):
+        """An otherwise identical FP64 gradient cannot reuse an FP32 spec."""
+        first = _reference(torch.ones(2, 3))
+        second = _reference(torch.ones(2, 3, dtype=torch.float64))
+        second.device_mesh = first.device_mesh
+        first.device_mesh.mesh = torch.tensor([0, 1])
+        mesh_cache, spec_cache = {}, {}
+        with patch.object(TorchMesh, "from_group"), patch.object(compatibility, "TorchDTensor") as factory:
+            compatibility.to_torch_view(first, mesh_cache=mesh_cache, detached_spec_cache=spec_cache)
+            compatibility.to_torch_view(second, mesh_cache=mesh_cache, detached_spec_cache=spec_cache)
+        self.assertEqual(factory.from_local.call_count, 2)
+        factory.assert_not_called()
+        self.assertEqual(len(spec_cache), 2)

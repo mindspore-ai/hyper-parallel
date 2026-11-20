@@ -23,8 +23,7 @@ With VeOmni's adapter startup entry, enable it in the training configuration:
 model:
   accelerator:
     fsdp_config:
-      fsdp_mode: fsdp2
-      fsdp_backend: hyper_parallel
+      fsdp_mode: hyper_fsdp2
       fsdp_scope: module
       reshard_after_forward: true
       reshard_after_backward: true
@@ -42,20 +41,15 @@ model:
       hyper_parallel:
         comm_fusion: false
         comm_fusion_vit: null
-        forward_prefetch_depth: 2
+        forward_prefetch_depth: 1
         backward_prefetch_depth: 1
         reduce_comm_interval: 1
   optimizer:
-    type: muon
-    use_hyper_optimizer: true
+    type: hyper_muon
 ```
 
-Omni activation reads resolved per-module settings. Module-scoped Hyper FSDP
-requires one shared FSDP backend and configuration across FSDP2 modules;
-composed wrapping uses the top-level FSDP configuration. Muon remains selected
-per module. Incompatible FSDP settings are rejected before binding.
-Inference passes `for_inference=True` with the resolved configuration to activate
-only FSDP bindings, without enabling Muon from inherited training settings.
+The standard VeOmni trainers activate the adapter before constructing the model.
+SeedOmni training and inference are not supported by this integration.
 
 Then run its normal task:
 
@@ -64,14 +58,15 @@ torchrun --standalone --nproc_per_node=2 \
   tasks/train_text.py config.yaml
 ```
 
-FSDP and Muon are selected independently. `fsdp_backend: hyper_parallel`
-selects Hyper FSDP/HSDP; its default `torch` retains native FSDP2.
-`use_hyper_optimizer: true` selects Hyper Muon and requires `type: muon`;
-its default `false` retains VeOmni Muon. There is no training-wide enable flag.
+FSDP and Muon are selected independently. `fsdp_mode: hyper_fsdp2`
+selects Hyper FSDP/HSDP; `fsdp_mode: fsdp2` retains native FSDP2.
+`optimizer.type: hyper_muon` selects Hyper Muon; `type: muon` retains VeOmni Muon.
 AdamW reuses VeOmni's parameter-name and weight-decay grouping rules. With
 ExtraParallel, the adapter reads the live Hyper mesh and constructs native AdamW
-on the original parameters, including shared EP LoRA. It does not create temporary
-Torch parameter views or replace training parameters.
+on the original parameters, including shared EP LoRA. When `state_offload: cpu`
+is selected, shared-storage Torch views let VeOmni's native factory create
+`SwapAdamW` with the configured memory fraction and pinned-memory setting.
+Neither path replaces live training parameters.
 
 Hyper Muon accepts `muon_adjust_lr_fn: match_rms_adamw` or `original`.
 With `original`, an unspecified `muon_lr` defaults to 25 times the AdamW LR,
@@ -94,28 +89,14 @@ settings. During real VeOmni DCP loads, required option templates contain
 unloaded markers rather than usable current defaults. Partial loading cannot
 make an absent checkpoint option appear to have been saved.
 
-Old checkpoints missing NS metadata are rejected by default. If the historical
-settings are known, explicitly confirm the missing values before loading:
-
-```python
-optimizer.confirm_legacy_muon_checkpoint_options(
-    ns_implementation="gram",
-    gram_ns_reset_iterations=[2],
-)
-# Run the normal VeOmni DCP restore after this explicit confirmation.
-```
-
-Confirmation fills only missing checkpoint fields and must match the active
-optimizer. It never overrides saved values or infers historical settings from
-the current configuration. Supply any other missing NS options explicitly too.
+Checkpoints missing required Muon metadata are rejected.
 
 The original public FSDP configuration is reused. `comm_fusion` is forwarded
 to native Hyper, which automatically enables zero-copy when fusion is enabled.
 The adapter uses VeOmni's original block wrap targets, initialization and loading. Prefetch depth
 counts following blocks and `forward_prefetch: false` disables forward prefetch.
-Backward reshard uses the native Hyper setter. A non-default reduction interval
-requires `set_reduce_comm_interval`; unsupported intervals fail before model
-construction. The Torch-only low-precision RS transport hook is not supported.
+Backward reshard and reduction intervals use the native Hyper setters.
+The Torch-only low-precision RS transport hook is not supported.
 
 For VeOmni's standard VLM task, `comm_fusion_vit` optionally overrides fusion
 for the visual tower; `null` inherits `comm_fusion` without changing wrapping.
@@ -127,14 +108,16 @@ Zero-copy follows each unit's effective fusion setting automatically.
 
 With Hyper FSDP and native Muon, the optimizer consumes shared-storage Torch
 parameter views; the live training parameters stay Hyper DTensors. Native Muon
-algorithms and state handling are reused. This combination currently excludes
-ExtraParallel layouts. With Torch FSDP and Hyper Muon, sharding, loading and
+algorithms, ExtraParallel grouping and state handling are reused, including
+the expert zero-communication layout. With Torch FSDP and Hyper Muon, sharding, loading and
 clipping stay native; only the optimizer factory is adapted.
 
 All bindings are confined to VeOmni module attributes. Loading readers,
 broadcasting, model forward, runtime, trainer, schedulers and native DCP remain
-owned by VeOmni. Hyper owns real training DTensors, sharding, clipping and Muon
-execution. Checkpoint-only Torch DTensor views expose existing local storage to
+owned by VeOmni. Hyper owns real training DTensors, sharding and Hyper Muon
+execution. Clipping reuses VeOmni's norm reductions and scaling through local
+gradient views, including FP32 main gradients and ExtraParallel ownership.
+Checkpoint-only Torch DTensor views expose existing local storage to
 native DCP; they never replace live training parameters.
 
 Importing this package does not import VeOmni or activate bindings. Torch exports
@@ -182,7 +165,7 @@ ordinary Shard/Replicate placements; special layouts fail rather than lose seman
 
 VeOmni dependencies are maintained in two places: `adapter.py` owns
 the weight dispatcher's `_dispatch_parameter`/`_find_submodule` (under
-`models.checkpoint.weights`, or `models.module_utils` in older versions) and FSDP/clipping bindings;
+`models.checkpoint.weights`) and FSDP/clipping bindings;
 `optimizer.py` owns `build_optimizer`, `_collect_muon_kwargs`,
 `_make_param_groups_for_subset`, and native Muon grouping/NS calls.
 Optimizer binding requires named, keyword-compatible `model`, `optimizer_type`

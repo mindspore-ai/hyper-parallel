@@ -15,44 +15,127 @@
 """CPU checks of VeOmni ExtraParallel boundary translation."""
 
 import math
-import gc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
-import weakref
 
 import torch
+from torch.distributed.tensor import DTensor as TorchDTensor
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.integration.veomni import extra_parallel
 from hyper_parallel.integration.veomni.extra_parallel import (
-    _clipping_layout,
     bind_gradient_divisor,
-    parameters_for_clipping,
+    native_clipping_view,
 )
 
 
-class _ClippingSpec(SimpleNamespace):
-    """Reject expensive submesh lookup when complete metadata is available."""
-
-    @property
-    def para_mesh(self):
-        """Catch accidental use of the native dynamic submesh property."""
-        raise AssertionError("Clipping must use the existing full mesh")
-
-
 class TestExtraParallel(unittest.TestCase):
-    """Keep divisor scaling equivalent and ordinary parameters unchanged."""
+    """Check native clipping views and gradient-divisor translation."""
 
-    def setUp(self):
-        """Keep metadata caches isolated across test cases."""
-        _clipping_layout.cache_clear()
+    def test_plain_fsdp_clip_uses_torch_gradient_views_without_ep_groups(self):
+        """EP=1 must reach the same native norm branch as ordinary Torch FSDP."""
+        model = self._expert_model()
+        delattr(model, "_fqn2spec_info")
+        gradient = model.weight.grad
+        converted = MagicMock(spec=TorchDTensor)
+        with patch("hyper_parallel.integration.veomni.extra_parallel.to_torch_view",
+                   return_value=converted) as convert:
+            proxy = native_clipping_view(model)
+        convert.assert_called_once_with(gradient, mesh_cache={}, detached_spec_cache={})
+        self.assertFalse(hasattr(proxy, "_extra_parallel_param_groups"))
+        self.assertIs(next(proxy.parameters()).grad, converted)
 
-    def tearDown(self):
-        """Release mesh metadata created by this test."""
-        _clipping_layout.cache_clear()
+    def test_plain_fsdp_metadata_caches_do_not_survive_the_clip_call(self):
+        """Scope metadata reuse to one invocation instead of retaining old gradients."""
+        model = self._expert_model()
+        delattr(model, "_fqn2spec_info")
+        with patch("hyper_parallel.integration.veomni.extra_parallel.to_torch_view",
+                   return_value=MagicMock(spec=TorchDTensor)) as convert:
+            native_clipping_view(model)
+            native_clipping_view(model)
+        for name in ("mesh_cache", "detached_spec_cache"):
+            first, second = [call.kwargs[name] for call in convert.call_args_list]
+            self.assertIsNot(first, second)
+
+    def test_plain_fsdp_clip_preserves_missing_gradients(self):
+        """Unused parameters must not enter native Torch's norm list as extra zeros."""
+        model = torch.nn.Linear(2, 2)
+        proxy = native_clipping_view(model)
+        self.assertTrue(all(view.grad is None for view in proxy.parameters()))
+        self.assertFalse(hasattr(proxy, "_extra_parallel_param_groups"))
+
+    def test_cpu_offload_clip_uses_native_offload_branch(self):
+        """CPU gradients keep VeOmni's explicit shard reduction and host scaling."""
+        model = torch.nn.Linear(2, 2)
+        setattr(model, "_fsdp_cpu_offload_enabled", True)
+        proxy = native_clipping_view(model)
+        self.assertTrue(getattr(proxy, "_fsdp_cpu_offload_enabled", False))
+        self.assertFalse(hasattr(proxy, "_extra_parallel_param_groups"))
+
+    def test_native_clip_view_shares_live_gradient_storage(self):
+        """VeOmni scaling mutates the original Hyper gradient, not a copy."""
+        model = self._expert_model()
+        proxy = native_clipping_view(model)
+        view = next(proxy.parameters())
+        gradient = model.weight.grad.to_local()
+        self.assertEqual(view.grad.data_ptr(), gradient.data_ptr())
+        view.grad.mul_(0.5)
+        self.assertTrue(torch.equal(gradient, torch.full_like(gradient, 0.5)))
+        self.assertEqual(getattr(proxy, "_extra_parallel_param_groups")["ep"], [view])
+
+    def test_native_clip_view_prefers_fp32_main_gradient(self):
+        """A main gradient is clipped without changing the parameter or .grad."""
+        model = self._expert_model()
+        original = model.weight.grad
+        model.weight.main_grad = model.weight.grad.detach().clone()
+        proxy = native_clipping_view(model)
+        view = next(proxy.parameters())
+        self.assertEqual(view.grad.data_ptr(), model.weight.main_grad.to_local().data_ptr())
+        self.assertIs(model.weight.grad, original)
+
+    def test_native_clip_missing_gradient_keeps_collective_membership(self):
+        """An unused trainable shard contributes zero without allocating a full gradient."""
+        model = self._expert_model()
+        model.weight.grad = None
+        proxy = native_clipping_view(model)
+        view = next(proxy.parameters())
+        self.assertEqual(view.grad.numel(), 1)
+        self.assertEqual(float(view.grad), 0.0)
+        self.assertIsNone(model.weight.grad)
+        self.assertEqual(getattr(proxy, "_extra_parallel_param_groups")["ep"], [view])
+
+    def test_native_clip_preserves_replicated_and_persistent_ownership(self):
+        """Shared LoRA skips EP summation while persistent experts use the flat group."""
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                model = self._expert_model()
+                specification = getattr(model, "_fqn2spec_info")["weight"]
+                specification.placement = Replicate()
+                specification.para_name = "ep"
+                specification.persistent_fsdp_shard_dim = 0 if persistent else None
+                proxy = native_clipping_view(model)
+                view = next(proxy.parameters())
+                self.assertEqual(getattr(proxy, "_extra_parallel_param_groups")["ep"], [view])
+                self.assertEqual(getattr(proxy, "_persistent_extra_parallel_param_ids"),
+                                 {id(view)} if persistent else set())
+                self.assertEqual(getattr(proxy, "_ep_replicated_lora_param_ids"),
+                                 set() if persistent else {id(view)})
+
+    def test_native_clip_empty_gradient_contributes_zero(self):
+        """An empty shard contributes zero to infinity norm without leaving its group."""
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.empty(0, 3))
+        model.weight.grad = torch.empty_like(model.weight)
+        setattr(model, "_fsdp_cpu_offload_enabled", True)
+
+        proxy = native_clipping_view(model)
+        view = next(proxy.parameters())
+
+        self.assertEqual(float(torch.max(torch.abs(view.grad))), 0.0)
+        self.assertEqual(model.weight.grad.numel(), 0)
+        self.assertTrue(getattr(proxy, "_fsdp_cpu_offload_enabled", False))
 
     @staticmethod
     def _expert_model(dtype=torch.float32):
@@ -70,117 +153,6 @@ class TestExtraParallel(unittest.TestCase):
             para_mesh=SimpleNamespace(size=lambda: 2), para_fsdp_mesh=full_mesh,
             fsdp_shard_dim=1)})
         return module
-
-    def test_expert_views_reuse_only_layout_metadata(self):
-        """Repeated calls reuse layouts while exposing fresh tensor wrappers."""
-        module = self._expert_model()
-        with patch.object(extra_parallel, "to_hyper_mesh", wraps=extra_parallel.to_hyper_mesh) as conversion:
-            first = parameters_for_clipping(module)[0]
-            second = parameters_for_clipping(module)[0]
-        conversion.assert_called_once()
-        self.assertIs(first.layout, second.layout)
-        self.assertIsNot(first, second)
-        self.assertIsNot(first.grad, second.grad)
-        self.assertEqual(tuple(first.shape), (4, 4, 3))
-        self.assertEqual(first.placements, (Shard(1), Shard(0)))
-        self.assertEqual(first.to_local().data_ptr(), module.weight.to_local().data_ptr())
-        self.assertEqual(second.grad.to_local().data_ptr(), module.weight.grad.to_local().data_ptr())
-
-    def test_expert_views_refresh_and_clear_gradients(self):
-        """Replacing or clearing a gradient never reuses an earlier gradient."""
-        module = self._expert_model()
-        first = parameters_for_clipping(module)[0]
-        replacement = torch.full_like(module.weight.grad.to_local(), 3)
-        module.weight.grad = DTensor.from_local(replacement, module.weight.device_mesh,
-                                                module.weight.placements, shape=module.weight.shape)
-        second = parameters_for_clipping(module)[0]
-        self.assertEqual(second.grad.to_local().data_ptr(), replacement.data_ptr())
-        self.assertNotEqual(first.grad.to_local().data_ptr(), replacement.data_ptr())
-        module.weight.grad = None
-        self.assertIsNone(parameters_for_clipping(module)[0].grad)
-
-    def test_expert_clipping_traverses_model_once(self):
-        """Planned EP parameters need only one complete named-parameter walk."""
-        module = self._expert_model()
-        with patch.object(module, "named_parameters", wraps=module.named_parameters) as named:
-            views = parameters_for_clipping(module)
-        named.assert_called_once_with()
-        self.assertEqual(len(views), 1)
-        self.assertEqual(views[0].grad.to_local().data_ptr(), module.weight.grad.to_local().data_ptr())
-
-    def test_expert_views_do_not_construct_submeshes(self):
-        """Read the EP axis directly for unequal FSDP/EP and HSDP meshes."""
-        for shape, names, placements in (
-            ((2, 4), ("ep_fsdp", "ep"), (Shard(1), Shard(0))),
-            ((2, 2, 4), ("replicate", "ep_fsdp", "ep"), (Replicate(), Shard(1), Shard(0))),
-        ):
-            with self.subTest(mesh_shape=shape):
-                module = self._expert_model()
-                specification = vars(module)["_fqn2spec_info"]["weight"]
-                values = {key: value for key, value in vars(specification).items() if key != "para_mesh"}
-                values["para_fsdp_mesh"] = DeviceMesh(
-                    "cpu", torch.arange(math.prod(shape)).reshape(shape),
-                    mesh_dim_names=names, _init_backend=False)
-                setattr(module, "_fqn2spec_info", {"weight": _ClippingSpec(**values)})
-                view = parameters_for_clipping(module)[0]
-                self.assertEqual(tuple(view.shape), (8, 4, 3))
-                self.assertEqual(view.placements, placements)
-                self.assertEqual(view.grad.to_local().data_ptr(), module.weight.grad.to_local().data_ptr())
-
-    def test_clip_view_sets_autograd_on_local_storage(self):
-        """Preparing metadata does not dispatch a distributed requires-grad op."""
-        module = self._expert_model()
-        with patch.object(DTensor, "requires_grad_", side_effect=AssertionError("Unexpected distributed dispatch")):
-            view = parameters_for_clipping(module)[0]
-        self.assertTrue(view.requires_grad)
-        self.assertTrue(module.weight.requires_grad)
-
-    def test_changed_shape_does_not_reuse_old_layout(self):
-        """A new logical shape selects new metadata rather than a stale view."""
-        module = self._expert_model()
-        first = parameters_for_clipping(module)[0]
-        original = module.weight
-        module.weight = torch.nn.Parameter(DTensor.from_local(
-            torch.ones(2, 2, 5), original.device_mesh, original.placements, shape=(2, 4, 5)))
-        second = parameters_for_clipping(module)[0]
-        self.assertEqual(tuple(second.shape), (4, 4, 5))
-        self.assertIsNot(first.layout, second.layout)
-
-    def test_expert_main_gradient_preserves_its_dtype(self):
-        """FP32 main gradients keep distinct metadata from BF16 parameters."""
-        module = self._expert_model(torch.bfloat16)
-        gradient = torch.full((2, 2, 3), 5.0)
-        module.weight.main_grad = gradient
-        view = parameters_for_clipping(module)[0]
-        self.assertEqual(view.dtype, torch.bfloat16)
-        self.assertEqual(view.main_grad.dtype, torch.float32)
-        self.assertEqual(view.main_grad.to_local().data_ptr(), gradient.data_ptr())
-        self.assertIsNone(view.grad)
-        self.assertIsNot(view.layout, view.main_grad.layout)
-
-    def test_clipping_cache_does_not_retain_gradients(self):
-        """Only layouts survive after temporary clipping views are released."""
-        module = self._expert_model()
-        local = module.weight.grad.to_local()
-        reference = weakref.ref(local)
-        views = parameters_for_clipping(module)
-        module.weight.grad = None
-        del local, views
-        gc.collect()
-        self.assertIsNone(reference())
-
-    def test_replaced_parameter_uses_current_storage(self):
-        """Parameter replacement does not require tensor-cache invalidation."""
-        module = self._expert_model()
-        original = module.weight
-        first = parameters_for_clipping(module)[0]
-        module.weight = torch.nn.Parameter(DTensor.from_local(
-            torch.full_like(original.to_local(), 7), original.device_mesh,
-            original.placements, shape=original.shape))
-        second = parameters_for_clipping(module)[0]
-        self.assertIs(first.layout, second.layout)
-        self.assertNotEqual(first.to_local().data_ptr(), second.to_local().data_ptr())
-        self.assertEqual(second.to_local().data_ptr(), module.weight.to_local().data_ptr())
 
     def test_gradient_divisor_uses_native_scaling(self):
         """Convert sum/divisor without changing the reduction implementation."""
@@ -205,12 +177,3 @@ class TestExtraParallel(unittest.TestCase):
             ):
                 module.set_gradient_divide_factor(factor)
         module.set_gradient_scaling_factor.assert_not_called()
-
-    def test_plain_parameters_retain_identity(self):
-        """Ordinary models need neither layout wrappers nor gradient copies."""
-        module = torch.nn.Linear(2, 2)
-        original = list(module.parameters())
-        actual = parameters_for_clipping(module)
-        self.assertEqual(len(original), len(actual))
-        for expected, parameter in zip(original, actual):
-            self.assertIs(expected, parameter)

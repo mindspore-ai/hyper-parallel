@@ -31,8 +31,9 @@ from hyper_parallel.integration.veomni.optimizer import (
     HyperOptimizerAdapter,
     _build_hyper_muon_adapter,
     _muon_layout_options,
-    _NativeMuonAdapter,
+    _NativeOptimizerAdapter,
     _optimizer_leaf_from_flat,
+    _register_torch_extra_parallel_clipping,
     _restore_hyper_state_view,
     build_optimizer_binding,
     build_optimizer_state_binding,
@@ -45,6 +46,44 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
 
     # CPU AdamW uses explicit foreach=False: torch-npu's automatic kernel
     # discovery queries NPU hardware even when all parameters are on CPU.
+
+    def test_torch_hyper_muon_registers_native_extra_parallel_clipping(self):
+        """Expert and ordinary Torch meshes must not enter a mixed-mesh stack."""
+        model = torch.nn.Linear(2, 2)
+        model.bias.requires_grad_(False)
+        model.expert = torch.nn.Linear(2, 2, bias=False)
+        native = SimpleNamespace(
+            _should_build_extra_parallel_aware=lambda _: True,
+            get_parallel_state=lambda: SimpleNamespace(extra_parallel_names=("ep",)),
+            _is_extra_parallel_param=lambda parameter, _: "ep" if parameter is model.expert.weight else None,
+        )
+        with patch("hyper_parallel.integration.veomni.optimizer.TorchDTensor", torch.nn.Parameter):
+            _register_torch_extra_parallel_clipping(model, native)
+        groups = model._extra_parallel_param_groups
+        self.assertEqual(len(groups["ep"]), 1)
+        self.assertIs(groups["ep"][0], model.expert.weight)
+        self.assertEqual(len(groups["non_extra_parallel"]), 1)
+        self.assertIs(groups["non_extra_parallel"][0], model.weight)
+        self.assertEqual(model._ep_replicated_lora_param_ids, set())
+
+    def test_torch_hyper_muon_without_ep_preserves_native_clipping(self):
+        """Unwrapped models do not initialize a default single-rank topology."""
+        model = torch.nn.Linear(2, 2)
+        native = SimpleNamespace(
+            _should_build_extra_parallel_aware=MagicMock(side_effect=AssertionError("Unwrapped models need no mesh"))
+        )
+        _register_torch_extra_parallel_clipping(model, native)
+        self.assertFalse(hasattr(model, "_extra_parallel_param_groups"))
+        native._should_build_extra_parallel_aware.assert_not_called()
+
+    def test_torch_hyper_muon_shards_without_ep_keep_native_clipping(self):
+        """Torch shards without extra parallelism retain their native dispatch."""
+        model = torch.nn.Linear(2, 2)
+        native = SimpleNamespace(_should_build_extra_parallel_aware=MagicMock(return_value=False))
+        with patch("hyper_parallel.integration.veomni.optimizer.TorchDTensor", torch.nn.Parameter):
+            _register_torch_extra_parallel_clipping(model, native)
+        native._should_build_extra_parallel_aware.assert_called_once_with(model)
+        self.assertFalse(hasattr(model, "_extra_parallel_param_groups"))
 
     def test_adamw_groups_live_parameters_without_torch_views(self):
         """Mesh grouping must retain original parameters and native decay rules."""
@@ -87,7 +126,7 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
                 filter_empty_param_groups=lambda groups: groups,
                 _make_param_groups_for_subset=native_groups,
             ),
-            use_hyper_optimizer=False,
+            hyper_muon=False,
         )
         with (
             patch(
@@ -134,7 +173,7 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
                 build_optimizer=native,
                 _should_build_extra_parallel_aware=lambda model: False,
             ),
-            use_hyper_optimizer=False,
+            hyper_muon=False,
         )
         with patch(
             "hyper_parallel.integration.veomni.optimizer.uses_hyper", return_value=True
@@ -188,8 +227,6 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         )
         self.assertEqual(loaded["param_groups.weight.lr"], 0.01)
         self.assertEqual(state["param_groups.weight.ns_implementation"], "gram")
-        with self.assertRaisesRegex(ValueError, "NS configuration keys"):
-            adapter.confirm_legacy_muon_checkpoint_options(lr=0.01)
 
     def test_restore_state_retains_ceil_chunk_mesh_and_placements(self):
         """Both owner and empty ranks keep their live FSDP geometry."""
@@ -371,6 +408,8 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         missing.pop("param_groups.weight.ns_implementation")
         with self.assertRaisesRegex(ValueError, "missing NS configuration"):
             adapter.load_state_dict(missing)
+        with self.assertRaisesRegex(ValueError, "missing NS configuration"):
+            adapter.load_state_dict(adapter.dcp_load_template(state))
         state["param_groups.weight.ns_coefficients"] = [
             list(row) for row in settings["ns_coefficients"]
         ]
@@ -381,35 +420,6 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
             adapter.load_state_dict(state)
         restore.assert_called_once()
 
-    def test_confirmed_ns_options_reach_the_actual_restore_payload(self):
-        """Validated legacy values must replace markers in the loaded groups too."""
-        model = torch.nn.Linear(2, 2, bias=False)
-        settings = {
-            "ns_implementation": "gram",
-            "ns_coefficients": [(3.4445, -4.775, 2.0315)] * 5,
-            "ns_epsilon": 1e-7,
-            "ns_steps": 5,
-            "ns_variant": "custom",
-            "gram_ns_reset_iterations": (2,),
-        }
-        leaf = SimpleNamespace(
-            is_muon=True, param_groups=[{"params": [model.weight], **settings}]
-        )
-        adapter = HyperOptimizerAdapter(model, {"muon": leaf})
-        state = {f"param_groups.weight.{key}": value for key, value in settings.items()}
-        marked = adapter.dcp_load_template(state)
-        for key in ("ns_implementation", "gram_ns_reset_iterations"):
-            state[f"param_groups.weight.{key}"] = marked[f"param_groups.weight.{key}"]
-        adapter.confirm_legacy_muon_checkpoint_options(
-            ns_implementation="gram", gram_ns_reset_iterations=[2]
-        )
-        with patch(
-            "hyper_parallel.integration.veomni.optimizer.set_optim_state_dict"
-        ) as restore:
-            adapter.load_state_dict(state)
-        group = restore.call_args.args[2]["param_groups"][0]
-        self.assertEqual(group["ns_implementation"], "gram")
-        self.assertEqual(tuple(group["gram_ns_reset_iterations"]), (2,))
 
     def test_optimizer_binding_rejects_missing_or_incompatible_parameters(self):
         """Fail at activation, not with a dictionary KeyError during construction."""
@@ -430,7 +440,7 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
                 ),
             ):
                 build_optimizer_binding(
-                    SimpleNamespace(build_optimizer=factory), use_hyper_optimizer=True
+                    SimpleNamespace(build_optimizer=factory), hyper_muon=True
                 )
 
     def test_optimizer_binding_accepts_keyword_only_and_additional_parameters(self):
@@ -442,7 +452,7 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
             return model, extra_option
 
         original, wrapper = build_optimizer_binding(
-            SimpleNamespace(build_optimizer=native), use_hyper_optimizer=False
+            SimpleNamespace(build_optimizer=native), hyper_muon=False
         )
         model = torch.nn.Linear(2, 2)
         self.assertIs(original, native)
@@ -455,12 +465,55 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         model = torch.nn.Linear(2, 2)
         view_model = torch.nn.Linear(2, 2)
         optimizer = MagicMock()
-        adapter = _NativeMuonAdapter(model, view_model, optimizer)
+        adapter = _NativeOptimizerAdapter(model, view_model, optimizer)
         adapter.step()
         optimizer.step.assert_called_once_with()
         for parameter, view in zip(model.parameters(), view_model.parameters()):
             self.assertEqual(parameter.data_ptr(), view.data_ptr())
             self.assertIsNone(view.grad)
+
+    def test_adamw_state_offload_delegates_to_native_view_factory(self):
+        """State offload must not bypass VeOmni's SwapAdamW dispatch under EP."""
+        def native(model, optimizer_type="adamw", param_groups=None, optimizer_config=None):
+            return model, optimizer_type, param_groups, optimizer_config
+
+        native_module = SimpleNamespace(build_optimizer=native)
+        _, wrapper = build_optimizer_binding(native_module, hyper_muon=False)
+        model = torch.nn.Linear(2, 2)
+        config = SimpleNamespace(state_offload="cpu")
+        with (
+            patch("hyper_parallel.integration.veomni.optimizer.uses_hyper", return_value=True),
+            patch("hyper_parallel.integration.veomni.optimizer._build_native_optimizer_adapter") as build,
+        ):
+            actual = wrapper(model=model, optimizer_config=config)
+        self.assertIs(actual, build.return_value)
+        self.assertIs(build.call_args.args[1]["optimizer_config"], config)
+        self.assertIs(build.call_args.args[2], native)
+
+    def test_native_restore_rebinds_state_mesh_without_moving_host_storage(self):
+        """DCP's EP mesh descriptor must match the active optimizer view after load."""
+        model = torch.nn.Linear(2, 2)
+        parameter = MagicMock(spec=TorchDTensor)
+        parameter.device_mesh = object()
+        moment = MagicMock(spec=TorchDTensor)
+        moment.device_mesh = object()
+        moment.to_local.return_value = torch.ones(2, 2)
+        moment.placements = (TorchShard(0),)
+        moment.shape = torch.Size([4, 2])
+        moment.stride.return_value = (2, 1)
+        state = {"momentum_buffer": moment, "step": 3}
+        native = MagicMock()
+        native.optimizers_dict = {"ep": SimpleNamespace(state={parameter: state})}
+        adapter = _NativeOptimizerAdapter(model, model, native)
+        rewrap = MagicMock()
+        with patch("hyper_parallel.integration.veomni.optimizer.import_module",
+                   return_value=SimpleNamespace(rewrap_dtensor_local=rewrap)):
+            adapter.load_state_dict({"saved": True})
+        native.load_state_dict.assert_called_once_with({"saved": True})
+        rewrap.assert_called_once_with(moment.to_local.return_value, mesh=parameter.device_mesh,
+                                       placements=moment.placements, shape=moment.shape, stride=(2, 1))
+        self.assertIs(state["momentum_buffer"], rewrap.return_value)
+        self.assertEqual(state["step"], 3)
 
     def test_hyper_muon_matches_native_vlm_grouping_contract(self):
         """VLM groups are re-split by Muon, just as in the native factory."""
@@ -470,7 +523,7 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
 
         logger = MagicMock()
         native_module = SimpleNamespace(build_optimizer=native, logger=logger)
-        _, wrapper = build_optimizer_binding(native_module, use_hyper_optimizer=True)
+        _, wrapper = build_optimizer_binding(native_module, hyper_muon=True)
         model = torch.nn.Linear(2, 2)
         groups = [{"params": list(model.parameters()), "lr": 0.01}]
         with patch(
@@ -480,6 +533,21 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         logger.warning_rank0.assert_called_once()
         self.assertIs(build.call_args.args[0], model)
         self.assertIs(build.call_args.args[1]["param_groups"], groups)
+
+    def test_hyper_muon_type_selects_hyper(self):
+        """Explicit optimizer types dispatch independently of the FSDP binding."""
+        def native(model, optimizer_type="muon", param_groups=None):
+            return model, optimizer_type, param_groups
+
+        native_module = SimpleNamespace(build_optimizer=native, logger=MagicMock())
+        _, wrapper = build_optimizer_binding(native_module, hyper_muon=False)
+        model = torch.nn.Linear(2, 2)
+        with patch(
+            "hyper_parallel.integration.veomni.optimizer._build_hyper_muon_adapter"
+        ) as build:
+            result = wrapper(model=model, optimizer_type="hyper_muon")
+        self.assertIs(result, build.return_value)
+        self.assertEqual(build.call_args.args[1]["optimizer_type"], "muon")
 
     def test_unsharded_hyper_module_remains_recognizable(self):
         """Evaluation exposes plain parameters but must retain the Hyper boundary."""
@@ -657,7 +725,10 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
                     "hyper_parallel.integration.veomni.optimizer.import_module",
                     side_effect=modules.__getitem__,
                 ):
-                    _build_hyper_muon_adapter(model, values, SimpleNamespace())
+                    _build_hyper_muon_adapter(
+                        model, values,
+                        SimpleNamespace(_should_build_extra_parallel_aware=lambda _: False),
+                    )
                 self.assertEqual(factory.call_args.kwargs["momentum_mode"], "vanilla")
                 callback = factory.call_args.kwargs["zeropower_fn"]
                 if implementation == "std":

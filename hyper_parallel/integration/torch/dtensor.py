@@ -66,12 +66,23 @@ def to_hyper_placement(placement: Any) -> Any:
     )
 
 
-def to_torch_view(value: Any) -> Any:
+def to_torch_view(
+    value: Any,
+    *,
+    mesh_cache: dict[DeviceMesh, TorchMesh] | None = None,
+    detached_spec_cache: dict | None = None,
+) -> Any:
     """Return a detached Torch checkpoint view sharing a Hyper tensor's storage.
 
     No gather, reduction or autograd bridge is introduced. Ordinary values pass
     through unchanged. Only ordinary Shard and Replicate layouts are supported;
     special placements must not lose their ordering at this boundary.
+
+    ``mesh_cache`` optionally reuses mesh descriptors within a conversion
+    scope. It holds meshes only, never tensors or their storage.
+    ``detached_spec_cache`` additionally reuses layout metadata for detached
+    clipping views. It must be scoped to a conversion call, not a gradient's
+    lifetime. The opt-in constructor path does not establish autograd edges.
     """
     if not isinstance(value, HyperDTensor):
         return value
@@ -89,24 +100,42 @@ def to_torch_view(value: Any) -> Any:
             )
         placements.append(convert(placement))
     mesh = value.device_mesh
-    torch_mesh = TorchMesh.from_group(
-        mesh.get_all_groups(),
-        mesh.device_type,
-        mesh=torch.tensor(mesh.mesh.tolist()),
-        mesh_dim_names=mesh.mesh_dim_names,
+    torch_mesh = mesh_cache.get(mesh) if mesh_cache is not None else None
+    if torch_mesh is None:
+        torch_mesh = TorchMesh.from_group(
+            mesh.get_all_groups(),
+            mesh.device_type,
+            mesh=torch.tensor(mesh.mesh.tolist()),
+            mesh_dim_names=mesh.mesh_dim_names,
+        )
+        if mesh_cache is not None:
+            mesh_cache[mesh] = torch_mesh
+    stride = (
+        value.layout.tensor_stride
+        if value.layout.tensor_stride is not None
+        else torch.empty(value.shape, device="meta").stride()
     )
-    return TorchDTensor.from_local(
-        value.to_local().detach(),
+    local = value.to_local().detach()
+    key = (torch_mesh, tuple(placements), tuple(value.shape), tuple(stride), local.dtype)
+    specification = detached_spec_cache.get(key) if detached_spec_cache is not None else None
+    if specification is not None:
+        if torch_mesh.get_coordinate() is None:
+            local = local.new_empty(0)
+        # Clipping needs no autograd bridge. Use Torch's internal constructor
+        # only for detached, same-layout aliases; never retain gradient views.
+        return TorchDTensor(local.view_as(local), specification, requires_grad=False)
+    result = TorchDTensor.from_local(
+        local,
         torch_mesh,
         placements,
         run_check=False,
         shape=value.shape,
-        stride=(
-            value.layout.tensor_stride
-            if value.layout.tensor_stride is not None
-            else torch.empty(value.shape, device="meta").stride()
-        ),
+        stride=stride,
     )
+    if detached_spec_cache is not None:
+        # No public API exposes the detached constructor's layout descriptor.
+        detached_spec_cache[key] = result._spec  # pylint: disable=protected-access
+    return result
 
 
 def _check_reference_partition(

@@ -34,19 +34,17 @@ class TestVeOmniAdapter(unittest.TestCase):
     """Verify binding ownership and native-path isolation without communication."""
 
     def test_public_patch_names_are_explicit(self):
-        """Export one apply/remove pair without legacy entry aliases."""
+        """Export the public apply/remove activation entry points."""
         self.assertIs(
             veomni_integration.apply_hyper_parallel_patch, apply_hyper_parallel_patch
         )
         self.assertIs(
             veomni_integration.remove_hyper_parallel_patch, remove_hyper_parallel_patch
         )
-        self.assertFalse(hasattr(veomni_integration, "apply_veomni_patch"))
-        self.assertFalse(hasattr(veomni_integration, "disable"))
 
     def setUp(self):
         """Install an isolated framework surface instead of importing VeOmni."""
-        self.loading = ModuleType("veomni.models.module_utils")
+        self.loading = ModuleType("veomni.models.checkpoint.weights")
         self.clipping = ModuleType("veomni.distributed.fsdp2.clip_grad_norm")
         self.aliases = ModuleType("veomni.loaded_aliases")
         self.native_load_calls = []
@@ -109,7 +107,7 @@ class TestVeOmniAdapter(unittest.TestCase):
         self.assertIs(torch.nn.utils.clip_grad_norm_, torch_clip)
         self.assertIn("veomni.loaded_aliases.clip_alias", self.adapter.bound_targets)
         self.assertIn(
-            "veomni.models.module_utils._dispatch_parameter", self.adapter.bound_targets
+            "veomni.models.checkpoint.weights._dispatch_parameter", self.adapter.bound_targets
         )
         self.adapter.unpatch()
         self.assertEqual(self.adapter.bound_targets, ())
@@ -134,21 +132,21 @@ class TestVeOmniAdapter(unittest.TestCase):
         )
         self.assertEqual(len(self.native_clip_calls), 1)
 
-    def test_hyper_clip_delegates_to_existing_hyper_function(self):
-        """No replacement norm algorithm is implemented in the adapter."""
+    def test_hyper_clip_reuses_native_veomni_function(self):
+        """The adapter only translates gradient ownership, not norm arithmetic."""
         parameter = MagicMock(spec=DTensor)
         model = SimpleNamespace(parameters=lambda: iter([parameter]))
         self.adapter.patch()
         with patch(
-            "hyper_parallel.integration.veomni.adapter.clip_grad_norm_",
-            return_value=torch.tensor(5.0),
-        ) as clip:
+            "hyper_parallel.integration.veomni.adapter.native_clipping_view",
+            return_value="local-gradient-view",
+        ) as prepare:
             actual = self.clipping.clip_grad_norm(
                 model, 2.0, norm_type=3.0, error_if_nonfinite=True, foreach=False
             )
-        self.assertEqual(float(actual), 5.0)
-        clip.assert_called_once_with([parameter], 2.0, 3.0, True, False)
-        self.assertEqual(self.native_clip_calls, [])
+        self.assertEqual(actual, "native-clip")
+        prepare.assert_called_once_with(model)
+        self.assertEqual(self.native_clip_calls, [("local-gradient-view", 2.0, 3.0, True, False)])
 
     def test_hyper_detection_stops_at_first_hyper_parameter(self):
         """Backend detection must not materialize the complete parameter list."""
@@ -162,16 +160,13 @@ class TestVeOmniAdapter(unittest.TestCase):
         model = SimpleNamespace(parameters=parameters)
         self.adapter.patch()
         with (
-            patch("hyper_parallel.integration.veomni.adapter.parameters_for_clipping",
-                  return_value=[parameter]) as prepare,
-            patch("hyper_parallel.integration.veomni.adapter.clip_grad_norm_",
-                  return_value=torch.tensor(5.0)) as clip,
+            patch("hyper_parallel.integration.veomni.adapter.native_clipping_view",
+                  return_value="local-gradient-view") as prepare,
         ):
             actual = self.clipping.clip_grad_norm(model, 2.0)
-        self.assertEqual(float(actual), 5.0)
+        self.assertEqual(actual, "native-clip")
         prepare.assert_called_once_with(model)
-        clip.assert_called_once_with([parameter], 2.0, 2.0, False, None)
-        self.assertEqual(self.native_clip_calls, [])
+        self.assertEqual(self.native_clip_calls, [("local-gradient-view", 2.0, 2.0, False, None)])
 
     def test_hyper_parameter_write_uses_hyper_payload_boundary(self):
         """Keep the original reader/broadcast and replace only shard writing."""
@@ -283,106 +278,41 @@ class TestVeOmniAdapter(unittest.TestCase):
         self.assertFalse(self.adapter.is_patched)
         self.assertIs(self.clipping.clip_grad_norm, self.original_clip)
 
-    def test_module_selection_respects_wrap_scope_and_independent_muon(self):
-        """Resolved module choices, not launcher defaults, own module-scoped execution."""
-        for root_hyper, scope, module_hyper, muon, for_inference, root_mode in (
-            (False, "module", False, False, False, "fsdp2"),
-            (False, "module", True, False, False, "fsdp2"),
-            (False, "module", False, True, False, "fsdp2"),
-            (False, "module", True, True, False, "fsdp2"),
-            (True, "module", False, False, False, "fsdp2"),
-            (True, "model", False, False, False, "fsdp2"),
-            (False, "model", True, False, False, "fsdp2"),
-            (True, "module", False, True, True, "fsdp2"),
-            (False, "module", True, True, True, "fsdp2"),
-            (True, "model", False, True, True, "fsdp2"),
-            (False, "model", True, True, True, "eager"),
-        ):
-            with self.subTest(
-                root=root_hyper, scope=scope, fsdp=module_hyper, muon=muon
-            ):
-                root_fsdp = SimpleNamespace(
-                    fsdp_backend="hyper_parallel" if root_hyper else "torch",
-                    fsdp_mode=root_mode,
-                    fsdp_scope=scope,
-                )
-                module_fsdp = SimpleNamespace(
-                    fsdp_backend="hyper_parallel" if module_hyper else "torch",
-                    fsdp_mode="fsdp2",
-                    fsdp_scope=scope,
-                )
+    def test_mode_and_optimizer_type_select_hyper_independently(self):
+        """FSDP and optimizer selections activate only the requested components."""
+        for fsdp, muon in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(fsdp=fsdp, muon=muon):
                 config = SimpleNamespace(
-                    accelerator=SimpleNamespace(fsdp_config=root_fsdp),
-                    optimizer=SimpleNamespace(use_hyper_optimizer=False, type="adamw"),
-                    modules={
-                        "child": SimpleNamespace(
-                            accelerator=SimpleNamespace(fsdp_config=module_fsdp),
-                            optimizer=SimpleNamespace(
-                                use_hyper_optimizer=muon,
-                                type="muon" if muon else "adamw",
-                            ),
-                        )
-                    },
+                    accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(
+                        fsdp_mode="hyper_fsdp2" if fsdp else "fsdp2",
+                        fsdp_scope="module",
+                    )),
+                    optimizer=SimpleNamespace(type="hyper_muon" if muon else "muon"),
                 )
-                expected_fsdp = root_hyper if scope == "model" and root_mode != "eager" else module_hyper
                 with (
                     patch("hyper_parallel.integration.veomni.adapter._ADAPTER", self.adapter),
                     patch.object(self.adapter, "patch", return_value=self.adapter) as activate,
                 ):
-                    apply_hyper_parallel_patch(config, for_inference=for_inference)
-                expected_muon = muon and not for_inference
-                self.assertEqual(activate.call_count, int(expected_fsdp or expected_muon))
-                self.assertEqual(
-                    (self.adapter.fsdp, self.adapter.muon), (expected_fsdp, expected_muon)
-                )
-                self.assertFalse(config.optimizer.use_hyper_optimizer)
+                    apply_hyper_parallel_patch(config)
+                self.assertEqual((self.adapter.fsdp, self.adapter.muon), (fsdp, muon))
+                self.assertEqual(activate.call_count, int(fsdp or muon))
                 self.adapter.unpatch()
 
-    def test_mixed_module_fsdp_settings_are_rejected_before_binding(self):
-        """Process-wide bindings cannot silently override a native module or its options."""
-        for other in ("torch", "hyper_parallel"):
-            with self.subTest(backend=other):
-                first = SimpleNamespace(
-                    fsdp_backend="hyper_parallel",
-                    fsdp_mode="fsdp2",
-                    fsdp_scope="module",
-                    depth=2,
-                )
-                second = SimpleNamespace(
-                    fsdp_backend=other, fsdp_mode="fsdp2", fsdp_scope="module", depth=3
-                )
+    def test_inference_rejects_hyper_before_binding(self):
+        """Training-only selectors cannot install bindings during inference."""
+        for mode, optimizer in (("hyper_fsdp2", "adamw"), ("fsdp2", "hyper_muon")):
+            with self.subTest(mode=mode, optimizer=optimizer):
                 config = SimpleNamespace(
-                    accelerator=SimpleNamespace(fsdp_config=first),
-                    modules={
-                        name: SimpleNamespace(
-                            accelerator=SimpleNamespace(fsdp_config=fsdp)
-                        )
-                        for name, fsdp in (("first", first), ("second", second))
-                    },
+                    accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode=mode)),
+                    optimizer=SimpleNamespace(type=optimizer),
                 )
-                with self.assertRaisesRegex(
-                    ValueError, "share one FSDP backend and configuration"
+                with (
+                    patch("hyper_parallel.integration.veomni.adapter._ADAPTER", self.adapter),
+                    patch.object(self.adapter, "patch") as activate,
+                    self.assertRaisesRegex(ValueError, "training only"),
                 ):
-                    apply_hyper_parallel_patch(config)
-                self.assertFalse(self.adapter.is_patched)
-
-    def test_relocated_weight_dispatcher_is_supported(self):
-        """VeOmni's weight-loader move keeps the same shard-write boundary."""
-
-        def import_loading(name):
-            if name == "veomni.models.module_utils":
-                raise ModuleNotFoundError(name=name)
-            if name == "veomni.models.checkpoint.weights":
-                return self.loading
-            return self.clipping
-
-        with patch(
-            "hyper_parallel.integration.veomni.adapter.import_module",
-            side_effect=import_loading,
-        ) as resolve:
-            self.adapter.patch()
-        resolve.assert_any_call("veomni.models.checkpoint.weights")
-        self.assertIsNot(getattr(self.loading, "_dispatch_parameter"), self.original_load)
+                    apply_hyper_parallel_patch(config, for_inference=True)
+                activate.assert_not_called()
 
     def test_external_rebinding_is_not_overwritten(self):
         """Do not clobber another component's later binding during cleanup."""

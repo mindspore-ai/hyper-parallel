@@ -15,16 +15,82 @@
 """ExtraParallel boundary descriptors without changing model-owned parallelism."""
 
 import math
-from functools import lru_cache
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import torch
 from torch.distributed.tensor import DTensor as TorchDTensor
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.integration.torch.dtensor import from_torch_view, to_hyper_mesh
+from hyper_parallel.integration.torch.dtensor import to_torch_view
+
+
+def _fsdp_clipping_view(model: torch.nn.Module) -> object:
+    """Keep Torch's DTensor norm arithmetic without replacing live parameters."""
+    views = []
+    mesh_cache = {}
+    detached_spec_cache = {}
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        gradient = getattr(parameter, "main_grad", None)
+        if gradient is None:
+            gradient = parameter.grad
+        gradient = to_torch_view(gradient, mesh_cache=mesh_cache, detached_spec_cache=detached_spec_cache)
+        if gradient is not None and isinstance(parameter, DTensor) and not isinstance(gradient, TorchDTensor):
+            reference = to_torch_view(parameter, mesh_cache=mesh_cache)
+            gradient = TorchDTensor.from_local(
+                gradient.detach(), reference.device_mesh, reference.placements,
+                run_check=False, shape=reference.shape, stride=reference.stride(),
+            )
+        views.append(SimpleNamespace(grad=gradient))
+    return SimpleNamespace(parameters=lambda: iter(views))
+
+
+def native_clipping_view(model: torch.nn.Module) -> object:
+    """Expose live local gradients and ownership to VeOmni's native clipper.
+
+    The proxy owns descriptors only: gradient scaling writes into the original
+    storage, including FP32 main gradients. Plain FSDP retains Torch DTensor
+    norm arithmetic. EP and CPU offload use VeOmni's local reductions, where
+    missing or empty gradients contribute zero on every peer.
+    """
+    specifications = getattr(model, "_fqn2spec_info", {})
+    cpu_offload = getattr(model, "_fsdp_cpu_offload_enabled", False)
+    if not specifications and not cpu_offload:
+        return _fsdp_clipping_view(model)
+    groups = {"non_extra_parallel": []}
+    replicated, persistent = set(), set()
+    views = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        gradient = getattr(parameter, "main_grad", None)
+        if gradient is None:
+            gradient = parameter.grad
+        if isinstance(gradient, (DTensor, TorchDTensor)):
+            gradient = gradient.to_local()
+        if gradient is None or gradient.numel() == 0:
+            gradient = torch.zeros((), device=parameter.device, dtype=torch.float32)
+        view = SimpleNamespace(grad=gradient.detach())
+        views.append(view)
+        specification = specifications.get(name)
+        mesh = getattr(parameter, "device_mesh", None)
+        dimensions = getattr(mesh, "mesh_dim_names", ()) or ()
+        owner = next((dim[:-5] for dim in dimensions if dim.endswith("_fsdp")), "non_extra_parallel")
+        if specification is not None and specification.persistent_fsdp_shard_dim is not None:
+            owner = specification.para_name
+            persistent.add(id(view))
+        elif specification is not None and specification.placement.is_replicate():
+            replicated.add(id(view))
+        groups.setdefault(owner, []).append(view)
+    if not specifications:
+        return SimpleNamespace(parameters=lambda: iter(views), _fsdp_cpu_offload_enabled=cpu_offload)
+    return SimpleNamespace(
+        parameters=lambda: iter(views),
+        _extra_parallel_param_groups=groups,
+        _ep_replicated_lora_param_ids=replicated,
+        _persistent_extra_parallel_param_ids=persistent,
+    )
 
 
 def bind_gradient_divisor(module: torch.nn.Module, group_size: int) -> None:
@@ -46,90 +112,5 @@ def bind_gradient_divisor(module: torch.nn.Module, group_size: int) -> None:
         self.set_gradient_scaling_factor(group_size / factor)
 
     module.set_gradient_divide_factor = MethodType(set_gradient_divide_factor, module)
+    # VeOmni's current NPU EP builder still calls this name, including on Torch 2.10.
     module.set_reduce_scatter_divide_factor = module.set_gradient_divide_factor
-
-
-@lru_cache(maxsize=128)
-def _clipping_layout(mesh_key: tuple, placements: tuple, shape: tuple, dtype) -> Layout:
-    """Cache metadata only; identity keeps equal-topology process groups distinct."""
-    layout = Layout.from_device_mesh(to_hyper_mesh(mesh_key[1]))
-    layout.set_placements(placements)
-    layout.placement_to_tensor_map(len(shape))
-    layout.set_tensor_meta(shape, torch.empty(shape, device="meta").stride(), dtype)
-    return layout
-
-
-def _clipping_view(local: torch.Tensor, mesh, placements: tuple, shape: tuple) -> DTensor:
-    """Bind current storage without copying layout metadata or retaining gradients."""
-    layout = _clipping_layout((id(mesh), mesh), placements, shape, local.dtype)
-    return DTensor.from_local_with_layout(local, layout, shape=shape)
-
-
-def _bind_clip_gradient(view: DTensor, parameter: torch.nn.Parameter) -> None:
-    """Expose the current gradient, retaining FP32 main-gradient semantics."""
-    main_gradient = getattr(parameter, "main_grad", None)
-    gradient = main_gradient if main_gradient is not None else parameter.grad
-    if gradient is None:
-        return
-    local = gradient.to_local() if isinstance(gradient, (DTensor, TorchDTensor)) else gradient
-    if isinstance(parameter, TorchDTensor):
-        gradient_view = DTensor.from_local(
-            local, view.device_mesh, view.placements, shape=view.shape,
-            stride=view.layout.tensor_stride, run_check=False,
-        )
-    else:
-        gradient_view = _clipping_view(local, view.device_mesh, view.placements, tuple(view.shape))
-    if main_gradient is not None:
-        view.main_grad = gradient_view
-    else:
-        view.grad = gradient_view
-
-
-def parameters_for_clipping(model: torch.nn.Module) -> list:
-    """Describe every shard to Hyper clipping, sharing live gradient storage.
-
-    VeOmni intentionally drops the EP axis from FSDP-managed expert parameters;
-    its SpecInfo retains that axis. Restore the descriptor only for clipping.
-    Persistent Torch DTensors remain model-owned and are exposed as local views.
-    No parameter is replaced and no data collective is added by these views.
-    """
-    specifications = getattr(model, "_fqn2spec_info", {})
-    if not specifications:
-        parameters = list(model.parameters())
-        if not any(isinstance(parameter, TorchDTensor) for parameter in parameters):
-            return parameters
-    result = []
-    for name, parameter in model.named_parameters():
-        specification = specifications.get(name)
-        if isinstance(parameter, TorchDTensor):
-            view = from_torch_view(parameter)
-            view.requires_grad_(parameter.requires_grad)
-        elif (
-            isinstance(parameter, DTensor)
-            and specification is not None
-            and specification.persistent_fsdp_shard_dim is None
-            and specification.placement.is_shard()
-            and specification.para_fsdp_mesh is not None
-        ):
-            mesh = specification.para_fsdp_mesh
-            placements = [Replicate() for _ in range(mesh.ndim)]
-            placements[-2] = Shard(specification.fsdp_shard_dim)
-            placements[-1] = Shard(specification.placement.dim)
-            shape = list(parameter.shape)
-            # SpecInfo.para_mesh slices a new Torch mesh on every access.
-            # The restored descriptor already places EP on its final axis.
-            shape[specification.placement.dim] *= mesh.size(-1)
-            local_parameter = parameter.to_local().detach()
-            local_parameter.requires_grad_(parameter.requires_grad)
-            view = _clipping_view(
-                local_parameter,
-                mesh,
-                tuple(placements),
-                tuple(shape),
-            )
-        else:
-            result.append(parameter)
-            continue
-        _bind_clip_gradient(view, parameter)
-        result.append(view)
-    return result

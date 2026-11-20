@@ -59,6 +59,7 @@ class TestConstructionBindings(unittest.TestCase):
             calls.append((module, kwargs))
             module.__class__ = type("Sharded", (ShardedModule, module.__class__), {})
             module.set_reshard_after_backward = MagicMock()
+            module.set_reduce_comm_interval = MagicMock()
             module.set_modules_to_forward_prefetch = MagicMock()
             module.set_modules_to_backward_prefetch = MagicMock()
             return module
@@ -79,6 +80,7 @@ class TestConstructionBindings(unittest.TestCase):
                 comm_fusion=global_fusion,
                 comm_fusion_vit=vit_fusion,
                 forward_prefetch_depth=2,
+                backward_prefetch_depth=1,
                 reduce_comm_interval=1,
             ),
         )
@@ -109,6 +111,7 @@ class TestConstructionBindings(unittest.TestCase):
             self.assertIs(build(model), model)
         visual_units = {visual, visual.blocks[0]}
         for module, kwargs in calls:
+            module.set_reduce_comm_interval.assert_called_once_with(1)
             expected = (
                 vit_fusion
                 if vit_fusion is not None and module in visual_units
@@ -178,7 +181,7 @@ class TestConstructionBindings(unittest.TestCase):
         ]
         config = SimpleNamespace(
             forward_prefetch=True,
-            hyper_parallel=SimpleNamespace(forward_prefetch_depth=2),
+            hyper_parallel=SimpleNamespace(forward_prefetch_depth=2, backward_prefetch_depth=1),
         )
         _configure_block_prefetch(blocks, config)
         blocks[0].set_modules_to_forward_prefetch.assert_called_once_with(
@@ -239,7 +242,7 @@ class TestConstructionBindings(unittest.TestCase):
             forward_prefetch=True,
             reshard_after_backward=False,
             hyper_parallel=SimpleNamespace(
-                forward_prefetch_depth=2, reduce_comm_interval=1
+                forward_prefetch_depth=2, backward_prefetch_depth=1, reduce_comm_interval=1
             ),
         )
         _, wrapper = _build_parallelize_binding(parallel, config)
@@ -271,6 +274,7 @@ class TestConstructionBindings(unittest.TestCase):
             low_precision_reduce_scatter_comm=False,
             hyper_parallel=SimpleNamespace(
                 comm_fusion=True,
+                comm_fusion_vit=None,
                 reduce_comm_interval=1,
             ),
         )
@@ -354,7 +358,7 @@ class TestConstructionBindings(unittest.TestCase):
                                 return_value="hyper",
                             ) as hyper_factory,
                             patch(
-                                "hyper_parallel.integration.veomni.optimizer._build_native_muon_adapter",
+                                "hyper_parallel.integration.veomni.optimizer._build_native_optimizer_adapter",
                                 return_value="native-view",
                             ) as view_factory,
                         ):
