@@ -278,7 +278,6 @@ class MockGPTDataset(_MockDataset):
 
     def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Generate a deterministic mock sample for one split and index."""
-        token = 1
         pad = 2
         eod = self.config.tokenizer.eod
 
@@ -289,7 +288,27 @@ class MockGPTDataset(_MockDataset):
 
         rng = np.random.default_rng(seed=[self.index_split.value, index])
         length = rng.integers(low=0, high=self.config.sequence_length)
-        sample_tokens = np.zeros(length) + token
+        # Draw real vocabulary ids rather than one constant filler token. A
+        # constant stream makes every position's hidden state identical, so a
+        # MoE router sends every token to the same few experts: the loss still
+        # moves, but the expert-parallel dispatch concentrates on the ranks that
+        # own those experts while the rest of the expert domain stays idle. Mock
+        # batches exist to exercise the training and memory paths, so they have
+        # to carry the routing diversity real data does -- otherwise the peak
+        # device memory they report is not the peak a real run would see.
+        #
+        # ``eod`` and the pad sentinel stay reserved: the boundary resolver scans
+        # for ``eod`` to recover sequence ends and ``pad`` fills the tail, so a
+        # random draw must not forge either. Draw from a vocabulary reduced by
+        # the reserved ids, then push every draw that lands on a reserved id (or
+        # above one) past it -- ascending, so a shift landing on the next
+        # reserved id is shifted again.
+        reserved = sorted({int(pad), int(eod)})
+        sample_tokens = rng.integers(
+            low=0, high=len(self.config.tokenizer) - len(reserved), size=length
+        )
+        for reserved_id in reserved:
+            sample_tokens += sample_tokens >= reserved_id
         sample_pads = np.zeros(self.config.sequence_length - length - 1) + pad
         sample = np.int64(np.concatenate([[length], sample_tokens, [eod], sample_pads]))
         tokens = sample[:-1]
