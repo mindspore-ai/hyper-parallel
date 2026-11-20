@@ -21,25 +21,25 @@ from hyper_parallel.models.registry import register_model_adapter
 
 
 def _load_stock_model_patches():
-    """Return the entrypoint applying the family's stock-Transformers fixes."""
+    """Apply the family's stock-Transformers fixes to the loaded classes."""
 
     from hyper_parallel.models.qwen3_omni.adapter.model_patches import (  # pylint: disable=C0415
         apply_stock_model_patches,
     )
-    return apply_stock_model_patches
+    apply_stock_model_patches()
 
 
-def _load_materialization():
-    """Return the derived positional-buffer rebuild provider."""
+def _load_materialization(model):
+    """Register the family's derived positional-buffer rebuilds on ``model``."""
 
     from hyper_parallel.models.qwen3_omni.adapter.materialization import (  # pylint: disable=C0415
         register_omni_derived_buffer_materialization,
     )
-    return register_omni_derived_buffer_materialization
+    register_omni_derived_buffer_materialization(model)
 
 
-def _load_fsdp_wrap_modules():
-    """Return the provider declaring the vision tower's FSDP2 child units.
+def _load_fsdp_wrap_modules(model):
+    """Declare the vision tower's FSDP2 child units on ``model``.
 
     The omni ``visual`` branch (patch embed / blocks / merger) lives outside
     the HF decoder-container convention; declare its projection modules as
@@ -49,24 +49,21 @@ def _load_fsdp_wrap_modules():
     leave parameters sharded at compute time).
     """
 
-    def _fsdp_wrap_modules(model):
-        visual = getattr(model, "visual", None)
-        if visual is None:
-            thinker = getattr(model, "thinker", None)
-            visual = getattr(thinker, "visual", None) if thinker is not None else None
-        if visual is None:
-            return []
-        # ``model.visual`` exists only on the bare thinker; the conditional-
-        # generation wrapper nests it under ``thinker``.
-        prefix = "visual" if hasattr(model, "visual") else "thinker.visual"
-        fqns = []
-        for name in ("patch_embed", "merger"):
-            child = getattr(visual, name, None)
-            if isinstance(child, torch.nn.Module) and not isinstance(child, torch.nn.ModuleList):
-                fqns.append(f"{prefix}.{name}")
-        return fqns
-
-    return _fsdp_wrap_modules
+    visual = getattr(model, "visual", None)
+    if visual is None:
+        thinker = getattr(model, "thinker", None)
+        visual = getattr(thinker, "visual", None) if thinker is not None else None
+    if visual is None:
+        return []
+    # ``model.visual`` exists only on the bare thinker; the conditional-
+    # generation wrapper nests it under ``thinker``.
+    prefix = "visual" if hasattr(model, "visual") else "thinker.visual"
+    fqns = []
+    for name in ("patch_embed", "merger"):
+        child = getattr(visual, name, None)
+        if isinstance(child, torch.nn.Module) and not isinstance(child, torch.nn.ModuleList):
+            fqns.append(f"{prefix}.{name}")
+    return fqns
 
 
 QWEN3_OMNI_ADAPTER_SPEC = ModelAdapterSpec(

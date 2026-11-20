@@ -58,10 +58,11 @@ def test_model_adapter_declares_its_providers() -> None:
     spec = get_model_adapter("qwen3_omni_moe")
 
     assert spec.materialization is not None
+    assert spec.materialization(nn.Module()) is None
     assert spec.stock_model_patches is not None
-    assert callable(spec.stock_model_patches())
+    assert spec.stock_model_patches() is None
     assert spec.fsdp_wrap_modules is not None
-    assert callable(spec.fsdp_wrap_modules())
+    assert spec.fsdp_wrap_modules(nn.Module()) == []
 
 
 class _VisualStub(nn.Module):
@@ -77,7 +78,7 @@ class _VisualStub(nn.Module):
 def test_fsdp_wrap_modules_declares_vision_projection_units() -> None:
     """The provider names patch_embed and merger on the nested vision tower."""
     spec = get_model_adapter("qwen3_omni_moe")
-    provider = spec.fsdp_wrap_modules()
+    provider = spec.fsdp_wrap_modules
 
     thinker = nn.Module()
     thinker.visual = _VisualStub()  # type: ignore[attr-defined]
