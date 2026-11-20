@@ -286,7 +286,11 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         value = self._dequantizer.convert(
             {"weight": weight, "weight_scale_inv": scale},
             full_layer_name="weight", model=self._dtype_target,
-        )["weight"][:stop - start, :right - left]
+        )["weight"]
+        # Older Transformers releases return the single decoded block in a list.
+        if isinstance(value, list):
+            (value,) = value
+        value = value[:stop - start, :right - left]
         if value.shape != (stop - start, right - left) or value.dtype != torch.bfloat16:
             raise ValueError("Transformers Fp8Dequantize did not produce the requested BF16 rectangle")
         if not torch.all(torch.isfinite(value)):
