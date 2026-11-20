@@ -523,8 +523,8 @@ def _has_source_constructor(tree: ast.AST, record: dict, expected: str) -> bool:
                 targets = node.targets if isinstance(node, ast.Assign) else (
                     [node.target] if isinstance(node, ast.AnnAssign) else []
                 )
-                if any(isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
-                       and target.value.id == "self" and target.attr == site["attribute"] for target in targets):
+                if any(isinstance(target, ast.Attribute) and ast.unparse(target.value) == site.get("base", "self")
+                       and target.attr == site["attribute"] for target in targets):
                     values.append(node.value)
         if len(values) != 1:
             return False

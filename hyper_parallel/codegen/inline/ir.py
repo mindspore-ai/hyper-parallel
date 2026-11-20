@@ -63,6 +63,7 @@ class ConstructorPatch:
     attribute: str
     source_class: str
     expression: str
+    base: str = "self"
 
 
 @dataclass

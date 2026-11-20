@@ -58,6 +58,14 @@ class IdentitySensitiveBlock(FinalBlock):
         self.source_module = type(module).__module__
 
 
+class PathSensitiveBlock(FinalBlock):
+    """A concrete constructor that consumes its own exact instance path."""
+
+    def __init__(self, *, module, module_fqn, context):
+        super().__init__(module=module, module_fqn=module_fqn, context=context)
+        self.instance_path = module_fqn
+
+
 def _replacement_record():
     return {
         "primary_fqn": "block",
@@ -83,6 +91,30 @@ def _patch_plan():
 
 class TestConstructorMaterialization(unittest.TestCase):
     """Inspect the model actually built by the generated source."""
+
+    def test_native_owner_loop_preserves_required_instance_paths(self):
+        source = (f"from {__name__} import SourceBlock\n"
+                  "class Layer:\n    pass\n"
+                  "class FutureModel:\n    def __init__(self):\n"
+                  "        self.layers = [Layer() for index in range(2)]\n"
+                  "        for layer_idx in range(2):\n"
+                  "            layer = self.layers[layer_idx]\n"
+                  "            layer.block = SourceBlock()\n")
+        records = []
+        for index in range(2):
+            record = _replacement_record()
+            path = f"layers.{index}.block"
+            record.update(primary_fqn=path, module_fqns=[path],
+                          replacement_type=f"{__name__}:PathSensitiveBlock", construction_sites=[{
+                              "owner": "Layer", "attribute": "block", "instances": ["layers.0", "layers.1"],
+                          }])
+            records.append(record)
+        rendered = materialize_module_constructions(source, records)
+        namespace = {}
+        exec(rendered, namespace)
+        layers = namespace["FutureModel"]().layers
+        self.assertEqual([layer.block.instance_path for layer in layers], ["layers.0.block", "layers.1.block"])
+        self.assertEqual(rendered.count("layer.block = PathSensitiveBlock("), 1)
 
     def test_conversion_preserves_unmodified_source_type_identity(self):
         """Moving copied definitions must not change an existing conversion policy."""

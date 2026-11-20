@@ -68,7 +68,7 @@ def construction_sites(source: str, record: dict) -> list[dict]:
     """Use captured owners, or resolve an unambiguous standalone source fixture."""
     sites = record.get("construction_sites")
     if sites is not None:
-        return sites
+        return _resolve_recorded_sites(source, record, sites)
     attribute = record["primary_fqn"].rsplit(".", 1)[-1]
     hosts = []
     for host in ast.parse(source).body:
@@ -84,6 +84,68 @@ def construction_sites(source: str, record: dict) -> list[dict]:
     return [{"owner": hosts[0], "attribute": attribute}]
 
 
+
+def _resolve_recorded_sites(source: str, record: dict, sites: list[dict]) -> list[dict]:
+    """Resolve captured object owners to unambiguous assignments in composed source."""
+    classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+    constructors = {record["source_type"].split(":")[-1], replacement_constructor(record).split(":")[-1]}
+    result = []
+    for site in sites:
+        candidates = []
+        direct = []
+        for name, host in classes.items():
+            for method in host.body:
+                if not isinstance(method, ast.FunctionDef) or method.name != "__init__":
+                    continue
+                for node in ast.walk(method):
+                    targets = node.targets if isinstance(node, ast.Assign) else (
+                        [node.target] if isinstance(node, ast.AnnAssign) else [])
+                    for target in targets:
+                        if not isinstance(target, ast.Attribute) or target.attr != site["attribute"]:
+                            continue
+                        if not any(isinstance(call, ast.Call) and ast.unparse(call.func).split(".")[-1]
+                                   in constructors for call in ast.walk(node.value)):
+                            continue
+                        item = (name, method, target)
+                        candidates.append(item)
+                        if name == site["owner"].split(":")[-1] and ast.unparse(target.value) == "self":
+                            direct.append(item)
+        selected = direct or candidates
+        if len(selected) != 1:
+            raise ValueError(f"Codegen construction {record['primary_fqn']!r} has {len(selected)} source assignments")
+        name, method, target = selected[0]
+        resolved = {**site, "owner": name, "base": ast.unparse(target.value)}
+        bases = [target.value]
+        root = target.value
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if isinstance(root, ast.Name) and root.id != "self":
+            bases.extend(node.value for node in ast.walk(method) if isinstance(node, ast.Assign)
+                         and any(isinstance(item, ast.Name) and item.id == root.id for item in node.targets))
+        indices = {node.slice.id for base in bases for node in ast.walk(base)
+                   if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Name)}
+        if len(indices) == 1:
+            resolved["selector"] = indices.pop()
+        result.append(resolved)
+    return result
+
+
+def _required_fqn_expression(source: str, record: dict, site: dict) -> str | None:
+    """Retain exact native paths when a concrete constructor requires them."""
+    parameter = inspect.signature(_symbol(replacement_constructor(record))).parameters.get("module_fqn")
+    if parameter is None or parameter.default is not inspect.Parameter.empty:
+        return None
+    parts = record["primary_fqn"].split(".")
+    indices = [index for index, part in enumerate(parts) if part.isdigit()]
+    if not indices:
+        return repr(record["primary_fqn"])
+    if len(indices) != 1:
+        raise ValueError("Codegen required module_fqn needs one unambiguous source container index")
+    selector = site.get("selector") or layer_selector(source, site["owner"].split(":")[-1])
+    parts[indices[0]] = "{" + selector + "}"
+    return "f" + repr(".".join(parts))
+
+
 def materialize_module_constructions(source: str, records: list[dict]) -> str:
     """Extend the existing inline edit pass with ordinary concrete constructor calls."""
     if not records:
@@ -92,16 +154,17 @@ def materialize_module_constructions(source: str, records: list[dict]) -> str:
     groups = {}
     for record in records:
         for site in construction_sites(source, record):
-            key = (site["owner"].split(":")[-1], site["attribute"])
+            key = (site["owner"].split(":")[-1], site["attribute"], site.get("base", "self"))
             groups.setdefault(key, []).append((record, site))
     classes = {node.name for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
     source_aliases = {}
-    for (owner, attribute), members in groups.items():
+    for (owner, attribute, base), members in groups.items():
         record, _ = members[0]
         calls = [_constructor_expression(
             item, patches.imports, classes,
             _source_expression(source, item, records, patches.imports, source_aliases),
-        ) for item, _ in members]
+            _required_fqn_expression(source, item, site),
+        ) for item, site in members]
         selected = {path.rpartition(".")[0] for item, _ in members
                     for path in item.get("module_fqns", [item["primary_fqn"]])}
         expected = {path for _, site in members for path in site.get("instances", selected)}
@@ -110,7 +173,7 @@ def materialize_module_constructions(source: str, records: list[dict]) -> str:
         else:
             expression = calls[0]
         patches.constructors.append(ConstructorPatch(
-            owner, attribute, record["source_type"].split(":")[-1], expression,
+            owner, attribute, record["source_type"].split(":")[-1], expression, base,
         ))
     return apply_patch_set(source, patches)
 
@@ -147,7 +210,8 @@ def _per_instance_expression(source: str, owner: str, members: list, calls: list
     prefixes = {path.rpartition(".")[0] for path in expected}
     if len(prefixes) != 1 or not all(path.rsplit(".", 1)[-1].isdigit() for path in expected):
         raise ValueError(f"Codegen partial construction for {owner} does not identify one indexed source container")
-    selector = layer_selector(source, owner)
+    selectors = {site["selector"] for _, site in members if site.get("selector")}
+    selector = selectors.pop() if len(selectors) == 1 else layer_selector(source, owner)
     expression = "__source_module__"
     for (record, site), call in reversed(list(zip(members, calls))):
         indices = tuple(sorted({int(path.rpartition(".")[0].rsplit(".", 1)[-1])
@@ -183,7 +247,9 @@ def _source_expression(source: str, record: dict, records: list[dict], imports: 
     return f'{alias}(__source_arguments__)'
 
 
-def _constructor_expression(record: dict, imports: list[ImportPatch], classes: set[str], source: str) -> str:
+def _constructor_expression(
+    record: dict, imports: list[ImportPatch], classes: set[str], source: str, fqn: str | None,
+) -> str:
     identity = replacement_constructor(record)
     module, name = identity.split(":", 1)
     if not name.isidentifier():
@@ -203,9 +269,8 @@ def _constructor_expression(record: dict, imports: list[ImportPatch], classes: s
     # The generated module neither selects a family nor installs a replacement.
     runtime = {"module": source, "config": "None", "context": _value_expression(context, imports)}
     kwargs = [f"{key}={value}" for key, value in runtime.items() if key in signature.parameters]
-    # module_fqn is optional diagnostic context; never freeze one layer's path for all layers.
-    if "module_fqn" in signature.parameters and signature.parameters["module_fqn"].default is inspect.Parameter.empty:
-        raise ValueError(f"Codegen constructor {identity!r} requires an instance-specific module_fqn")
+    if fqn is not None:
+        kwargs.append(f"module_fqn={fqn}")
     if set(arguments) != {"mapping"}:
         raise ValueError(f"Codegen construction arguments for {record['primary_fqn']!r} must be a mapping")
     kwargs.extend(f"{key}={_value_expression(value, imports)}" for key, value in arguments["mapping"].items()

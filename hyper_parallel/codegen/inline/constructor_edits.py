@@ -59,8 +59,8 @@ def constructor_edits(source: str, patches: list[ConstructorPatch]) -> list[Text
                 targets = node.targets if isinstance(node, ast.Assign) else (
                     [node.target] if isinstance(node, ast.AnnAssign) else []
                 )
-                if not any(isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
-                           and target.value.id == "self" and target.attr == patch.attribute for target in targets):
+                if not any(isinstance(target, ast.Attribute) and ast.unparse(target.value) == patch.base
+                           and target.attr == patch.attribute for target in targets):
                     continue
                 value = node.value
                 if isinstance(value, ast.Call) and ast.unparse(value.func).rsplit(".", 1)[-1] == patch.source_class:

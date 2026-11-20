@@ -156,7 +156,8 @@ def _construction_records(manifest: PreparationManifest, model: Any) -> tuple[di
             owner = owners[parent]
             sites.append({
                 "owner": owner, "attribute": attribute,
-                "instances": [key for key, value in owners.items() if value == owner],
+                "instances": [key for key, value in owners.items() if value == owner
+                              and f"{key}.{attribute}".lstrip(".") in owners],
             })
         record["construction_sites"] = sites
         result.append(record)
