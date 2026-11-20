@@ -15,8 +15,8 @@
 """Typed low-precision policies and their FQN-independent dtype-scheme catalog."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from typing import Literal, Optional, TypeAlias, cast
+from dataclasses import dataclass, field, fields
+from typing import Literal, Optional, TypeAlias, Union, cast
 
 
 MXBlockSizeValue: TypeAlias = Literal[32]
@@ -37,6 +37,8 @@ E8M0_BIAS = 127.0
 E8M0_MAX_EXPONENT = 255.0
 MXFP4_MAX_VALUE = 6.0
 FP8_E4M3_MAX = 448.0
+MAIN_KV_GROUP_SIZE = 16
+SWA_KV_GROUP_SIZE = 32
 
 # GroupedMatmul and DynamicMxQuant protocol values.
 GROUP_LIST_OFFSETS = 0
@@ -165,13 +167,69 @@ class LowPrecisionDtypeScheme:
             object.__setattr__(self, "block_size", block_size)
 
 
+@dataclass(frozen=True)
+class CSA2IndexerQKFormat:
+    """OCP MXFP4 activation QDQ for CSA2 Indexer queries and keys."""
+
+    act_format: Literal["mxfp4"]
+
+    def __post_init__(self) -> None:
+        if self.act_format != "mxfp4":
+            raise ValueError("indexer_qk.act_format must be 'mxfp4'.")
+
+
+@dataclass(frozen=True)
+class CSA2MainKVFormat:
+    """Main KV E2M1 with one E4M3 or E8M7 scale per 16 channels."""
+
+    act_format: Literal["fp4_e2m1"]
+    scale_format: Literal["e4m3", "e8m7"]
+    group: Literal[16] = MAIN_KV_GROUP_SIZE
+
+    def __post_init__(self) -> None:
+        if self.act_format != "fp4_e2m1":
+            raise ValueError("main_kv.act_format must be 'fp4_e2m1'.")
+        if self.scale_format not in ("e4m3", "e8m7"):
+            raise ValueError("main_kv.scale_format must be 'e4m3' or 'e8m7' (BF16).")
+        if isinstance(self.group, bool) or not isinstance(self.group, int) or self.group != MAIN_KV_GROUP_SIZE:
+            raise ValueError("main_kv.group must be 16.")
+
+
+@dataclass(frozen=True)
+class CSA2SWAKVFormat:
+    """FP8 E4M3 sliding-window KV with E8M0 or E8M7 scales."""
+
+    act_format: Literal["fp8_e4m3"]
+    scale_format: Literal["e8m0", "e8m7"] = "e8m0"
+    group: Literal[32] = SWA_KV_GROUP_SIZE
+
+    def __post_init__(self) -> None:
+        if self.act_format != "fp8_e4m3":
+            raise ValueError("swa_kv.act_format must be 'fp8_e4m3'.")
+        if self.scale_format not in ("e8m0", "e8m7"):
+            raise ValueError("swa_kv.scale_format must be 'e8m0' or 'e8m7' (BF16).")
+        if isinstance(self.group, bool) or not isinstance(self.group, int) or self.group != SWA_KV_GROUP_SIZE:
+            raise ValueError("swa_kv.group must be 32.")
+
+
+_CSA2_FORMAT_TYPES = {
+    "indexer_qk": CSA2IndexerQKFormat,
+    "main_kv": CSA2MainKVFormat,
+    "swa_kv": CSA2SWAKVFormat,
+}
+
+CSA2DtypeScheme: TypeAlias = Union[
+    LowPrecisionDtypeScheme, CSA2IndexerQKFormat, CSA2MainKVFormat, CSA2SWAKVFormat,
+]
+
+
 @dataclass
 class LowPrecisionConfig:
     """Global switch plus a catalog of named dtype schemes.
 
-    A dtype scheme is selected by the surrounding ``PlanOverride`` entry.
-    Matching module FQNs and selecting a dtype scheme are intentionally
-    separate concerns: this object is only the low-precision catalog.
+    A W/A dtype scheme is selected by the surrounding ``PlanOverride`` entry.
+    CSA2 formats are read directly by a matching attention replacement from
+    the shared build context; unused formats remain in this catalog.
 
     ``format``/``scaling`` retain the pre-catalog configuration surface. They
     are converted to one implicit scheme when no named catalog is supplied,
@@ -182,7 +240,7 @@ class LowPrecisionConfig:
     enabled: bool = False
     format: Literal["mxfp8_e4m3", "mxfp4_e2m1", "hif8"] = "mxfp8_e4m3"
     scaling: Literal["mx_block", "current"] = "mx_block"
-    dtype_schemes: dict[str, LowPrecisionDtypeScheme] = field(default_factory=dict)
+    dtype_schemes: dict[str, CSA2DtypeScheme] = field(default_factory=dict)
     default_dtype_scheme: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -208,35 +266,54 @@ class LowPrecisionConfig:
             )
         typed_schemes = {}
         for name, scheme in self.dtype_schemes.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("LowPrecisionConfig.dtype_schemes keys must be non-empty strings.")
+            scheme_type = _CSA2_FORMAT_TYPES.get(name, LowPrecisionDtypeScheme)
             if isinstance(scheme, Mapping):
                 try:
-                    scheme = LowPrecisionDtypeScheme(**dict(scheme))
+                    scheme = scheme_type(**dict(scheme))
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
-                        f"Invalid low-precision dtype scheme {name!r}: {exc}"
+                        f"Invalid LowPrecisionConfig.dtype_schemes.{name}: {exc}"
                     ) from exc
+            if not isinstance(scheme, scheme_type):
+                raise ValueError(
+                    f"LowPrecisionConfig.dtype_schemes.{name} must be a {scheme_type.__name__}."
+                )
             typed_schemes[name] = scheme
         self.dtype_schemes = typed_schemes
-
-        if any(
-            not isinstance(name, str) or not name
-            or not isinstance(scheme, LowPrecisionDtypeScheme)
-            for name, scheme in self.dtype_schemes.items()
-        ):
-            raise ValueError(
-                "LowPrecisionConfig.dtype_schemes must map non-empty names to "
-                "LowPrecisionDtypeScheme objects."
-            )
         if self.default_dtype_scheme is not None:
             if not isinstance(self.default_dtype_scheme, str) or not self.default_dtype_scheme:
                 raise ValueError(
                     "LowPrecisionConfig.default_dtype_scheme must be a dtype scheme name."
                 )
-            if self.default_dtype_scheme not in self.dtype_schemes:
+            if not isinstance(self.dtype_schemes.get(self.default_dtype_scheme), LowPrecisionDtypeScheme):
                 raise ValueError(
                     f"LowPrecisionConfig.default_dtype_scheme "
-                    f"{self.default_dtype_scheme!r} is not present in dtype_schemes."
+                    f"{self.default_dtype_scheme!r} is not a W/A scheme in dtype_schemes."
                 )
+
+    @property
+    def indexer_qk(self) -> Optional[CSA2IndexerQKFormat]:
+        """Return the configured Indexer activation format, if present."""
+        value = self.dtype_schemes.get("indexer_qk")
+        return value if isinstance(value, CSA2IndexerQKFormat) else None
+
+    @property
+    def main_kv(self) -> Optional[CSA2MainKVFormat]:
+        """Return the configured Main KV cache format, if present."""
+        value = self.dtype_schemes.get("main_kv")
+        return value if isinstance(value, CSA2MainKVFormat) else None
+
+    @property
+    def swa_kv(self) -> Optional[CSA2SWAKVFormat]:
+        """Return the configured SWA KV cache format, if present."""
+        value = self.dtype_schemes.get("swa_kv")
+        return value if isinstance(value, CSA2SWAKVFormat) else None
+
+    def active_direct_formats(self) -> frozenset[str]:
+        """Return explicitly configured CSA2 formats."""
+        return frozenset(self.dtype_schemes.keys() & _CSA2_FORMAT_TYPES.keys())
 
     def resolve_dtype_scheme(
         self, dtype_scheme_name: Optional[str] = None,
@@ -255,14 +332,18 @@ class LowPrecisionConfig:
                 raise ValueError(
                     "low-precision dtype scheme name must be a non-empty string."
                 )
-            try:
-                return self.dtype_schemes[selected]
-            except KeyError as exc:
+            scheme = self.dtype_schemes.get(selected)
+            if not isinstance(scheme, LowPrecisionDtypeScheme):
+                available = sorted(
+                    name for name, value in self.dtype_schemes.items()
+                    if isinstance(value, LowPrecisionDtypeScheme)
+                )
                 raise ValueError(
-                    f"Unknown low-precision dtype scheme {selected!r}; "
-                    f"available dtype schemes: {sorted(self.dtype_schemes)}."
-                ) from exc
-        if self.dtype_schemes:
+                    f"Unknown W/A low-precision dtype scheme {selected!r}; "
+                    f"available W/A schemes: {available}."
+                )
+            return scheme
+        if any(isinstance(value, LowPrecisionDtypeScheme) for value in self.dtype_schemes.values()):
             # A catalog exists but nothing was selected: fail loudly instead of
             # silently running the model unquantized.
             raise ValueError(
@@ -293,12 +374,7 @@ class LowPrecisionConfig:
         }
         if self.dtype_schemes:
             result["dtype_schemes"] = {
-                name: {
-                    "is_fake_quantize": scheme.is_fake_quantize,
-                    "weight_format": scheme.weight_format,
-                    "act_format": scheme.act_format,
-                    "block_size": scheme.block_size,
-                }
+                name: {scheme_field.name: getattr(scheme, scheme_field.name) for scheme_field in fields(scheme)}
                 for name, scheme in self.dtype_schemes.items()
             }
         if self.default_dtype_scheme is not None:
@@ -310,6 +386,11 @@ __all__ = [
     "MXBlockSizeValue",
     "LowPrecisionConfig",
     "LowPrecisionDtypeScheme",
+    "CSA2IndexerQKFormat",
+    "CSA2MainKVFormat",
+    "CSA2SWAKVFormat",
+    "MAIN_KV_GROUP_SIZE",
+    "SWA_KV_GROUP_SIZE",
     "MX_BLOCK_SIZE_32",
     "SUPPORTED_MX_BLOCK_SIZES",
     "validate_mx_block_size",
