@@ -286,15 +286,16 @@ Ascend 950PR/950DT 上可通过 Module Family 启用带 clamp 的 SwiGLU 与双�
 TorchNPU 2.9.0.post9，以及随 ops 包安装的 `cann_ops_nn 1.0.1`。
 需要先加载对应的 CANN `set_env.sh`；模型构造时会检查前向和反向融合接口是否齐全。
 
-此路径当前要求 **TP=CP=EP=PP=1**，可以配合数据并行/FSDP。
-从本目录的 online YAML 修改时，将 `accelerator` 中各并行大小设为 1，关闭
-`sequence_parallel`，并按实际卡数设置 `fsdp_config.dp_shard_size`。
-移除 `model.layers.*.mlp.forward` 的 MegaMoe/EP 方法替换，将
+此路径当前要求 **TP=CP=PP=1**，支持 `EP>=1` 专家并行并可配合数据并行/FSDP。
+从本目录的 online YAML 修改时，将 `accelerator` 中的 `tp_size`、`cp_size`、`pp_size` 设为 1，
+关闭 `sequence_parallel`，并按实际卡数设置 `ep_size`、`fsdp_config.dp_shard_size` 与 `edp_shard_size`。
+将 `model.layers.*.mlp.forward` 的 MegaMoe 替换改为开启 `use_grouped_gemm: true` 的普通 EP 规则，并将
 `model.layers.*.mlp.experts` 的 MegaMoe 替换改成下面的 Family 配置：
 
 ```yaml
 training:
   low_precision:
+    enabled: true
     dtype_schemes:
       experts_mxfp8:
         weight_format: mxfp8
@@ -303,6 +304,15 @@ training:
         is_fake_quantize: false
 
 plan_overrides:
+  - match: "model.layers.*.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+        use_grouped_gemm: true
+        fix_router: false
   - match: "model.layers.*.mlp.experts"
     replace:
       kind: module

@@ -173,10 +173,25 @@ class TestQATGroupedExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least one matrix dimension divisible by 64"):
             install_family(model, qat_config(fake=True))
         policy = qat_config().training.low_precision.resolve_dtype_scheme("experts")
-        with self.assertRaisesRegex(NotImplementedError, "requires TP=CP=EP=PP=1"):
-            LowPrecisionGroupedExperts(
-                module=TinyMoE().mlp.experts, strategy=MXFP8GroupedLinear(),
-                module_fqn="mlp.experts", context={"ep": True, "low_precision": policy})
+        mxfp8_policy = qat_config(weight_format="mxfp8").training.low_precision.resolve_dtype_scheme("experts")
+        ep_mxfp8 = LowPrecisionGroupedExperts(
+            module=TinyMoE().mlp.experts, strategy=MXFP8GroupedLinear(),
+            module_fqn="mlp.experts", context={"ep": True, "ep_size": 2, "low_precision": mxfp8_policy})
+        self.assertTrue(ep_mxfp8.requires_ep_grouped_gemm)
+        for axis in ("tp", "cp", "pp"):
+            with self.subTest(strategy="mxfp8", axis=axis), self.assertRaisesRegex(
+                NotImplementedError, "requires TP=CP=PP=1"
+            ):
+                LowPrecisionGroupedExperts(
+                    module=TinyMoE().mlp.experts, strategy=MXFP8GroupedLinear(),
+                    module_fqn="mlp.experts", context={axis: True, "low_precision": mxfp8_policy})
+        for strategy in (W4A8GroupedLinear(32), FakeW4A8GroupedLinear(32)):
+            with self.subTest(strategy=type(strategy).__name__), self.assertRaisesRegex(
+                NotImplementedError, "requires TP=CP=EP=PP=1"
+            ):
+                LowPrecisionGroupedExperts(
+                    module=TinyMoE().mlp.experts, strategy=strategy,
+                    module_fqn="mlp.experts", context={"ep": True, "ep_size": 2, "low_precision": policy})
         bad_experts = TinyMoE().mlp.experts
         bad_experts.config.hidden_act = "gelu"
         with self.assertRaisesRegex(ValueError, "requires SwiGLU source activation"):

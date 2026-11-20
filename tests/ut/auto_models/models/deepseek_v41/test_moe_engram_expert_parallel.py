@@ -32,13 +32,23 @@ except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
 from hyper_parallel.components import functional as hp_functional
+from hyper_parallel.components.modules.low_precision_grouped_experts import LowPrecisionGroupedExperts
+from hyper_parallel.components.modules.mxfp8_grouped_swiglu import FusedMXFP8GroupedSwiGLU
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
+from hyper_parallel.distributed.expert_parallel.experts import _run_ep_local_experts
+from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     _deepseek_v41_grouped_expert_forward,
     deepseek_v41_ep_compute_fn,
 )
-from hyper_parallel.trainer.config.parallelism import PlanOverride, entries_to_plan_overrides
-from hyper_parallel.trainer.config.resolver import resolve_component
+from hyper_parallel.models.replacement import _apply_module_replacement_actions, compile_module_replacements
+from hyper_parallel.trainer.config.parallelism import (
+    PlanOverride,
+    entries_to_plan_overrides,
+    normalize_distributed_setup_overrides,
+)
+from hyper_parallel.trainer.config.resolver import resolve_component, resolve_config
+from tests.common.qat_family import deepseek_experts_model, deepseek_qat_config
 
 
 # This fixture exercises the installed package's configuration contract, not the
@@ -370,3 +380,114 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
             module, 2, use_grouped_gemm=False,
             apply_gate=experts._apply_gate,  # pylint: disable=protected-access
         )
+
+    @staticmethod
+    def _mxfp8_fused_cpu_oracle(x, gate_up, down, counts, quantizer, clamp_limit=None):
+        """CPU reference for fused_grouped_swiglu preserving optional V4.1 SwiGLU clamping."""
+        del quantizer
+        parts = x.split(counts.tolist())
+        gate_up_out = torch.cat([part @ weight for part, weight in zip(parts, gate_up)])
+        gate, up = gate_up_out.chunk(2, dim=-1)
+        if clamp_limit is not None:
+            gate = gate.clamp(max=clamp_limit)
+            up = up.clamp(min=-clamp_limit, max=clamp_limit)
+        act_parts = (functional.silu(gate) * up).split(counts.tolist())
+        return torch.cat([part @ weight for part, weight in zip(act_parts, down)])
+
+    @staticmethod
+    def _mxfp8_gmm_cpu_oracle(x, weight, counts, strategy, group_list_type):
+        """CPU reference for _GroupedLinearFunction.apply using expert-major counts."""
+        del strategy, group_list_type
+        parts = x.split(counts.tolist())
+        return torch.cat([part @ w.transpose(-2, -1) for part, w in zip(parts, weight)])
+
+    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_swiglu_runtime")
+    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_gmm_runtime")
+    @patch("hyper_parallel.components.modules.low_precision_grouped_experts.validate_npu_gmm_runtime")
+    def test_ep_preserves_mxfp8_family_experts_and_enforces_grouped_gemm(
+            self, low_prec_gmm_probe, gmm_probe, swiglu_probe,
+    ) -> None:
+        """
+        Feature: DeepSeek-V4.1 MXFP8 expert parallelism through Module Family.
+        Description: Bind EP after replacing DeepseekV4Experts with fused and non-fused MXFP8 Family variants.
+        Expectation: Both variants pass global EP replacement gates, retain their MXFP8 forward_expert_major,
+            reject use_grouped_gemm=False, and preserve clamped SwiGLU gradients during local EP execution.
+        """
+        del low_prec_gmm_probe, gmm_probe, swiglu_probe
+        for fused, expected_cls in ((True, FusedMXFP8GroupedSwiGLU), (False, LowPrecisionGroupedExperts)):
+            with self.subTest(fused=fused):
+                raw = deepseek_qat_config(weight_format="mxfp8", fused=fused).to_dict()
+                raw["training"]["low_precision"]["enabled"] = True
+                config = resolve_config(raw)
+                holder = deepseek_experts_model()
+                source_oracle = copy.deepcopy(holder.experts)
+                setup = DistributedSetup(low_precision_config=config.training.low_precision)
+                normalize_distributed_setup_overrides(setup, config)
+                plan = compile_module_replacements(holder, setup.module_replacements)
+                for blocked in ("tp", "cp", "pp"):
+                    with self.assertRaisesRegex(NotImplementedError, "TP=CP=PP=1"):
+                        _apply_module_replacement_actions(
+                            copy.deepcopy(holder), plan, weights_mapping=[],
+                            context={"low_precision": config.training.low_precision, blocked: True},
+                        )
+                _apply_module_replacement_actions(
+                    holder, plan, weights_mapping=[],
+                    context={"low_precision": config.training.low_precision, "ep": True, "ep_size": 2},
+                )
+                self.assertIs(type(holder.experts), expected_cls)
+                bound_major = holder.experts.forward_expert_major.__func__
+                self.assertIsNot(bound_major, _deepseek_v41_grouped_expert_forward)
+
+                mlp = SimpleNamespace(
+                    gate=Mock(), experts=holder.experts, shared_experts=torch.zeros_like,
+                    is_hash=False, forward=lambda hidden_states, input_ids=None: hidden_states,
+                )
+                ep_mesh = Mock()
+                ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 1))
+                with self.assertRaisesRegex(ValueError, "requires use_grouped_gemm=True"):
+                    deepseek_v41_ep_compute_fn(
+                        module=mlp, mesh=None, tp_mesh=None, cp_mesh=None,
+                        ep_mesh=ep_mesh, use_grouped_gemm=False,
+                    )
+                deepseek_v41_ep_compute_fn(
+                    module=mlp, mesh=None, tp_mesh=None, cp_mesh=None,
+                    ep_mesh=ep_mesh, use_grouped_gemm=True,
+                )
+                self.assertIs(holder.experts.forward_expert_major.__func__, bound_major)
+                self.assertEqual(holder.experts.local_expert_count, 4)
+
+                torch.manual_seed(0)
+                indices = torch.tensor([2, 0, 2, 3, 0])
+                inputs = (torch.randn(5, 128) * 10).requires_grad_()
+                reference_inputs = inputs.detach().clone().requires_grad_()
+                scores = torch.tensor([0.3, 0.7, 0.4, 0.5, 0.6], requires_grad=True)
+                reference_scores = scores.detach().clone().requires_grad_()
+
+                with patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.fused_grouped_swiglu",
+                           side_effect=self._mxfp8_fused_cpu_oracle) as fused_mock, \
+                     patch("hyper_parallel.components.modules.low_precision_grouped_experts."
+                           "_GroupedLinearFunction.apply", side_effect=self._mxfp8_gmm_cpu_oracle) as gmm_mock, \
+                     patch("hyper_parallel.distributed.expert_parallel.experts.ep_all_to_all",
+                           side_effect=lambda values, *_: values):
+                    routed = _run_ep_local_experts(mlp, inputs, indices[:, None], [5], [5], None, 0)
+                self.assertEqual(fused_mock.call_count, 1 if fused else 0)
+                self.assertEqual(gmm_mock.call_count, 0 if fused else 2)
+                actual = routed * scores[:, None]
+                expected = source_oracle(reference_inputs, indices[:, None], reference_scores[:, None])
+                unclamped_oracle = copy.deepcopy(source_oracle)
+                unclamped_oracle.limit = 0.0
+                unclamped = unclamped_oracle(inputs.detach(), indices[:, None], scores.detach()[:, None])
+                self.assertGreater((actual.detach() - unclamped).abs().max().item(), 0.1)
+                torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+                upstream = torch.randn_like(actual)
+                (actual * upstream).sum().backward()
+                (expected * upstream).sum().backward()
+                torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=1e-4, atol=1e-4)
+                torch.testing.assert_close(scores.grad, reference_scores.grad, rtol=1e-4, atol=1e-4)
+                for name in ("gate_up_proj", "down_proj"):
+                    torch.testing.assert_close(
+                        getattr(holder.experts, name).grad,
+                        getattr(source_oracle, name).grad.transpose(-2, -1),
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
