@@ -330,6 +330,25 @@ class FSDP2Manager:
                 blocks = list(child.named_children())
                 if not blocks:
                     continue
+                if not isinstance(child, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    # ``child`` is a single module with its own ``forward`` (e.g.
+                    # Qwen3-Omni's ``visual.merger`` / ``visual.patch_embed``), not
+                    # a container of repeated transformer blocks. Its own children
+                    # may include an ``nn.ModuleList`` that the module iterates by
+                    # hand (``for layer in self.mlp: ...``) and never ``__call__``s,
+                    # so wrapping those grandchildren as FSDP units registers
+                    # all-gather hooks that never fire -> parameters stay sharded at
+                    # compute time (AttributeError: 'Tensor' has no 'to_local').
+                    # Wrap the whole module as one FSDP unit so its all-gather hook
+                    # fires on ``child.__call__``.
+                    if id(child) in wrapped_module_ids:
+                        continue
+                    wrapped_module_ids.add(id(child))
+                    wrapped_module = _get_checkpoint_wrapped_module(child)
+                    if wrapped_module is not None:
+                        wrapped_module_ids.add(id(wrapped_module))
+                    wrap_modules.append(_WrapModuleInfo(child_fqn, child))
+                    continue
                 for block_name, block in blocks:
                     if id(block) in wrapped_module_ids:
                         continue
@@ -853,6 +872,8 @@ class FSDP2Manager:
             dense_root_kwargs,
             ignored_params,
         )
+        if self.config.zero_grad_for_missing_params:
+            model.set_zero_grad_for_missing_params(True)
         self._log_gradient_scaling(gradient_scaled_units)
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
         self._configure_prefetch(

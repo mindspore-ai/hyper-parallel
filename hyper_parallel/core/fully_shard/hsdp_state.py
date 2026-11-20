@@ -347,7 +347,8 @@ class HSDPStateV2:
                 or not hsdp_param.unsharded_param_buffers
                 or not hsdp_param.sharded_param.requires_grad
                 or (
-                    hsdp_param.unsharded_param.grad is None
+                    not hsdp_param.zero_grad_for_missing_params
+                    and hsdp_param.unsharded_param.grad is None
                     and hsdp_param.unsharded_accumulated_grad_data is None
                 )
             )
@@ -530,12 +531,23 @@ class HSDPStateV2:
             hsdp_param.reduce_partial_output = None
             hsdp_param.unsharded_accumulated_grad = None
             hsdp_param._grad = None
-            if hsdp_param.unsharded_param_buffers:
+            # ``_unsharded_param`` only exists once the module has run forward;
+            # a never-executed module has no grad to clear.
+            if hsdp_param.unsharded_param_buffers and hasattr(
+                hsdp_param, "_unsharded_param"
+            ):
                 hsdp_param.unsharded_param.grad = None
 
     def set_requires_grad_sync(self, requires_grad_sync: bool) -> None:
         """set requires grad sync flag to control gradient sync."""
         self.reduce_grads = requires_grad_sync
+
+    def set_zero_grad_for_missing_params(self, enabled: bool) -> None:
+        """set whether params without a grad reduce exact zeros."""
+        if not isinstance(enabled, bool):
+            raise ValueError(f"enabled should be a bool, got {type(enabled)}")
+        for hsdp_param in self.hsdp_params:
+            hsdp_param.zero_grad_for_missing_params = enabled
 
     def set_reduce_op_type(self, reduce_op_type: str) -> None:
         """set reduce op type for gradient reduction."""
