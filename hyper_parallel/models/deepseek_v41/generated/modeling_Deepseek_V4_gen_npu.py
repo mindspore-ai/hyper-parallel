@@ -113,20 +113,16 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import Deep
 class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
     """Generated source-visible parallel form."""
 
-    cp_enable = False
-
     def _forward_impl(self, *args, **kwargs):
-        if self.cp_enable:
-            if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
-                raise ValueError('shared attention parallel contexts are owned by the wrapper')
-            call_kwargs = dict(kwargs)
-            if self._hyper_v41_shared_attention_cp_context is not None:
-                call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
-            if self._hyper_v41_shared_attention_tp_context is not None:
-                call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
-            return super().forward(*args, **call_kwargs)
-
-        return super().forward(*args, **kwargs)
+        original_forward = super().forward
+        if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
+            raise ValueError('shared attention parallel contexts are owned by the wrapper')
+        call_kwargs = dict(kwargs)
+        if self._hyper_v41_shared_attention_cp_context is not None:
+            call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
+        if self._hyper_v41_shared_attention_tp_context is not None:
+            call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
+        return original_forward(*args, **call_kwargs)
     def forward(self, *args, **kwargs):
         # [HYPER BOUNDARY] input redistribution
         args, kwargs = self._hp_boundary.redistribute_inputs(
