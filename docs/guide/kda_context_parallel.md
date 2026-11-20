@@ -29,40 +29,34 @@ The inter-group chain has `R/g` owners, but each owner still applies its group's
 
 ## Configuration Entry Point
 
-Select the unified wrapper for KDA layers in training `plan_overrides`:
+Select the complete KDA module family in training `plan_overrides`:
 
 ```yaml
 plan_overrides:
-  - match: "*.self_attn.forward"
-    when: cp
+  - match: "*.self_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        _target_: hyper_parallel.components.modules.KimiDeltaAttention
         backend: triton
+        conv_backend: eager
         state_cp_method: grouped_allgather_p2p
         ulysses_degree: 2
         allgather_group_size: 2
 ```
 
-`replace.kind: method` replaces a method; `match` contains the module's fully qualified name (FQN) plus the literal method suffix `.forward`.
-For example, `"*.self_attn.forward"` matches `model.layers.0.self_attn.forward`; for a root-level module, use
-`"self_attn.forward"`. The module portion uses a case-sensitive glob, where `*` can cross dots in the path; it does not identify module types.
-If KDA and other attention modules both use the name `self_attn`, match only the actual KDA layers.
-`when: cp` enables the rule only when CP exceeds 1. Forward-method replacement currently defaults to `region_dispatch: false`;
-wrappers containing communication and custom operators execute on local tensors, so this default is omitted from the example.
-Place the wrapper and its arguments under `replace.implementation`.
-This example uses the current Trainer method-replacement interface; see [YAML Configuration](trainer/yaml_config.md).
+`replace.kind: module` replaces the whole module. Match actual KDA module FQNs without a `.forward` suffix.
+CP1 selects the local member; CP>1 selects the CP member. Remove legacy CP method wrappers from this target.
+See [module families](linear_attention_module_families.md) for ownership, TND layout and migration details.
 
 With CP8, this example creates U2, state CP4, within-group AG2, and a two-owner P2P chain.
 Total CP size comes from the training parallel configuration. `state_cp_method` selects only the state CP method; the full strategy also depends on
 `ulysses_degree` and `allgather_group_size`. For example, `state_cp_method: p2p` with `ulysses_degree: 2`
-means Ulysses + P2P. The unified entry point fixes the chunk size at 64 tokens and does not expose `chunk_size`;
-all backends use this size.
+means Ulysses + P2P. The family defaults `chunk_size` to 64; fused backends require 64, while eager accepts other positive sizes.
 
 | Parameter | Default | Meaning and constraints |
 |------|--------|------------|
-| `backend` | `triton` | Local KDA backend. P2P/Ulysses supports `eager`; P2P, AG, grouped AG, RD, and their Ulysses combinations support `triton` and `ascendc`. |
+| `backend` | `eager` | Local KDA backend. Local and pure-U execution support `eager`; P2P, AG, grouped AG, RD, and their Ulysses combinations support `triton` and `ascendc`. |
 | `state_cp_method` | `p2p` | State CP method: `p2p`, `allgather`, `grouped_allgather_p2p`, or `recursive_doubling`. |
 | `ulysses_degree` | `1` | U, a positive integer dividing CP size; both query/key and value head counts must be divisible by U. |
 | `allgather_group_size` | `1` | g, the number of state ranks per within-group AllGather, which must divide R. Used only for `grouped_allgather_p2p`; pure `allgather` gathers the full R group automatically and leaves this at 1. |
@@ -83,8 +77,9 @@ Common CP8 combinations:
 
 With `U=1`, Ulysses is skipped. With `U=P`, state CP size is 1 and only local KDA runs.
 The grouped protocol reduces to P2P at `g=1` and to AG at `g=R`.
-Existing `kimi_delta_attention_p2p_cp_wrapper` and `kimi_delta_attention_ulysses_cp_wrapper` remain available with unchanged default parallel methods.
-Their `chunk_size` parameters, and those of the underlying eager operators, remain available for direct invocation and reference validation.
+Legacy wrappers have been removed. Migrate their configuration to the complete module family.
+Choose convolution independently with `conv_backend`, and use `input_layout: TH` for flat packed tokens.
+`ulysses_degree: null` selects pure-U scheduling with convolution after head exchange; integer `U=P` preserves pre-exchange halo/convolution.
 
 ## Input and Mesh Constraints
 
@@ -95,7 +90,7 @@ Their `chunk_size` parameters, and those of the underlying eager operators, rema
 - Hybrid methods must retain the association between the CP submesh and root mesh to create subgroups consistently. Arbitrary rank permutations are unsupported.
   The final root mesh used for splitting must cover WORLD; retaining only a local root is insufficient for safely creating all sibling groups.
 - ShortConv exchanges halos between neighbors in the original CP sequence before Ulysses, keeping convolution boundaries independent of head rearrangement.
-- For packed/TND inputs with contiguous equal-length shards, see [TND Context Parallelism](linear_attention_tnd_cp.md). Inference caches and simultaneous TP and CP are unsupported. CP does not reduce parameter gradients;
+- For packed/TND inputs with contiguous equal-length shards, see [TND Context Parallelism](linear_attention_tnd_cp.md). Inference caches are unsupported. TP/SP composition uses the [module-family layouts](linear_attention_module_families.md). CP does not reduce parameter gradients;
   training still requires the framework's corresponding data parallelism and gradient management configuration.
 
 ## Memory and Selection Guidance
@@ -148,7 +143,7 @@ and RD reuses plans for that snapshot in a bounded CPU cache. The existing Kimi 
 For manual calls, reuse it as follows. Each new batch needs its own metadata; do not mutate indices already passed to backward.
 
 ```python
-from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
+from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import PackedSequenceInfo
 
 info = PackedSequenceInfo(global_offsets, cp_rank * local_tokens, (cp_rank + 1) * local_tokens)
 for layer in local_layers:
@@ -159,7 +154,7 @@ Passing raw `cu_seq_lens` to every layer remains correct but rebuilds the snapsh
 Sharing CPU plans does not share communication buffers or backward-state caches, which remain isolated per call.
 
 Communication and caches are isolated per call, supporting validated paths for reverse-order backward and non-reentrant checkpointing. Triton RD transition caches grow with the number of rounds;
-AG's single-local-M retention rule cannot be used to estimate RD. Simultaneous TP, graph capture, empty ranks, and unequal-length ranks are currently unsupported.
+AG's single-local-M retention rule cannot be used to estimate RD. Graph capture, empty ranks, and unequal-length ranks are currently unsupported. TP/SP uses the module-family layouts above.
 All low-level communication uses the public `torch.distributed.batch_isend_irecv`, leaving internal implementation selection to the backend.
 The framework does not switch private coalescing APIs by version or device model. Protocol qualification and full-layer training qualification must be assessed separately;
 logarithmic round counts do not guarantee performance at arbitrary CP sizes.
@@ -171,15 +166,15 @@ For dependencies and public operator interfaces, see the [functional documentati
 
 ```yaml
 plan_overrides:
-  - match: "*.self_attn.forward"
-    when: cp
+  - match: "*.self_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        _target_: hyper_parallel.components.modules.KimiDeltaAttention
         ulysses_degree: 8
         state_cp_method: p2p
         backend: ascendc
+        conv_backend: ascendc
 ```
 
 When `ulysses_degree` equals the CP mesh size, the state communication group has size 1 and only Ulysses AllToAll runs.

@@ -29,40 +29,34 @@ CP rank，并保持 CP mesh 中的 rank 顺序与全局 token 顺序一致。
 
 ## 配置入口
 
-在训练配置的 `plan_overrides` 中，为 KDA 层选择统一 wrapper：
+在训练配置的 `plan_overrides` 中选择完整 KDA 模块族，参见 [模块族说明](linear_attention_module_families.md)：
 
 ```yaml
 plan_overrides:
-  - match: "*.self_attn.forward"
-    when: cp
+  - match: "*.self_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        _target_: hyper_parallel.components.modules.KimiDeltaAttention
         backend: triton
+        conv_backend: eager
         state_cp_method: grouped_allgather_p2p
         ulysses_degree: 2
         allgather_group_size: 2
 ```
 
-`replace.kind: method` 替换方法；`match` 写模块完整路径（FQN）加字面方法后缀 `.forward`。
-例如 `"*.self_attn.forward"` 匹配 `model.layers.0.self_attn.forward`；根级模块使用
-`"self_attn.forward"`。模块部分使用大小写敏感的 glob，`*` 可以跨越路径中的点，不能据此识别模块类型。
-模型同时包含 KDA 和其他注意力、且都使用 `self_attn` 名称时，应只匹配实际 KDA 层。
-`when: cp` 表示仅在 CP 大于1时启用。当前 forward 方法替换默认 `region_dispatch: false`，
-包含通信和自定义算子的 wrapper 按本地张量路径执行，因此示例省略该默认项。
-wrapper 及其参数写在 `replace.implementation` 下。
-该示例采用当前 Trainer 的方法替换接口，见 [YAML 配置说明](trainer/yaml_config.zh.md)。
+`replace.kind: module` 替换完整模块，`match` 使用实际 KDA 模块路径，不加 `.forward`。
+例如 `"*.self_attn"` 匹配 `model.layers.0.self_attn`；如果同名模块包含其他注意力，只匹配实际 KDA 层。
+CP1 选择普通成员，CP>1 选择 CP 成员；不再叠加旧 CP method wrapper。
 
 上例在 CP8 下形成 U2、状态 CP4、组内 AG2 和两个组 owner 的 P2P 链。
 CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 CP 方式，完整方案还需结合
 `ulysses_degree` 和 `allgather_group_size` 判断；例如 `state_cp_method: p2p` 配合 `ulysses_degree: 2`
-表示 Ulysses + P2P。统一入口内部固定使用 64-token chunk，不暴露 `chunk_size` 配置；
-各后端均采用这一大小。
+表示 Ulysses + P2P。模块族的 `chunk_size` 默认 64，融合后端要求 64；eager 可显式指定其他正整数。
 
 | 参数 | 默认值 | 含义与约束 |
 |------|--------|------------|
-| `backend` | `triton` | 本地 KDA 后端。P2P/Ulysses 支持 `eager`；P2P、AG、分组 AG、RD 及其 Ulysses 组合支持 `triton` 和 `ascendc`。 |
+| `backend` | `eager` | 本地 KDA 后端。本地与纯 Ulysses 支持 `eager`；P2P、AG、分组 AG、RD 及其 Ulysses 组合支持 `triton` 和 `ascendc`。 |
 | `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`、`recursive_doubling`。 |
 | `ulysses_degree` | `1` | U；正整数，必须整除 CP 大小，且 query/key head 数和 value head 数都必须能被 U 整除。 |
 | `allgather_group_size` | `1` | g；每个组内 AllGather 包含的状态 rank 数，必须整除 R。仅用于 `grouped_allgather_p2p`；纯 `allgather` 自动收集整个 R 组，此项保持1。 |
@@ -83,8 +77,9 @@ CP8 的常用组合：
 
 `U=1` 时不做 Ulysses；`U=P` 时状态 CP 大小为 1，只运行本地 KDA。
 分组协议在 `g=1` 时退化为 P2P，在 `g=R` 时退化为 AG。
-已有 `kimi_delta_attention_p2p_cp_wrapper` 和 `kimi_delta_attention_ulysses_cp_wrapper` 继续可用，默认并行方式不变。
-它们及底层 eager 算子的 `chunk_size` 参数保留，供直接调用和参考验证使用。
+旧 wrapper 已删除；配置统一迁移为完整模块族替换。
+`conv_backend` 独立选择卷积；`input_layout: TH` 声明 flat TND 的 token 轴。纯 Ulysses 可使用
+`ulysses_degree: null`，采用交换后卷积；整数 `U=P` 保留交换前 halo/卷积调度，详见模块族说明。
 
 ## 输入与 mesh 约束
 
@@ -148,7 +143,7 @@ RD 在有限的 CPU 缓存中复用该快照对应的计划。已有 Kimi runtim
 手动调用时可按下面的方式复用；每个新 batch 需构建自己的元数据，不要修改已交给 backward 的索引。
 
 ```python
-from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
+from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import PackedSequenceInfo
 
 info = PackedSequenceInfo(global_offsets, cp_rank * local_tokens, (cp_rank + 1) * local_tokens)
 for layer in local_layers:
@@ -171,15 +166,15 @@ AG 的“只留一份本地 M”不能用于估算 RD。当前不支持同时 TP
 
 ```yaml
 plan_overrides:
-  - match: "*.self_attn.forward"
-    when: cp
+  - match: "*.self_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        _target_: hyper_parallel.components.modules.KimiDeltaAttention
         ulysses_degree: 8
         state_cp_method: p2p
         backend: ascendc
+        conv_backend: ascendc
 ```
 
 `ulysses_degree` 等于 CP mesh 大小时，状态通信域大小为 1，仅进行 Ulysses AllToAll。

@@ -12,18 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed adapters for Qwen3.5."""
+"""Shared sequence, construction and parallel helpers for KDA and GDN.
 
-from hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel import (
-    qwen3_5_gdn_p2p_cp_wrapper,
-    qwen3_5_gdn_ulysses_cp_wrapper,
-    qwen3_5_gdn_packed_local_wrapper,
-    qwen3_5_packed_decoder_wrapper,
-)
-
-__all__ = [
-    "qwen3_5_gdn_p2p_cp_wrapper",
-    "qwen3_5_gdn_ulysses_cp_wrapper",
-    "qwen3_5_gdn_packed_local_wrapper",
-    "qwen3_5_packed_decoder_wrapper",
-]
+This package provides support code, not an attention implementation or family.
+"""

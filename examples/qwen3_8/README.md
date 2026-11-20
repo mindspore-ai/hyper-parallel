@@ -2,9 +2,9 @@
 
 本目录使用 Hugging Face 的 Qwen3.8-27B 模型、HyperParallel 的 FSDP/CP，以及仓库内的高性能
 GDN 融合算子。三份训练 YAML 通过 `plan_overrides[*].replace.implementation` 选择
-[`TritonGDN`](../../hyper_parallel/components/modules/gdn_triton.py) 模块映射，把原模型的
-`chunk_gated_delta_rule` 绑定到仓库内的
-[`components/functional/gated_delta_net.py`](../../hyper_parallel/components/functional/gated_delta_net.py)。
+[`GatedDeltaNet`](../../hyper_parallel/components/modules/attention/gated_delta_net/gated_delta_net_family.py)
+完整模块族，使用 `backend: triton`，并通过独立的 `conv_backend` 指定卷积实现。CP 成员共享本地层参数，
+不再拦截来源模型的 `chunk_gated_delta_rule` primitive。
 
 - [`launch_1node_8dies.sh`](launch_1node_8dies.sh) **只启动 online** `train_online.yaml`，接受 Trainer 的
   `--section.field=value` 覆盖参数。

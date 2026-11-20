@@ -7,10 +7,10 @@ TND 将多个独立文档的 token 连续拼接。文档边界必须同时约束
 
 | 层与执行方式 | TND 支持 |
 |---|---|
-| KDA 本地层、P2P、纯 Ulysses | 支持；可选 eager 参考与 Triton-Ascend |
+| KDA 本地层、纯 Ulysses | 支持 eager 参考与 Triton-Ascend；状态 P2P 使用 Triton-Ascend |
 | KDA AllGather、分组 AllGather + P2P、Recursive Doubling | 支持；使用 Triton-Ascend |
 | KDA Ulysses + P2P / AllGather / 分组 AllGather + P2P / RD | 支持；保持原有并行配置入口 |
-| GDN 本地层、P2P、纯 Ulysses | 支持；可选 eager 参考与 Triton-Ascend |
+| GDN 本地层、纯 Ulysses | 支持 eager 参考与 Triton-Ascend；状态 P2P 使用 Triton-Ascend |
 | KDA / GDN 本地算子、纯 Ulysses | 可选 Ascend C；各后端的算子能力与限制见下文及 KDA 指南 |
 | KDA P2P、AllGather、分组 AllGather + P2P 及其 Ulysses 混合 | 另支持 Ascend C；原生摘要和独立反向接口要求见 [KDA 指南](kda_context_parallel.md#ascend-c-状态-p2pallgather-与分组混合) |
 
@@ -24,14 +24,14 @@ Ascend C 的原生接口 dtype 与转换见 KDA 指南及下文。
 TND 的真实文档和局部片段不必是 64 的倍数；Triton 摘要显式零填充尾块，Ascend C 由原生接口处理文档尾块。
 未提供 TND 元数据时保留定长路径；定长序列末尾同样允许不足64的 chunk。
 
-此入口不覆盖 zigzag 分片、不等长或空 rank、TP 与 CP 同时开启、推理缓存，以及任意 `seq_idx` 或
+此入口不覆盖 zigzag 分片、不等长或空 rank、推理缓存，以及任意 `seq_idx` 或
 Megatron `packed_seq_params` 的自动转换。GDN 的可选无 gate 分支也不属于本特性。
 混合模型中的 full-attention 层仍需要单独配置支持同一 TND 分片方式的后端；仅替换线性注意力层不足以
 使整个模型支持 TND。
 
 ## 文档边界与局部片段
 
-模型或整层 wrapper 的 `cu_seq_lens` 表示**当前 CP 组完整 token 流**的累计长度，包含开头的 0 和总长度。
+完整模块族的 `cu_seq_lens` 表示**当前 CP 组完整 token 流**的累计长度，包含开头的 0 和总长度。
 例如 CP4、每 rank 4096 token：
 
 ```python
@@ -56,25 +56,25 @@ output = layer(local_hidden, cu_seq_lens=(0, 6145, 12288, 16383, 16384))
 
 ## 配置
 
-KDA 沿用 [KDA 上下文并行](kda_context_parallel.md) 的 wrapper、`state_cp_method`、`ulysses_degree` 和
+KDA 沿用 [KDA 上下文并行](kda_context_parallel.md) 的模块族、`state_cp_method`、`ulysses_degree` 和
 `allgather_group_size`。TND 不增加一套 CP 方法，也不在每个 batch 创建通信组。
 例如 CP8 的 U2 + 组内 AG2 + 组间 P2P：
 
 ```yaml
 plan_overrides:
-  - match: "model.layers.0.self_attn.forward"
-    when: cp
+  - match: "model.layers.0.self_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        _target_: hyper_parallel.components.modules.KimiDeltaAttention
         backend: triton
+        conv_backend: eager
         state_cp_method: grouped_allgather_p2p
         ulysses_degree: 2
         allgather_group_size: 2
 ```
 
-`replace.kind: method` 使用实际模块 FQN 的 glob 加 `.forward` 方法后缀。以上具体层名只是示例；
+`replace.kind: module` 使用实际模块 FQN 的 glob，不加 `.forward`。以上具体层名只是示例；
 应为模型里的所有 KDA 层配置相应规则，
 不能把它应用到同名的 full-attention 层。
 
@@ -95,40 +95,50 @@ dataloader:
 Qwen3.5 使用 `hyper_parallel.models.qwen3_5.adapter.data.runtime.Qwen35PackedRuntime`。
 这两个 adapter 从全局 `cu_seq_lens` 和当前 CP 坐标构造元数据，并保留供 full-attention 层消费的全局长度别名。
 
-Qwen3.5 的线性 decoder 还需要显式转发元数据。为实际线性层的 decoder 和 mixer 分别配置 wrapper：
+Qwen3.5 来源 decoder 若未向 mixer 转发文档元数据，需要下面的显式转发规则；
+已原生转发 `**kwargs` 的新版 decoder 可省略该规则。mixer 选择完整 GDN 模块族，decoder wrapper 只转发元数据：
 
 ```yaml
 plan_overrides:
-  - match: "model.layers.0.linear_attn.forward"
-    when: cp
+  - match: "model.layers.0.linear_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
+        _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: triton
+        conv_backend: eager
+        ulysses_degree: 1
   - match: "model.layers.0.forward"
+    params: {}  # decoder 无直接参数；声明仅转发元数据的边界
     replace:
       kind: method
       implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_packed_decoder_wrapper
+        _target_: hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.qwen3_5_linear_attention_decoder_wrapper
 ```
 
-纯 Ulysses 将 mixer wrapper 换成 `qwen3_5_gdn_ulysses_cp_wrapper`。CP1 的 packed 控制使用
-`qwen3_5_gdn_packed_local_wrapper`，且不设置 `when: cp`。decoder wrapper 只能匹配线性 decoder；
-不能用 `model.layers.*.forward` 无区别地覆盖 full-attention 层。它保留参数归属与 FQN，并让非 packed 调用继续
-使用模型原来的 forward。以上不是完整 Trainer 配置，新增适配器本身也不代表所有 Transformers 版本均已验收。
+纯 Ulysses 将 mixer 的 `ulysses_degree` 设为 `null`，卷积通过 `conv_backend` 显式选择。
+CP1 自动选择普通 GDN 成员，无需 packed-local wrapper。decoder wrapper 只能匹配线性 decoder；
+不能无区别覆盖 full-attention 层。flat `[T,H]` 的模块布局需要 `input_layout: TH`。
+更多构造和迁移说明见 [模块族说明](linear_attention_module_families.md)。
 
 ## 纯 Ulysses 的后端选择
 
-KDA 与 GDN 的纯 Ulysses 整层 wrapper 用一个 `backend` 同时选择 attention core 和 ShortConv，
-定长 dense 与 packed 共用该配置：
+KDA 与 GDN 通过同一个模块族选择本地/CP 成员；`backend` 选择 attention core，
+独立的 `conv_backend` 选择卷积。定长 dense 与 packed 共用配置：
 
 ```python
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention import KimiDeltaAttentionLayerUlyssesCP
-from hyper_parallel.distributed.context_parallel.gated_delta_net import GatedDeltaNetUlyssesCP
+from hyper_parallel.components.modules import KimiDeltaAttention, GatedDeltaNet
 
-kda_layer = KimiDeltaAttentionLayerUlyssesCP(original_kda_layer, cp_mesh, backend="triton")
-gdn_layer = GatedDeltaNetUlyssesCP(original_gdn_layer, cp_mesh, backend="triton")
+# mesh_context is the training job MeshContext with a built device_mesh.
+
+kda_layer = KimiDeltaAttention(
+    module=original_kda_layer, mesh=mesh_context, backend="triton",
+    conv_backend="triton", ulysses_degree=None,
+)
+gdn_layer = GatedDeltaNet(
+    module=original_gdn_layer, mesh=mesh_context, backend="triton",
+    conv_backend="triton", ulysses_degree=None,
+)
 ```
 
 `eager` 使用 Torch 参考实现；`triton` 使用 FLA 的注意力与卷积算子，需要兼容的
@@ -188,18 +198,19 @@ GDN 前向状态算子同时包含 key-gate 的布局和地址修复：`gk` 在�
 ## GDN 的 Ascend C 后端
 
 Qwen3.5 纯 Ulysses 可选择 `backend: ascendc`，同一配置选择本地 attention 与 ShortConv。
-TND 的 decoder metadata wrapper 不变，CP1 的 packed local wrapper 也支持该后端。
+TND 的 decoder metadata wrapper 不变，CP1 由普通模块族成员执行。
 依赖与公开算子接口见 [functional 说明](../../hyper_parallel/components/functional/README.md#linear-attention-backends)。
 
 ```yaml
 plan_overrides:
-  - match: "model.layers.0.linear_attn.forward"
-    when: cp
+  - match: "model.layers.0.linear_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_ulysses_cp_wrapper
+        _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: ascendc
+        conv_backend: ascendc
+        ulysses_degree: null
 ```
 
 当前适配输入为核外归一化的 Q/K、有效 log-decay 与 sigmoid(beta)。它们的 autograd 链保留在调用方；
@@ -209,3 +220,26 @@ plan_overrides:
 当前不开放非零初态、最终态输出/梯度、double backward 与 Ascend C 状态 P2P。
 显式选择的后端不做静默回退。融合卷积需要宽度为 2/3/4、通道数能被 16 整除，
 输入、权重和 bias 使用相同的 BF16 或 FP16 dtype；不隐式降低参数精度。
+
+TP/SP 的 token 布局和模型元数据约定见 [KDA/GDN 模块族](linear_attention_module_families.md)。
+
+### Qwen 完整文本模型的 packed mask
+
+在完整 Qwen3.5 文本模型中，仅转发 `cu_seq_lens` 还不够：HF 会从本地 CP 输入
+另外生成显式 mask，与使用全局文档边界的 GQA CP 接口冲突。为全部 GDN/GQA 层选择
+支持 packed 的模块族后，在文本模型入口增加下面的规则：
+
+```yaml
+plan_overrides:
+  - match: "model.forward"
+    params: {}
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.qwen3_5_packed_model_wrapper
+```
+
+该适配只在显式收到 `packed_sequence_info` 时让 HF 使用两类 attention 的空 mask 映射，
+由模块族基于全局文档边界处理因果关系与文档隔离。它不删除文档边界、不忽略用户传入的
+任意 mask；显式 mask 或 recurrent cache 与此训练路径并用会报错。普通非 packed 调用保持原样。
+`model.forward` 对应文本 CausalLM 的实际路径，其他模型嵌套应使用其真实 FQN。

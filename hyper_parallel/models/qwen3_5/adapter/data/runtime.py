@@ -17,7 +17,9 @@
 from collections.abc import Mapping
 from typing import Any
 
-from hyper_parallel.components.functional.linear_attention_packed import resolve_packed_sequence
+from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import (
+    resolve_packed_sequence,
+)
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
 
 
@@ -37,8 +39,8 @@ class Qwen35PackedRuntime(RuntimeInputAdapter):
         shape = context.local_input_shape
         if len(shape) != 2 or shape[0] != 1:
             raise ValueError("Packed linear attention requires flattened input_ids [1,T].")
-        if context.parallel_sizes.get("tp", 1) != 1:
-            raise NotImplementedError("Packed linear attention TP with CP is not qualified.")
+        # input_ids retain the full CP interval on every TP rank. The common
+        # SP boundary restores that same interval before attention consumes it.
         if batch.get("cu_seq_lens") is None:
             raise ValueError("Packed linear attention requires global cu_seq_lens.")
         info = resolve_packed_sequence(

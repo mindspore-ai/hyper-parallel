@@ -16,6 +16,7 @@
 import copy
 from datetime import timedelta
 import os
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -23,8 +24,8 @@ import torch_npu
 from torch.utils.checkpoint import checkpoint
 
 import hyper_parallel as hp
-from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
-from hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel import kimi_delta_attention_cp_wrapper
+from hyper_parallel.distributed.context_parallel.cp_context import CPContext
+from hyper_parallel.components.modules import KimiDeltaAttention
 from tests.torch.context_parallel._test_kda_ag_layer import _model
 
 
@@ -47,17 +48,15 @@ def _setup():
     generator = torch.Generator().manual_seed(1103)
     full = torch.randn(1, length * mesh.size(), 512, generator=generator, dtype=torch.bfloat16)
     full_do = torch.randn(full.shape, generator=generator, dtype=torch.bfloat16) * .01
-    local, dout = [value.chunk(mesh.size(), 1)[mesh.get_local_rank()].contiguous().npu() for value in (full, full_do)]
-    return mesh, _model(), local, dout
+    local, grad_output = [value.chunk(mesh.size(), 1)[mesh.get_local_rank()].contiguous().npu() for value in (full, full_do)]
+    return mesh, _model(), local, grad_output
 
 
 def _wrap(base, mesh, protocol, ulysses):
     """Install the explicit state CP method on a fresh copy of the same layer."""
-    model = copy.deepcopy(base).npu()
-    request = kimi_delta_attention_cp_wrapper(
-        model, None, None, mesh, None, backend="triton", state_cp_method=protocol, ulysses_degree=ulysses,
-    )
-    _commit_forward_rewrite(request)
+    model = KimiDeltaAttention(module=copy.deepcopy(base).npu(), context={"cp_size": mesh.size()},
+                               backend="triton", state_cp_method=protocol, ulysses_degree=ulysses)
+    model.bind_parallel(SimpleNamespace(cp_context=CPContext(mesh)))
     return model
 
 
@@ -89,12 +88,12 @@ def _assert_compact_cache(outputs):
         if node is None or node in seen:
             continue
         seen.add(node)
-        if type(node).__name__ == "_KDAStateP2PFunctionBackward" and node.state_cp is not None:
+        if type(node).__name__ == "_KDAStateCPFunctionBackward" and node.state_cp is not None:
             _assert_invocation_cache(node)
         stack.extend(item[0] for item in node.next_functions)
 
 
-def _capture(model, value, dout, *, lifetime=False, checkpointed=False, group=None):
+def _capture(model, value, grad_output, *, lifetime=False, checkpointed=False, group=None):
     """Capture outputs and gradients while checking invocation-owned compact caches."""
     model.zero_grad(set_to_none=True)
     inputs = [value.detach().clone().requires_grad_() for _ in range(2 if lifetime else 1)]
@@ -102,7 +101,7 @@ def _capture(model, value, dout, *, lifetime=False, checkpointed=False, group=No
     if not checkpointed:
         _assert_compact_cache(outputs)
     for index in reversed(range(len(inputs))):
-        outputs[index].backward(dout if index == 0 else torch.zeros_like(dout))
+        outputs[index].backward(grad_output if index == 0 else torch.zeros_like(grad_output))
     result = {"output": outputs[0].detach().cpu(), "hidden": inputs[0].grad.cpu()}
     if lifetime and torch.count_nonzero(inputs[1].grad):
         raise AssertionError("Zero-loss invocation has a nonzero input gradient")
@@ -129,19 +128,23 @@ def _assert_compatible(actual, expected):
 
 
 def test_kda_rd_layer():
-    """Compare pure/hybrid RD with identical same-U controls and live caches."""
-    mesh, base, local, dout = _setup()
+    """Feature: RD complete-layer accuracy and cache lifetime.
+
+    Description: Compare pure/hybrid RD with same-U controls and concurrent graphs.
+    Expectation: Outputs and gradients meet the existing budget; saved caches are compact.
+    """
+    mesh, base, local, grad_output = _setup()
     for ulysses in (1, 2):
         model = _wrap(base, mesh, "recursive_doubling", ulysses)
-        local_reference = _capture(model, local, dout)
+        local_reference = _capture(model, local, grad_output)
         for checkpointed in (False, True):
-            result = _capture(model, local, dout, lifetime=True, checkpointed=checkpointed)
+            result = _capture(model, local, grad_output, lifetime=True, checkpointed=checkpointed)
             _assert_compatible(result, local_reference)
         print(f"PASS RD/U{ulysses} rank={mesh.get_local_rank()} reverse-live/cache/checkpoint", flush=True)
-        actual = _capture(model, local, dout, group=mesh.get_group())
+        actual = _capture(model, local, grad_output, group=mesh.get_group())
         del model, local_reference, result
         control = _wrap(base, mesh, "p2p", ulysses)
-        expected = _capture(control, local, dout, group=mesh.get_group())
+        expected = _capture(control, local, grad_output, group=mesh.get_group())
         _assert_compatible(actual, expected)
         print(f"PASS RD/U{ulysses} rank={mesh.get_local_rank()} same-input P2P comparison", flush=True)
         del control, actual, expected

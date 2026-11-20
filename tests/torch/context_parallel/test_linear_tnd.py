@@ -24,22 +24,41 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_linear_tnd_cpu():
-    """Feature: TND CP. Description: Four-rank independent reference. Expectation: Isolated samples and gradients."""
+    """Feature: TND CP.
+    Description: Four-rank independent reference.
+    Expectation: Isolated samples and gradients.
+    """
     torchrun_case(str(Path(__file__).with_name("_test_linear_tnd.py")), "test_linear_tnd_gloo", num_proc=4)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 @pytest.mark.parametrize("workers", [4, 8])
 def test_linear_tnd_npu(workers, monkeypatch):
-    """Feature: TND CP. Description: Kernels, protocols and replay. Expectation: Finite, isolated, identical replay."""
+    """Feature: TND CP.
+    Description: Kernels, protocols and replay.
+    Expectation: Finite, isolated, identical replay.
+    """
     monkeypatch.setenv("HCCL_DETERMINISTIC", "true")
     torchrun_case(str(Path(__file__).with_name("_test_linear_tnd.py")), "test_linear_tnd_npu", num_proc=workers)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_gdn_ascendc_npu(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Feature: Native GDN. Description: Dense/TND Ulysses and replay. Expectation: Exact core and reset parity."""
+    """Feature: Native GDN.
+    Description: Dense/TND Ulysses and replay.
+    Expectation: Exact core and reset parity.
+    """
     if find_spec("fla_npu") is None:
         pytest.skip("Ascend C GDN requires the optional fla-npu package")
     monkeypatch.setenv("HCCL_DETERMINISTIC", "true")
     torchrun_case(str(Path(__file__).with_name("_test_gdn_ascendc.py")), "test_gdn_ascendc_ulysses", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_linear_attention_tp_sp_npu():
+    """Feature: Linear-attention TP/SP.
+    Description: TP2 CP2, GDN GVA and shared gates.
+    Expectation: Correct gradients.
+    """
+    torchrun_case(str(Path(__file__).with_name("_test_linear_tnd.py")),
+                  "test_linear_attention_tp_sp_npu", num_proc=4)

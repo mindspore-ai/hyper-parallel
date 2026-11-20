@@ -37,6 +37,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.common.mark_utils import arg_mark
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -44,8 +46,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 class TestImportBoundaries(unittest.TestCase):
     """Import-time side-effect rules for the entry packages."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_import_has_no_distributed_or_network_side_effects(self):
-        """Importing entry packages inits no process group, opens no socket."""
+        """Feature: Import side effects.
+
+        Description: Import entry packages while rejecting network and process-group creation.
+        Expectation: Imports create neither a process group nor a network connection.
+        """
         probe = r"""
 import socket
 import sys
@@ -85,8 +93,60 @@ print("IMPORT_CLEAN")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("IMPORT_CLEAN", result.stdout)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_linear_attention_cp_import_without_optional_kernels(self):
+        """Feature: Optional backend isolation.
+
+        Description: Hide fused packages in a clean interpreter and load CP entry points.
+        Expectation: Eager/native entry imports succeed; requesting Triton still fails explicitly.
+        """
+        probe = r"""
+import importlib
+import sys
+import torch
+
+for name in ("triton", "fla", "fla_npu"):
+    sys.modules[name] = None
+
+prefix = "hyper_parallel.components.modules.attention."
+for module in ("kimi_delta_attention.cp_kimi_delta_attention",
+               "kimi_delta_attention.cp_state_ascendc",
+               "gated_delta_net.cp_gated_delta_net"):
+    importlib.import_module(prefix + module)
+
+from hyper_parallel.components.modules import KimiDeltaAttention, KimiRMSNormGated
+from hyper_parallel.components.functional import fused_chunk_kda
+assert callable(fused_chunk_kda)
+assert KimiRMSNormGated.__module__ == prefix + "kimi_delta_attention.kimi_delta_attention"
+layer = KimiDeltaAttention(hidden_size=8, num_heads=2, head_k_dim=4, head_v_dim=4, chunk_size=4)
+values = torch.randn(1, 7, 8, requires_grad=True)
+layer(values).sum().backward()
+assert torch.isfinite(values.grad).all()
+try:
+    backend = importlib.import_module("hyper_parallel.components.functional.kimi_delta_attention_triton")
+    backend.get_fla_kda_staged_ops()
+except ModuleNotFoundError as error:
+    assert error.name in ("triton", "fla"), str(error)
+except RuntimeError as error:
+    assert "FLA" in str(error) or "Triton" in str(error), str(error)
+else:
+    raise AssertionError("Missing Triton silently accepted")
+print("LINEAR_CP_IMPORT_CLEAN")
+"""
+        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                                cwd=_REPO_ROOT, timeout=300, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LINEAR_CP_IMPORT_CLEAN", result.stdout)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_kimi_mla_import_without_optional_kda_kernels(self):
-        """Importing gated MLA must not load KDA or its optional fused kernels."""
+        """Feature: Optional KDA dependency isolation.
+
+        Description: Import gated MLA while blocking optional KDA kernel packages.
+        Expectation: MLA loads without importing KDA or its fused kernel dependencies.
+        """
         probe = r"""
 import sys
 import torch

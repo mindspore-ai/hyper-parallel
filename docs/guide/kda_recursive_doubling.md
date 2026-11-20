@@ -4,7 +4,7 @@ Kimi Delta Attention（KDA）可以将各序列片段的状态写成仿射摘要
 递归倍增（Recursive Doubling，RD）按距离1、2、4等合成相邻区间，
 用对数级通信阶段代替 P2P 的逐片段传递。区间必须保持原有 token 顺序。
 
-本功能建立在 [KDA 混合上下文并行](kda_context_parallel.md) 的公共 Layer/Core 入口上。
+本功能建立在 [KDA 混合上下文并行](kda_context_parallel.md) 的完整模块族入口上。
 可以单独使用 RD，也可以先通过 Ulysses 交换 token/head，再对每个 head 分片执行 RD。
 本地 prepare、S/M/G、FLA h/dhu 及投影/卷积沿用公共实现，改变的是状态交换与调用缓存。
 默认 state_cp_method 仍为 p2p；RD 需要显式选择。
@@ -13,18 +13,19 @@ Kimi Delta Attention（KDA）可以将各序列片段的状态写成仿射摘要
 
 ```yaml
 plan_overrides:
-  - match: "*.self_attn.forward"
-    when: cp
+  - match: "*.self_attn"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        _target_: hyper_parallel.components.modules.KimiDeltaAttention
         backend: triton
+        conv_backend: eager
         state_cp_method: recursive_doubling
         ulysses_degree: 2
 ```
 
-match 是模块完整路径加 `.forward` 后缀，只应匹配真实 KDA 层；混合其他注意力类型时需要收窄范围。
+match 是实际 KDA 模块完整路径，不加 `.forward`；混合其他注意力类型时需要收窄范围。
+配置迁移和参数所有权见 [模块族说明](linear_attention_module_families.md)。
 ulysses_degree=1 表示纯 RD，大于1表示 Ulysses×RD；它必须整除总 CP 大小以及 query/value head 数。
 RD 不使用 allgather_group_size，该参数保持默认1。局部融合计算固定64-token chunk。
 
