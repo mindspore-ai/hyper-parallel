@@ -46,9 +46,15 @@ def _valid_positive_int(value: int, name: str) -> None:
 
 
 def _storage_key(tensor: Any) -> int:
-    """Return a stable identity for a tensor's underlying storage."""
+    """Return a stable identity for a tensor's underlying storage.
+
+    The key is the storage PyObject's identity, which stays distinct for the
+    pool's unpinned CPU buffers under logical simulation. The pool owns every
+    underlying buffer for its whole lifetime, so the id cannot be recycled
+    while a key is registered.
+    """
     try:
-        return int(tensor.untyped_storage().data_ptr())
+        return id(tensor.untyped_storage())
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError("release() expects a tensor with an identifiable storage.") from exc
 

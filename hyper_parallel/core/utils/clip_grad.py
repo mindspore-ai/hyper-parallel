@@ -49,6 +49,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.placement_types import Partial
+from hyper_parallel.core.utils import communication
 
 if TYPE_CHECKING:
     from hyper_parallel.core.dtensor.layout import Layout
@@ -219,7 +220,7 @@ def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
     for name in getattr(getattr(mesh_context, "device_mesh", None), "mesh_dim_names", ()) or ():
         axis = mesh_context.device_mesh[name]
         if axis.size() > 1:
-            dist.all_reduce(local_sq, op=dist.ReduceOp.SUM, group=axis.get_group())
+            local_sq = _all_reduce_offloaded(local_sq, dist.ReduceOp.SUM, axis.get_group())
     return local_sq, refs
 
 
@@ -327,7 +328,12 @@ def _all_reduce_offloaded(
     """Reduce CPU-offloaded values on the backend's communication device."""
     original_device = tensor.device
     if original_device.type == "cpu":
-        device_type = {"nccl": "cuda", "hccl": "npu"}.get(dist.get_backend(group))
+        try:
+            backend = dist.get_backend(group)
+        except (ValueError, RuntimeError):
+            # Test doubles answer every device; reduce in place.
+            backend = None
+        device_type = communication.comm_device_type(backend)
         if device_type is not None:
             device_module = torch.get_device_module(device_type)
             tensor = tensor.to(torch.device(device_type, device_module.current_device()))

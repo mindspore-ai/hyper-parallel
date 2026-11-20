@@ -24,7 +24,11 @@ from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.trainer.runtime.flops import estimate_step_flops
 from hyper_parallel.data.constants import IGNORE_INDEX
-from hyper_parallel.trainer.runtime.device import get_device_type, get_torch_device
+from hyper_parallel.trainer.runtime.device import (
+    get_device_type,
+    get_torch_device,
+    is_device_runtime_simulated,
+)
 
 from .base import Callback, TrainerState
 
@@ -295,7 +299,9 @@ class EnvironMeterCallback(Callback):
 
     def _memory_metrics(self) -> dict[str, float]:
         """Collect maximum accelerator memory metrics, if available."""
-        if get_device_type() == "cpu":
+        if get_device_type() == "cpu" or is_device_runtime_simulated():
+            # Logical simulation never touches the accelerator runtime;
+            # querying allocator statistics would initialize it.
             return {}
         device = get_torch_device()
         allocated = self._reduce(device.max_memory_allocated(), op="max")

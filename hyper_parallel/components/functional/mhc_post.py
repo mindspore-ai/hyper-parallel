@@ -14,6 +14,7 @@
 # ============================================================================
 """Manifold hyper-connection post-processing functions."""
 
+import importlib
 from typing import Any, Tuple
 
 import torch
@@ -21,6 +22,40 @@ import torch
 from hyper_parallel.tools.logging import get_logger
 
 logger = get_logger()
+
+
+class _CannMhcPost(torch.autograd.Function):
+    """Autograd bridge routing CANN mhc_post through the PyTorch dispatcher."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        h_res: torch.Tensor,
+        h_out: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
+        """Invoke the registered CANN mhc_post dispatcher op."""
+        # Keep the optional CANN extension out of CPU/non-CANN imports.
+        importlib.import_module("cann_ops_transformer.ops.mhc_post")
+
+        ctx.save_for_backward(x, h_res, h_out, h_post)
+        return torch.ops.cann_ops_transformer.mhc_post(x, h_res, h_out, h_post)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Invoke the registered CANN mhc_post_backward dispatcher op."""
+        # Keep the optional CANN extension out of CPU/non-CANN imports.
+        importlib.import_module("cann_ops_transformer.ops.mhc_post_backward")
+
+        x, h_res, h_out, h_post = ctx.saved_tensors
+        grad_x, grad_h_res, grad_h_out, grad_h_post = torch.ops.cann_ops_transformer.mhc_post_backward(
+            grad_output, x, h_res, h_out, h_post
+        )
+        return grad_x, grad_h_res, grad_h_out, grad_h_post
 
 
 class _MhcPost(torch.autograd.Function):
@@ -101,11 +136,9 @@ def mhc_post(
         # Load only the selected optional backend so either can be used independently.
         # pylint: disable=import-outside-toplevel
         if backend == "cann":
-            from cann_ops_transformer.ops import mhc_post as cann_mhc_post
-
             # CANN argument order: residual streams, residual matrix, block
             # output, post coefficients.
-            return cann_mhc_post(residual, h_res, x, h_post).flatten(2)
+            return _CannMhcPost.apply(residual, h_res, x, h_post).flatten(2)
         logger.warning(
             "mhc_post backend='omni' is deprecated and will be removed in a future release; "
             "use backend='cann'."

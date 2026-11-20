@@ -76,18 +76,24 @@ def _return_cpu_pinned_buf(buf):
     _CPU_PINNED_POOL[str(buf.dtype)].append(buf)
 
 
-def _collect_device_storage_ptrs(tensors: Any) -> Set[int]:
-    """Collect device storage pointers from a nested tensor structure."""
-    storage_ptrs = set()
+def _collect_device_storage_ids(tensors: Any) -> Set[int]:
+    """Collect device storage identities from a nested tensor structure.
+
+    Each storage is identified by its Python object identity, which stays
+    distinct for empty tensors and FakeTensors. The ids stay valid while the
+    owning tensors are alive, which the caller guarantees for the duration of
+    one protect pass.
+    """
+    storage_ids = set()
 
     def _collect(x):
         local_tensor = x.to_local() if isinstance(x, DTensor) else x
         if isinstance(local_tensor, _backend.Tensor) and str(local_tensor.device).lower() != "cpu":
-            storage_ptrs.add(local_tensor.untyped_storage().data_ptr())
+            storage_ids.add(id(local_tensor.untyped_storage()))
         return x
 
     _backend.tree_map(_collect, tensors)
-    return storage_ptrs
+    return storage_ids
 
 
 class SwapTensor:
@@ -122,13 +128,19 @@ class SwapTensor:
             self.storage_size = 0
 
     def dedup_key(self):
-        """Return a stable identity key for duplicate-swap detection."""
+        """Return a stable identity key for duplicate-swap detection.
+
+        The key is the storage PyObject's identity, which stays distinct for
+        every FakeTensor and empty storage. The SwapTensor keeps ``self.val``
+        (and with it the storage object) alive for the whole group lifecycle,
+        so the id cannot be recycled while the key is in a group's seen-set.
+        """
         if self._state == self.STATE_NON_TENSOR:
             return None
         val_storage = self.val.untyped_storage()
         return (
             str(self.val.device),
-            val_storage.data_ptr(),
+            id(val_storage),
             self.val.storage_offset(),
             val_storage.size(),
             tuple(self.val.stride()),
@@ -138,11 +150,15 @@ class SwapTensor:
         """Mark this wrapper as a duplicate registration in the same swap group."""
         self._duplicate_swap = True
 
-    def protect_if_aliases(self, alias_storage_ptrs: Set[int]) -> None:
-        """Keep tensors that alias externally-owned tensors on device."""
+    def protect_if_aliases(self, alias_storage_ids: Set[int]) -> None:
+        """Keep tensors that alias externally-owned tensors on device.
+
+        Args:
+            alias_storage_ids: Storage identities owned outside the swap group.
+        """
         if self._state == self.STATE_NON_TENSOR:
             return
-        if self.val.untyped_storage().data_ptr() in alias_storage_ptrs:
+        if id(self.val.untyped_storage()) in alias_storage_ids:
             self._keep_on_device = True
 
     def get_val(self) -> Any:
@@ -381,7 +397,11 @@ class Storage:
         return collected
 
     def mark_duplicate_swaps(self, seen_keys) -> int:
-        """Mark tensors already registered in the same swap group as duplicates."""
+        """Mark tensors already registered in the same swap group as duplicates.
+
+        Args:
+            seen_keys: Dedup keys already registered in this group.
+        """
         duplicate_count = 0
         for swap_tensor in self.iter_swap_tensors():
             dedup_key = swap_tensor.dedup_key()
@@ -394,14 +414,18 @@ class Storage:
             seen_keys.add(dedup_key)
         return duplicate_count
 
-    def protect_alias_storage_ptrs(self, alias_storage_ptrs: Set[int]):
-        """Avoid offloading swap entries that alias externally-owned storage."""
-        if not alias_storage_ptrs:
+    def protect_alias_storage_ids(self, alias_storage_ids: Set[int]) -> None:
+        """Avoid offloading swap entries that alias externally-owned storage.
+
+        Args:
+            alias_storage_ids: Storage identities owned outside the swap group.
+        """
+        if not alias_storage_ids:
             return
 
         def _protect_tensor(x):
             if isinstance(x, SwapTensor):
-                x.protect_if_aliases(alias_storage_ptrs)
+                x.protect_if_aliases(alias_storage_ids)
             return x
 
         for storage_list in self.values():
@@ -501,14 +525,18 @@ class SwapGroup:
         self._group_device_buf = None         # temp device bufs; cleared after each phase
         # Persistent dedup set accumulated across add() calls; avoids O(N²) rebuild.
         # mark_duplicate_swaps mutates it in-place, so new keys are added automatically.
-        # Reset at wait_load() so stale data_ptrs don't leak into the next iteration.
+        # Reset at wait_load() so stale storage ids don't leak into the next iteration.
         self._seen_dedup_keys: set = set()
         # Per-bucket SwapTensor lists built in _collect_packable_tensors and consumed
         # in launch_offload, eliminating a redundant pass over _packed_tensor_info.
         self._packed_by_bucket: Dict[str, List] = {}
 
     def add(self, storage):
-        """Add a storage to the swap group."""
+        """Add a storage to the swap group.
+
+        Args:
+            storage: Swap tensor storage wrapper being registered.
+        """
         duplicate_count = storage.mark_duplicate_swaps(self._seen_dedup_keys)
         if duplicate_count > 0:
             warnings.warn(
@@ -517,12 +545,16 @@ class SwapGroup:
         self._storages.append(storage)
 
     def protect_alias_tensors(self, tensors: Any):
-        """Protect externally-owned tensors from premature offload."""
-        alias_storage_ptrs = _collect_device_storage_ptrs(tensors)
-        if not alias_storage_ptrs:
+        """Protect externally-owned tensors from premature offload.
+
+        Args:
+            tensors: Nested tensors whose storages must stay on device.
+        """
+        alias_storage_ids = _collect_device_storage_ids(tensors)
+        if not alias_storage_ids:
             return
         for storage in self._storages:
-            storage.protect_alias_storage_ptrs(alias_storage_ptrs)
+            storage.protect_alias_storage_ids(alias_storage_ids)
 
     @staticmethod
     def _bucket_tensor(candidate_buckets, dtype_key, x):
@@ -658,7 +690,7 @@ class SwapGroup:
         for buf in group_device_bufs.values():
             device = getattr(buf, "device", None)
             if device is not None and device.type not in ("cpu", "meta"):
-                buf.record_stream(copy_stream)
+                _backend.record_stream(buf, copy_stream)
 
     def _acquire_bucket_cpu_buf(self, bucket_key, bucket):
         """Acquire the pinned CPU buffer that receives one bucket's D2H copy."""
@@ -915,7 +947,12 @@ class SwapManager:
         group.launch_offload(copy_stream)
 
     def protect_alias_tensors(self, group_name: str, tensors: Any):
-        """Keep tensors that alias externally-owned tensors on device."""
+        """Keep tensors that alias externally-owned tensors on device.
+
+        Args:
+            group_name: Swap group the tensors are being registered with.
+            tensors: Nested tensors whose storages must stay on device.
+        """
         group = self._groups.get(group_name)
         if group is None:
             raise RuntimeError(f"Group {group_name} does not exist.")

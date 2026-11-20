@@ -44,11 +44,18 @@ class TestMhcPre(unittest.TestCase):
         hin = torch.randn(B, S, C)
         h_post = torch.randn(B, S, N)
         h_res = torch.randn(B, S, N * N)
-        ops = ModuleType("cann_ops_transformer.ops")
-        ops.mhc_pre_sinkhorn = Mock(return_value=(hin, h_post, h_res))
-        package = ModuleType("cann_ops_transformer")
-        package.ops = ops
-        with patch.dict(sys.modules, {"cann_ops_transformer": package, "cann_ops_transformer.ops": ops}):
+        saved = (
+            torch.randn(B, S, N),
+            torch.randn(B, S, N * N + 2 * N),
+            torch.randn(B, S, 1),
+            torch.randn(40, B, S, N),
+            torch.randn(40, B, S, N, N),
+        )
+        cann_mod = ModuleType("cann_ops_transformer.ops.mhc_pre_sinkhorn")
+        cann_ns = Mock()
+        cann_ns.mhc_pre_sinkhorn = Mock(return_value=(hin, h_post, h_res, *saved))
+        with patch.dict(sys.modules, {"cann_ops_transformer.ops.mhc_pre_sinkhorn": cann_mod}), \
+                patch.object(torch.ops, "cann_ops_transformer", cann_ns, create=True):
             block_input, post, residual, streams = mhc_pre(
                 x, phi, alpha, beta, N, sinkhorn_iters=20, norm_eps=1e-6, hc_eps=1e-6,
             )
@@ -57,10 +64,10 @@ class TestMhcPre(unittest.TestCase):
         self.assertIs(post, h_post)
         self.assertEqual(residual.shape, (B, S, N, N))
         self.assertEqual(streams.shape, (B, S, N * C))
-        args = ops.mhc_pre_sinkhorn.call_args.args
+        args = cann_ns.mhc_pre_sinkhorn.call_args.args
         self.assertEqual(args[0].shape, (B, S, N, C))
         self.assertEqual(args[1].dtype, torch.float32)
-        self.assertEqual(args[4:], (N, 20, 1e-6, 1e-6))
+        self.assertEqual(args[4:], (N, 20, 1e-6, 1e-6, True))
 
     def test_cann_pre_folds_gamma_into_phi(self):
         """
@@ -73,14 +80,23 @@ class TestMhcPre(unittest.TestCase):
         phi = torch.randn(N * N + 2 * N, N * C)
         gamma = torch.randn(N, C)
         hin = torch.randn(B, S, C)
-        ops = ModuleType("cann_ops_transformer.ops")
-        ops.mhc_pre_sinkhorn = Mock(return_value=(hin, torch.randn(B, S, N), torch.randn(B, S, N * N)))
-        package = ModuleType("cann_ops_transformer")
-        package.ops = ops
-        with patch.dict(sys.modules, {"cann_ops_transformer": package, "cann_ops_transformer.ops": ops}):
+        saved = (
+            torch.randn(B, S, N),
+            torch.randn(B, S, N * N + 2 * N),
+            torch.randn(B, S, 1),
+            torch.randn(40, B, S, N),
+            torch.randn(40, B, S, N, N),
+        )
+        cann_mod = ModuleType("cann_ops_transformer.ops.mhc_pre_sinkhorn")
+        cann_ns = Mock()
+        cann_ns.mhc_pre_sinkhorn = Mock(
+            return_value=(hin, torch.randn(B, S, N), torch.randn(B, S, N * N), *saved)
+        )
+        with patch.dict(sys.modules, {"cann_ops_transformer.ops.mhc_pre_sinkhorn": cann_mod}), \
+                patch.object(torch.ops, "cann_ops_transformer", cann_ns, create=True):
             mhc_pre(x, phi, torch.randn(3), torch.randn(N * N + 2 * N), N, gamma=gamma)
 
-        folded = ops.mhc_pre_sinkhorn.call_args.args[1]
+        folded = cann_ns.mhc_pre_sinkhorn.call_args.args[1]
         torch.testing.assert_close(folded, phi * gamma.reshape(1, -1))
 
     def test_omni_backend_is_deprecated(self):

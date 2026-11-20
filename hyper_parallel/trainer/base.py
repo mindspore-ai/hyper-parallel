@@ -402,6 +402,10 @@ class BaseTrainer(Stateful, ABC):
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
         )
+        self._finalize_model_build()
+
+    def _finalize_model_build(self) -> None:
+        """Validate parameter dtypes and derive Trainer-owned model runtime state."""
         _validate_optimize_dtype(
             self.model,
             fp32_main_params=self.config.optimizer.fp32_main_params,

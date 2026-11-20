@@ -223,3 +223,34 @@
 
 # PyTorch has no public shutdown for a retained persistent DataLoader iterator.
 "hyper-parallel/hyper_parallel/data/distributed/metadata.py"             "protected-access"
+
+# Dry-run package __init__ uses PEP 562 __getattr__ lazy exports so importing
+# hyper_parallel.tools.dryrun does not eagerly load runner/torch submodules.
+"hyper-parallel/hyper_parallel/tools/dryrun/__init__.py"                 "undefined-all-variable"
+"hyper-parallel/hyper_parallel/tools/dryrun/__init__.py"                 "invalid-name"
+
+# Dry-run compatibility, runner, and example replay modules integrate with
+# internal Trainer, model_builder, optimizer, and PyTorch seams that have no
+# public override hooks.
+"hyper-parallel/hyper_parallel/tools/dryrun/compatibility.py"            "import-outside-toplevel"
+"hyper-parallel/hyper_parallel/tools/dryrun/compatibility.py"            "global-statement"
+"hyper-parallel/hyper_parallel/tools/dryrun/compatibility.py"            "protected-access"
+"hyper-parallel/hyper_parallel/tools/dryrun/runner.py"                   "protected-access"
+"hyper-parallel/hyper_parallel/tools/dryrun/examples/deepseek_v41.py"    "protected-access"
+
+# Meta-shell DTensor variants invoke Tensor.data.__set__ inside
+# DisableTorchFunctionSubclass to rebind local storage without __torch_function__.
+"hyper-parallel/hyper_parallel/core/dtensor/dtensor_base.py"             "unnecessary-dunder-call"
+
+# Legacy core files touched by dry-run simulation hooks have pre-existing
+# public functions without type hints or docstrings.
+"hyper-parallel/hyper_parallel/core/activation_memory/_backend.py"       "missing-public-type-hints"
+"hyper-parallel/hyper_parallel/core/activation_memory/pinned_memory_pool.py" "missing-public-docstring"
+"hyper-parallel/hyper_parallel/core/activation_memory/swap.py"           "missing-public-type-hints"
+"hyper-parallel/hyper_parallel/core/activation_memory/swap.py"           "missing-public-docstring"
+"hyper-parallel/hyper_parallel/core/dtensor/dtensor_base.py"             "missing-public-type-hints"
+"hyper-parallel/hyper_parallel/core/dtensor/dtensor_base.py"             "missing-public-docstring"
+"hyper-parallel/hyper_parallel/core/fully_shard/hsdp_param.py"           "missing-public-type-hints"
+"hyper-parallel/hyper_parallel/core/fully_shard/hsdp_param.py"           "missing-public-docstring"
+"hyper-parallel/hyper_parallel/core/fully_shard/hsdp_state.py"           "missing-public-type-hints"
+"hyper-parallel/hyper_parallel/core/fully_shard/param_group.py"          "missing-public-docstring"

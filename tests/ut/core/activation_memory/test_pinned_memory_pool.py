@@ -42,20 +42,14 @@ class _Event:
 
 
 class _SyntheticStorage:
-    """Storage exposing a caller-controlled identity."""
-
-    def __init__(self, key: int) -> None:
-        self.key = key
-
-    def data_ptr(self) -> int:
-        return self.key
+    """Storage stand-in; the pool keys blocks by this object's identity."""
 
 
 class _SyntheticView:
     """Tensor-like object used to emulate framework storage views."""
 
-    def __init__(self, key: int) -> None:
-        self.storage = _SyntheticStorage(key)
+    def __init__(self) -> None:
+        self.storage = _SyntheticStorage()
 
     def untyped_storage(self) -> _SyntheticStorage:
         return self.storage
@@ -64,13 +58,16 @@ class _SyntheticView:
 class _SyntheticBuffer(_SyntheticView):
     """Buffer whose slices expose identities different from the base buffer."""
 
-    def __init__(self, key: int, view_keys) -> None:
-        super().__init__(key)
-        self.view_keys = iter(view_keys)
+    def __init__(self, view_count: int = 0) -> None:
+        super().__init__()
+        self._remaining_views = view_count
 
     def __getitem__(self, index) -> _SyntheticView:
         del index
-        return _SyntheticView(next(self.view_keys))
+        if self._remaining_views <= 0:
+            raise AssertionError("unexpected view checkout")
+        self._remaining_views -= 1
+        return _SyntheticView()
 
 
 class TestPinnedMemoryPool(unittest.TestCase):
@@ -145,7 +142,7 @@ class TestPinnedMemoryPool(unittest.TestCase):
         self.assertEqual(pool.align_limit, 1500)
 
     def test_exact_capacity_checkout_returns_base_buffer(self) -> None:
-        buffer = _SyntheticBuffer(100, view_keys=())
+        buffer = _SyntheticBuffer()
         self.mock_platform.alloc_tensor_buffer.side_effect = [buffer]
         pool = PinnedMemoryPool(1024)
 
@@ -184,7 +181,7 @@ class TestPinnedMemoryPool(unittest.TestCase):
         self.assertIn("aligned_bytes=1024", error)
         self.assertIn("pooled_bytes=1024", error)
         self.assertIn("max_host_bytes=1500", error)
-        self.assertEqual(self.mock_platform.alloc_tensor_buffer.call_count, 1)
+        self.assertEqual(self.mock_platform.alloc_tensor_buffer.call_count, 1)  # pylint: disable=no-member
 
     def test_completed_pending_block_is_reclaimed_without_wait(self) -> None:
         """Reuse a completed pending block without synchronizing its event."""
@@ -248,16 +245,17 @@ class TestPinnedMemoryPool(unittest.TestCase):
     def test_tracks_storage_identity_of_each_returned_view(self) -> None:
         """Replace stale storage identities when returning a new view."""
         self.mock_platform.alloc_tensor_buffer.side_effect = [
-            _SyntheticBuffer(100, view_keys=(101, 102))
+            _SyntheticBuffer(view_count=2)
         ]
         pool = PinnedMemoryPool(1024)
 
         first = pool.acquire(600)
+        first_key = id(first.untyped_storage())
         pool.release(first)
         second = pool.acquire(600)
 
-        self.assertNotIn(101, pool._blocks)  # pylint: disable=protected-access
-        self.assertIn(102, pool._blocks)  # pylint: disable=protected-access
+        self.assertNotIn(first_key, pool._blocks)  # pylint: disable=protected-access
+        self.assertIn(id(second.untyped_storage()), pool._blocks)  # pylint: disable=protected-access
         pool.release(second)
 
     def test_allocation_failure_rolls_back_reserved_capacity(self) -> None:
