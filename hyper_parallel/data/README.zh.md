@@ -365,7 +365,7 @@ Indexed 路径使用同一 prefix 的两个文件：
 | 变长文档 | `low_level_dataset._target_: ...GPTDataset` | `GPTDataset` | document/sample/shuffle index 动态组样 |
 | 离线预切定长 record | `low_level_dataset._target_: ...GPTFromMRDataset` | `GPTFromMRDataset` | 直接读取固定 record |
 
-完整 target 模块为 `hyper_parallel.data.indexed.indexed_pretrain_dataset`。
+完整 target 模块为 `hyper_parallel.data.offline.dataset`。
 
 Indexed 的逻辑顺序为：
 
@@ -849,7 +849,7 @@ dataset:
     max_seq_len: 4096
     simple_blend: "no"
     low_level_dataset:
-      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
+      _target_: hyper_parallel.data.offline.dataset.GPTDataset
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader

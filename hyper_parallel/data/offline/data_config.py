@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Resolve indexed data paths and normalize GPT Dataset build options."""
+"""Normalize and validate offline Dataset build options."""
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -134,134 +133,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             raise ValueError("Attribute 'tokenizer' must not be None")
 
 
-def _discover_indexed_paths(
-    current_path: str,
-    rank: int,
-    world_size: int,
-    distributed_walk: bool,
-    file_suffix: str,
-) -> list[str]:
-    """Discover indexed prefixes under one directory."""
-    if not distributed_walk:
-        return _walk_data_directories([current_path], file_suffix)
-
-    root_layout = None
-    if rank == 0:
-        subdirectories = []
-        top_files = []
-        for name in os.listdir(current_path):
-            path = os.path.join(current_path, name)
-            if os.path.isdir(path):
-                subdirectories.append(path)
-            elif name.endswith(file_suffix):
-                top_files.append(os.path.splitext(path)[0] if file_suffix == ".bin" else path)
-        root_layout = (subdirectories, top_files)
-
-    gathered_layouts: list[tuple[list[str], list[str]] | None] = [None] * world_size
-    dist.all_gather_object(gathered_layouts, root_layout)
-    rank_zero_layout = gathered_layouts[0]
-    if rank_zero_layout is None:
-        raise ValueError("Rank 0 did not provide the indexed directory layout")
-    subdirectories, file_paths = rank_zero_layout
-    local_files = _walk_data_directories(subdirectories[rank::world_size], file_suffix)
-    gathered_files: list[list[str] | None] = [None] * world_size
-    dist.all_gather_object(gathered_files, local_files)
-    for rank_files in gathered_files:
-        if rank_files:
-            file_paths.extend(rank_files)
-    return file_paths
-
-
-def resolve_data_paths(
-    data_path: str | Sequence[str],
-    *,
-    distributed_walk: bool = True,
-    file_suffix: str = ".bin",
-) -> list[str]:
-    """Discover independent data files and return source paths with optional weights.
-
-    Args:
-        data_path: One indexed prefix, Arrow file, or sequence of directories/source paths.
-        distributed_walk: Whether initialized ranks divide directory walking.
-        file_suffix: Dataset storage suffix: .bin returns prefixes, .arrow keeps full file paths.
-
-    Returns:
-        One prefix directly, or alternating weight/prefix values for multiple sources. If ``data_path`` is not a
-        collection of discoverable indexed paths, return it unchanged so an explicit blend can be parsed.
-    """
-    # Both original and replacement workers use the same local ordering.
-    # Replaying a distributed directory walk would require parked peers.
-    return _resolve_data_paths(
-        data_path,
-        distributed_walk=distributed_walk and not is_recovery_enabled(),
-        file_suffix=file_suffix,
-    )
-
-
-def _resolve_data_paths(
-    data_path: str | Sequence[str],
-    *,
-    distributed_walk: bool,
-    file_suffix: str,
-) -> list[str]:
-    """Discover indexed prefixes using the ordinary initial-training path."""
-    # 1. Normalize one path and multiple paths to the same traversal form.
-    data_paths = [data_path] if isinstance(data_path, str) else list(data_path)
-
-    # 2. Use distributed walking only after the process group is available.
-    # Before initialization, one process walks all configured directories.
-    try:
-        rank = int(dist.get_rank())
-        world_size = int(dist.get_world_size())
-    except (RuntimeError, ValueError):
-        rank, world_size = 0, 1
-    use_distributed_walk = distributed_walk and world_size > 1
-
-    # 3. Accept a direct prefix, or recursively discover prefixes in a directory.
-    file_paths: list[str] = []
-    for current_path in data_paths:
-        if file_suffix == ".arrow" and current_path.endswith(file_suffix) and os.path.isfile(current_path):
-            file_paths.append(current_path)
-            continue
-        if file_suffix == ".bin" and os.path.isfile(current_path + ".bin"):
-            file_paths.append(current_path)
-            continue
-        if not os.path.isdir(current_path):
-            # Keep args.data_path unchanged when filesystem discovery
-            # returns no files. This preserves explicit forms such as
-            # ["30", prefix_a, "70", prefix_b] for the blend parser.
-            original_paths = list(data_paths)
-            return original_paths
-
-        file_paths.extend(_discover_indexed_paths(current_path, rank, world_size, use_distributed_walk, file_suffix))
-
-    if not file_paths:
-        raise ValueError(f"data_path {data_paths!r} has no data file ending with {file_suffix}")
-
-    if len(file_paths) == 1:
-        return file_paths
-
-    if file_suffix == ".arrow":
-        # Every rank must blend files in the same order after directory discovery.
-        file_paths.sort()
-    else:
-        # 4. Prefer the numeric shard order encoded by the corpus filenames.
-        # Unknown naming schemes remain usable in their original walk order.
-        try:
-            def numeric_shard_key(path: str) -> tuple[int, int]:
-                """Extract numeric corpus and shard identifiers from a path."""
-                path_parts = os.path.basename(path).split("_")
-                return int(path_parts[2]), int(path_parts[-1])
-
-            file_paths.sort(key=numeric_shard_key)
-        except (IndexError, TypeError, ValueError):
-            logger.warning("Cannot sort indexed files with the numeric filename rule; keeping walk order")
-
-    # 5. Automatically discovered sources use equal blend weights.
-    weighted_paths = [value for path in file_paths for value in ("1", path)]
-    return weighted_paths
-
-
 def build_gpt_dataset_config(
     data_paths: Sequence[str],
     data_config: Mapping[str, Any],
@@ -269,7 +140,7 @@ def build_gpt_dataset_config(
     """Build a GPT Dataset config from provider fields.
 
     Args:
-        data_paths: Weighted prefixes returned by :func:`resolve_data_paths`.
+        data_paths: Weighted source paths discovered by the offline Dataset builder.
         data_config: Indexed pretraining configuration supplied by the caller.
 
     Returns:
@@ -328,21 +199,6 @@ def build_gpt_dataset_config(
     logger.debug("Resolved indexed sources=%d, first four=%s", len(source_paths), source_paths[:4])
 
     return config
-
-
-def _walk_data_directories(directories: Sequence[str], file_suffix: str) -> list[str]:
-    """Recursively find source files below the assigned directories."""
-    file_paths = []
-    for directory in directories:
-        for root, subdirectories, filenames in os.walk(directory):
-            if is_recovery_enabled():
-                subdirectories.sort()
-                filenames = sorted(filenames)
-            for filename in filenames:
-                if filename.endswith(file_suffix):
-                    path = os.path.abspath(os.path.join(root, filename))
-                    file_paths.append(os.path.splitext(path)[0] if file_suffix == ".bin" else path)
-    return file_paths
 
 
 def resolve_dataset_type(spec: Mapping[str, Any] | type) -> type:

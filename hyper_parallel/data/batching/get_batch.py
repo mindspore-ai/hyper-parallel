@@ -33,8 +33,8 @@ from hyper_parallel.data.constants import (
     OMNI_LOSS_INPUT_FIELDS,
 )
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_data_config import resolve_dataset_type
-from hyper_parallel.data.indexed.indexed_pretrain_dataset import SFTFromMRDataset
+from hyper_parallel.data.offline.data_config import resolve_dataset_type
+from hyper_parallel.data.offline.dataset import SFTFromMRDataset
 from hyper_parallel.data.parallel import (
     CPBatchSharder,
     DataLoaderParallelContext,

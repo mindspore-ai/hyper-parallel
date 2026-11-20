@@ -114,7 +114,7 @@ dataset:
     create_ltor_fields_in_dataloader: false
     data_cache_path: ./outputs/deepseek_v32/data_cache
     low_level_dataset:
-      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
+      _target_: hyper_parallel.data.offline.dataset.GPTDataset
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader

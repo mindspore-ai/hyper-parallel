@@ -368,7 +368,7 @@ Two mid-level Dataset types:
 | Variable-length documents | `low_level_dataset._target_: ...GPTDataset` | `GPTDataset` | Dynamic samples from document/sample/shuffle indices |
 | Offline fixed-length records | `low_level_dataset._target_: ...GPTFromMRDataset` | `GPTFromMRDataset` | Read fixed records directly |
 
-The full target module is `hyper_parallel.data.indexed.indexed_pretrain_dataset`.
+The full target module is `hyper_parallel.data.offline.dataset`.
 
 Indexed processing order:
 
@@ -862,7 +862,7 @@ dataset:
     max_seq_len: 4096
     simple_blend: "no"
     low_level_dataset:
-      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
+      _target_: hyper_parallel.data.offline.dataset.GPTDataset
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
