@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+from copy import copy
 from dataclasses import dataclass
 from functools import partial
 import inspect
@@ -25,10 +26,16 @@ from typing import Any
 
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
 from hyper_parallel.distributed.mesh import LogicalDeviceMesh
+from hyper_parallel.models.registry import resolve_model_adapter
 
 
 @dataclass(frozen=True)
 class _GroupReference:
+    axis: str
+
+
+@dataclass(frozen=True)
+class _RankReference:
     axis: str
 
 
@@ -49,6 +56,10 @@ class _MethodMesh(LogicalDeviceMesh):
             raise ValueError(f"Unknown logical method group {name!r}")
         return _GroupReference(name)
 
+    def get_local_rank(self, name=None):
+        """Leave the execution rank symbolic so exported source works on every rank."""
+        return _RankReference(self.get_group(name).axis)
+
 
 class _MethodNames(ast.NodeTransformer):
     def __init__(self, expressions):
@@ -63,6 +74,13 @@ class _MethodNames(ast.NodeTransformer):
 def _expression(value: Any, imports: set[str]) -> str:
     if isinstance(value, _GroupReference):
         return f"self._hp_{value.axis}_group"
+    if isinstance(value, _RankReference):
+        return f"self._hp_{value.axis}_mesh.get_local_rank()"
+    if isinstance(value, _MethodMesh) and len(value.mesh_dim_names) == 1:
+        return f"self._hp_{value.mesh_dim_names[0]}_mesh"
+    if isinstance(value, tuple):
+        items = ", ".join(_expression(item, imports) for item in value)
+        return f"({items},)" if value else "()"
     if value is None or isinstance(value, (bool, int, float, str)):
         return repr(value)
     if inspect.isfunction(value) or inspect.isbuiltin(value):
@@ -83,7 +101,7 @@ def _expression(value: Any, imports: set[str]) -> str:
             expressions = {key: f"{alias}.{key}" for key in closure.globals}
             for key, item in closure.nonlocals.items():
                 expression = _expression(item, imports)
-                if isinstance(item, _GroupReference):
+                if "self." in expression:
                     if not function.args.args:
                         raise ValueError(f"Codegen closure {name!r} has no resource owner argument")
                     expression = expression.replace("self.", function.args.args[0].arg + ".", 1)
@@ -130,6 +148,26 @@ def _method_source(function: Any, name: str, imports: set[str]) -> str:
     return ast.unparse(node)
 
 
+def _source_spec(spec: Any, provider: Any) -> Any:
+    """Pass an optional model-owned source view through the unchanged native resolver."""
+    select = getattr(provider, "source_compute_factory", None)
+    if select is None:
+        return spec
+    original = spec.local_compute_fn
+    factory = getattr(original, "_target_", original)
+    selected = select(factory)
+    if selected is factory:
+        return spec
+    result = copy(spec)
+    if hasattr(original, "_target_"):
+        target = copy(original)
+        target._target_ = selected  # pylint: disable=protected-access
+        result.local_compute_fn = target
+    else:
+        result.local_compute_fn = selected
+    return result
+
+
 def observe_local_methods(plan: Any, model: Any, mesh_context: Any) -> dict[str, dict]:
     """Run the original resolver on the isolated meta model and export its result.
 
@@ -145,11 +183,16 @@ def observe_local_methods(plan: Any, model: Any, mesh_context: Any) -> dict[str,
     mesh = _MethodMesh(dense.mesh_dim_names, dense.shape)
     expert_mesh = _MethodMesh(expert.mesh_dim_names, expert.shape) if expert is not None else None
     modules = dict(model.named_modules(remove_duplicate=False))
+    adapter = resolve_model_adapter(model)
+    loader = getattr(adapter, "codegen", None)
+    provider = loader() if loader is not None else None
     before = {path: dict(module.__dict__) for path, module in modules.items()}
     try:
         resolved = {}
         for path, spec in entries:
-            function = _resolve_local_compute_fn(modules[path], spec, mesh, plan.mesh_dim_names, expert_mesh)
+            function = _resolve_local_compute_fn(
+                modules[path], _source_spec(spec, provider), mesh, plan.mesh_dim_names, expert_mesh,
+            )
             factory = spec.local_compute_fn
             factory = getattr(factory, "_target_", factory)
             resolved.setdefault(path, {})[factory.__name__] = function

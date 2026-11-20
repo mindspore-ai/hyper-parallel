@@ -92,12 +92,15 @@ def _local_router_metadata(tensor: torch.Tensor | None, states: torch.Tensor, tp
     return tensor.narrow(-1, tp_mesh.get_local_rank() * local_length, local_length)
 
 
+def _router_sequence_groups(tp_mesh: Any, cp_mesh: Any) -> tuple[Any, ...]:
+    """Return the resources covering token partitions, without binding a router."""
+    return tuple(axis.get_group() for axis in (cp_mesh, tp_mesh)
+                 if axis is not None and axis.size() > 1)
+
+
 def _configure_router_statistics(gate: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any) -> tuple[Any, ...]:
     """Configure bias-update groups and return the router's token-partition groups."""
-    sequence_groups = tuple(
-        axis.get_group() for axis in (cp_mesh, tp_mesh)
-        if axis is not None and axis.size() > 1
-    )
+    sequence_groups = _router_sequence_groups(tp_mesh, cp_mesh)
     dp_groups = tuple(
         mesh[name].get_group() for name in (mesh.mesh_dim_names if mesh is not None else ())
         if name in ("dp", "dp_replicate", "dp_shard") and mesh[name].size() > 1
@@ -345,6 +348,19 @@ def deepseek_v41_megamoe_compute_fn(
     Returns:
         The local compute callable matching the source forward signature.
     """
+    ep_group, arguments = _megamoe_compute_context(
+        module=module, mesh=mesh, tp_mesh=tp_mesh, cp_mesh=cp_mesh, ep_mesh=ep_mesh, fix_router=fix_router,
+    )
+    sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
+    module.experts.configure(ep_group, module.gate.top_k)
+    return _build_megamoe_compute(sequence_groups=sequence_groups, **arguments)
+
+
+def _megamoe_compute_context(
+        *, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any, fix_router: bool = False,
+) -> tuple[Any, dict[str, Any]]:
+    """Validate the native compute contract before allocating execution resources."""
+    del mesh, cp_mesh
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 MegaMoe")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 MegaMoe requires learned routing")
@@ -365,9 +381,17 @@ def deepseek_v41_megamoe_compute_fn(
     tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
     if dist.is_initialized() and dist.get_world_size(ep_group) != ep_size:
         raise ValueError("MegaMoe EP mesh and process group sizes must match")
-    sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
-    module.experts.configure(ep_group, module.gate.top_k)
+    return ep_group, {
+        "module": module, "tp_mesh": tp_mesh, "tp_size": tp_size, "tp_rank": tp_rank,
+        "ep_size": ep_size, "fix_router": fix_router,
+    }
 
+
+def _build_megamoe_compute(
+        *, module: Any, tp_mesh: Any, tp_size: int, tp_rank: int, ep_size: int,
+        fix_router: bool, sequence_groups: tuple[Any, ...],
+) -> Callable:
+    """Build the shared computation without creating or configuring an executor."""
     def compute_fn(
             module: Any, hidden_states: torch.Tensor,
             input_ids: torch.Tensor | None = None, image_mask: torch.Tensor | None = None,
