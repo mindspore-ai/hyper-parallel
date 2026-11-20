@@ -710,9 +710,15 @@ class Muon(torch.optim.Optimizer):
         nesterov: bool = True,
         weight_decay: float = 0.1,
         hsdp_replica_count: int | None = None,
+        *,
+        use_kernel: bool = False,
         ...
     )
 ```
+
+On Ascend NPU, set `use_kernel=True` to run the two symmetric matrix products
+in each built-in Newton–Schulz iteration with Triton-Ascend. Parameter groups can
+override the flag. When using `get_hyper_optimizer`, pass `muon_kwargs={"use_kernel": True}`.
 
 `hsdp_replica_count` sets the target size of each Muon HSDP replicate subgroup
 when topology detection enables splitting. The default `None` lets Muon infer

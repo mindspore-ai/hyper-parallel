@@ -25,7 +25,10 @@ single submodule (e.g. ``functional.npu_grouped_swiglu``).
 # pylint: disable=invalid-name,undefined-all-variable
 
 import importlib
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.functional._symmetric_matmul import symmetric_matmul
 
 _EXPORT_TO_MODULE = {
     "aggregate_hidden": "aggregate_hidden",
@@ -62,6 +65,7 @@ _EXPORT_TO_MODULE = {
     "situ": "activation_situ",
     "situ_packed": "activation_situ",
     "swiglu": "swiglu",
+    "symmetric_matmul": "_symmetric_matmul",
 }
 
 
@@ -115,4 +119,5 @@ __all__ = [
     "situ",
     "situ_packed",
     "swiglu",
+    "symmetric_matmul",
 ]

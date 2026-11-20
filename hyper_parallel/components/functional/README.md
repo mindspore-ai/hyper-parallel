@@ -20,6 +20,45 @@ query, key = apply_rotary_pos_emb(query, key, cos, sin)
 Use `apply_rotary_pos_emb_interleave` for Transformers models whose source
 attention calls the interleaved variant.
 
+## Symmetric matrix multiplication
+
+```python
+import torch
+from hyper_parallel.components.functional import symmetric_matmul
+
+# x: [N, K] or [B, N, K]; use torch.no_grad() for inputs requiring gradients.
+gram = symmetric_matmul(x, x.mT)
+square = symmetric_matmul(gram, gram)
+accumulators = symmetric_matmul(x, x.mT, out_dtype=torch.float32)
+```
+
+The caller guarantees that `a @ b` is mathematically symmetric. The forward-only
+Triton-Ascend implementation computes lower-triangular tiles in FP32 and mirrors
+the rounded values to produce a complete, bitwise-symmetric matrix. Muon can
+opt in to this operation for its two symmetric products with `use_kernel=True`.
+
+Inputs are matching 2D matrices or 3D batches in FP16/BF16 on the same Ascend NPU.
+Contiguous matrices and last-two-axis transposes are accepted without layout
+copies. Broadcasting and backward are unsupported. The output uses the input
+dtype unless `out_dtype=torch.float32` is requested. `out=` may reuse a contiguous
+destination with the selected metadata, but must not share storage with either
+input. Empty outputs and zero-length reductions need no Triton launch.
+
+Install [Triton-Ascend](https://github.com/triton-lang/triton-ascend) with compatible
+PyTorch, torch-npu and CANN versions. Optional device/compiler dependencies are
+loaded on the first nonempty product; imports do not initialize the backend.
+Install a CANN-compatible [PyAsc](https://pypi.org/project/pyasc/) to enable host
+tiling queries. On the first call for a device, shape, dtype and layout, the
+launcher queries Ascend C Matmul tiling and caches compatible Triton blocks.
+It uses static Triton blocks when PyAsc is absent, the plan does not fit the
+triangular kernel, or the plan would use fewer Cube cores. The Triton K step can
+group multiple CANN base blocks.
+Warm up each configuration before NPU graph capture.
+Compiler and execution failures propagate. No CANN environment settings are
+changed by the function. For native matmul precision comparisons, launch the
+process with `CLOSE_MATMUL_K_SHIFT=1`; bitwise parity for all shapes and inputs is
+not guaranteed. Kernel/device qualification must be measured on the target NPU.
+
 ## MoE functions
 
 The reusable MoE interfaces include:
