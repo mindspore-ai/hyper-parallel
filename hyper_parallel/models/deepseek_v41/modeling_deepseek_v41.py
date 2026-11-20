@@ -856,6 +856,13 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         self.gradient_checkpointing = False
         self._megamoe_runtime_prepared = False
         self.post_init()
+        # A zero construction-time coefficient disables Indexer learning for this run.
+        # Keep selection weights in the model, but omit their uninitialized optimizer state.
+        if float(getattr(config, "v41_indexer_loss_coeff", 0.0)) == 0.0:
+            for layer in self.layers:
+                indexer = getattr(layer.self_attn, "indexer", None)
+                if indexer is not None:
+                    indexer.requires_grad_(False)
 
     def _prepare_megamoe_runtime(self) -> None:
         """Share serial expert workspace once after EP binding and before execution."""

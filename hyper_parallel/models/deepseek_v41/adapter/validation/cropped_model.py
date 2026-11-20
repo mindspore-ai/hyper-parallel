@@ -418,7 +418,9 @@ def build_deepseek_v41_validation_config(
         enable_candidate_pool: Retain hierarchical candidates when True. Defaults to False, which
             disables candidate-specific crop remapping and preserves the
             retained released Full/Reindex/Reuse roles with full-range causal indexing.
-        indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        indexer_loss_coeff: Sparse-stage Indexer KL coefficient. Zero freezes Indexer
+            parameters at model construction while retaining selection and checkpoint weights.
+            Changing this training policy requires rebuilding parallel and optimizer state.
         router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
         router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
@@ -521,7 +523,9 @@ def build_cropped_deepseek_v41(
             Only applies when enable_candidate_pool is True.
         enable_candidate_pool: Enable hierarchical candidates. Defaults to False, which disables
             candidate-specific remapping and preserves the retained released layer roles.
-        indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        indexer_loss_coeff: Sparse-stage Indexer KL coefficient. Zero freezes Indexer
+            parameters at model construction while retaining selection and checkpoint weights.
+            Changing this training policy requires rebuilding parallel and optimizer state.
         router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
         router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
