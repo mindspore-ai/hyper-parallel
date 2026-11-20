@@ -14,6 +14,7 @@
 # ============================================================================
 """CPU regression tests for configurable DeepSeek-V4.1 validation crops."""
 
+from copy import deepcopy
 import json
 import tempfile
 import unittest
@@ -25,12 +26,16 @@ import torch
 from safetensors.torch import save_file
 
 from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
+from hyper_parallel.components.optim.parameter_groups import get_adamw_param_groups
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.models.deepseek_v41.adapter.validation import cropped_model
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
     build_cropped_deepseek_v41,
     build_deepseek_v41_validation_config,
 )
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Engram, DeepseekV41ForCausalLM
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
+    DeepseekV41Engram, DeepseekV41ForCausalLM, SharedAttentionState,
+)
 
 
 def _write_engram_assets(
@@ -143,6 +148,96 @@ def _write_released_config(directory: str) -> Path:
 
 class TestDeepseekV41ValidationCrop(unittest.TestCase):
     """Depth crops preserve retained model roles and reject inconsistent layouts."""
+
+    def test_zero_kl_freezes_only_indexer_parameters(self):
+        """Preserve selection weights while excluding permanently inactive training parameters.
+
+        Feature: Static Indexer trainability for disabled KL.
+        Description: Construct the complete released role sequence with KL off and on.
+        Expectation: Only Indexer parameters freeze at zero; all state keys are retained.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            keys = None
+            for coefficient in (0.0, 0.001):
+                with self.subTest(coefficient=coefficient):
+                    config = build_deepseek_v41_validation_config(
+                        directory, str(assets_path), indexer_loss_coeff=coefficient,
+                    )
+                    config.v41_engram_layer_ids = []
+                    with torch.device("meta"):
+                        model = DeepseekV41ForCausalLM(config)
+                    current_keys = tuple(model.state_dict())
+                    if keys is None:
+                        keys = current_keys
+                    self.assertEqual(current_keys, keys)
+                    indexer_count = 0
+                    for layer in model.model.layers:
+                        attention = layer.self_attn
+                        self.assertTrue(attention.q_a_proj.weight.requires_grad)
+                        self.assertTrue(attention.kv_proj.weight.requires_grad)
+                        if attention.is_index_source:
+                            indexer_count += 1
+                            self.assertTrue(all(
+                                parameter.requires_grad == (coefficient != 0.0)
+                                for parameter in attention.indexer.parameters()
+                            ))
+                        if attention.is_kv_source:
+                            self.assertTrue(attention.compressor.wkv.weight.requires_grad)
+                    self.assertEqual(indexer_count, len(config.v41_index_source_layer_ids))
+
+    def test_zero_kl_optimizer_restores_into_fresh_attention(self):
+        """Resume the real attention learning path without inactive Indexer optimizer state.
+
+        Feature: Strict optimizer restore with Indexer KL disabled.
+        Description: Train, save, reconstruct and restore both optimizer-state formats.
+        Expectation: Selection remains executable and the next parameter update matches exactly.
+        """
+        def build_attention(config, flatten):
+            attention = DeepseekV41ForCausalLM(config).model.layers[2].self_attn
+            groups, _ = get_adamw_param_groups(attention)
+            optimizer = torch.optim.AdamW(groups, lr=1.0e-4)
+            chained = ChainedOptimizer(attention, {"adamw": optimizer}, flatten=flatten)
+            ids = {id(parameter) for group in groups for parameter in group["params"]}
+            self.assertTrue(all(id(parameter) not in ids for parameter in attention.indexer.parameters()))
+            return attention, optimizer, chained
+
+        def step(attention, optimizer, seed):
+            optimizer.zero_grad(set_to_none=True)
+            torch.manual_seed(seed)
+            hidden = torch.randn(1, 16, attention.config.hidden_size, requires_grad=True)
+            positions = torch.arange(16).unsqueeze(0)
+            angle = positions.unsqueeze(-1) * torch.ones(attention.rope_head_dim // 2)
+            embeddings = {kind: (angle.cos(), angle.sin()) for kind in ("main", "compress")}
+            state = SharedAttentionState()
+            output = attention(hidden, embeddings, positions, None, shared_attention_state=state)[0]
+            output.square().mean().backward()
+            optimizer.step()
+            return output.detach(), state.topk_indices_by_source[2]
+
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            config = build_deepseek_v41_validation_config(
+                directory, str(assets_path), num_hidden_layers=4, indexer_loss_coeff=0.0,
+            )
+            config.v41_engram_layer_ids = []
+            for flatten in (False, True):
+                with self.subTest(flatten=flatten):
+                    attention, optimizer, chained = build_attention(config, flatten)
+                    step(attention, optimizer, 42)
+                    weights = deepcopy(attention.state_dict())
+                    state = deepcopy(chained.state_dict())
+                    expected, expected_topk = step(attention, optimizer, 43)
+                    restored, restored_optimizer, restored_chained = build_attention(config, flatten)
+                    restored.load_state_dict(weights, strict=True)
+                    restored_chained.load_state_dict(state)
+                    actual, actual_topk = step(restored, restored_optimizer, 43)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(actual_topk, expected_topk, rtol=0, atol=0)
+                    for name, value in attention.state_dict().items():
+                        torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
 
     def test_pretrained_builder_preserves_config_and_decodes_native_weights(self):
         """Retain training options and decode selected FP8 weights with their scales."""
