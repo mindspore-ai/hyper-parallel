@@ -238,12 +238,14 @@ def _source_expression(source: str, record: dict, records: list[dict], imports: 
         return '__source_module__'
     if ast.dump(copied) != ast.dump(original):
         return '__source_module__'
-    alias = aliases.setdefault(record['source_type'], f'_Source{name}_{len(aliases)}')
+    alias = aliases.setdefault(record['source_type'], f'{module}.{name}')
     if all(part.isidentifier() for part in module.split('.')):
-        statement = f'from {module} import {name} as {alias}'
+        statement = f'import {module}'
     else:
-        statement = f"{alias} = __import__({module!r}, fromlist=[{name!r}]).{name}"
-    imports.append(ImportPatch(module, (), raw=statement))
+        alias = f"__import__({module!r}, fromlist=[{name!r}]).{name}"
+        statement = ""
+    if statement:
+        imports.append(ImportPatch(module, (), raw=statement))
     return f'{alias}(__source_arguments__)'
 
 

@@ -22,7 +22,8 @@ import json
 import textwrap
 from typing import Any
 
-from hyper_parallel.codegen.inline.ir import ConstructorPatch, ImportPatch, InlinePatchSet
+from hyper_parallel.codegen.plan.boundary_forms import FORM_IDENTITY, classify_boundary_form
+from hyper_parallel.codegen.inline.ir import ConstructorPatch, ImportPatch, InlinePatchSet, ModuleSnippetPatch
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _is_vocab_parallel_embed,
@@ -101,6 +102,9 @@ def materialize_primitive_boundaries(source: str, meta: Any) -> str:
         path, identity = record['fqn'], record['type']
         if len(record['inputs']) != 1 or not record['inputs'][0].isidentifier():
             raise ValueError(f"Codegen imported boundary {path!r} requires an explicit single-input source contract")
+        if (not record['vocab'] and classify_boundary_form(
+                meta.param_plan[path], meta.mesh_dim_names).form == FORM_IDENTITY):
+            continue
         argument = record['argument']
         original_argument = record['inputs'][0]
         entry = dict(meta.param_plan[path])
@@ -113,15 +117,19 @@ def materialize_primitive_boundaries(source: str, meta: Any) -> str:
         key = (identity, argument, record['vocab'], json.dumps(contract, sort_keys=True))
         if key not in names:
             module, original = identity.split(':', 1)
-            name = f"Parallel{original}_{len(names)}"
+            name = original
+            if name in names.values():
+                raise ValueError(f"Codegen primitive {original} has incompatible source contracts")
             names[key] = name
-            base = f"_Native{original}_{len(names)}"
-            patches.imports.append(ImportPatch(module, (), raw=f"from {module} import {original} as {base}"))
+            base = f"{module}.{original}"
+            patches.imports.append(ImportPatch(module, (), raw=f"import {module}"))
             body = _vocab_forward(argument) if record['vocab'] else f"return super().forward({argument})"
             if record['vocab']:
                 patches.imports.append(ImportPatch('', (), raw='import torch'))
-            source += (f"\n\nclass {name}({base}):\n"
-                       f"    def forward(self, {argument}):\n{textwrap.indent(body, '        ')}\n")
+            patches.module_snippets.append(ModuleSnippetPatch(
+                f"class {name}({base}):\n"
+                f"    def forward(self, {argument}):\n{textwrap.indent(body, '        ')}\n"
+            ))
         name = names[key]
         site = (record['owner'], record['attribute'])
         selected = {item['fqn'].rpartition('.')[0] for item in records

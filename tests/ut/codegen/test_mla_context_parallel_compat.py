@@ -139,6 +139,11 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
             observed = publish_codegen_ir(project_model_build(capture), directory)
             self.assertEqual(observed.snapshot.to_dict()["status"], "generated")
             modeling = next(Path(directory).rglob("modeling_*_gen_npu.py"))
+            text = modeling.read_text(encoding="utf-8")
+            self.assertNotIn(" as _hp_parallel_base_", text)
+            self.assertNotIn(" as _Source", text)
+            self.assertLess(text.index("class CPMultiLatentAttentionModule("),
+                            text.index("class DeepseekV3ForCausalLM("))
             spec = util.spec_from_file_location("mla_family_codegen_test", modeling)
             generated_module = util.module_from_spec(spec)
             with patch.dict(sys.modules, {"mla_family_codegen_test": generated_module}):

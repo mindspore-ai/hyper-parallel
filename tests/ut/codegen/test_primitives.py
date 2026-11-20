@@ -73,6 +73,9 @@ class TestPrimitiveSource(unittest.TestCase):
         torch.testing.assert_close(output, torch.tensor([[0., 0.], [1., 2.], [7., 8.]]))
         self.assertNotIn('forward', actual.__dict__)
         self.assertIn('reduce_scatter', rendered)
+        self.assertNotIn(' as _Native', rendered)
+        self.assertEqual(type(actual).__name__, 'Embedding')
+        self.assertLess(rendered.index('class Embedding('), rendered.index('class PrimitiveModel('))
 
     def test_no_plan_does_not_create_primitive_shells(self):
         self.assertEqual(observe_primitive_boundaries(SimpleNamespace(plan=None)), [])

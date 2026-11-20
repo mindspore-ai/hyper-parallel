@@ -22,6 +22,9 @@ import inspect
 import textwrap
 from typing import Any
 
+from hyper_parallel.codegen.inline.ir import ImportPatch, InlinePatchSet, ModuleSnippetPatch
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+
 
 class _ForwardGlobals(ast.NodeTransformer):
     """Bind copied body references to their original module."""
@@ -34,7 +37,7 @@ class _ForwardGlobals(ast.NodeTransformer):
         """Qualify the native module globals used by the copied forward."""
         if isinstance(node.ctx, ast.Load) and node.id in self.names:
             return ast.copy_location(
-                ast.Attribute(ast.Name(self.module_alias, ast.Load()), node.id, ast.Load()), node,
+                ast.Attribute(ast.parse(self.module_alias, mode="eval").body, node.id, ast.Load()), node,
             )
         return node
 
@@ -57,7 +60,7 @@ def _native_forward_source(member: type, globals_alias: str) -> tuple[str, str]:
             argument.annotation = None
     if ast.get_docstring(function) is not None:
         function.body.pop(0)
-    globals_import = f"import {forward.__module__} as {globals_alias}\n" if closure.globals else ""
+    globals_import = f"import {forward.__module__}\n" if closure.globals else ""
     transformed = _ForwardGlobals(set(closure.globals), globals_alias).visit(function)
     return ast.unparse(transformed), globals_import
 
@@ -93,22 +96,25 @@ def materialize_parallel_family_forwards(source: str, records: dict[str, Any]) -
         return source
     classes = {node.name for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
     owners = {item["type"]: item["kind"] for item in records.values()}
-    for index, (identity, kind) in enumerate(sorted(owners.items())):
+    for identity, kind in sorted(owners.items()):
         module_name, name = identity.split(":", 1)
         if name in classes:
             continue
         if not name.isidentifier():
             raise ValueError(f"Codegen cannot emit nested parallel member {identity}")
         member = getattr(import_module(module_name), name)
-        base = f"_hp_parallel_base_{index}"
-        body, globals_import = _native_forward_source(member, f"_hp_parallel_globals_{index}")
-        source += (
-            f"\n\nfrom {module_name} import {name} as {base}\n"
-            f"{globals_import}\n\n"
-            f"class {name}({base}):\n"
+        body, globals_import = _native_forward_source(member, member.forward.__module__)
+        declaration = (
+            f"class {name}({module_name}.{name}):\n"
             f"    # {kind.upper()} forward stages selected by native preparation.\n"
             f"{textwrap.indent(body, '    ')}\n"
         )
+        patches = InlinePatchSet()
+        patches.imports.append(ImportPatch('', (), raw=f"import {module_name}"))
+        if globals_import:
+            patches.imports.append(ImportPatch("", (), raw=globals_import.strip()))
+        patches.module_snippets.append(ModuleSnippetPatch(declaration))
+        source = apply_patch_set(source, patches)
         classes.add(name)
     verify_parallel_family_forwards(ast.parse(source), records)
     return source
