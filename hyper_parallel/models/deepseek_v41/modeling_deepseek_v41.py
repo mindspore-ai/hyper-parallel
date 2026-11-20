@@ -45,7 +45,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.modules.shared_expert import SharedExpertModule
-from hyper_parallel.components.modules.swiglu_mlp import swiglu_activation
+from hyper_parallel.components.modules.swiglu_mlp import shared_swiglu_activation, swiglu_activation
 from hyper_parallel.components.modules.router import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
@@ -55,7 +55,7 @@ from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     sequence_load_balancing_loss,
     update_modality_bias,
 )
-from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
+from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark, collapse_streams
 # pylint: disable=unused-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
@@ -380,10 +380,10 @@ def deepseek_v41_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> t
 
 def _v41_shared_expert_forward(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     """Use native activation math without replacing the HF projection modules."""
-    intermediate = deepseek_v41_swiglu(
-        module.gate_proj(hidden_states), module.up_proj(hidden_states), module.limit,
+    intermediate = shared_swiglu_activation(
+        module.gate_proj(hidden_states), module.up_proj(hidden_states), module.limit, "float32", hidden_states.dtype,
     )
-    return module.down_proj(intermediate.to(hidden_states.dtype))
+    return module.down_proj(intermediate)
 
 
 def bind_shared_expert_forward(shared_expert: nn.Module) -> None:
@@ -615,7 +615,7 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
 
 def _hc_pre(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse the parallel residual streams."""
-    return (pre_mix.unsqueeze(-1) * hidden_states.float()).sum(dim=2).to(hidden_states.dtype)
+    return collapse_streams(hidden_states, pre_mix)
 
 
 def _hc_post(
@@ -1378,12 +1378,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         # The trainer may keep labels on its loss-only path, so the drafter
         # must not depend on them: it supervises from input_ids when absent.
         if self.dspark is not None and input_ids is not None:
-            targets = getattr(self.model, "dspark_target_hiddens", None)
-            if not targets:
-                raise RuntimeError("DSpark is enabled but no backbone target hiddens were collected")
-            dspark_loss, dspark_metrics = self.dspark(
-                targets, input_ids, labels, self.model.dspark_inputs_embeds, self.lm_head
-            )
+            dspark_loss, dspark_metrics = self.compute_dspark_loss(input_ids, labels, kwargs.get("packed_seq_params"))
             dspark_term = self.dspark_loss_coeff * dspark_loss
             # The trainer's default ModelOutputLoss backpropagates
             # model_output.loss, so the drafter objective must join that
@@ -1398,6 +1393,25 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             # non-field attributes; the module attribute is the stable path.
             self.pending_extra_metrics = dspark_metrics
         return outputs
+
+    def compute_dspark_loss(
+            self,
+            input_ids: torch.Tensor,
+            labels: torch.Tensor | None,
+            packed_sequence: SharedPackedSequence | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run DSpark for the local decoder shard using its packed-document limits."""
+        targets = self.model.dspark_target_hiddens
+        if not targets:
+            raise RuntimeError("DSpark is enabled but no backbone target hiddens were collected")
+        segment_starts = None
+        if packed_sequence is not None:
+            global_starts = packed_sequence.local_segment_starts(input_ids.device)
+            segment_starts = (global_starts - packed_sequence.local_query_start).clamp_min(0)
+        return self.dspark(
+            targets, input_ids, labels, self.model.dspark_inputs_embeds, self.lm_head,
+            segment_starts=segment_starts,
+        )
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":

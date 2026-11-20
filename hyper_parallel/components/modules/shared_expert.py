@@ -31,7 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.swiglu_mlp import (
-    SwiGLUMLPModule, _validate_mlp_config, local_swiglu, _activation_settings,
+    SwiGLUMLPModule, _validate_mlp_config, local_swiglu, _activation_settings, shared_swiglu_activation,
 )
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 
@@ -330,8 +330,14 @@ class SharedExpertModule(nn.Module):
             raise ValueError("provide exactly one of hidden_states or x")
         hidden_states = x if hidden_states is None else hidden_states
         if self._preserve_source_layout:
-            intermediate = torch.cat((self.gate_proj(hidden_states), self.up_proj(hidden_states)), dim=-1)
-            return self.down_proj(self.activation_func(intermediate).to(hidden_states.dtype))
+            gate, up = self.gate_proj(hidden_states), self.up_proj(hidden_states)
+            if self.swiglu_limit > 0 or self.activation_dtype == "float32":
+                intermediate = shared_swiglu_activation(
+                    gate, up, self.swiglu_limit, self.activation_dtype, hidden_states.dtype,
+                )
+            else:
+                intermediate = self.activation_func(torch.cat((gate, up), dim=-1)).to(hidden_states.dtype)
+            return self.down_proj(intermediate)
         intermediate, bias = self.linear_fc1(hidden_states)
         if bias is not None:
             intermediate = intermediate + bias

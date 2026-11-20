@@ -80,6 +80,27 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 attention.compressed_causal_topk(self.query, self.key, self.weights,
                                                 use_fused=True, **kwargs, **options)
 
+    def test_fused_indexer_publishes_only_reachable_complete_pool_blocks(self):
+        """The native path retains packed causal bounds and rejects a binding pool."""
+        indexer = attention.SharedCompressedDSAIndexer(_source(index_source=True).indexer)
+        indexer.use_fused = True
+        indexer.is_candidate_source = True
+        indexer.index_topk = 2
+        indexer.candidate_topk_blocks = 2
+        starts = torch.tensor([[0, 1]])
+        upper = torch.tensor([[1, 2]])
+        segments = ((0, 1, 0, 1, 0), (1, 2, 1, 2, 0))
+        with patch.object(attention, "_run_lightning_indexer", return_value=self.indices) as native:
+            indices, blocks = indexer._select_indices(
+                self.query, self.key, self.weights, None, 0, None, starts, segments, upper,
+            )
+            native.assert_called_once()
+        torch.testing.assert_close(indices, self.indices)
+        torch.testing.assert_close(blocks, torch.tensor([[[0, -1], [-1, 1]]], dtype=torch.int32))
+        indexer.candidate_topk_blocks = 1
+        with self.assertRaisesRegex(NotImplementedError, "complete key bank"):
+            indexer._select_indices(self.query, self.key, self.weights, None, 0, None, starts, segments, upper)
+
     def test_kl_required_mode_never_invokes_reference(self):
         """Reject unsupported active KL before entering the reference function."""
         with patch.object(attention._SharedCompressedIndexerKLLoss, "apply") as reference:

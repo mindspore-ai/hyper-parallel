@@ -660,8 +660,7 @@ def build_sliding_window_indices(
         device=device,
     ).unsqueeze(-1)
     offsets = torch.arange(width - 1, -1, -1, device=device)
-    indices = query - offsets
-    indices = indices.masked_fill(indices < 0, -1)
+    indices = (query - offsets).clamp_min(-1)
     return indices.unsqueeze(0).expand(batch_size, -1, -1)
 
 
@@ -873,6 +872,21 @@ def select_candidate_block_indices(
     scores = scores.masked_fill(block_positions == last, float("inf"))
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1, sorted=False)
     return top.indices.masked_fill(top.values == float("-inf"), -1).to(torch.int32)
+
+
+
+def _complete_candidate_blocks(
+        visible: torch.Tensor, minimum: torch.Tensor | None, key_length: int, block_size: int,
+) -> torch.Tensor:
+    """Enumerate reachable blocks when the configured pool can hold them all."""
+    block_count = (key_length + block_size - 1) // block_size
+    blocks = torch.arange(block_count, device=visible.device).view(1, 1, -1)
+    visible = visible.unsqueeze(-1)
+    reachable = blocks * block_size < visible
+    if minimum is not None:
+        reachable = reachable & (((blocks + 1) * block_size).clamp_max(key_length) > minimum.unsqueeze(-1))
+    pinned = blocks == (visible - 1) // block_size
+    return torch.where(reachable | pinned, blocks, -1).to(torch.int32)
 
 
 def compressed_causal_candidates(
@@ -1582,6 +1596,42 @@ class SharedCompressedDSAIndexer(nn.Module):
             )
         return topk_indices, candidate_blocks
 
+    def _select_complete_pool(
+            self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
+            candidate_blocks: torch.Tensor | None, query_offset: int,
+            reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
+            minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
+            causal_upper: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use native causal selection when candidate selection cannot prune valid keys."""
+        block_size = self.candidate_block_size
+        if block_size <= 0:
+            raise ValueError("Fused candidate-pool Indexer requires a positive candidate block size")
+        key_length = key.shape[1]
+        block_count = (key_length + block_size - 1) // block_size
+        if self.candidate_topk_blocks <= 0 or self.candidate_topk_blocks < block_count:
+            raise NotImplementedError("Fused candidate-pool Indexer requires coverage of the complete key bank")
+        if self.uses_candidates:
+            if candidate_blocks is None:
+                raise RuntimeError("a hierarchical Reindex layer requires candidate block ids")
+            if candidate_blocks.shape != (*query.shape[:2], block_count):
+                raise ValueError("Complete candidate pool must retain every key-bank block slot")
+        topk_indices = compressed_causal_topk(
+            query, key, merge_weight, compress_ratio=self.compress_ratio, sparse_count=self.index_topk,
+            query_offset=query_offset, query_chunk_size=self.query_chunk_size, reduce_sum=reduce_sum,
+            minimum_key_indices=minimum_key_indices, query_segments=query_segments, use_fused=True,
+        )
+        if self.is_candidate_source:
+            visible, minimum = _causal_key_bounds(
+                query, self.compress_ratio, query_offset, minimum_key_indices, query_segments, causal_upper,
+            )
+            candidate_blocks = _complete_candidate_blocks(visible, minimum, key_length, block_size)
+            candidate_blocks = candidate_blocks.expand(*query.shape[:2], block_count)
+        else:
+            width = min(self.index_topk, block_count * block_size)
+            topk_indices = torch.nn.functional.pad(topk_indices, (0, width - topk_indices.shape[-1]), value=-1)
+        return topk_indices, candidate_blocks
+
     def _select_indices(
             self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
             candidate_blocks: torch.Tensor | None, query_offset: int,
@@ -1591,7 +1641,10 @@ class SharedCompressedDSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Select the requested implementation without changing candidate policies."""
         if self.use_fused and (self.is_candidate_source or self.uses_candidates):
-            raise NotImplementedError("V4.1 fused Indexer does not support candidate-pool selection")
+            return self._select_complete_pool(
+                query, key, merge_weight, candidate_blocks, query_offset,
+                reduce_sum, minimum_key_indices, query_segments, causal_upper,
+            )
         if self.is_candidate_source:
             topk_indices, candidate_blocks = compressed_causal_topk_and_candidates(
                 query,
@@ -1686,6 +1739,35 @@ def reference_sparse_attention(
     sink_logits = sinks.view(1, num_heads, 1, 1).expand(batch_size, -1, sequence_length, -1)
     probabilities = torch.cat((logits, sink_logits), dim=-1).softmax(dim=-1, dtype=torch.float32)
     return torch.matmul(probabilities[..., :-1].to(key_value.dtype), key_value).transpose(1, 2)
+
+
+class _GroupedProj8x2DFunction(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Grouped output projection using contiguous 2D ``torch.mm`` per group on NPU."""
+
+    @staticmethod
+    def forward(ctx, grouped: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # grouped: [N, G, H], weight: [G, O, H]
+        ctx.save_for_backward(grouped, weight)
+        g_cnt = weight.shape[0]
+        wt = weight.transpose(1, 2)
+        return torch.stack([torch.mm(grouped[:, g, :], wt[g]) for g in range(g_cnt)], dim=1)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        grouped, weight = ctx.saved_tensors
+        g_cnt = weight.shape[0]
+        grad_in = grad_w = None
+        if ctx.needs_input_grad[0]:
+            grad_in = torch.stack(
+                [torch.mm(grad_out[:, g, :], weight[g]) for g in range(g_cnt)],
+                dim=1,
+            )
+        if ctx.needs_input_grad[1]:
+            grad_w = torch.stack(
+                [torch.mm(grad_out[:, g, :].t(), grouped[:, g, :]) for g in range(g_cnt)],
+                dim=0,
+            )
+        return grad_in, grad_w
 
 
 class SharedCompressedDSAAttentionBase(nn.Module):
@@ -2183,9 +2265,14 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         output_per_group = self.o_a_proj.weight.shape[0] // self.num_groups
         projection = self.o_a_proj.weight.view(
             self.num_groups, output_per_group, hidden_per_group
-        ).transpose(1, 2)
-        flattened = grouped.reshape(-1, self.num_groups, hidden_per_group).transpose(0, 1)
-        projected = torch.bmm(flattened, projection).transpose(0, 1)
+        )
+        flattened = grouped.reshape(-1, self.num_groups, hidden_per_group)
+        if flattened.device.type == "npu" and projection.dtype == flattened.dtype:
+            projected = _GroupedProj8x2DFunction.apply(flattened, projection)
+        else:
+            projected = torch.bmm(
+                flattened.transpose(0, 1), projection.transpose(1, 2)
+            ).transpose(0, 1)
         projected = projected.reshape(batch_size, sequence_length, -1)
         return self.o_b_proj(projected)
 

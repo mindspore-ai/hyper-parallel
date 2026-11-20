@@ -48,10 +48,12 @@ runtime-semantic deltas to revisit):
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 import torch
 from torch import nn
+from torch.autograd.function import once_differentiable
 from torch.nn import functional
 
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -74,6 +76,32 @@ def _checkpoint(function, *args):
     return function(*args)
 
 
+@lru_cache(maxsize=1)
+def _load_fused_stream_collapse():
+    """Resolve the optional Triton implementation on supported NPU inputs."""
+    try:
+        from hyper_parallel.components.functional._triton.v41_fusions import FusedStreamCollapse  # pylint: disable=C0415
+    except ImportError:
+        return None
+    return FusedStreamCollapse.apply
+
+
+def collapse_streams(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    """Collapse independent mHC streams using FP32 accumulation."""
+    if (
+            hidden_states.device.type == "npu" and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[-2:] == (4, 5120) and hidden_states.numel() > 0
+            and pre_mix.dtype == torch.float32 and pre_mix.shape == hidden_states.shape[:-1]
+            and hidden_states.is_contiguous() and pre_mix.is_contiguous()
+            and type(hidden_states) is torch.Tensor and type(pre_mix) is torch.Tensor
+            and not torch.compiler.is_compiling()
+    ):
+        fused = _load_fused_stream_collapse()
+        if fused is not None:
+            return fused(hidden_states, pre_mix)
+    return (pre_mix.unsqueeze(-1) * hidden_states.float()).sum(-2).to(hidden_states.dtype)
+
+
 def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
     """Rotate the last dimension halves for rotary embedding."""
     half = tensor.shape[-1] // 2
@@ -83,6 +111,37 @@ def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
 def _apply_rope(tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Apply rotary position embedding on the trailing rope dimensions."""
     return tensor * cos + _rotate_half(tensor) * sin
+
+
+class _PrecomputedVocabLoss(torch.autograd.Function):
+    """Save first-order DSpark gradients and avoid replaying vocabulary logits."""
+
+    @staticmethod
+    def forward(
+            ctx, hidden: torch.Tensor, markov: torch.Tensor, head: torch.Tensor,
+            markov_head: torch.Tensor, targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate vocabulary loss, hits and the required derivatives once."""
+        logits = functional.linear(hidden, head) + functional.linear(markov, markov_head)
+        hits = (logits.argmax(dim=-1) == targets) & (targets != IGNORE_INDEX)
+        ctx.mark_non_differentiable(hits)
+        logits_fp32 = logits.float()
+        del logits
+        with torch.enable_grad():
+            leaf = logits_fp32.detach().requires_grad_(True)
+            loss = functional.cross_entropy(leaf, targets, ignore_index=IGNORE_INDEX, reduction="sum")
+            (grad_logits,) = torch.autograd.grad(loss, leaf)
+        grad_logits = grad_logits.to(hidden.dtype)
+        ctx.save_for_backward(grad_logits @ head, grad_logits @ markov_head, grad_logits.T @ markov)
+        return loss.detach(), hits
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_loss: torch.Tensor, _grad_hits: torch.Tensor | None) -> tuple:
+        """Scale precomputed first-order gradients by the outer loss derivative."""
+        grad_hidden, grad_markov, grad_weight = ctx.saved_tensors
+        scale = grad_loss.to(grad_hidden.dtype)
+        return grad_hidden * scale, grad_markov * scale, None, grad_weight * scale, None
 
 
 class DSparkMarkovHead(nn.Module):
@@ -112,6 +171,37 @@ class DSparkConfidenceHead(nn.Module):
         """Return per-position confidence logits in FP32."""
         joined = torch.cat([hidden, markov_embed], dim=-1)
         return self.proj(joined.float()).squeeze(-1)
+
+
+class _GroupedWoAFunction(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Grouped linear projection using contiguous 2D ``torch.mm`` per group."""
+
+    @staticmethod
+    def forward(ctx, grouped: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
+        # grouped: [B, S, J, G, D], wo_a: [G, R, D]
+        batch, seq, block, groups, dim = grouped.shape
+        rank = wo_a.shape[1]
+        g_flat = grouped.permute(3, 0, 1, 2, 4).contiguous().view(groups, -1, dim)
+        w = wo_a.to(grouped.dtype)
+        out = torch.empty((groups, g_flat.shape[1], rank), dtype=grouped.dtype, device=grouped.device)
+        for g in range(groups):
+            torch.mm(g_flat[g], w[g].t(), out=out[g])
+        ctx.save_for_backward(g_flat, w)
+        ctx.shape_info = (batch, seq, block, groups, dim, rank, wo_a.dtype)
+        return out.view(groups, batch, seq, block, rank).permute(1, 2, 3, 0, 4).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        g_flat, w = ctx.saved_tensors
+        batch, seq, block, groups, dim, rank, w_orig_dtype = ctx.shape_info
+        go_flat = grad_out.permute(3, 0, 1, 2, 4).contiguous().view(groups, -1, rank)
+        grad_g = torch.empty_like(g_flat)
+        grad_w = torch.empty_like(w)
+        for g in range(groups):
+            torch.mm(go_flat[g], w[g], out=grad_g[g])
+            torch.mm(go_flat[g].t(), g_flat[g], out=grad_w[g])
+        grad_grouped = grad_g.view(groups, batch, seq, block, dim).permute(1, 2, 3, 0, 4).contiguous()
+        return grad_grouped, grad_w.to(w_orig_dtype)
 
 
 class DSparkDraftAttention(nn.Module):
@@ -155,6 +245,7 @@ class DSparkDraftAttention(nn.Module):
             main_states: torch.Tensor,
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
+            segment_starts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend draft queries over the windowed backbone KV stream.
 
@@ -163,6 +254,7 @@ class DSparkDraftAttention(nn.Module):
             main_states: ``[batch, seq, hidden]`` stage KV source stream.
             rope_cos: ``[batch, seq, rope_dim]`` cosine table for positions.
             rope_sin: ``[batch, seq, rope_dim]`` sine table for positions.
+            segment_starts: Local beginning of each token's packed document.
 
         Returns:
             ``[batch, seq, block, hidden]`` attention output.
@@ -187,19 +279,19 @@ class DSparkDraftAttention(nn.Module):
         positions = torch.arange(seq, device=draft_states.device)
         offsets_back = torch.arange(window - 1, -1, -1, device=draft_states.device)
         window_index = positions.unsqueeze(1) - offsets_back.unsqueeze(0)
-        valid = window_index >= 0
+        valid = window_index.unsqueeze(0) >= (0 if segment_starts is None else segment_starts.unsqueeze(-1))
         window_index = window_index.clamp(min=0)
         gathered_key = key[:, window_index]
         gathered_value = key_value[:, window_index]
         scores = torch.einsum("bsjhd,bswd->bshjw", query, gathered_key.to(query.dtype)) * self.scaling
-        scores = scores.masked_fill(~valid[None, :, None, None, :], torch.finfo(scores.dtype).min)
+        scores = scores.masked_fill(~valid[:, :, None, None, :], torch.finfo(scores.dtype).min)
         sink = self.attn_sink.view(1, 1, self.num_heads, 1, 1).to(scores.dtype)
         joined = torch.cat([scores, sink.expand(batch, seq, -1, block, 1)], dim=-1)
         weights = joined.float().softmax(dim=-1).to(query.dtype)[..., :-1]
         context = torch.einsum("bshjw,bswd->bsjhd", weights, gathered_value.to(query.dtype))
         grouped = context.reshape(batch, seq, block, self.o_groups, -1)
         wo_a = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, -1)
-        reduced = torch.einsum("bsjgd,grd->bsjgr", grouped, wo_a.to(context.dtype))
+        reduced = _GroupedWoAFunction.apply(grouped, wo_a)
         return self.wo_b(reduced.flatten(3))
 
 
@@ -229,6 +321,7 @@ class DSparkStage(nn.Module):
             main_states: torch.Tensor,
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
+            segment_starts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the communication-free stage prefix up to the FFN input.
 
@@ -243,6 +336,7 @@ class DSparkStage(nn.Module):
             main_states: Stage KV source stream.
             rope_cos: Rotary cosine table.
             rope_sin: Rotary sine table.
+            segment_starts: Local beginning of each token's packed document.
 
         Returns:
             Post-attention flat stream, FFN input, and the mHC pre/post/
@@ -254,12 +348,12 @@ class DSparkStage(nn.Module):
         flat = hidden_streams.reshape(batch, seq * block, streams, hidden)
         residual = flat
         attn_pre, attn_post, attn_comb = self.attn_hc(flat)
-        collapsed = (pre_mix.unsqueeze(-1) * flat.float()).sum(dim=2).to(flat.dtype)
+        collapsed = collapse_streams(flat, pre_mix)
         attn_input = self.input_layernorm(collapsed).view(batch, seq, block, hidden)
-        attn_output = self.self_attn(attn_input, main_states, rope_cos, rope_sin)
+        attn_output = self.self_attn(attn_input, main_states, rope_cos, rope_sin, segment_starts)
         flat = pipelined_mhc_post(attn_output.reshape(batch, seq * block, hidden), residual, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(flat)
-        collapsed = (attn_pre.unsqueeze(-1) * flat.float()).sum(dim=2).to(flat.dtype)
+        collapsed = collapse_streams(flat, attn_pre)
         ffn_input = self.post_attention_layernorm(collapsed)
         return flat, ffn_input, ffn_pre, ffn_post, ffn_comb
 
@@ -272,6 +366,7 @@ class DSparkStage(nn.Module):
             rope_sin: torch.Tensor,
             input_ids: torch.Tensor,
             use_checkpoint: bool = False,
+            segment_starts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one DSpark stage over the flattened draft stream.
 
@@ -281,6 +376,7 @@ class DSparkStage(nn.Module):
             main_states: Stage KV source stream.
             rope_cos: Rotary cosine table.
             rope_sin: Rotary sine table.
+            segment_starts: Local beginning of each token's packed document.
             input_ids: Flattened draft token ids for the MoE router.
             use_checkpoint: Recompute the communication-free prefix in
                 backward instead of storing its activations.
@@ -294,10 +390,10 @@ class DSparkStage(nn.Module):
         if use_checkpoint:
             flat, ffn_input, ffn_pre, ffn_post, ffn_comb = _checkpoint(
                 self._pre_ffn, hidden_streams, pre_mix, main_states,
-                rope_cos, rope_sin)
+                rope_cos, rope_sin, segment_starts)
         else:
             flat, ffn_input, ffn_pre, ffn_post, ffn_comb = self._pre_ffn(
-                hidden_streams, pre_mix, main_states, rope_cos, rope_sin)
+                hidden_streams, pre_mix, main_states, rope_cos, rope_sin, segment_starts)
         ffn_output = self.mlp(ffn_input, input_ids=input_ids)
         flat = pipelined_mhc_post(ffn_output, flat, ffn_post, ffn_comb)
         return flat.view(batch, seq, block, streams, hidden), ffn_pre
@@ -354,7 +450,8 @@ class DeepseekV41DSpark(nn.Module):
         # Sequence-chunk granularity of the draft objective: smaller chunks
         # lower the vocabulary-logits peak at the cost of more recompute
         # rounds; the loss value itself is chunking-invariant.
-        self.loss_chunk_size = int(getattr(config, "v41_dspark_loss_chunk_size", 64) or 64)
+        self.loss_chunk_size = int(getattr(config, "v41_dspark_loss_chunk_size", 512) or 512)
+        self.precompute_vocab_grad = bool(getattr(config, "v41_dspark_precompute_vocab_grad", False))
         if self.block_size <= 0 or self.num_targets == 0:
             raise ValueError("DSpark requires a positive block size and target layers")
         hidden = int(config.hidden_size)
@@ -431,6 +528,8 @@ class DeepseekV41DSpark(nn.Module):
             labels: torch.Tensor | None,
             inputs_embeds: torch.Tensor,
             lm_head: nn.Linear,
+            *,
+            segment_starts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the DSpark draft objective for one batch.
 
@@ -443,6 +542,7 @@ class DeepseekV41DSpark(nn.Module):
                 from ``input_ids`` (full LM-draft objective).
             embed_tokens: Backbone embedding tied into the drafter.
             lm_head: Backbone output head tied into the drafter.
+            segment_starts: Local document starts clipped to the context-parallel shard.
 
         Returns:
             The scalar DSpark loss and a metrics dictionary.
@@ -478,19 +578,14 @@ class DeepseekV41DSpark(nn.Module):
         gradient_active = torch.is_grad_enabled() and self.training
         for stage in self.stages:
             streams, pre_mix = stage(streams, pre_mix, main_states, rope_cos,
-                                     rope_sin, draft_ids, use_checkpoint=gradient_active)
+                                     rope_sin, draft_ids, use_checkpoint=gradient_active,
+                                     segment_starts=segment_starts)
         def _collapse(streams_in: torch.Tensor, pre_mix_in: torch.Tensor) -> torch.Tensor:
-            merged = (pre_mix_in.unsqueeze(-1)
-                      * streams_in.reshape(batch, seq * block, self.hc_mult, -1).float())
-            merged = merged.sum(dim=2).to(streams_in.dtype).view(batch, seq, block, -1)
+            flat = streams_in.reshape(batch, seq * block, self.hc_mult, -1)
+            merged = collapse_streams(flat, pre_mix_in).view(batch, seq, block, -1)
             return self.norm(merged)
 
-        # The fp32 merge buffer otherwise stays resident for the norm
-        # backward; recomputing it is cheap and communication-free.
-        if gradient_active:
-            hidden_out = _checkpoint(_collapse, streams, pre_mix)
-        else:
-            hidden_out = _collapse(streams, pre_mix)
+        hidden_out = _collapse(streams, pre_mix)
 
         # Teacher-forced targets: draft offset j at position t predicts the
         # token at t + 1 + j; the Markov head is conditioned on t + j.  When
@@ -509,6 +604,10 @@ class DeepseekV41DSpark(nn.Module):
         # aligned via labels[t + j] <-> input_ids[t + 1 + j].
         pad_target_ids = functional.pad(input_ids, (0, block), value=IGNORE_INDEX)
         targets = pad_target_ids.gather(1, (gather + 1).reshape(1, -1).expand(batch, -1)).view(batch, seq, block)
+        if segment_starts is not None:
+            future_positions = (gather + 1).clamp_max(seq - 1).flatten()
+            future_segments = segment_starts.index_select(1, future_positions).reshape(batch, seq, block)
+            targets = targets.masked_fill(future_segments != segment_starts.unsqueeze(-1), IGNORE_INDEX)
         if labels is not None:
             pad_label_mask = functional.pad(labels, (0, block), value=IGNORE_INDEX)
             label_mask = pad_label_mask.gather(1, gather_flat).view(batch, seq, block) == IGNORE_INDEX
@@ -526,40 +625,52 @@ class DeepseekV41DSpark(nn.Module):
         head_weight = raw_head_weight.detach()
         chunk = self.loss_chunk_size
 
+        def _confidence_loss(hidden_chunk, markov_embed, chunk_mask, chunk_hits):
+            confidence = self.confidence_head(hidden_chunk, markov_embed)
+            bce = functional.binary_cross_entropy_with_logits(confidence, chunk_hits.float(), reduction="none")
+            return bce.masked_fill(~chunk_mask, 0).sum()
+
         def _chunk_objective(hidden_chunk, markov_chunk, target_chunk):
             markov_bias, markov_embed = self.markov_head(markov_chunk)
             logits = functional.linear(hidden_chunk, head_weight) + markov_bias  # pylint: disable=not-callable
             chunk_mask = target_chunk != IGNORE_INDEX
             ce_sum = functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(),
-                target_chunk.reshape(-1),
-                ignore_index=IGNORE_INDEX,
-                reduction="sum",
+                logits.reshape(-1, logits.shape[-1]).float(), target_chunk.reshape(-1),
+                ignore_index=IGNORE_INDEX, reduction="sum",
             )
             with torch.no_grad():
-                hit_sum = ((logits.argmax(dim=-1) == target_chunk) & chunk_mask).sum()
-            confidence = self.confidence_head(hidden_chunk, markov_embed)
-            if bool(chunk_mask.any()):
-                with torch.no_grad():
-                    chunk_hits = (logits.argmax(dim=-1) == target_chunk) & chunk_mask
-                bce_sum = functional.binary_cross_entropy_with_logits(
-                    confidence[chunk_mask], chunk_hits[chunk_mask].float(), reduction="sum"
-                )
-            else:
-                bce_sum = confidence.sum() * 0.0
-            return ce_sum, bce_sum, hit_sum.float()
+                chunk_hits = (logits.argmax(dim=-1) == target_chunk) & chunk_mask
+            del logits
+            bce_sum = _confidence_loss(hidden_chunk, markov_embed, chunk_mask, chunk_hits)
+            return ce_sum, bce_sum, chunk_hits.sum().float()
+
+        markov_weight = self.markov_head.head.weight
+        use_precomputed = (
+            self.precompute_vocab_grad and gradient_active and hidden_out.device.type == "npu"
+            and hidden_out.dtype == head_weight.dtype == markov_weight.dtype == torch.bfloat16
+            and not hasattr(markov_weight, "full_tensor") and not torch.compiler.is_compiling()
+        )
+
+        def _precomputed_objective(hidden_chunk, markov_chunk, target_chunk):
+            markov_embed = self.markov_head.embed(markov_chunk)
+            ce_sum, hits = _PrecomputedVocabLoss.apply(
+                hidden_chunk.flatten(0, -2), markov_embed.flatten(0, -2),
+                head_weight, markov_weight, target_chunk.flatten(),
+            )
+            hits = hits.view_as(target_chunk)
+            bce_sum = _confidence_loss(hidden_chunk, markov_embed, target_chunk != IGNORE_INDEX, hits)
+            return ce_sum, bce_sum, hits.sum().float()
 
         ce_total = hidden_out.new_zeros((), dtype=torch.float32)
         bce_total = hidden_out.new_zeros((), dtype=torch.float32)
         hit_total = hidden_out.new_zeros((), dtype=torch.float32)
         for start in range(0, seq, chunk):
             stop = min(start + chunk, seq)
-            ce_sum, bce_sum, hit_sum = _checkpoint(
-                _chunk_objective,
-                hidden_out[:, start:stop],
-                markov_inputs[:, start:stop],
-                targets[:, start:stop],
-            )
+            chunk_inputs = hidden_out[:, start:stop], markov_inputs[:, start:stop], targets[:, start:stop]
+            if use_precomputed:
+                ce_sum, bce_sum, hit_sum = _precomputed_objective(*chunk_inputs)
+            else:
+                ce_sum, bce_sum, hit_sum = _checkpoint(_chunk_objective, *chunk_inputs)
             ce_total = ce_total + ce_sum
             bce_total = bce_total + bce_sum
             hit_total = hit_total + hit_sum
