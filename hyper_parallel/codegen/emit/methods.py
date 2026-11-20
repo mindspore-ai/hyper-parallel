@@ -39,8 +39,14 @@ def verify_observed_methods(source: str, records: dict) -> None:
             if method_name == "forward" and "_forward_impl" in methods:
                 actual = methods["_forward_impl"]
             wanted = ast.parse(expected).body[0]
-            if actual is None or ast.dump(ast.Module(body=actual.body, type_ignores=[])) != ast.dump(
-                ast.Module(body=wanted.body, type_ignores=[])
+            # Indenting a copied multiline docstring changes its whitespace,
+            # while the executable statements must remain exactly equivalent.
+            actual_body = actual.body[1:] if actual and ast.get_docstring(actual) is not None else (
+                actual.body if actual else []
+            )
+            wanted_body = wanted.body[1:] if ast.get_docstring(wanted) is not None else wanted.body
+            if actual is None or ast.dump(ast.Module(body=actual_body, type_ignores=[])) != ast.dump(
+                ast.Module(body=wanted_body, type_ignores=[])
             ):
                 raise ValueError(f"Codegen native method {path}.{method_name} was not materialized")
 
