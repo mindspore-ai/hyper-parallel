@@ -709,6 +709,158 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 0)
                 self.assertEqual(_count_targets(gm, "wait_tensor"), 0)
 
+    def test_expert_edp_replication_chains_reduce_then_replicate(self):
+        """EDP replicate shards on edp_shard, then all-reduces on its own axis."""
+        gm = _odd_joint_graph()
+        model = _OddParam()
+        model.odd = nn.Parameter(torch.zeros(4, 4))
+        with _patch_dist(world_size=4):
+            FSDPPass().run(
+                gm,
+                PassConfig(fsdp_degree=4),
+                model=model,
+                fsdp_group_name="dense",
+                fsdp_plan=FsdpPlan(
+                    {
+                        "odd": FsdpParamSpec(
+                            "fsdp_expert",
+                            2,
+                            pad_policy="error",
+                            replicate_group_name="fsdp_expert_replicate",
+                            replicate_degree=2,
+                        ),
+                    }
+                ),
+            )
+        self.assertEqual(tuple(model.odd.shape), (2, 4))
+        self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 1)
+        reductions = [
+            node
+            for node in gm.graph.nodes
+            if node.meta.get("comm_type") == "fsdp_reduce_scatter"
+        ]
+        self.assertEqual([node.args[2:] for node in reductions], [(2, "fsdp_expert")])
+        replicated = [
+            node
+            for node in gm.graph.nodes
+            if node.meta.get("comm_type") == "dp_all_reduce"
+        ]
+        self.assertEqual(
+            [node.args[2:] for node in replicated], [("fsdp_expert_replicate",)]
+        )
+        self.assertEqual(_waited_rs_ar_chain(gm), 1)
+        self.assertEqual(_count_targets(gm, "wait_tensor"), 3)
+
+    def test_expert_pad_shard_chains_pad_reduce_replicate(self):
+        """A non-divisible expert pads like eager fully_shard, then EDP reduces."""
+        gm = _odd_joint_graph()
+        model = _OddParam()
+        with _patch_dist(world_size=4):
+            FSDPPass().run(
+                gm,
+                PassConfig(fsdp_degree=4),
+                model=model,
+                fsdp_group_name="dense",
+                fsdp_plan=FsdpPlan(
+                    {
+                        "odd": FsdpParamSpec(
+                            "fsdp_expert",
+                            2,
+                            pad_policy="pad",
+                            replicate_group_name="fsdp_expert_replicate",
+                            replicate_degree=2,
+                        ),
+                    }
+                ),
+            )
+        self.assertEqual(tuple(model.odd.shape), (2, 4))
+        self.assertEqual(_count_targets(gm, "constant_pad_nd"), 1)
+        reductions = [
+            node
+            for node in gm.graph.nodes
+            if node.meta.get("comm_type") == "fsdp_reduce_scatter"
+        ]
+        self.assertEqual([node.args[2:] for node in reductions], [(2, "fsdp_expert")])
+        replicated = [
+            node
+            for node in gm.graph.nodes
+            if node.meta.get("comm_type") == "dp_all_reduce"
+        ]
+        self.assertEqual(
+            [node.args[2:] for node in replicated], [("fsdp_expert_replicate",)]
+        )
+        self.assertEqual(_waited_rs_ar_chain(gm), 1)
+
+    def test_expert_edp_replication_without_sharding_all_reduces_only(self):
+        """A singleton expert shard keeps the parameter full and reduces EDP only."""
+        gm = _odd_joint_graph()
+        model = _OddParam()
+        with _patch_dist(world_size=4):
+            FSDPPass().run(
+                gm,
+                PassConfig(fsdp_degree=4),
+                model=model,
+                fsdp_group_name="dense",
+                fsdp_plan=FsdpPlan(
+                    {
+                        "odd": FsdpParamSpec(
+                            "fsdp_expert",
+                            1,
+                            mode="replicate",
+                            pad_policy="error",
+                            replicate_group_name="fsdp_expert_replicate",
+                            replicate_degree=4,
+                        ),
+                    }
+                ),
+            )
+        self.assertEqual(tuple(model.odd.shape), (3, 4))
+        self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
+        self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 0)
+        replicated = [
+            node
+            for node in gm.graph.nodes
+            if node.meta.get("comm_type") == "dp_all_reduce"
+        ]
+        self.assertEqual(
+            [node.args[2:] for node in replicated], [("fsdp_expert_replicate",)]
+        )
+        self.assertEqual(_count_targets(gm, "wait_tensor"), 1)
+
+    def test_expert_pad_shards_and_skips_dense_group_under_ddp(self):
+        """Dense ddp still pad-shards experts and never resolves the dense group."""
+        gm = _odd_joint_graph()
+        model = _OddParam()
+        resolved = []
+
+        def _record_resolve(name):
+            resolved.append(name)
+            return MagicMock()
+
+        with _patch_dist(world_size=4) as mocked:
+            mocked.get_rank.side_effect = lambda group=None: 0
+            with patch(_RESOLVE_PG_PATH, side_effect=_record_resolve):
+                FSDPPass().run(
+                    gm,
+                    PassConfig(dp_mode="ddp", dp_replicate_degree=4),
+                    model=model,
+                    fsdp_plan=FsdpPlan(
+                        {
+                            "odd": FsdpParamSpec(
+                                "fsdp_expert",
+                                2,
+                                pad_policy="pad",
+                                replicate_group_name="fsdp_expert_replicate",
+                                replicate_degree=2,
+                            ),
+                        }
+                    ),
+                )
+        self.assertEqual(tuple(model.odd.shape), (2, 4))
+        self.assertEqual(_count_targets(gm, "constant_pad_nd"), 1)
+        self.assertIn("fsdp_expert", resolved)
+        self.assertNotIn("fsdp", resolved)
+
     def test_unmarked_expert_fallback_uses_edp_group(self):
         """A partial-plan expert fallback must never reduce across dense/EP peers."""
         for degree in (1, 2):

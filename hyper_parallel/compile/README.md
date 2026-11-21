@@ -444,7 +444,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | Activation checkpoint | Implemented | `ActivationCheckpointPass` (`ac_mode: full` / `selective`); reuses the eager `activation_checkpoint` config (mode, safe-region selection) |
 | Activation offload | Implemented | `CpuOffloadPass`; reuses the dynamic `activation_swap: attention` config, offloads saved attention activations to host with a largest-first budget |
 | PP + HSDP / PP + TP | Planned | HSDP needs a 3-D mesh; TP-in-stage needs per-stage TP collectives in the graph |
-| EP | Planned | — |
+| EP | Implemented (limited) | Expert parameters shard over the `edp_shard` axis and optionally gradient-reduce over `edp_replicate`; requires a `MeshContext` with `fsdp_moe_mesh`, `fsdp_enabled=True`, and `PP=1`. CP is supported (it joins the expert data-parallel domain); dense HSDP may compose with expert EDP replication |
 
 ## Limitations
 
@@ -469,6 +469,18 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   intra-stage DP group and the cross-stage `"pp"` group. PP+HSDP (3-D mesh)
   and PP composed with an external `MeshContext` are not supported yet.
   Without a pp group (direct `PpPass` use), `fsdp_enabled=True` is rejected.
+- **Graph EP topology**: expert parameters require a `MeshContext` whose
+  `fsdp_moe_mesh` has an `edp_shard` axis. `edp_replicate>1` is supported: each
+  rank shards on `edp_shard` and then all-reduces the local gradient on the
+  separate `edp_replicate` group (`fsdp_expert_replicate`); with
+  `edp_shard_size == 1` the expert weights stay full and only the replicate
+  axis is reduced. Dense `dp_mode="fsdp"` / `"hsdp"` / `"ddp"` may compose with
+  expert EDP, but `fsdp_enabled` must be `True`; PP remains unsupported
+  (`PP=1`). CP is supported: `MeshContext.build_meshs` folds the CP axis into
+  the dense `fsdp_shard` and the expert data-parallel domain, and the expert
+  gradient normalization divides by `dp_size * cp_size` exactly like eager.
+  A missing expert mesh, an unbound expert model, or `fsdp_enabled=False`
+  fails fast instead of leaving experts silently unsharded.
 - **VPP stage plan**: with `pp_chunks > 1`, a manual `GraphParallelPlan`
   must declare `pp_degree * pp_chunks` exact module FQNs (one list per
   virtual stage); auto split distributes layers evenly across the virtual

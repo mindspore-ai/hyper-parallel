@@ -102,8 +102,9 @@ class GraphCompiler:
             mesh_context: Optional automodel ``MeshContext`` carrying the
                 pre-built parallel meshes. Model forwards retain their TP/EP
                 groups; the compiler registers the dense shard sub-mesh under
-                ``"fsdp"`` and, for basic EP, the expert EDP shard sub-mesh
-                under ``"fsdp_expert"`` for the graph-mode FSDP pass.
+                ``"fsdp"``, the expert EDP shard sub-mesh under
+                ``"fsdp_expert"``, and (when the expert mesh replicates) the
+                expert EDP replicate sub-mesh under ``"fsdp_expert_replicate"``.
             dynamic: Symbolize user input dimensions; inherits trainer_config.compile.dynamic when omitted.
             dynamic_arg_dims: Optional dotted input paths to dynamic dimensions, e.g. {"x": [0, 1]}.
                 Overrides automatic dimension selection and inherits trainer configuration when omitted.
@@ -130,6 +131,9 @@ class GraphCompiler:
         self.source_shard_info = source_shard_info
         self._fsdp_mesh = None
         self._expert_fsdp_mesh = None
+        self._expert_shard_degree: Optional[int] = None
+        self._expert_replicate_group_name: Optional[str] = None
+        self._expert_replicate_degree: int = 1
         self._fsdp_config = getattr(trainer_config, 'fsdp_config', None)
         self._parameter_meshes = {}
         self._parameter_groups = {}
@@ -497,30 +501,25 @@ class GraphCompiler:
         self.pass_config.fsdp_degree = world_size
 
     def _validate_ep_topology(self) -> None:
-        """Limit graph EP to the synchronous, non-pipelined basic topology."""
+        """Allow graph EP with CP, but not with pipeline parallelism."""
         context = self._mesh_context
         if context is None or getattr(context, "ep_size", 1) <= 1:
             return
-        if any(
-            getattr(context, axis, 1) != 1 for axis in ("cp_size", "pp_size")
-        ):
-            raise ValueError("Graph EP currently requires CP=PP=1")
+        if not self.pass_config.fsdp_enabled:
+            raise ValueError(
+                "Graph EP requires fsdp_enabled=True so expert parameters can "
+                "be sharded over the EDP mesh"
+            )
+        if getattr(context, "pp_size", 1) != 1:
+            raise ValueError("Graph EP currently requires PP=1")
 
     def _init_expert_dp(self, context: Any) -> None:
-        """Use EDP for the exact parameters owned by bound local experts."""
+        """Bind expert parameters to their EDP shard and replicate groups."""
         if getattr(context, "ep_size", 1) <= 1:
             return
         mesh = context.fsdp_moe_mesh
         if mesh is None or "edp_shard" not in mesh.mesh_dim_names:
             raise ValueError("Graph EP requires the expert data-parallel shard mesh")
-        if self.pass_config.dp_mode != "fsdp":
-            raise ValueError(
-                "Graph EP currently supports sharded data parallelism without replication"
-            )
-        if "edp_replicate" in mesh.mesh_dim_names and mesh["edp_replicate"].size() > 1:
-            raise ValueError(
-                "Graph EP currently does not support expert data-parallel replication"
-            )
         parameters = {
             id(parameter)
             for module in self.model.modules()
@@ -534,8 +533,23 @@ class GraphCompiler:
         }
         if not self._expert_param_names:
             raise ValueError("Graph EP requires bound local expert parameters")
-        self._expert_fsdp_mesh = mesh["edp_shard"]
-        self._register_mesh_group("fsdp_expert", self._expert_fsdp_mesh)
+        names = tuple(mesh.mesh_dim_names)
+        shard_mesh = mesh["edp_shard"]
+        self._expert_shard_degree = shard_mesh.size()
+        self._register_mesh_group("fsdp_expert", shard_mesh)
+        if "edp_replicate" in names:
+            replicate_mesh = mesh["edp_replicate"]
+            self._expert_replicate_group_name = "fsdp_expert_replicate"
+            self._expert_replicate_degree = replicate_mesh.size()
+            self._register_mesh_group(self._expert_replicate_group_name, replicate_mesh)
+            expert_dims = tuple(
+                name for name in names if name in ("edp_replicate", "edp_shard")
+            )
+            self._expert_fsdp_mesh = mesh[expert_dims]
+        else:
+            self._expert_replicate_group_name = None
+            self._expert_replicate_degree = 1
+            self._expert_fsdp_mesh = shard_mesh
 
     def _init_pp_dp_mesh(
         self, dp_mode: str, mesh_context: Optional[Any] = None
@@ -814,18 +828,19 @@ class GraphCompiler:
             for name, (group, degree) in self._parameter_groups.items()
         }
         if self._expert_param_names:
-            if self._expert_fsdp_mesh is None:
+            if self._expert_fsdp_mesh is None or self._expert_shard_degree is None:
                 raise ValueError("Expert parameters require fsdp_moe_mesh['edp_shard']")
-            expert_degree = self._expert_fsdp_mesh.size()
             for name in self._expert_param_names:
                 bound = specs.get(name)
                 group = bound.group_name if bound is not None else "fsdp_expert"
-                degree = bound.degree if bound is not None else expert_degree
+                degree = bound.degree if bound is not None else self._expert_shard_degree
                 specs[name] = FsdpParamSpec(
                     group,
                     degree,
                     mode="replicate" if degree == 1 else "shard",
-                    pad_policy="error",
+                    pad_policy="pad",
+                    replicate_group_name=self._expert_replicate_group_name,
+                    replicate_degree=self._expert_replicate_degree,
                 )
         return FsdpPlan(specs) if specs else None
 
