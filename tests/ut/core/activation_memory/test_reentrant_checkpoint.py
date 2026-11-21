@@ -18,6 +18,8 @@ import contextlib
 import importlib
 import unittest
 import weakref
+from copy import deepcopy
+from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -27,12 +29,51 @@ from hyper_parallel.core.activation_memory import (
     recompute_handle_collector_ctx, recompute_handle, recompute_session_ctx, clear_recompute_session,
     is_recomputing,
 )
+from hyper_parallel.core.activation_memory.api import CheckpointPolicy, create_selective_checkpoint_contexts
 
 _RECIPES = importlib.import_module("hyper_parallel.core.activation_memory.checkpoint_exclude")
 
 
 class TestReentrantCheckpoint(unittest.TestCase):
     """Compare ordinary and split checkpoint gradients with eager autograd."""
+
+    def test_sac_exclusion_preserves_direct_and_nested_checkpoint_gradients(self):
+        """Excluded linears must not consume the enclosing SAC cache slots."""
+        def policy(_ctx, op, *_args, **_kwargs):
+            if op == torch.ops.aten.addmm.default:
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.MUST_RECOMPUTE
+
+        reference = torch.nn.Sequential(
+            torch.nn.Linear(2, 2), torch.nn.Sigmoid(), torch.nn.Linear(2, 2), torch.nn.Sigmoid(),
+        )
+        inputs = torch.ones(2, 2, requires_grad=True)
+        expected = reference(inputs)
+        expected.sum().backward()
+        for kind in ("non_reentrant", "reentrant", "nested"):
+            with self.subTest(kind=kind):
+                model = deepcopy(reference)
+                model.zero_grad(set_to_none=True)
+                calls = []
+                model[0].register_forward_hook(lambda *_args: calls.append(1))
+                model[0] = checkpoint_exclude_wrapper(model[0])
+                candidate_inputs = inputs.detach().requires_grad_()
+
+                def nested(value):
+                    return checkpoint(model, value, use_reentrant=True)
+
+                actual = checkpoint(
+                    nested if kind == "nested" else model,
+                    candidate_inputs,
+                    use_reentrant=kind == "reentrant",
+                    context_fn=partial(create_selective_checkpoint_contexts, policy),
+                )
+                actual.sum().backward()
+                self.assertEqual(len(calls), 2 if kind == "nested" else 1)
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(candidate_inputs.grad, inputs.grad)
+                for got, want in zip(model.parameters(), reference.parameters()):
+                    torch.testing.assert_close(got.grad, want.grad)
 
     def test_excluded_internal_saves_and_input_recipes_release_after_backward(self) -> None:
         """The local graph retains real internal saves but rebuilds input aliases on replay."""

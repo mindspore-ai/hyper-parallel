@@ -19,6 +19,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
 
 from hyper_parallel.core.activation_memory import CheckpointPolicy
@@ -132,6 +134,34 @@ class TestCreateSelectiveCheckpointContexts(unittest.TestCase):
 
 class TestTorchDispatchModes(unittest.TestCase):
     """Unit tests for the caching and cached dispatch modes."""
+
+    def test_collective_rejects_saved_local_and_dtensor_views(self):
+        """Cached physical storage cannot be modified even with mutation allowed."""
+        collective = getattr(getattr(torch.ops.c10d, "allreduce_", None), "default", None)
+        if collective is None:
+            self.skipTest("This Torch build does not register c10d.allreduce_")
+        local = torch.ones(2, 2)
+        spec = DTensorSpec(MagicMock(ndim=1), (Replicate(),),
+                           TensorMeta(local.shape, local.stride(), local.dtype))
+        distributed = DTensor(local, spec, requires_grad=False)
+        for saved in (local, distributed):
+            with self.subTest(tensor=type(saved).__name__):
+                caching, _ = create_selective_checkpoint_contexts(
+                    lambda *_a, **_kw: CheckpointPolicy.MUST_RECOMPUTE, allow_cache_entry_mutation=True,
+                )
+                caching.storage[torch.ops.aten.mul.Tensor].append(_VersionWrapper(saved))
+                with self.assertRaisesRegex(RuntimeError, "cached tensor or its alias"):
+                    caching.__torch_dispatch__(collective, (), ([local[:, 1:]],))
+                self.assertIsNone(caching._check_collective_writes(collective, ([local.clone()],), {}))
+
+    def test_raw_collective_returns_cannot_be_cached(self):
+        """Saving the Work cannot replay a collective's write to its buffer."""
+        collective = getattr(getattr(torch.ops.c10d, "allreduce_", None), "default", None)
+        if collective is None:
+            self.skipTest("This Torch build does not register c10d.allreduce_")
+        for mode in create_selective_checkpoint_contexts([collective]):
+            with self.assertRaisesRegex(ValueError, "MUST_RECOMPUTE"):
+                mode.__torch_dispatch__(collective, ())
 
     def test_must_save_cache_is_restored_during_recompute(self):
         """Saved activations should be replayed from cache during recompute."""
