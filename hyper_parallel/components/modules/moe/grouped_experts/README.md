@@ -7,9 +7,9 @@
 
 ```text
 grouped_experts/
+  README.md
   grouped_experts.py
   grouped_experts_family.py
-  mega_grouped_experts.py
   ep/
     __init__.py
     ep_grouped_experts.py
@@ -25,7 +25,7 @@ from hyper_parallel.components.modules.moe.grouped_experts import GroupedExperts
 ```
 
 `hyper_parallel.components.modules.GroupedExperts` 统一导出本目录的新专家族工厂。
-默认本地计算复用现有 NPU grouped-GEMM；Mega/MoonEP 已注册为成员，但执行仍是骨架，选择它们会在构建时明确报错。
+默认本地计算复用现有 NPU grouped-GEMM；Mega 已接入 HyperMulticore 融合 executor，MoonEP 仍是构建时明确拒绝的骨架。
 
 ## 维度与 slot
 
@@ -65,6 +65,12 @@ output = activated @ down_proj[e].T        -> [N_e,H]
 ```
 
 参数采用 Transformers packed 布局。两组权重以最后两维的转置视图传给 [grouped_matmul](../../../functional/grouped_matmul.py)。
+
+默认激活不配置 limit 时，直接调用已有 [SwiGLU 封装](../../../functional/swiglu.py)，底层为
+`torch_npu.npu_swiglu`。正值 `swiglu_limit` 使用 FP32 pre-SiLU clamp 路径；模型明确提供的
+`activation` 回调仍保留其数学语义。
+显式配置或来源模型的 `limit/swiglu_limit` 为有限 `<=0` 时，在构造阶段发出 `UserWarning` 并归一化为
+`None`，关闭 clamp；没有自定义 activation 时走默认 SwiGLU。布尔值、非数字和 NaN/Inf 仍报错。
 EP 沿专家维 `Shard(0)`，每个 owner 保留它负责的完整专家矩阵。
 
 ## 公开入口与初始化
@@ -244,6 +250,137 @@ dense 层可以启用 TP；专家区域复用已有作业的派生 EP mesh，专
 dense/SP 边界的输入输出布局由模型声明，本模块不猜测 DTensor 布局或重复复制 token。
 这里支持的是 TP-extend-EP，不包括将单个专家的 H/I 再切开的 ETP。
 
+## MegaKernel 接入
+
+`GroupedExperts(..., megakernel=True)` 仅在 EP>1 时选择 `EPMegaGroupedExperts`，
+使用 `hyper_multicore.MegaMoeExperts` executor。EP=1 自动回退已有的普通 GroupedExperts
+并发出 `UserWarning`，不加载 HyperMulticore、不创建 native runtime。
+MegaMoE 没有非 EP 成员；融合入口与 runtime holder 均放在 [EP Mega 实现](ep/ep_mega_grouped_experts.py)。
+原模型仍负责 router、aux-loss、专家 bias 更新、共享专家和掩码；本模块仅消费已经选好的三 Tensor。
+
+### 参数与执行
+
+- 专家族是唯一的参数所有者：`gate_up_proj[E,2I,H]`、`down_proj[E,H,I]`。
+  复用普通专家族的 `reset_parameters()` 和 `make_transforms()`，checkpoint 名称与形状保持 canonical。
+- runtime 使用普通 Python holder，不注册为子 `nn.Module`，也不保存权重副本。
+  当前 HyperMulticore executor 本身已无参数，不需要旧接口的 `create_parameters=False`。
+- 每次 forward 在 FSDP hook 恢复参数后读取当前参数，DTensor 通过 `to_local()` 取得当前本地 Tensor，
+  直接作为 `expert_weights` 传入。后端根据两组 shape 识别 EOI；不在 forward 中转置或复制专家权重。
+  EOI 要求连续存储，由后端统一校验。
+- 直接传入原始 `hidden_states[...,H]`、`topk_ids[T,K]`、`topk_weights[T,K]`，
+  不先执行普通 permute、EP dispatch/combine 或 unpermute，输出仍为 `[...,H]`。
+- EP>1 的 Mega `top_k` 必须固定。独立构建在 `GroupedExpertsConfig` 中传入；替换模型时从 source/context 的
+  `num_experts_per_tok`、`top_k`、`moe_topk` 获取。`num_layers` 沿用构建器的全局层数传递。
+- `routing_weight_mode` 映射到 `MegaMoeNumericsOptions.apply_probs_before_fc2`：
+  `output=False`、`before_fc2=True`。默认仍为 `before_fc2`；采用 HF packed 来源时保留 `output`。
+- `swiglu_limit` 传给 `SwiGLUParameters.clamp_limit`。`None` 使用普通 SwiGLU，正值表示 FP32 pre-SiLU clamp：
+  gate 仅截断上界、up 截断到正负 limit。有限 `<=0` 会提醒并关闭 clamp，EP>1 仍使用 Mega 后端。
+  Mega 不接收任意 Python activation callable。
+- `dispatch_mode`、`initial_capacity_factor`、`capacity_growth_factor` 继续转发给
+  `MegaMoeTuningOptions`；默认 push 和后端默认容量策略。EP=1 回退时忽略这些选项；
+  未开启 Mega 的普通 local/EP 请求只接受默认值。
+
+注册表直接指向各成员类。通用构建器先校验公共参数名和模块族约束，再按具体成员签名传参；
+普通 local/EP 构造函数无需声明 Mega 调优参数，也无需增加兼容包装函数。
+
+依赖当前公开的 [MegaMoeExperts](https://github.com/mindspore-ai/hyper-multicore/blob/master/hyper_multicore/modules/mega_moe/module.py)、
+[MegaMoeNumericsOptions](https://github.com/mindspore-ai/hyper-multicore/blob/master/hyper_multicore/modules/mega_moe/numerics.py)
+与 `hyper_multicore.experimental.MegaMoeTuningOptions`。
+仅选择 Mega 成员时才加载可选依赖；不对旧版接口进行静默降级。
+
+### 绑定与生命周期
+
+1. replacement 构造 canonical 参数，选择 Mega 具体成员，不申请通信组或设备 workspace。
+2. `parallel_module_spec()` 声明 `binding_kind="mesh"`，复用既有布局校验。
+   EP>1 时两组权重均仅在专家轴 `Shard(0)`；不做专家内部 TP。
+3. 公共 binder 调用 `bind_parallel()`，借用 EP>1 的作业 EP group；直接给 Mega 成员绑定 EP=1 会报错。
+   Mega 内部已融合通信，不再创建普通 `EPContext`。
+4. 模型构建器在 FSDP 包装、materialize/load、最终 dtype 转换之后，compile 之前调用
+   `prepare_module_runtimes(model)`。兼容的顺序层复用后端 `share_execution_resources()`。
+   对透明 wrapper 按实际方法 owner 去重；重复 prepare 不重复创建 executor。
+5. 所有 forward/backward 完成后，可显式调用 `close_module_runtimes(model)` 释放 native runtime。
+   该方法不放在 optimizer step 中，不改变梯度缩放、裁剪或更新顺序。
+
+公共 [megakernel_utils.py](../../megakernel_utils.py) 只协调模块声明的生命周期：`_runtime_groups()` 按兼容 key 分组并对
+透明 wrapper 的真实 owner 去重；`prepare_module_runtimes()` 调用各组的准备接口；
+`close_module_runtimes()` 逐模块关闭 runtime。它不拥有专家参数、不执行 reset，也不负责 FSDP unshard/预取。
+具体 Mega executor 和共享 workspace 的实现仍在 `ep/ep_mega_grouped_experts.py`。
+
+旧实现分散在模型和 Mega adapter 中：[compute factory](../../../../models/deepseek_v41/adapter/distributed/moe_engram_expert_parallel.py)
+调用 `DeepseekV41MegaMoeExperts.configure()`，V4.1 模型首次 forward 通过
+[`_prepare_megamoe_runtime()`](../../../../models/deepseek_v41/modeling_deepseek_v41.py) 遍历旧 Mega 类并共享 workspace；
+[`megamoe.py`](../../../../models/deepseek_v41/adapter/distributed/megamoe.py) 原本就提供 `close_runtime()`。
+新分组逻辑去掉模型类型依赖，Trainer 构建器自动准备新族 runtime；独立组件需要在完成绑定和设备配置后准备，
+因为它没有模型构建器的生命周期入口。释放接口供最后一次 backward 后显式使用，不是每步训练的额外操作。
+
+未使用 Hyper Trainer 的用户也可复用此流程：完成布局绑定、设备实例化与 dtype 转换后，调用
+`hyper_parallel.components.modules.megakernel_utils.prepare_module_runtimes(model)`；最终 backward 后调用同模块的
+`close_module_runtimes(model)`。直接对尚未绑定/prepare 的 Mega 成员 forward 会明确报错。
+
+独立组件可直接传入已有 EP>1 的 `MeshContext`，复用模块族的布局与绑定入口。
+传入 EP=1 的 mesh 时同样会 warning 并回退普通实现，不需要准备 Mega runtime：
+
+```python
+from hyper_parallel.components.modules import GroupedExperts
+from hyper_parallel.components.modules.moe.grouped_experts import GroupedExpertsConfig
+from hyper_parallel.components.modules.megakernel_utils import close_module_runtimes, prepare_module_runtimes
+
+experts = GroupedExperts(
+    config=GroupedExpertsConfig(
+        num_experts=8, hidden_size=1024, intermediate_size=2048,
+        num_layers=24, top_k=2,
+    ),
+    megakernel=True,
+    mesh=mesh,  # 已创建的作业 MeshContext。
+)
+# 用户完成设备实例化、dtype 转换以及所需的 FSDP 包装后：
+prepare_module_runtimes(experts)
+output = experts(hidden_states, topk_ids, topk_weights)
+# 完成最终 backward 后：
+close_module_runtimes(experts)
+```
+
+当前保留旧 Mega adapter 的限制：PP=1；dense TP>1 需要 EP>1 且 `sequence_parallel=true`。
+后端当前执行 BF16 NPU eager 路径，不支持 graph capture。本次不引入低精或专家内部 ETP。
+共享 workspace 的成员必须按顺序执行，不用于同时执行的多个模型请求。
+
+### YAML 使用
+
+标准 SwiGLU 来源：
+
+```yaml
+plan_overrides:
+  - match: "model.layers.*.mlp.experts"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+        megakernel: true
+        dispatch_mode: push
+```
+
+DeepSeek-V4.1 也直接使用上面的公共 target，无需模型专用 Mega replacement。
+公共入口读取 packed 来源的 `limit/swiglu_limit`、top-k 和全局层数，保留原参数；
+`megakernel: true` 选择 EP Mega，false 选择普通 local/EP。EP=1 且开启 Mega 时仍 warning 并回退。
+正 limit 保留 FP32 pre-SiLU clamp；有限的非正来源值表示关闭 clamp，未配置时使用默认融合 SwiGLU。
+
+新专家族保留父 MoE 的原生 forward，由专家成员执行自身的通信和计算；
+不同时配置旧 `deepseek_v41_ep_compute_fn` 或 `deepseek_v41_megamoe_compute_fn`。
+旧 recipe 继续使用原生专家与普通 EP compute 的组合，或旧 `DeepseekV41MegaMoeExperts` 与 Mega compute 的组合。
+`megamoe.py` 和 `moe_engram_expert_parallel.py` 的旧实现保持不变。
+
+### 精度与验证边界
+
+新路径保留 router 输入输出、概率位置、pre-SiLU clamp 和共享专家的父级执行顺序；不新增随机路由或 loss hook。
+初始化沿用新专家族规则：FC1 std 为 `init_method_std`，FC2 std 为
+`init_method_std / sqrt(2 * num_layers)`。旧 `DeepseekV41MegaMoeExperts` 两层均使用 initializer_range，
+且初始化存储为 EIO；因此同 seed 重新随机初始化不构成可比的二进制精度实验。
+对比时应加载同一份 canonical checkpoint，并统一输入、优化器状态、拓扑、后端数值选项。
+
+EOI 与旧 EIO 可能选择不同 kernel，普通 GMM 与 Mega 的激活舍入、矩阵乘法和归约顺序也可能不同；
+不能仅凭接口一致宣称 raw bytes 对齐。
+CPU UT 覆盖接口、权重所有权、梯度链、绑定与资源生命周期，不替代 NPU 输出/dX/dW/路由权重梯度、训练曲线或性能验收。
+
 ## MoonEP 接入骨架
 
 [ep/moonep_grouped_experts.py](ep/moonep_grouped_experts.py) 定义 MoonEPGroupedExperts，继承规范参数和共享计算，
@@ -274,12 +411,13 @@ MoonEP 规划的 `prefetch_weights` 用于把其他 EP owner 的专家临时复�
 | --- | --- | --- | --- | --- |
 | false | false | 1 | 默认算法成员 / local | 默认本地计算已实现 |
 | false | false | >1 | `EPGroupedExperts` / ep | 复用默认数学，slot 运输已实现 |
-| true | false | 1 | `MegaGroupedExperts` / mega | 已注册，构建时报内核未实现 |
-| true | false | >1 | `EPMegaGroupedExperts` / ep_mega | 已注册，构建时报内核未实现 |
+| true | false | 1 | 默认算法成员 / local | 自动回退普通 grouped-GEMM，并发出 warning |
+| true | false | >1 | `EPMegaGroupedExperts` / ep_mega | 融合 executor，绑定作业 EP group |
 | false | true | >1 | `MoonEPGroupedExperts` / ep_moonep | 已注册，构建时报 runtime 未实现 |
 
-没有对应成员的组合直接拒绝，不静默回退。
-Mega 覆盖 `forward`，后续以一次 core executor 调用融合运输和计算，避免重复执行普通 EP 阶段。
+EP=1 且 megakernel=true 时，回退到已有 local 成员并发出 warning，忽略 Mega 调优参数。
+其他没有对应成员的组合直接拒绝，不静默回退。
+Mega 覆盖 `forward`，以一次 core executor 调用融合运输和计算，避免重复执行普通 EP 阶段。详见 [MegaKernel 接入](#megakernel-接入)。
 
 | 族内 provider | 输入 | 输出与含义 |
 | --- | --- | --- |
@@ -350,7 +488,7 @@ YAML 请求经过既有 replacement 规划与 build_family，结合作业规模�
 | Qwen3.5/3.6-MoE、DeepSeek-V3/V3.2 | 新版 Transformers packed SwiGLU | 当前普通配方选择新族；移除同一路径上的旧父层 EP 方法替换 |
 | Qwen2-MoE、DeepSeek-V2 | 新版 Transformers packed SwiGLU | 选择新族后由 planner 自动推导父层布局，可使用上面的显式替换规则 |
 | Kimi K2.5/K2.6 native 文本塔 | 新版 Transformers DeepSeek-V3 packed SwiGLU | 当前 recipe 使用专家族；保留原生 router 和共享专家 |
-| DeepSeek-V4.1 普通专家 | 相同 packed 权重，额外 clamp/FP32 激活 | 模型 adapter 注入原生激活；现有 MegaMoe 示例配置保持独立 |
+| DeepSeek-V4.1 专家 | 相同 packed 权重，额外 clamp/FP32 激活 | 公共 target 直接读取 limit；既有 MegaMoe recipe 保持独立 |
 | Kimi-K3 | 官方 remote 实现为 ModuleList，Situ 激活，可带 latent MoE | 尚未迁移旧 ModuleList，不注册新专家族替换 |
 | Kimi Linear 官方 remote 实现 | ModuleList，每个专家持有 w1/w2/w3 | 当前普通 packed 接管入口不支持 |
 
@@ -383,6 +521,8 @@ DeepSeek-V3 的 MLA 配方也加入普通专家族；原 router 和共享专家�
 | num_layers | num_hidden_layers、num_layers |
 | init_method_std | init_method_std、initializer_range |
 | hidden_act | hidden_act、hidden_activation、mlp_hidden_act |
+| top_k | num_experts_per_tok、top_k、moe_topk |
+| swiglu_limit | swiglu_limit、limit；来源模块优先，有限非正值提醒并关闭 clamp |
 
 `forward` 调用 `match_grouped_experts_inputs`，保持三个位置参数的语义，同时接受以下关键字：
 
@@ -412,7 +552,7 @@ DeepSeek-V3 的 MLA 配方也加入普通专家族；原 router 和共享专家�
 | DeepSeek-V2 | DeepseekV2Experts | 显式替换选择新族，父层布局自动推导 | 未统一固定 |
 | Qwen2-MoE | Qwen2MoeExperts | 显式替换选择新族，父层布局自动推导 | 未统一固定 |
 | Kimi-K2.5/K2.6 native | kimi_k25 外壳，DeepseekV3Experts 文本塔 | 当前主配方接入 | Kimi-K2.6 文档记录 5.13.0 |
-| DeepSeek-V4.1 普通专家 | 仓内自研模型复用 DeepseekV4Experts | 专用 adapter 注入 clamp/FP32 激活；MegaMoe 示例不切换 | 未提供完整模型统一验收版本 |
+| DeepSeek-V4.1 普通专家 | 仓内自研模型复用 DeepseekV4Experts | 公共入口读取 limit 并执行 FP32 clamp；既有 MegaMoe 示例保持独立 | 未提供完整模型统一验收版本 |
 | Kimi-K3 | 官方 remote 实现；没有 HF 原生 K3 专家类 | 旧 ModuleList 未迁移，不注册新专家族替换 | 官方 text config 记录 4.56.2，不能当作 5.13 运行验收 |
 | Kimi Linear remote | 官方 remote 模型，ModuleList w1/w2/w3 | 未接管旧专家结构；整改为兼容专家后才可使用默认推导 | 官方配置记录 4.57.1，未完成 5.13 模型整改 |
 
@@ -424,13 +564,13 @@ DeepSeek-V3 的 MLA 配方也加入普通专家族；原 router 和共享专家�
 | Qwen3-VL-MoE | 权重为 `[E,H,2I]` / `[E,I,H]`；调用顺序是 hidden、dense `[T,E]` 概率、IDs，输出含额外维度；不能通过关键字别名适配 | 已是 `[E,2I,H]` / `[E,H,I]` 和 top-k 三 Tensor，专家契约兼容 |
 | Qwen3.5/3.6-MoE | 该 tag 不含 qwen3_5_moe 模型实现 | qwen3_5_moe 专家契约兼容；这不代表已验证整个 Qwen3.6 模型 |
 | DeepSeek-V3.2 | 该 tag 不含 deepseek_v32 模型实现 | packed 专家契约兼容，类名为 DeepseekV32NaiveMoe |
-| DeepSeek-V4.1 | 该 tag 不含所依赖的 deepseek_v4 实现 | DeepseekV4Experts 已存在；仍须专用激活 adapter，整模型跨版本未验收 |
+| DeepSeek-V4.1 | 该 tag 不含所依赖的 deepseek_v4 实现 | DeepseekV4Experts 已存在；公共入口读取来源 limit，整模型跨版本未验收 |
 | Kimi-K2.5/K2.6 native | 该 tag 不含 kimi_k25 | 仍无 kimi_k25；即使文本专家兼容，也无法构建此 native 整模型 |
 | Kimi-K3 / Kimi Linear remote | 属于独立 remote 实现，旧 ModuleList 接口未接管 | 升级 Transformers 不会自动转换 ModuleList、训练分支或 checkpoint；仍需模型整改 |
 
 上表的旧版“不兼容”指当前新族入口无法直接接管，或版本中缺少所需原生模型，
 不表示模型使用其旧实现也不能运行。5.11 的专家契约相同项可复用本入口；不同模型的原生类是否存在，以及完整训练能力，需要分别确认。
-MegaKernel 和低精实现继续走各自既有入口，未改为调用本普通专家族。
+既有 MegaKernel 和低精入口保持独立；新专家族可通过 `megakernel: true` 显式选择 MegaKernel。
 
 固定源码依据：
 [Qwen3.5-MoE 5.13.1](https://github.com/huggingface/transformers/blob/v5.13.1/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py)、
@@ -444,12 +584,13 @@ Kimi-K3 的版本字段和当前接口见
 [官方 config](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)
 及 [官方模型源码](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/modeling_kimi_linear.py)。
 
-### 模型特有的激活适配
+### 模型激活语义
 
-[DeepSeek-V4.1 adapter](../../../../models/deepseek_v41/adapter/distributed/moe_engram_expert_parallel.py)
-提供 `replace_deepseek_v41_grouped_experts`。它复用 [deepseek_v41_swiglu](../../../../models/deepseek_v41/modeling_deepseek_v41.py)，
-在 FP32 中执行 gate 上界 clamp、up 双边 clamp 和 SwiGLU，FC2 前恢复输入 dtype；非正 limit 关闭 clamp。
-普通 `F.silu(gate) * up` 无法保留这些语义，因此由模型工厂通过 activation 回调注入，local/EP 共用。
+DeepSeek-V4.1 可通过公共 target 将来源 `limit` 转为配置 `swiglu_limit`，
+在 FP32 中执行 gate 上界 clamp、up 双边 clamp 和 SwiGLU，FC2 前恢复输入 dtype。
+该路径与 [deepseek_v41_swiglu](../../../../models/deepseek_v41/modeling_deepseek_v41.py) 复用同一个激活 helper。
+历史 [adapter](../../../../models/deepseek_v41/adapter/distributed/moe_engram_expert_parallel.py) 的
+`replace_deepseek_v41_grouped_experts` 仍保留显式 activation 回调，供旧配置使用；新配置无需经过它。
 这与 HF 原始逐专家循环未显式转 FP32 的实现存在精度路径差异，不能据此声称逐位对齐。
 
 Kimi-K3 尚未注册新专家族替换。旧 w1/w3 合并与 w2 堆叠、checkpoint 映射、SituAndMul 激活、
@@ -528,6 +669,6 @@ HF packed 来源使用 `output`，保留原模型在 FC2 后应用概率的位�
 ## 当前边界
 
 默认实现是无 bias SwiGLU 的 NPU grouped-GEMM，允许 dense TP 配合作业的 TP-extend-EP 布局。
-GPU、Mega 融合内核、MoonEP runtime、专家内部 ETP、任意 HF 来源和旧训练状态迁移尚未完成。
+GPU、MoonEP runtime、专家内部 ETP、任意 HF 来源和旧训练状态迁移尚未完成。Mega 融合内核接口已接入，原生 NPU 精度与性能仍需验收。
 router、aux-loss、共享专家、padding mask 和通信 overlap 调度属于模型组装；本期三 Tensor 契约不支持 capacity/drop 哨兵。
 本页说明当前代码接口与语义，不代表已通过本次数值、多卡训练或性能验收。

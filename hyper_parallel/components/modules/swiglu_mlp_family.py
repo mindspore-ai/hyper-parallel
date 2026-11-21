@@ -54,6 +54,12 @@ def swiglu_activation(gate: torch.Tensor, up: torch.Tensor, *, limit: float = 0.
 
     FP32 activation remains FP32 even when clamp is disabled. The projection
     owner decides when to cast back before its down projection.
+
+    Args:
+        gate: Gate projection activations.
+        up: Matching up-projection activations.
+        limit: Positive clamp bound; nonpositive values disable clamping.
+        activation_dtype: Compute in the input dtype or float32.
     """
     if activation_dtype not in ("input", "float32"):
         raise ValueError("activation_dtype must be input or float32")
@@ -66,15 +72,27 @@ def swiglu_activation(gate: torch.Tensor, up: torch.Tensor, *, limit: float = 0.
     return F.silu(gate) * up
 
 
-def local_swiglu(x: torch.Tensor, *, limit: float = 0.0, activation_dtype: str | None = None) -> torch.Tensor:
-    """Apply packed SwiGLU, retaining the historical FP32 clamp default."""
+def _resolve_activation_dtype(activation_dtype: str | None, limit: float) -> str:
+    """Resolve the shared input/FP32 activation policy without changing projection dtype."""
     if activation_dtype is None:
         activation_dtype = "float32" if limit > 0 else "input"
     if activation_dtype not in ("input", "float32"):
         raise ValueError("activation_dtype must be input or float32")
+    return activation_dtype
+
+
+def local_swiglu(x: torch.Tensor, *, limit: float = 0.0, activation_dtype: str | None = None) -> torch.Tensor:
+    """Apply packed SwiGLU, retaining the historical FP32 clamp default.
+
+    Args:
+        x: Packed gate/up activations ending in twice the intermediate width.
+        limit: Positive clamp bound; nonpositive values disable clamping.
+        activation_dtype: Explicit compute dtype policy or the clamp-dependent default.
+    """
+    activation_dtype = _resolve_activation_dtype(activation_dtype, limit)
     if x.device.type == "npu" and limit <= 0 and activation_dtype == "input":
         # Optional NPU operators are required only by NPU execution.
-        from hyper_parallel.components.functional.swiglu import swiglu  # pylint: disable=C0415
+        from hyper_parallel.components.functional import swiglu  # pylint: disable=C0415
         return swiglu(x)
     gate, up = x.chunk(2, dim=-1)
     return swiglu_activation(gate, up, limit=limit, activation_dtype=activation_dtype).to(x.dtype)
@@ -99,11 +117,9 @@ def _activation_settings(source: Any, *, limit: float | None = None,
     if activation_dtype is None:
         activation_dtype = getattr(source, "activation_dtype",
                                    None if hf_source else getattr(config, "activation_dtype", None))
-    if activation_dtype is None:
-        activation_dtype = "float32" if limit > 0 and not hf_clamped_source else "input"
-    if activation_dtype not in ("input", "float32"):
-        raise ValueError("activation_dtype must be input or float32")
-    return limit, activation_dtype
+    if activation_dtype is None and hf_clamped_source:
+        activation_dtype = "input"
+    return limit, _resolve_activation_dtype(activation_dtype, limit)
 
 
 class SwiGLUMLPModule(nn.Module):
@@ -206,14 +222,12 @@ class SwiGLUMLPModule(nn.Module):
         """
         super().__init__()
         del module_fqn, context
-        if config is None and module is None:
+        if (config is None) == (module is None):
             raise ValueError("provide exactly one of config or module")
         source = config if config is not None else module
         self.swiglu_limit, self.activation_dtype = _activation_settings(
             source, limit=swiglu_limit, activation_dtype=activation_dtype)
         if config is not None:
-            if module is not None:
-                raise ValueError("provide config or module, not both")
             _validate_mlp_config(config)
             self.config = config
             self.hidden_size = config.hidden_size
@@ -291,7 +305,12 @@ class SwiGLUMLPModule(nn.Module):
         return transforms
 
     def forward(self, x: torch.Tensor | None = None, *, hidden_states: torch.Tensor | None = None) -> torch.Tensor:
-        """Apply the fused Gate/Up projection, SwiGLU, and Down projection."""
+        """Apply the fused Gate/Up projection, SwiGLU, and Down projection.
+
+        Args:
+            x: Token activations, exclusive with hidden_states.
+            hidden_states: Equivalent keyword spelling for token activations.
+        """
         if (x is None) == (hidden_states is None):
             raise ValueError("provide exactly one of x or hidden_states")
         x = hidden_states if x is None else x
@@ -333,7 +352,11 @@ class W1W2SwiGLUMLPModule(nn.Module):
             self.train(module.training)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the shared SwiGLU math without changing source checkpoint names."""
+        """Apply the shared SwiGLU math without changing source checkpoint names.
+
+        Args:
+            hidden_states: Token activations ending in the input hidden width.
+        """
         return self.w2(local_swiglu(self.w1(hidden_states), limit=self.swiglu_limit,
                                    activation_dtype=self.activation_dtype))
 

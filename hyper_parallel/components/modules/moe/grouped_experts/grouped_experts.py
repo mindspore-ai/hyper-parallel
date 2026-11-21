@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import math
 from typing import Any, Literal
+import warnings
 
 import torch
 from torch import Tensor, nn
@@ -27,10 +28,26 @@ from torch.nn import functional as F
 from transformers.activations import SiLUActivation
 
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
-from hyper_parallel.components.functional.grouped_matmul import grouped_matmul
+from hyper_parallel.components.functional import grouped_matmul, swiglu as npu_swiglu
 from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
 from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
+from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation
 from hyper_parallel.core.dtensor.dtensor import DTensor
+
+
+def _normalize_swiglu_limit(limit: Any) -> float | None:
+    """Validate a source/config clamp and normalize disabled values once at construction."""
+    if limit is None:
+        return None
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit):
+        raise ValueError("swiglu_limit/limit must be None or a finite number")
+    if limit > 0:
+        return limit
+    warnings.warn(
+        f"swiglu_limit/limit={limit} <= 0 disables clamping; using unclamped SwiGLU.",
+        UserWarning, stacklevel=4,
+    )
+    return None
 
 
 @dataclass(frozen=True)
@@ -45,6 +62,8 @@ class GroupedExpertsConfig:
         init_method_std: Base std for normal initialization, matching Megatron's 0.02.
         num_layers: Required global Transformer depth for FC2 scaling, before PP partitioning.
         activation: Optional gate/up activation supplied by the model; defaults to SwiGLU.
+        top_k: Static routing width required by fused executors; optional for ordinary GMM.
+        swiglu_limit: Positive pre-SiLU clamp in FP32; None disables it, as do nonpositive values with a warning.
     """
 
     num_experts: int
@@ -54,6 +73,8 @@ class GroupedExpertsConfig:
     init_method_std: float = 0.02
     num_layers: int | None = None
     activation: Callable[[Tensor, Tensor], Tensor] | None = None
+    top_k: int | None = None
+    swiglu_limit: float | None = None
 
     def __post_init__(self) -> None:
         if self.num_layers is None:
@@ -68,6 +89,12 @@ class GroupedExpertsConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.routing_weight_mode not in ("output", "before_fc2"):
             raise ValueError("routing_weight_mode must be output or before_fc2")
+        top_k_type = type(self.top_k)
+        if self.top_k is not None and (top_k_type is not int or not 1 <= self.top_k <= self.num_experts):
+            raise ValueError("top_k must be a positive integer no greater than num_experts")
+        object.__setattr__(self, "swiglu_limit", _normalize_swiglu_limit(self.swiglu_limit))
+        if self.activation is not None and self.swiglu_limit is not None:
+            raise ValueError("declare either a custom activation or swiglu_limit")
 
 
 _EXPERT_CONFIG_KEYS = {
@@ -76,6 +103,8 @@ _EXPERT_CONFIG_KEYS = {
     "intermediate_size": ("intermediate_dim", "moe_intermediate_size", "intermediate_size"),
     "init_method_std": ("init_method_std", "initializer_range"),
     "hidden_act": ("hidden_act", "hidden_activation", "mlp_hidden_act"),
+    "top_k": ("num_experts_per_tok", "top_k", "moe_topk"),
+    "swiglu_limit": ("swiglu_limit", "limit"),
 }
 _EXPERT_INPUT_KEYS = {
     "top_k_index": "topk_ids", "topk_indices": "topk_ids", "selected_experts": "topk_ids",
@@ -138,8 +167,6 @@ def _packed_parameters(module, module_fqn, configs, activation):
     if activation is None and (hidden_act != "silu" or (
             act_fn is not None and type(act_fn) not in (nn.SiLU, SiLUActivation) and act_fn is not F.silu)):
         raise ValueError(f"{module_fqn}: supply the activation for packed experts with non-SwiGLU math")
-    if activation is None and getattr(module, "limit", 0) > 0:
-        raise ValueError(f"{module_fqn}: supply the model activation for clamped packed experts")
     return parameters
 
 
@@ -198,6 +225,9 @@ class GroupedExpertsModule(nn.Module):
                     experts, hidden, intermediate, routing_weight_mode="output", activation=activation,
                     num_layers=(context or {}).get("num_layers"),
                     init_method_std=_match_expert_config_value(configs, "init_method_std", 0.02),
+                    top_k=_match_expert_config_value((module, *configs), "top_k"),
+                    swiglu_limit=(_match_expert_config_value((module, *configs), "swiglu_limit")
+                                  if activation is None else None),
                 )
             self.config = source_config
             self.gate_up_proj = module.gate_up_proj
@@ -351,9 +381,16 @@ class GroupedExpertsModule(nn.Module):
         # Empty ranks avoid unsupported empty GMM calls while retaining gradients to both weights.
         fc1 = (grouped_matmul(hidden, gate_up, group_list=group_list)  # pylint: disable=not-callable
                if hidden.shape[0] else hidden @ gate_up[0])
-        gate, up = fc1.chunk(2, dim=-1)
         activation = self.config.activation
-        activated = F.silu(gate) * up if activation is None else activation(gate, up).to(hidden.dtype)
+        if self.config.swiglu_limit is not None:
+            gate, up = fc1.chunk(2, dim=-1)
+            activated = swiglu_activation(
+                gate, up, limit=self.config.swiglu_limit, activation_dtype="float32",
+            ).to(hidden.dtype)
+        elif activation is not None:
+            activated = activation(*fc1.chunk(2, dim=-1)).to(hidden.dtype)
+        else:
+            activated = npu_swiglu(fc1)  # pylint: disable=not-callable
         if self.config.routing_weight_mode == "before_fc2":
             if routing_weights is None:
                 raise ValueError("before_fc2 requires differentiable slot routing weights")
