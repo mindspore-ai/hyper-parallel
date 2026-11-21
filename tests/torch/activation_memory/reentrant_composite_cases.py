@@ -158,3 +158,13 @@ def test_fsdp_checkpoint_wrapper_exclude() -> None:
 def test_fsdp_checkpoint_api_exclude() -> None:
     """Verify the explicit checkpoint(use_reentrant=True) API under FSDP."""
     _run("api")
+
+
+def test_fsdp_checkpoint_exclude_level0() -> None:
+    """Check both checkpoint entry points with independent models on the same two ranks."""
+    rank, device_id = init_dist()
+    try:
+        for mode in ("wrapper", "api"):
+            _run_steps(mode, rank, device_id)
+    finally:
+        dist.destroy_process_group()

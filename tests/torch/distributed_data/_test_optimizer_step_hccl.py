@@ -189,12 +189,7 @@ def _check_legacy_complete_step(device: torch.device, metadata_mode: bool) -> No
 
 @pytest.mark.parametrize("accumulation,device_depth", ((1, 1), (3, 0), (3, 1), (3, 2), (5, 2)))
 def test_optimizer_step_loading_hccl(accumulation: int, device_depth: int) -> None:
-    """Overlap window data preparation with compute and independent HCCL collectives.
-
-    Args:
-        accumulation: Micro-batches prepared per optimizer step.
-        device_depth: Future micro-batches staged on Device.
-    """
+    """Exercise all four delivery modes at each accumulation and prefetch boundary."""
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     torch.npu.set_device(device)
     dist.init_process_group("hccl", timeout=timedelta(seconds=90))
@@ -205,7 +200,8 @@ def test_optimizer_step_loading_hccl(accumulation: int, device_depth: int) -> No
         ):
             with torch.npu.stream(torch.npu.Stream(device=device)):
                 _run_case(device, backend, metadata_mode, broadcast_plan, accumulation, device_depth)
-        if accumulation > 1:
+        # Legacy replay fixes the accumulation, prefetch depth and cursor in its own loader.
+        if (accumulation, device_depth) == (3, 1):
             for metadata_mode in (False, True):
                 _check_legacy_complete_step(device, metadata_mode)
         dist.barrier()

@@ -259,12 +259,10 @@ def _assert_pp_hsdp_vpp_matches_reference(
     world_size = dist.get_world_size()
     expected_world = _PP_SIZE * _DP_SIZE * _FSDP_SIZE
     if world_size != expected_world:
-        if rank == 0:
-            print(
-                f"Skip {case_name}: requires world_size={expected_world} "
-                f"(pp={_PP_SIZE}, dp={_DP_SIZE}, fsdp={_FSDP_SIZE}), got {world_size}."
-            )
-        return
+        raise AssertionError(
+            f"{case_name}: PP{_PP_SIZE} x DP{_DP_SIZE} x FSDP{_FSDP_SIZE} requires "
+            f"{expected_world} ranks, got {world_size}"
+        )
     if _TOTAL_LAYERS % _PP_SIZE != 0:
         raise AssertionError(f"TOTAL_LAYERS ({_TOTAL_LAYERS}) must be divisible by pp_size ({_PP_SIZE}).")
     if _D_HID % _FSDP_SIZE != 0:

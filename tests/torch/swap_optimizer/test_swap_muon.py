@@ -17,28 +17,32 @@
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
+from tests.common.parallel_case import TorchCase, parallel_run, parallel_run_ascend_batches
 
 SWAP_MUON = str(Path(__file__).resolve().parent / "swap_muon.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_swap_muon_1():
-    """Test swap muon."""
-    parallel_run([
-        TorchCase(SWAP_MUON, "test_swap_muon_parameter_align", None, 1),
-        TorchCase(SWAP_MUON, "test_swap_muon_checkpoint_host_state", None, 1),
-        TorchCase(SWAP_MUON, "test_swap_muon_first_step_is_lazy_and_offloaded", None, 1),
-        TorchCase(SWAP_MUON, "test_swap_muon_packed_swap", None, 1),
-        TorchCase(SWAP_MUON, "test_swap_muon_optimizer_step_hooks", None, 1),
-        TorchCase(SWAP_MUON, "test_swap_muon_post_hook_exception_semantics", None, 1),
+def test_swap_muon_1() -> None:
+    """Check single-device lifecycle, checkpoint and hooks on two disjoint cards."""
+    parallel_run_ascend_batches([
+        TorchCase(SWAP_MUON, (
+            "test_swap_muon_parameter_align",
+            "test_swap_muon_packed_swap",
+            "test_swap_muon_checkpoint_host_state",
+        ), num_proc=1),
+        TorchCase(SWAP_MUON, (
+            "test_swap_muon_first_step_is_lazy_and_offloaded",
+            "test_swap_muon_optimizer_step_hooks",
+            "test_swap_muon_post_hook_exception_semantics",
+        ), num_proc=1),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_swap_muon_2():
-    """Test swap muon."""
-    parallel_run([
+def test_swap_muon_2() -> None:
+    """Check unpacked and packed HSDP schedules on four cards per worker."""
+    parallel_run_ascend_batches([
         TorchCase(SWAP_MUON, "test_swap_muon_hsdp_logical_schedule_4p", None, 4),
         TorchCase(SWAP_MUON, "test_swap_muon_hsdp_packed_logical_schedule_4p", None, 4),
     ])

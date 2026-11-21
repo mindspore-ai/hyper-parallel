@@ -15,6 +15,7 @@
 """Launch _test_muon_e2e.py distributed cases."""
 from pathlib import Path
 
+from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
@@ -22,43 +23,9 @@ _TEST_MUON_E2E = str(Path(__file__).resolve().parent / "_test_muon_e2e.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_muon_e2e_full_shard_8p():
-    """
-    Feature: Muon e2e precision self-consistency under full sharding.
-    Description:
-        1. test_muon_e2e_full_shard_8p (all params sharded on a flat 8-card mesh)
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_MUON_E2E, "test_muon_e2e_full_shard_8p", None, 8),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_muon_e2e_hybrid_shard_replicate_8p():
-    """
-    Feature: Muon e2e precision self-consistency under hybrid sharding with replica dedup.
-    Description:
-        1. test_muon_e2e_hybrid_shard_replicate_8p ((replicate=2, shard=4) mesh, hsdp_replica_count=2)
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_MUON_E2E, "test_muon_e2e_hybrid_shard_replicate_8p", None, 8),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_muon_e2e_mixed_mesh_per_module_8p():
-    """
-    Feature: Muon e2e precision self-consistency with mixed sharding rules in one model.
-    Description:
-        1. test_muon_e2e_mixed_mesh_per_module_8p (attention on 8 cards, experts on (2, 4),
-           embedding and norms replicated)
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_MUON_E2E, "test_muon_e2e_mixed_mesh_per_module_8p", None, 8),
-    ])
+def test_muon_e2e_sharding_parity() -> None:
+    """Compare three sharding layouts and optimizer states in one eight-rank job."""
+    torchrun_case(_TEST_MUON_E2E, "test_muon_e2e_sharding_parity", num_proc=8)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
