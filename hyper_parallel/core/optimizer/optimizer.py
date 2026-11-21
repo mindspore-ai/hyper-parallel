@@ -29,6 +29,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
+from hyper_parallel.core.optimizer.parameter_views import OptimizerParameterViews
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
     build_owner_by_size,
@@ -59,6 +60,7 @@ class ChainedOptimizer:
             optimizers: Leaf optimizers keyed by their configured names.
             flatten: Whether leaf optimizer state uses flattened FQN keys.
         """
+        self.parameter_views: Optional[OptimizerParameterViews] = None
         self.optimizers_dict = optimizers
         self.chained_optimizers = list(optimizers.values())
         self.optimizers_keys = list(optimizers.keys())
@@ -73,6 +75,20 @@ class ChainedOptimizer:
         ] = {}
 
         self._rebind_param_attrs()
+
+    def defer_parameter_binding(self) -> None:
+        """Defer parameter-dependent state until the physical graph shards exist."""
+        if self.parameter_views is None:
+            self.parameter_views = OptimizerParameterViews()
+
+    def bind_parameter_layouts(self, layouts: Optional[dict]) -> None:
+        """Provide logical layouts and valid shard extents for the optimizer.
+
+        Args:
+            layouts: Compiler layouts keyed by model parameter, or None for an unsharded graph.
+        """
+        if self.parameter_views is not None:
+            self.parameter_views.bind(self, layouts, fp32_main_params=False)
 
     def __iter__(self) -> Iterator[torch.optim.Optimizer]:
         """Allow iteration over the underlying optimizers."""
@@ -168,8 +184,20 @@ class ChainedOptimizer:
         Args:
             closure: Optional callable forwarded to every sub-optimizer.
         """
+        if self.parameter_views is not None:
+            self.parameter_views.prepare_grads()
+        self.step_with_ready_grads(closure)
+
+    def step_with_ready_grads(self, closure: Any = None) -> None:
+        """Update all leaves after gradient transfer or precision conversion.
+
+        Args:
+            closure: Optional loss closure forwarded to each leaf.
+        """
         for opt in self.chained_optimizers:
             opt.step(closure=closure)
+        if self.parameter_views is not None:
+            self.parameter_views.clear_padding()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear gradients for all sub-optimizers.
@@ -179,6 +207,8 @@ class ChainedOptimizer:
         """
         for opt in self.chained_optimizers:
             opt.zero_grad(set_to_none=set_to_none)
+        if self.parameter_views is not None:
+            self.parameter_views.clear_grads()
 
     @property
     def optimizer(self) -> torch.optim.Optimizer:
@@ -199,6 +229,8 @@ class ChainedOptimizer:
         parameters. This method first broadcasts state to all replicate-group peers,
         then clones exported values while preserving every DTensor layout.
         """
+        if self.parameter_views is not None:
+            self.parameter_views.require_bound()
         prepared = []
         try:
             # Swap optimizers must restore released device storage before the
@@ -307,6 +339,8 @@ class ChainedOptimizer:
         Args:
             state_dict: FQN-keyed optimizer state to restore.
         """
+        if self.parameter_views is not None:
+            self.parameter_views.require_bound()
         for optimizer in self.chained_optimizers:
             load_context = getattr(optimizer, "_swap_checkpoint_load_context", None)
             context = load_context(state_dict, self.flatten) if callable(load_context) else nullcontext()
@@ -1054,6 +1088,10 @@ class AsyncReplicateBroadcaster:
 
         All ranks must call this at the same point in the execution flow
         to ensure collective communication consistency.
+
+        Args:
+            hsdp_assign: Assignment defining the replica groups and owners.
+            records: Optional subset of parameter records to broadcast.
         """
         if not hsdp_assign.is_replicated or not hsdp_assign.replicate_pgs:
             return
@@ -1082,6 +1120,12 @@ class AsyncReplicateBroadcaster:
 
         while len(self._inflight) > self._max_inflight_batches:
             self._wait_and_release_oldest()
+
+    @staticmethod
+    def _unpack_batch(buffer: torch.Tensor, offsets: List[Tuple[torch.Tensor, int, int, int]]) -> None:
+        """Copy completed replica broadcasts back to the corresponding parameter shards."""
+        for tensor, offset, numel, _ in offsets:
+            tensor.view(-1).copy_(buffer[offset:offset + numel])
 
     def _flush_key(
             self,
@@ -1144,8 +1188,7 @@ class AsyncReplicateBroadcaster:
                     self._inflight.append((batch_buffer, batch_tensor_offsets, handles))
                 else:
                     # No async work was enqueued on this rank, so unpack and free now.
-                    for t, offset, actual_numel, _ in batch_tensor_offsets:
-                        t.view(-1).copy_(batch_buffer[offset:offset + actual_numel])
+                    self._unpack_batch(batch_buffer, batch_tensor_offsets)
                     batch_buffer.untyped_storage().resize_(0)
                     del batch_buffer
             else:
@@ -1153,8 +1196,7 @@ class AsyncReplicateBroadcaster:
                     batch_buffer, src_coord, replicate_pgs, local_coord,
                 )
                 # Unpack immediately for sync path
-                for t, offset, actual_numel, _ in batch_tensor_offsets:
-                    t.view(-1).copy_(batch_buffer[offset:offset + actual_numel])
+                self._unpack_batch(batch_buffer, batch_tensor_offsets)
 
         if not async_op:
             # Sync path: buffer can be freed immediately
@@ -1168,8 +1210,7 @@ class AsyncReplicateBroadcaster:
             handle.wait()
 
         # Unpack after the async broadcast completes.
-        for t, offset, actual_numel, _ in batch_tensor_offsets:
-            t.view(-1).copy_(batch_buffer[offset:offset + actual_numel])
+        self._unpack_batch(batch_buffer, batch_tensor_offsets)
 
         batch_buffer.untyped_storage().resize_(0)
         del batch_buffer
