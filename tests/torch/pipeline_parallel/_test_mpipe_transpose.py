@@ -259,6 +259,13 @@ def test_mpipe_transpose_owner_backward_accum():
     print(f"[rank {dist.get_rank()}] MPipe owner-backward grad-accum correctness OK")
 
 
+def test_mpipe_transpose_npu_matrix() -> None:
+    """Run the centralized, owner-backward and accumulated paths on one HCCL job."""
+    test_mpipe_transpose()
+    test_mpipe_transpose_owner_backward()
+    test_mpipe_transpose_owner_backward_accum()
+
+
 if __name__ == "__main__":
     test_mpipe_transpose()
     test_mpipe_transpose_owner_backward()

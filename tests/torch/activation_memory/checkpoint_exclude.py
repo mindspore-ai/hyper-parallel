@@ -715,6 +715,21 @@ def _assert_swap_save_chain_matches_baseline(baseline: dict, actual: dict) -> No
     assert actual["remaining_storage_count"] == 0
 
 
+def test_checkpoint_exclude_save_chain_swap_matrix() -> None:
+    """Reuse the reference while checking per-tensor and pooled group swap in isolation."""
+    baseline = _run_mode_in_subprocess("swap_save_chain_baseline")
+    swapped = _run_mode_in_subprocess("swap_save_chain")
+    pooled = _run_mode_in_subprocess("group_swap_pool_save_chain")
+
+    _assert_swap_save_chain_matches_baseline(baseline, swapped)
+    _assert_swap_save_chain_matches_baseline(baseline, pooled)
+    assert swapped["group_managed_tensor_count"] == 0, f"Per-tensor swap used a group: {swapped}"
+    assert swapped["pool_allocated_bytes"] == 0, f"Per-tensor swap used the pool: {swapped}"
+    assert pooled["group_managed_tensor_count"] > 0, f"Fused swap did not manage any tensors: {pooled}"
+    allocated, capacity = pooled["pool_allocated_bytes"], pooled["pool_capacity_bytes"]
+    assert 0 < allocated <= capacity, f"Pooled swap allocated {allocated} bytes with capacity {capacity}"
+
+
 def test_checkpoint_exclude_save_chain_swap() -> None:
     """checkpoint_exclude_wrapper(swap=True) should offload and restore SAVE activations."""
     baseline = _run_mode_in_subprocess("swap_save_chain_baseline")

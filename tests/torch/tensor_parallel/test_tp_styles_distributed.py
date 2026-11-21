@@ -14,17 +14,9 @@
 # ============================================================================
 """Pytest launchers for ``ColwiseParallel`` / ``RowwiseParallel`` NPU distributed tests.
 
-Uses the real ``ColwiseParallel`` / ``RowwiseParallel`` styles from
-``hyper_parallel.core.tensor_parallel.style`` (not custom substitutes).
-
-Two 2-card waves (Col/Row Linear fwd+bwd merged into one torchrun each).
-4-card Linear retests removed — covered by 2-card cases + UT.
-Wave 1 also packs ``NoParallel`` (same level1 wave, fills 8 ranks).
-
-Port allocation (``sum(num_proc) <= 8`` per wave):
-
-  Wave 1: 10500–10503
-  Wave 2: 10510–10512
+The Level1 NPU wave runs Colwise and NoParallel concurrently on four ranks
+with automatically assigned ports. The Gloo wave uses ports 10500–10502
+and the second NPU wave uses 10510–10512.
 """
 from pathlib import Path
 
@@ -47,20 +39,16 @@ def _run_group(*cases):
           card_mark="allcards", essential_mark="essential")
 def test_tp_styles_two_card_wave_one():
     """
-    Feature: first parallel_run — four 2-card worker cases (sum ranks = 8)
+    Feature: Run two independent two-rank precision checks concurrently.
     Description:
-        1. test_colwise_unsupported_module_raises_npu
-        2. test_rowwise_unsupported_module_raises_npu
-        3. test_colwise_linear_fwd_bwd_precision_npu
-        4. test_no_parallel_linear_and_redistribute_npu
-    Expectation: Run success.
+        Compare Colwise Linear forward/backward and NoParallel Linear and redistribute.
+        Exercise Colwise and Rowwise rejection paths in the Colwise NPU worker.
+    Expectation: Outputs and gradients match the reference and both styles reject LayerNorm.
     """
     parallel_run([
-        TorchCase(_WORKER, "test_colwise_unsupported_module_raises_npu", 10500, 2),
-        TorchCase(_WORKER, "test_rowwise_unsupported_module_raises_npu", 10501, 2),
-        TorchCase(_WORKER, "test_colwise_linear_fwd_bwd_precision_npu", 10502, 2),
-        TorchCase(_NO_PARALLEL_WORKER, "test_no_parallel_linear_and_redistribute_npu", 10503, 2),
-    ])
+        TorchCase(_WORKER, "test_colwise_precision_and_unsupported_styles_npu", num_proc=2),
+        TorchCase(_NO_PARALLEL_WORKER, "test_no_parallel_linear_and_redistribute_npu", num_proc=2),
+    ], global_num_proc=4)
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",

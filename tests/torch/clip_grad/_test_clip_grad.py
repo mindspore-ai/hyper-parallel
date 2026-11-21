@@ -14,7 +14,11 @@
 # ============================================================================
 """Distributed tests for clip_grad_norm_ FSDP2-aligned precision."""
 
+from collections.abc import Callable
+from unittest.mock import patch
+
 import numpy as np  # pylint: disable=C0413
+import pytest
 import torch  # pylint: disable=C0413
 import torch.distributed as dist  # pylint: disable=C0413
 from torch import nn  # pylint: disable=C0413
@@ -22,11 +26,13 @@ import torch_npu  # pylint: disable=C0413,W0611
 
 from hyper_parallel import init_device_mesh, SkipDTensorDispatch  # pylint: disable=C0413
 from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.api import fully_shard  # pylint: disable=C0413
-from hyper_parallel.core.utils.clip_grad import clip_grad_norm_  # pylint: disable=C0413
 from hyper_parallel.core.fully_shard.utils import (  # pylint: disable=C0413
     MixedPrecisionPolicy,
 )
+from hyper_parallel.core.utils import clip_grad as clip_grad_module
+from hyper_parallel.core.utils.clip_grad import clip_grad_norm_  # pylint: disable=C0413
 
 from tests.torch.common_net import DenseNet, DenseMutiLayerNet  # pylint: disable=C0413
 from tests.torch.utils import init_dist  # pylint: disable=C0413
@@ -240,15 +246,13 @@ def test_clip_grad_norm_training_5step():  # pylint: disable=R0914
 # Test B – main_grad support (apply_grad_on_fp32_main_grad)
 # ===================================================================
 
-def test_clip_grad_norm_main_grad():  # pylint: disable=R0914
+def _check_main_grad():  # pylint: disable=R0914
     """Verify clip_grad_norm_ reads param.main_grad when param.grad is None.
 
     Simulates ``apply_grad_on_fp32_main_grad=True`` where the training
     loop stores the real gradient in ``param.main_grad`` and sets
     ``param.grad = None``.
     """
-    init_dist()
-
     mesh = init_device_mesh(
         device_type="npu", mesh_shape=(4, 2),
         mesh_dim_names=("dp", "op"),
@@ -296,7 +300,7 @@ def test_clip_grad_norm_main_grad():  # pylint: disable=R0914
         if hasattr(p, "main_grad") and p.main_grad is not None:
             p.grad = p.main_grad
     our_clipped = _gather_full(model, "grad")
-    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
+    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped, strict=True)):
         assert _close(og, rg), f"main_grad clipped grad[{i}] mismatch"
 
     # Cleanup
@@ -310,10 +314,8 @@ def test_clip_grad_norm_main_grad():  # pylint: disable=R0914
 # Test C – Frozen params
 # ===================================================================
 
-def test_clip_grad_norm_frozen_params():
+def _check_frozen_params():
     """Verify clip_grad_norm_ correctly skips frozen (requires_grad=False) params."""
-    init_dist()
-
     mesh = init_device_mesh(
         device_type="npu", mesh_shape=(4, 2),
         mesh_dim_names=("dp", "op"),
@@ -359,7 +361,7 @@ def test_clip_grad_norm_frozen_params():
 
     # Check 2: clipped grads match torch reference
     our_clipped = _gather_full(model, "grad")
-    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
+    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped, strict=True)):
         assert _close(og, rg), f"Frozen: clipped grad[{i}] mismatch"
 
     # Restore
@@ -371,22 +373,19 @@ def test_clip_grad_norm_frozen_params():
 # Test D-replicate – Mixed FSDP-sharded + replicate_params over-count
 # ===================================================================
 
-def test_clip_grad_norm_replicate_params():  # pylint: disable=R0914
+def _check_replicate_params():  # pylint: disable=R0914
     """Replicate-grad norms must not be all-reduced over the shard group.
 
     Regression: ``_total_norm_fsdp2_aligned`` previously stacked
     per-tensor norms across ALL grad groups and did ONE all_reduce
     over the first non-empty group's shard dims. Replicated grads
-    (already identical on every shard rank) got summed by the shard
-    world size, e.g. DP=8 with ~28% norm² from replicate_params
-    inflated 28 → 48.
+    (already identical on every shard rank) were counted once per shard
+    rank instead of once in the global norm.
 
     Setup chooses every layer's bias as ``replicate_params`` so the
     replicate contribution is large enough to fail the old code but
     small enough that the weights still dominate.
     """
-    init_dist()
-
     mesh = init_device_mesh(
         device_type="npu", mesh_shape=(8,),
         mesh_dim_names=("dp",),
@@ -433,7 +432,7 @@ def test_clip_grad_norm_replicate_params():  # pylint: disable=R0914
     )
 
     our_clipped = _gather_full(model, "grad")
-    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
+    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped, strict=True)):
         assert _close(og, rg), (
             f"[rank={rank}] replicate clipped grad[{i}] mismatch: "
             f"max_diff={torch.max(torch.abs(og - rg)).item():.2e}"
@@ -444,7 +443,7 @@ def test_clip_grad_norm_replicate_params():  # pylint: disable=R0914
 # Test D – Multi-grad-group parameter ordering
 # ===================================================================
 
-def test_clip_grad_norm_multi_group():  # pylint: disable=R0914
+def _check_multi_group():  # pylint: disable=R0914
     """Verify stack order stability across multiple grad groups.
 
     Regression guard for param / grad_group iteration order: when
@@ -456,8 +455,6 @@ def test_clip_grad_norm_multi_group():  # pylint: disable=R0914
     Check on all ranks explicitly — the regression does not manifest
     on rank 0 in general.
     """
-    init_dist()
-
     mesh = init_device_mesh(
         device_type="npu", mesh_shape=(4, 2),
         mesh_dim_names=("dp", "op"),
@@ -503,8 +500,64 @@ def test_clip_grad_norm_multi_group():  # pylint: disable=R0914
 
     # Check 2: clipped grads match torch reference on ALL ranks
     our_clipped = _gather_full(model, "grad")
-    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
+    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped, strict=True)):
         assert _close(og, rg), (
             f"[rank={rank}] multi-group grad[{i}] mismatch: "
             f"max_diff={torch.max(torch.abs(og - rg)).item():.2e}"
         )
+
+
+def _check_shared_shard_group_order() -> None:  # pylint: disable=too-many-locals
+    """Watch the actual norm input order and collective count for two mesh objects."""
+    meshes = (
+        init_device_mesh("npu", (4, 2), mesh_dim_names=("dp", "op")),
+        init_device_mesh("npu", (4, 2), mesh_dim_names=("replica", "shard")),
+    )
+    assert meshes[0] is not meshes[1], f"Expected distinct meshes, got {meshes}"
+    shard = meshes[0].get_local_rank("op")
+    full_grads = [torch.arange(1, 5, device="npu", dtype=torch.float32) * factor for factor in (1, 8, 2, 4)]
+    reference_norm, reference_grads = _ref_clip(full_grads, _MAX_NORM, 2.0)
+    parameters = []
+    local_grads = []
+    placements = (Replicate(), Shard(0))
+    for index, full in enumerate(full_grads):
+        mesh = meshes[index % len(meshes)]
+        local = full.chunk(2)[shard].clone()
+        param = nn.Parameter(DTensor.from_local(torch.zeros_like(local), mesh, placements))
+        param.grad = DTensor.from_local(local, mesh, placements)
+        parameters.append(param)
+        local_grads.append(param.grad.to_local())
+
+    # Norm rounding alone cannot reliably detect a permuted stack on every backend.
+    per_tensor_norms = clip_grad_module._per_tensor_norms  # pylint: disable=protected-access
+    with (
+        patch.object(clip_grad_module, "_per_tensor_norms", wraps=per_tensor_norms) as norms,
+        patch.object(dist, "all_reduce", wraps=dist.all_reduce) as reduce,
+        SkipDTensorDispatch(),
+    ):
+        actual_norm = clip_grad_norm_(parameters, _MAX_NORM)
+    assert norms.call_count == 1, f"Expected one norm stack, got {norms.call_count}"
+    order = [grad.data_ptr() for grad in norms.call_args.args[0]]
+    expected_order = [grad.data_ptr() for grad in local_grads]
+    assert order == expected_order, f"Norm input order {order}, expected {expected_order}"
+    assert reduce.call_count == 1, f"Expected one shard norm all-reduce, got {reduce.call_count}"
+    reduced_ranks = dist.get_process_group_ranks(reduce.call_args.kwargs["group"])
+    expected_ranks = dist.get_process_group_ranks(meshes[0].get_group("op"))
+    assert reduced_ranks == expected_ranks, f"Reduced over {reduced_ranks}, expected {expected_ranks}"
+    torch.testing.assert_close(actual_norm, reference_norm, rtol=1e-6, atol=1e-6)
+    for local, expected in zip(local_grads, reference_grads, strict=True):
+        torch.testing.assert_close(local, expected.chunk(2)[shard], rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("check", [
+    pytest.param(_check_main_grad, id="main-grad"),
+    pytest.param(_check_frozen_params, id="frozen"),
+    pytest.param(_check_replicate_params, id="replicate"),
+    pytest.param(_check_multi_group, id="multi-group"),
+    pytest.param(_check_shared_shard_group_order, id="shared-shard-group-order"),
+])
+def test_clip_grad_norm_edge_cases(check: Callable[[], None]) -> None:
+    """Run each gradient path against the Torch reference on the same eight ranks."""
+    init_dist()
+    check()
+    dist.barrier()
