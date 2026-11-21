@@ -14,7 +14,14 @@
 # ============================================================================
 """Family preparation and codegen observation share the native installation contract."""
 
+import json
+import gc
+from functools import wraps
+from importlib import util
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any
 import unittest
 from unittest.mock import Mock, patch
 import weakref
@@ -26,6 +33,14 @@ from hyper_parallel.codegen.model_build_overlay import (
     _observe_plan, _observe_replacement_installations, _observe_replacements, use_codegen_model_build_overlay,
 )
 from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.codegen.build import _ObservationMesh
+from hyper_parallel.codegen.inline.observations import collect_source_observations
+from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+from hyper_parallel.codegen.inline.ir import ImportPatch
+from hyper_parallel.codegen.inline.pipeline import _materialize_imported_forward_hosts
+from hyper_parallel.distributed.recipe_spec import inner_wrapper, ModuleShardingSpec
+from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest, _commit_forward_rewrite
 from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
@@ -79,6 +94,296 @@ class _TiedModel(nn.Module):
     def get_parameter_or_buffer(self, name: str) -> nn.Parameter:
         """Resolve a declared alias endpoint for the native identity check."""
         return self.get_parameter(name)
+
+
+_OBSERVED_CALLS = []
+
+
+class _ObservedLayer(nn.Module):
+    """Host whose native factory chooses one of two different closures."""
+
+    def __init__(self):
+        """Keep one scalar configuration on the source host."""
+        super().__init__()
+        self.bias = 7
+
+    def forward(self, value):
+        """Provide the original forward that both closures capture."""
+        return value * 2
+
+
+@inner_wrapper
+def _selected_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Choose the forward in the native factory, not in the source recognizer."""
+    del mesh, tp_mesh, cp_mesh, ep_mesh
+    _OBSERVED_CALLS.append(id(target_module))
+    original_forward = target_module.forward
+    bias = target_module.bias
+    if bias == 0:
+        raise ValueError("native wrapper failure")
+    if bias == 99:
+        return _ForwardRewriteRequest(target_module, original_forward)
+
+    @wraps(original_forward)
+    def positive(value):
+        return original_forward(value) + bias
+
+    @wraps(original_forward)
+    def negative(value):
+        return original_forward(value) - bias
+
+    if getattr(target_module, "inplace", False):
+        target_module.forward = negative
+        return None
+    return _ForwardRewriteRequest(target_module, positive if bias > 0 else negative)
+
+
+
+@inner_wrapper
+def _mesh_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Capture the exact CP mesh provided by native resolution."""
+    del mesh, tp_mesh, ep_mesh
+    _OBSERVED_CALLS.append(id(target_module))
+    original = target_module.forward
+
+    @wraps(original)
+    def selected(value):
+        return original(value) + cp_mesh.get_local_rank()
+
+    return _ForwardRewriteRequest(target_module, selected)
+
+
+
+def _source_helper(module, value, *, bias=None, **kwargs):
+    """Make a delegated helper's keyword and target observable in execution."""
+    return value * 2 + bias + kwargs.get("extra", 0) + module.bias
+
+
+@inner_wrapper
+def _helper_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Delegate actual arguments while capturing a native configuration value."""
+    del mesh, tp_mesh, cp_mesh, ep_mesh
+    _OBSERVED_CALLS.append(id(target_module))
+    original = target_module.forward
+    bias = 3
+
+    @wraps(original)
+    def selected(value, **kwargs):
+        return _source_helper(target_module, value, bias=bias, **kwargs)
+
+    return _ForwardRewriteRequest(target_module, selected)
+
+
+
+@inner_wrapper
+def _state_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh, selection=None):
+    """Publish optional native state separately from the explicit configuration."""
+    del mesh, cp_mesh, ep_mesh
+    original = target_module.forward
+    context = None
+
+    @wraps(original)
+    def selected(value: Any) -> Any:
+        return original(value), context, selection, tp_mesh
+
+    return _ForwardRewriteRequest(
+        target_module, selected,
+        companion_attrs={"published_context": context, "published_selection": selection, "published_tp": tp_mesh},
+    )
+
+
+class TestObservedWrapperConnection(unittest.TestCase):
+    """Native factory decisions must survive the frozen plan and existing inline passes."""
+
+    def test_optional_native_state_is_preserved_without_annotation_imports(self):
+        """None state keeps its native field while None configuration remains literal."""
+        model = nn.Sequential(_ObservedLayer())
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_state_wrapper, inner_target="self", region_dispatch=False,
+        )}, mesh_dim_names=("cp",), parallel_modules={})
+        context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                  tp_size=1, cp_size=2, ep_size=1,
+                                  sequence_parallel=False, loss_parallel=False)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.observe_plan(plan, model, context)
+        result = session.finish()._emission_view()["plan"]["injections"][0]["observed_wrapper"]
+        self.assertIn("self.published_context", result["body"])
+        self.assertIn("self.published_tp", result["body"])
+        self.assertNotIn("published_selection", result["body"])
+        self.assertIn("None", result["body"])
+        self.assertFalse(any(name == "Any" for _, name in result["imports"]))
+
+    def test_native_class_owned_boundary_does_not_run_external_wrapper(self):
+        """Use native ownership decisions instead of injecting CP a second time."""
+        _OBSERVED_CALLS.clear()
+        model = nn.Sequential(_ObservedLayer())
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_selected_wrapper, inner_target="self", region_dispatch=False,
+        )}, mesh_dim_names=("cp", "tp"), parallel_modules={"0": object()})
+        context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                  tp_size=1, cp_size=2, ep_size=1,
+                                  sequence_parallel=False, loss_parallel=False)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.observe_plan(plan, model, context)
+        result = session.finish()._emission_view()["plan"]["injections"][0]["observed_wrapper"]
+        self.assertEqual(_OBSERVED_CALLS, [])
+        self.assertIsNone(result["body"])
+
+
+    def test_already_installed_native_forward_is_observed_without_factory_replay(self):
+        """Native preparation may already own the method before Planner observation."""
+        model = nn.Sequential(_ObservedLayer())
+        _commit_forward_rewrite(_selected_wrapper(model[0], None, None, None, None))
+        _OBSERVED_CALLS.clear()
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_selected_wrapper, inner_target="self", region_dispatch=False,
+        )}, mesh_dim_names=("cp", "tp"), parallel_modules={"0": object()})
+        context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                  tp_size=1, cp_size=2, ep_size=1,
+                                  sequence_parallel=False, loss_parallel=False)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.observe_plan(plan, model, context)
+        result = session.finish()._emission_view()["plan"]["injections"][0]["observed_wrapper"]
+        self.assertEqual(_OBSERVED_CALLS, [])
+        self.assertIn("+ 7", result["body"])
+
+    def test_native_child_target_does_not_rewrite_the_parent_boundary(self):
+        """Source placement follows the resolved target rather than the boundary class."""
+        _OBSERVED_CALLS.clear()
+        parent = nn.Module()
+        parent.layer = _ObservedLayer()
+        model = nn.Sequential(parent)
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_selected_wrapper, inner_target="layer", region_dispatch=False,
+        )}, mesh_dim_names=("cp", "tp"), parallel_modules={})
+        context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                  tp_size=1, cp_size=2, ep_size=1,
+                                  sequence_parallel=False, loss_parallel=False)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.observe_plan(plan, model, context)
+        payload = session.finish()._emission_view()["plan"]
+        rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
+        patches = build_strategy_patches(rules, boundary_classes={"0": "Parent"})
+        self.assertEqual([item.class_name for item in patches.forward_extracts], ["_ObservedLayer"])
+        self.assertEqual(_OBSERVED_CALLS, [id(parent.layer)])
+
+    def test_observed_helper_binds_arguments_on_imported_host(self):
+        """A real native helper must survive the imported host's variadic signature."""
+        _OBSERVED_CALLS.clear()
+        model = nn.Sequential(_ObservedLayer())
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_helper_wrapper, inner_target="self", region_dispatch=False,
+        )}, mesh_dim_names=("cp", "tp"), parallel_modules={})
+        context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                  tp_size=1, cp_size=2, ep_size=1,
+                                  sequence_parallel=False, loss_parallel=False)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        with patch.object(_ObservedLayer.forward, "__module__", "unrelated.original_model"):
+            session.observe_plan(plan, model, context)
+        payload = session.finish()._emission_view()["plan"]
+        rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
+        patches = build_strategy_patches(rules, boundary_classes={"0": "_ObservedLayer"})
+        patches.imports.append(ImportPatch(__name__, ("_ObservedLayer",)))
+        _materialize_imported_forward_hosts("", patches)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "imported.py"
+            path.write_text(apply_patch_set("", patches), encoding="utf-8")
+            module_spec = util.spec_from_file_location("imported", path)
+            module = util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(module)
+            host = module._ObservedLayer()
+            host.cp_enable = True
+            self.assertEqual(host.forward(5, extra=2), 22)
+        self.assertEqual(_OBSERVED_CALLS, [id(model[0])])
+
+    def test_observed_mesh_stays_a_runtime_expression(self):
+        """Observation rank zero must not be frozen into the generated body."""
+        _OBSERVED_CALLS.clear()
+        model = nn.Sequential(_ObservedLayer())
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_mesh_wrapper, inner_target="self", region_dispatch=False,
+        )}, mesh_dim_names=("cp", "tp"), parallel_modules={})
+        context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                  tp_size=1, cp_size=2, ep_size=1,
+                                  sequence_parallel=False, loss_parallel=False)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.observe_plan(plan, model, context)
+        source = session.finish()._emission_view()["plan"]["injections"][0]["observed_wrapper"]
+        self.assertIn("get_local_rank()", source["body"])
+        self.assertIn("self._hp_boundary.compiled.mesh", source["body"])
+        self.assertEqual(_OBSERVED_CALLS, [id(model[0])])
+        self.assertEqual(source["imports"], [("hyper_parallel.distributed._builder.applier", "_get_cp_submesh")])
+
+    def test_native_factory_failure_does_not_seal_or_retain_model(self):
+        """A native constructor error is not turned into successful source facts."""
+        _OBSERVED_CALLS.clear()
+        model = nn.Sequential(_ObservedLayer())
+        model[0].bias = 0
+        reference = weakref.ref(model[0])
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_selected_wrapper, inner_target="self", region_dispatch=False,
+        )}, mesh_dim_names=("cp", "tp"), parallel_modules={})
+        context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)))
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        with self.assertRaisesRegex(ValueError, "native wrapper failure"):
+            session.observe_plan(plan, model, context)
+        self.assertEqual(len(_OBSERVED_CALLS), 1)
+        with self.assertRaisesRegex(RuntimeError, "still collecting"):
+            session.finish()
+        del model
+        self.assertIsNone(reference())
+
+    def test_selected_forward_reaches_existing_emitter_once_without_live_references(self):
+        """Emit the selected native branch and release all observation model references."""
+        for bias, inplace in ((7, False), (-3, False), (-3, True), (99, False)):
+            with self.subTest(bias=bias, inplace=inplace):
+                _OBSERVED_CALLS.clear()
+                model = nn.Sequential(_ObservedLayer())
+                target = model[0]
+                target.bias = bias
+                target.inplace = inplace
+                original = target.forward.__func__
+                reference = weakref.ref(target)
+                plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+                    is_boundary=True, inner_wrapper=_selected_wrapper, inner_target="self", region_dispatch=False,
+                )}, mesh_dim_names=("cp", "tp"), parallel_modules={})
+                context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                          tp_size=1, cp_size=2, ep_size=1,
+                                          sequence_parallel=False, loss_parallel=False)
+                session = CodegenBuildSession()
+                session.record_source({"model_type": "test"})
+                session.observe_plan(plan, model, context)
+                snapshot = session.finish()
+                payload = snapshot._emission_view()
+                json.dumps(payload)
+                self.assertEqual(_OBSERVED_CALLS, [id(target)])
+                if not inplace:
+                    self.assertIs(target.forward.__func__, original)
+                injections = payload["plan"]["injections"]
+                meta = SimpleNamespace(injections=injections)
+                rules = collect_source_observations(meta)
+                patches = build_strategy_patches(rules, boundary_classes={"0": "_ObservedLayer"})
+                source = "class _ObservedLayer:\n    def forward(self, value):\n        return value * 2\n"
+                generated = apply_patch_set(source, patches)
+                with TemporaryDirectory() as directory:
+                    path = Path(directory) / "observed.py"
+                    path.write_text(generated, encoding="utf-8")
+                    module_spec = util.spec_from_file_location("observed", path)
+                    module = util.module_from_spec(module_spec)
+                    module_spec.loader.exec_module(module)
+                    result = module._ObservedLayer().forward(5)
+                expected = 10 if bias == 99 else (10 + bias if bias > 0 else 10 - bias)
+                self.assertEqual(result, expected)
+                del target, model
+                gc.collect()
+                self.assertIsNone(reference())
 
 
 class TestModelBuildOverlay(unittest.TestCase):

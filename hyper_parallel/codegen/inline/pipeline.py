@@ -386,6 +386,8 @@ def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = No
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
             if target is None:
                 continue
+            if target == rule.inner_wrapper_target and rule.observed_wrapper is not None:
+                continue
             if strategy_spec(
                 target, model_type, inner_wrapper=target == rule.inner_wrapper_target,
                 construction_kwargs=rule.construction_kwargs if target == rule.inner_wrapper_target else (),

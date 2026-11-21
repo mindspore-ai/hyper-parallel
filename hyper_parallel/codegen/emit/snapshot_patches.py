@@ -171,7 +171,8 @@ def _inner_wrapper_patch(
     wrapper = injection.get("inner_wrapper")
     if wrapper is None:
         return None
-    target_type = replacement_types.get(module_fqn) or source_type or declared_type
+    target_type = ((injection.get("observed_wrapper") or {}).get("target_type")
+                   or replacement_types.get(module_fqn) or source_type or declared_type)
     if target_type is None:
         raise ValueError(
             "snapshot inner_wrapper requires an observed replacement or "

@@ -93,7 +93,7 @@ class CodegenBuildSession:
 
     def observe_plan(self, plan: Any, model: Any, mesh: Any) -> None:
         """Observe a native planner result without exposing codegen to the builder."""
-        observed_plan = observe_emission_plan(plan, model).to_dict()
+        observed_plan = observe_emission_plan(plan, model, mesh).to_dict()
         observed_plan["parallel_dims"] = {
             "dp_size": getattr(mesh, "dp_size", 1),
             "tp_size": mesh.tp_size,

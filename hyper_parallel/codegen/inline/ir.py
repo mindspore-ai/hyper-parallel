@@ -30,6 +30,7 @@ class SourceObservation:
     construction_kwargs: tuple[str, ...] = ()
     inner_wrapper_target: Optional[str] = None
     local_compute_target: Optional[str] = None
+    observed_wrapper: dict | None = None
 
 
 @dataclass(frozen=True)

@@ -21,11 +21,12 @@ from typing import Collection, Mapping
 
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch,
+    ImportPatch,
     InlinePatchSet,
     SourceObservation,
     StrategySpec,
 )
-from hyper_parallel.codegen.inline.framework_spec import strategy_spec_for as strategy_spec
+from hyper_parallel.codegen.inline.framework_spec import CP_ATTENTION_KIND, strategy_spec_for as strategy_spec
 
 
 def rule_block_classes(
@@ -86,13 +87,12 @@ def build_strategy_patches(
             if target is None:
                 continue
             inner_wrapper = target == rule.inner_wrapper_target
-            spec = strategy_spec(target, model_type, inner_wrapper=inner_wrapper,
-                                 construction_kwargs=rule.construction_kwargs if inner_wrapper else ())
+            spec = _rule_strategy(rule, target, model_type, inner_wrapper)
             if spec is None:
                 continue
+            patch_set.imports.extend(spec.imports)
             if (target, inner_wrapper) not in imported:
                 imported.add((target, inner_wrapper))
-                patch_set.imports.extend(spec.imports)
                 patch_set.module_snippets.extend(spec.snippets)
             if spec.subclass_shell is not None:
                 _materialize_cp_forward(
@@ -147,7 +147,8 @@ def _materialize_cp_forward(
     subclassed: dict[str, str],
 ) -> None:
     """Materialize CP dispatch in the original host class exactly once."""
-    host_classes = rule_block_classes(rule, boundary_classes)
+    host_classes = ({rule.observed_wrapper["host_class"]} if rule.observed_wrapper is not None
+                    else rule_block_classes(rule, boundary_classes))
     if not host_classes:
         raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
     for host_class in sorted(host_classes):
@@ -180,3 +181,16 @@ def _unmaterialized_strategy_error(
         "materialized; check the match pattern or the plan's "
         "boundary coverage"
     )
+
+
+def _rule_strategy(
+    rule: SourceObservation, target: str, model_type: str | None, inner_wrapper: bool,
+) -> StrategySpec | None:
+    """Prefer the native constructor result when the build has observed it."""
+    if inner_wrapper and rule.observed_wrapper is not None:
+        return StrategySpec(
+            kind=CP_ATTENTION_KIND, subclass_shell=rule.observed_wrapper["body"],
+            imports=tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"]),
+        )
+    return strategy_spec(target, model_type, inner_wrapper=inner_wrapper,
+                         construction_kwargs=rule.construction_kwargs if inner_wrapper else ())
