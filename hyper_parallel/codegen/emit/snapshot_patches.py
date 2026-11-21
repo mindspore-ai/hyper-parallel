@@ -171,17 +171,22 @@ def _inner_wrapper_patch(
     wrapper = injection.get("inner_wrapper")
     if wrapper is None:
         return None
-    target_type = replacement_types.get(module_fqn) or source_type or declared_type
+    target_type = ((injection.get("observed_wrapper") or {}).get("target_type")
+                   or replacement_types.get(module_fqn) or source_type or declared_type)
     if target_type is None:
         raise ValueError(
             "snapshot inner_wrapper requires an observed replacement or "
             f"boundary class for {module_fqn!r}"
         )
+    definition = (injection.get("observed_wrapper") or {}).get("definition")
     return {
         "module_fqn": module_fqn,
         "target_fqn": injection.get("inner_target") or "self",
-        "wrapper": import_target_path(wrapper),
+        "wrapper": None if definition else import_target_path(wrapper),
         "target_type": target_type,
+        "factory_kwargs": {name: value for name, value in wrapper.items() if name not in ("_target_", "target")}
+        if isinstance(wrapper, dict) else {},
+        **({"observed_definition": definition} if definition else {}),
     }
 
 

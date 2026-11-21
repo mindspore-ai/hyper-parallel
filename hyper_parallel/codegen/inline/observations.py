@@ -38,6 +38,8 @@ def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
                     match=_matches(record),
                     module_type=record.get("module_type"),
                     replace_target=target,
+                    shared_fqns=tuple(record.get("fqns") or ()),
+                    construction=record.get("construction"),
                     construction_kwargs=_construction_kwargs(record),
                 )
             )
@@ -50,6 +52,11 @@ def collect_source_observations(meta: Any) -> tuple[SourceObservation, ...]:
                     match=_matches(record),
                     inner_wrapper_target=inner,
                     local_compute_target=local,
+                    observed_wrapper=record.get("observed_wrapper"),
+                    construction_kwargs=_construction_kwargs({"target_config": {
+                        key: value for key, value in record.get("inner_wrapper", {}).items()
+                        if key not in ("_target_", "target")
+                    }}) if isinstance(record.get("inner_wrapper"), dict) else (),
                 )
             )
     return tuple(rules)

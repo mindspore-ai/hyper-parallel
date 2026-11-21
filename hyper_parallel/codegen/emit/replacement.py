@@ -66,6 +66,8 @@ def replacement_records_from_snapshot(snapshot: Any) -> tuple[dict[str, Any], ..
             record["factory"] = family["factory"].replace(":", ".", 1)
             record["replacement_target"] = record["factory"]
             record["target_config"] = {**family["kwargs"], "context": family["context"]}
+        if application.get("construction"):
+            record["construction"] = application["construction"]
         records.append(record)
     return tuple(records)
 

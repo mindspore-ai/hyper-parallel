@@ -30,6 +30,9 @@ class SourceObservation:
     construction_kwargs: tuple[str, ...] = ()
     inner_wrapper_target: Optional[str] = None
     local_compute_target: Optional[str] = None
+    observed_wrapper: dict | None = None
+    shared_fqns: tuple[str, ...] = ()
+    construction: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -64,11 +67,13 @@ class ConstructorReplacePatch:
 
     old_ctor: str
     new_ctor: str
-    mode: Literal["name", "wrap_source"] = "name"
+    mode: Literal["name", "wrap_source", "construct", "config"] = "name"
     keyword_args: tuple[str, ...] = ()
     scope_attrs: tuple[str, ...] = ()
     scope_fqns: tuple[str, ...] = ()
     defer_to_fqns: bool = False
+    shared_fqns: tuple[tuple[str, ...], ...] = ()
+    scope_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,7 +83,7 @@ class ForwardExtractPatch:
     class_name: str
     method_name: str
     body: str
-    merge_original_body: bool = False
+    definition: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,27 +132,15 @@ class StrategySpec:
 
     kind: str
     imports: tuple[ImportPatch, ...]
-    target_class: str | None = None
     method_name: str = "forward"
-    body_template: str | None = None
     subclass_shell: str | None = None
-    subclass_state_attr: str | None = None
+    definition: str | None = None
     snippets: tuple[ModuleSnippetPatch, ...] = ()
-    strip_boundary_subpatterns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Require a complete method patch or an imports-only declaration."""
-        if self.target_class is not None and self.body_template is None:
-            raise ValueError("Inline strategy target_class requires a body_template")
-        if self.target_class is not None and (not self.target_class or not self.body_template.strip()):
-            raise ValueError("Inline strategy class and body must be nonempty")
         if not self.method_name.isidentifier():
             raise ValueError("Inline strategy method_name must be a Python identifier")
         if self.subclass_shell is not None:
-            if self.target_class is not None or self.body_template is not None:
-                raise ValueError(
-                    "Inline strategy subclass_shell is exclusive with "
-                    "target_class and body_template"
-                )
             if not self.subclass_shell.strip():
                 raise ValueError("Inline strategy subclass shell must be nonempty")

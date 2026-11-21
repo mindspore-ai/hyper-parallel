@@ -62,6 +62,8 @@ class InnerWrapperPatch:
     request: Any
     target_type: Optional[type] = None
     secondary_requests: tuple[Any, ...] = ()
+    observed_definition: Optional[str] = None
+    factory_kwargs: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True)
@@ -109,9 +111,11 @@ def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
         InnerWrapperPatch(
             module_fqn=item["module_fqn"],
             target_fqn=item["target_fqn"],
-            wrapper=_resolve_symbol(item["wrapper"]),
+            wrapper=_resolve_symbol(item["wrapper"]) if item.get("wrapper") else None,
             request=SimpleNamespace(target=None),
             target_type=_resolve_symbol(item["target_type"]),
+            observed_definition=item.get("observed_definition"),
+            factory_kwargs=MappingProxyType(item.get("factory_kwargs", {})),
         )
         for item in data.get("inner_wrappers", ())
     )

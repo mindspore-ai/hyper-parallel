@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 
 from hyper_parallel.codegen.inline.ir import InlinePatchSet, SourceObservation
 from hyper_parallel.codegen.inline.replacement_pass import build_replacement_patches
@@ -28,7 +28,6 @@ def build_source_patch_plan(
     strategy_observations: tuple[SourceObservation, ...],
     model_type: str | None,
     boundary_classes: Mapping[str, str] | None,
-    external_state_classes: Collection[str] | None,
 ) -> InlinePatchSet:
     """Build the complete ordered patch set for one modeling source."""
     replacement = build_replacement_patches(observations, model_type)
@@ -36,7 +35,6 @@ def build_source_patch_plan(
         strategy_observations,
         model_type,
         boundary_classes,
-        external_state_classes,
     )
     return merge_patch_sets(replacement, strategy)
 

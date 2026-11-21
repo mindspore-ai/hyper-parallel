@@ -21,8 +21,8 @@ module only folds a whole observed boundary entry (its ``in_src``/``in_dst``/
 ``out_src``/``out_dst`` named placements) into one of four forms:
 
 - ``region``        — the boundary has a ``local_compute_fn`` injection (EP
-  MoE local region): the forward delegates to ``self.__hp_compute__`` and
-  re-wraps locals per ``out_src`` before the boundary exit.
+  MoE local region): recorded source emission identifies the native compute
+  method; runtime application retains ownership of its boundary wrapper.
 - ``identity``      — every declared transition is identity on the plan's
   active axes AND no inner-wrapper injection is declared: the class forward
   is not rewritten because the observed contract is a no-op.
@@ -126,9 +126,8 @@ def classify_boundary_form(
     # compiled plan's redistribute owns it either way.
     is_region = injection is not None and injection.get("local_compute_fn") is not None
     # An inner-wrapper boundary keeps the generic rewrite even when every
-    # transition is identity: ``hp_apply_inner_wrapper`` mutates the target
-    # forward at runtime, and the P1 contract (wrapper weaves into the
-    # rewritten redistribute forward) must not change under pruning.
+    # transition is identity: its CP dispatch must stay visible between the
+    # boundary entry and exit rather than being pruned with redistribution.
     inner_wrap = injection is not None and injection.get("inner_wrapper") is not None
 
     axes = tuple(mesh_dim_names or ())

@@ -14,7 +14,14 @@
 # ============================================================================
 """Family preparation and codegen observation share the native installation contract."""
 
+import ast
+import builtins
+from functools import wraps
+from importlib import util
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any
 import unittest
 from unittest.mock import Mock, patch
 import weakref
@@ -26,6 +33,16 @@ from hyper_parallel.codegen.model_build_overlay import (
     _observe_plan, _observe_replacement_installations, _observe_replacements, use_codegen_model_build_overlay,
 )
 from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.codegen.inline.observations import collect_source_observations
+from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+from hyper_parallel.codegen.inline.ir import ImportPatch
+from hyper_parallel.codegen.inline.recognition import _function_source_qualname, _source_qualname
+from hyper_parallel.codegen.inline.pipeline import _materialize_imported_forward_hosts
+from hyper_parallel.codegen.emit.snapshot_patches import emission_patches_from_snapshot_payload
+from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
+from hyper_parallel.codegen.emit.modeling import verify_recorded_patch_bundle
+from hyper_parallel.distributed.recipe_spec import inner_wrapper, ModuleShardingSpec
 from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
@@ -34,6 +51,7 @@ from hyper_parallel.models import HyperAutoModelForCausalLM, module_build
 from hyper_parallel.models._transformers import auto_model, model_builder
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.module_build import attach_build_context, build_module_context
+from hyper_parallel.models.kimi_k26.adapter.distributed.context_parallel import bind_context_parallel
 from hyper_parallel.models.replacement import (
     MethodReplacementSpec, ModuleReplacementRequest, ModuleReplacementSpec, apply_module_replacements,
     compile_module_replacements, method_replacement, module_replacement,
@@ -59,6 +77,235 @@ class _MethodModel(nn.Module):
         return self.stage(inputs)
 
 
+class _TiedModel(nn.Module):
+    """Expose the native tied-weight contract without a Transformers dependency."""
+
+    def __init__(self, config, *, context):
+        super().__init__()
+        del context
+        self.config = config
+        self.embedding = nn.Embedding(4, 3)
+        self.lm_head = nn.Linear(3, 4, bias=False)
+        self.all_tied_weights_keys = {"lm_head.weight": "embedding.weight"}
+
+    def tie_weights(self, *, recompute_mapping: bool) -> None:
+        """Establish the declared parameter alias using the existing mapping."""
+        if recompute_mapping:
+            raise ValueError("The native helper must reuse the declared mapping")
+        self.lm_head.weight = self.embedding.weight
+
+    def get_parameter_or_buffer(self, name: str) -> nn.Parameter:
+        """Resolve a declared alias endpoint for the native identity check."""
+        return self.get_parameter(name)
+
+
+class _ObservedLayer(nn.Module):
+    """Small source host whose final patch does not require a distributed runtime."""
+
+    def forward(self, value):
+        """Provide an ordinary source method for the patch to preserve."""
+        return value * 2
+
+
+class _ObservedTextTower(nn.Module):
+    """Expose the keyword input contract consumed by the native Kimi CP wrapper."""
+
+    def forward(self, **kwargs: Any) -> dict[str, Any]:
+        """Return prepared inputs for exact comparisons with the native wrapper."""
+        return kwargs
+
+
+def _bind_constant_cp_rank(model):
+    """An unrelated scalar with a CP-like name must not acquire a mesh binding."""
+    cp_rank = 7
+    original_forward = model.forward
+
+    def forward(value: Any) -> Any:
+        """Expose an unrelated scalar to the closure observer."""
+        return original_forward(value) + cp_rank
+
+    model.forward = forward
+
+
+@inner_wrapper
+def _runtime_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Native runtime preparation must never execute during offline plan projection."""
+    raise AssertionError("offline codegen executed the runtime wrapper")
+
+
+def _bind_factory_tail(model):
+    """Represent an already-installed native patch without reading mesh state."""
+    original_forward = model.forward
+
+    @wraps(original_forward)
+    def tail(*args, **kwargs):
+        if args:
+            raise TypeError("factory tail accepts only keyword arguments")
+        return original_forward(**kwargs) + 1
+
+    model.forward = tail
+
+
+def _bind_published_mesh(model, cp_mesh):
+    """Represent a native patch whose resource binding belongs to Trainer."""
+    original_forward = model.forward
+
+    @wraps(original_forward)
+    def forward(value):
+        return original_forward(value) + cp_mesh.get_local_rank()
+
+    model.native_cp_mesh = cp_mesh
+    model.forward = forward
+
+
+def _legacy_code_getattr(value, name, *default):
+    """Exercise the pre-3.11 code-object interface without patching global builtins."""
+    if name == "co_qualname":
+        if default:
+            return default[0]
+        raise AttributeError(name)
+    return builtins.getattr(value, name, *default)
+
+
+class TestOfflinePlanObservation(unittest.TestCase):
+    """Offline review consumes declarations rather than constructing runtime executors."""
+
+    def test_decorated_forward_uses_lexical_owner_without_code_qualname(self):
+        """Source position distinguishes decorated closures sharing the same public name."""
+        for binder, nested in ((_bind_factory_tail, "tail"), (_bind_published_mesh, "forward")):
+            with self.subTest(binder=binder.__name__):
+                model = _ObservedLayer()
+                if binder is _bind_published_mesh:
+                    binder(model, Mock())
+                else:
+                    binder(model)
+                self.assertEqual(model.forward.__qualname__, _ObservedLayer.forward.__qualname__)
+                with patch("hyper_parallel.codegen.inline.recognition.getattr", _legacy_code_getattr, create=True):
+                    self.assertEqual(_function_source_qualname(model.forward),
+                                     f"{binder.__qualname__}.<locals>.{nested}")
+
+    def test_source_qualname_keeps_nested_class_and_method_scopes(self):
+        """Restored names match Python's lexical class/function scope convention."""
+        source = ("class Outer:\n    def build(self):\n        class Inner:\n"
+                  "            async def forward(self):\n                pass\n")
+        code = SimpleNamespace(co_name="forward", co_firstlineno=4)
+        self.assertEqual(_source_qualname(ast.parse(source), code), "Outer.build.<locals>.Inner.forward")
+        code.co_firstlineno = 20
+        self.assertIsNone(_source_qualname(ast.parse(source), code))
+
+    def test_kimi_cp_closure_without_code_qualname(self):
+        """The legacy interpreter path keeps rank independence and the complete native input contract."""
+        with patch("hyper_parallel.codegen.inline.recognition.getattr", _legacy_code_getattr, create=True):
+            self.test_kimi_cp_closure_emits_rank_independent_source_and_preserves_inputs()
+
+    def test_plan_projection_never_executes_wrapper_or_queries_distributed_state(self):
+        """An active CP declaration remains visible with no runtime mesh API available."""
+        model = nn.Sequential(_ObservedLayer())
+        plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+            is_boundary=True, inner_wrapper=_runtime_wrapper, inner_target="self", region_dispatch=False,
+        )}, mesh_dim_names=("cp",), parallel_modules={})
+        logical = LogicalDeviceMesh(("dp", "cp", "tp"), (2, 2, 2))
+        self.assertFalse(hasattr(logical, "get_group"))
+        self.assertFalse(hasattr(logical, "get_local_rank"))
+        context = SimpleNamespace(device_mesh=logical, dp_size=2, tp_size=2, cp_size=2, ep_size=1,
+                                  sequence_parallel=False, loss_parallel=False)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        with patch.object(torch.distributed, "get_rank", side_effect=AssertionError("runtime rank lookup")), \
+                patch.object(torch.distributed, "get_world_size", side_effect=AssertionError("runtime WORLD lookup")), \
+                patch.object(torch.distributed, "new_group", side_effect=AssertionError("runtime group creation")):
+            session.observe_plan(plan, model, context)
+        payload = session.finish()._emission_view()["plan"]
+        self.assertEqual(len(payload["injections"]), 1)
+        self.assertNotIn("observed_wrapper", payload["injections"][0])
+        self.assertIn("_runtime_wrapper", str(payload["injections"][0]["inner_wrapper"]))
+        self.assertEqual(payload["parallel_dims"]["cp_size"], 2)
+
+    def test_published_mesh_is_kept_as_source_without_reading_its_runtime_state(self):
+        """The review source retains the native field; Codegen never resolves its rank."""
+        model = _ObservedLayer()
+        originals = {"": model.forward}
+        runtime_mesh = Mock()
+        runtime_mesh.get_local_rank.side_effect = AssertionError("Codegen queried a runtime rank")
+        runtime_mesh.get_group.side_effect = AssertionError("Codegen queried a communication group")
+        _bind_published_mesh(model, runtime_mesh)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.mark_not_required("no_layout_patch")
+        session.observe_final_forwards(model, originals)
+        observed = session.finish()._emission_view()["plan"]["injections"][0]["observed_wrapper"]
+        self.assertIn("self.native_cp_mesh.get_local_rank()", observed["definition"])
+        runtime_mesh.get_local_rank.assert_not_called()
+        runtime_mesh.get_group.assert_not_called()
+
+    def test_kimi_cp_closure_emits_rank_independent_source_and_preserves_inputs(self):
+        """Read the real native closure offline and execute its emitted body for both CP peers."""
+        rendered_sources = []
+        values = torch.arange(32).reshape(1, 8, 4)
+        padding = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        for rank in (0, 1):
+            with self.subTest(cp_rank=rank):
+                model = nn.Module()
+                model.config = SimpleNamespace(model_type="kimi_k25")
+                model.model = nn.Module()
+                model.model.language_model = _ObservedTextTower()
+                target = model.model.language_model
+                original = target.forward
+                bind_context_parallel(model, SimpleNamespace(cp_size=2, cp_rank=rank))
+                session = CodegenBuildSession()
+                session.record_source({"model_type": "kimi_k25"})
+                session.mark_not_required("no_parameter_layout")
+                with patch.object(torch.distributed, "get_rank", side_effect=AssertionError("runtime rank query")), \
+                        patch.object(torch.distributed, "new_group", side_effect=AssertionError("runtime group")):
+                    session.observe_final_forwards(model, {"model.language_model": original})
+                payload = session.finish()._emission_view()["plan"]
+                rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
+                patches = build_strategy_patches(rules)
+                source = "class _ObservedTextTower:\n    def forward(self, **kwargs):\n        return kwargs\n"
+                rendered = apply_patch_set(source, patches)
+                rendered_sources.append(rendered)
+                self.assertIn(".get_local_rank()", rendered)
+                self.assertIn(".size()", rendered)
+                self.assertNotIn("cp_rank = 0", rendered)
+                self.assertNotIn("get_group", rendered)
+                with TemporaryDirectory() as directory:
+                    path = Path(directory) / "kimi_cp.py"
+                    path.write_text(rendered, encoding="utf-8")
+                    spec = util.spec_from_file_location("kimi_cp_review", path)
+                    module = util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    generated = module._ObservedTextTower()
+                    cp_mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda value=rank: value)
+                    generated._hp_boundary = SimpleNamespace(compiled=SimpleNamespace(
+                        mesh={"cp": cp_mesh}, mesh_dim_names=("cp",)))
+                    inputs = {"inputs_embeds": values, "attention_mask": padding, "use_cache": True,
+                              "extra_option": "preserved"}
+                    expected, actual = target(**inputs), generated.forward(**inputs)
+                    self.assertEqual(set(actual), set(expected))
+                    for name in expected:
+                        if isinstance(expected[name], torch.Tensor):
+                            torch.testing.assert_close(actual[name], expected[name])
+                        else:
+                            self.assertEqual(actual[name], expected[name])
+                    self.assertEqual(tuple(actual["inputs_embeds"].shape), (1, 4, 4))
+                    torch.testing.assert_close(actual["position_ids"], torch.arange(rank * 4, (rank + 1) * 4)[None])
+                    self.assertTrue(inputs["use_cache"])
+                    with self.assertRaisesRegex(TypeError, "by keyword"):
+                        generated.forward(values)
+        self.assertEqual(rendered_sources[0], rendered_sources[1])
+
+    def test_cp_like_scalar_without_native_context_provenance_remains_an_error(self):
+        """A scalar name alone cannot authorize replacing a captured value with a runtime rank."""
+        model = _ObservedLayer()
+        originals = {"": model.forward}
+        _bind_constant_cp_rank(model)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.mark_not_required("no_layout_patch")
+        with self.assertRaisesRegex(RuntimeError, "unresolved captured state.*cp_rank"):
+            session.observe_final_forwards(model, originals)
+
+
 class TestModelBuildOverlay(unittest.TestCase):
     """Exercise real module identities, meta construction and snapshot contents."""
 
@@ -67,6 +314,83 @@ class TestModelBuildOverlay(unittest.TestCase):
         handle.start()
         self.addCleanup(handle.stop)
         register_linear_family()
+
+    def test_outer_factory_publishes_only_after_success_and_restores_overlay(self):
+        """Factory-tail facts are included; an outer failure cannot publish an early bundle."""
+        original_build = auto_model._BaseHyperAutoModelClass.__dict__["_build_model"]
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                session = CodegenBuildSession()
+                mesh = MeshContext()
+                mesh.device_mesh = LogicalDeviceMesh(("dp", "cp", "tp"), (1, 1, 1))
+                publisher = "hyper_parallel.codegen.model_build_overlay.ensure_codegen_artifact_from_snapshot"
+                with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
+                        patch(publisher) as emit:
+                    try:
+                        with use_codegen_model_build_overlay(session, defer_publish=True) as result:
+                            result.model = HyperAutoModelForCausalLM.from_config(
+                                FamilyModelConfig(), model_factory=_MethodModel, torch_dtype=torch.float32,
+                                distributed_setup=DistributedSetup(mesh_context=mesh),
+                            )
+                            self.assertIsNone(result.snapshot)
+                            emit.assert_not_called()
+                            _bind_factory_tail(result.model)
+                            if fail:
+                                raise ValueError("outer factory failure")
+                    except ValueError as exc:
+                        self.assertTrue(fail)
+                        self.assertEqual(str(exc), "outer factory failure")
+                    self.assertIsNone(result.model)
+                    self.assertIs(auto_model._BaseHyperAutoModelClass.__dict__["_build_model"], original_build)
+                    if fail:
+                        emit.assert_not_called()
+                        self.assertIsNone(result.snapshot)
+                    else:
+                        emit.assert_called_once()
+                        self.assertIs(session.finish(), result.snapshot)
+                        injection = result.snapshot._emission_view()["plan"]["injections"][0]
+                        self.assertIn("+ 1", injection["observed_wrapper"]["body"])
+
+    def test_final_factory_keeps_review_source_without_runtime_mesh(self):
+        """Render an already-installed patch without rank, group or WORLD lookups."""
+        model = _ObservedLayer()
+        originals = {"": model.forward}
+        _bind_factory_tail(model)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.mark_not_required("pure_data_parallel")
+        session.observe_final_forwards(model, originals)
+        with self.assertRaisesRegex(RuntimeError, "already been observed"):
+            session.observe_final_forwards(model, originals)
+        snapshot = session.finish()._emission_view()
+        payload = snapshot["plan"]
+        rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
+        emission = emission_patches_from_meta(SimpleNamespace(
+            emission_patches=emission_patches_from_snapshot_payload(snapshot),
+        ))
+        for imported in (False, True):
+            with self.subTest(imported=imported):
+                patches = build_strategy_patches(rules)
+                source = "class _ObservedLayer:\n    def forward(self, value):\n        return value * 2\n"
+                if imported:
+                    patches.imports.append(ImportPatch(__name__, ("_ObservedLayer",)))
+                    _materialize_imported_forward_hosts("", patches)
+                    source = ""
+                rendered = apply_patch_set(source, patches)
+                verify_recorded_patch_bundle({"model.py": rendered}, patch_plan=emission)
+                self.assertNotIn("get_rank", rendered)
+                self.assertNotIn("get_group", rendered)
+                with TemporaryDirectory() as directory:
+                    path = Path(directory) / "factory_tail.py"
+                    path.write_text(rendered, encoding="utf-8")
+                    spec = util.spec_from_file_location("factory_tail", path)
+                    module = util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    with patch.object(torch.distributed, "get_rank", side_effect=AssertionError("runtime rank lookup")):
+                        self.assertEqual(module._ObservedLayer().forward(value=5), 11)
+                        with self.assertRaisesRegex(TypeError, "only keyword"):
+                            module._ObservedLayer().forward(5)
+
 
     def test_defaults_and_legacy_rules_share_one_plan_and_snapshot_order(self):
         """Default and legacy requests share compilation and preserve observed installation order."""
@@ -130,6 +454,25 @@ class TestModelBuildOverlay(unittest.TestCase):
                 apply_module_replacements(model, plan)
         self.assertEqual(applications, [])
         self.assertEqual(tuple(model), original)
+
+    def test_observation_ties_weights_before_freezing_and_planning(self):
+        """The observation planner sees native parameter aliases and their frozen state."""
+        def _check_plan(model, *args):
+            self.assertIs(model.lm_head.weight, model.embedding.weight)
+            self.assertFalse(model.lm_head.weight.requires_grad)
+            _observe_plan(model, *args)
+
+        with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
+                patch("hyper_parallel.codegen.model_build_overlay._observe_plan", side_effect=_check_plan) as plan, \
+                use_codegen_model_build_overlay(CodegenBuildSession()):
+            model = HyperAutoModelForCausalLM.from_config(
+                FamilyModelConfig(), model_factory=_TiedModel, distributed_setup=DistributedSetup(),
+                torch_dtype=torch.float32, freeze_config=("lm_head",),
+            )
+
+        plan.assert_called_once()
+        self.assertIs(model.lm_head.weight, model.embedding.weight)
+        self.assertEqual(model.lm_head.weight.device.type, "meta")
 
     def test_observation_does_not_keep_replaced_sources_alive(self):
         """Codegen observation releases source modules after the shared installer replaces them."""

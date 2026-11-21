@@ -40,7 +40,10 @@ from hyper_parallel.codegen.source.composition import compose_nested_model_sourc
 from hyper_parallel.codegen.source.compat import sanitize_source_compat
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
-from hyper_parallel.codegen.inline.pipeline import render_inline_modeling_with_plan
+from hyper_parallel.codegen.inline.pipeline import _imported_forward_definition, render_inline_modeling_with_plan
+from hyper_parallel.codegen.inline.component_source import collapse_unmodified_components
+from hyper_parallel.codegen.inline.framework_spec import strategy_spec_for
+from hyper_parallel.codegen.inline.targets import projected_target_path
 
 # ---------------------------------------------------------------------------
 # source copy
@@ -353,6 +356,7 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
         ),
     )
     text = _lower_forward_boundaries(text, emission_meta, module_name)
+    text = collapse_unmodified_components(text)
     _verify_recorded_patch_materialization(
         text, emission_meta, patch_plan=patch_plan
     )
@@ -486,10 +490,11 @@ def _verify_replacement_records(
     for record in records:
         constructor = getattr(record, "factory", None) or record.replacement_type
         name = constructor.__name__
-        visible = name in bound_names and any(
-            isinstance(node, ast.Call) and _call_name(node.func) == name
-            for node in ast.walk(tree)
-        )
+        if name not in bound_names:
+            name = record.replacement_type.__name__
+        calls = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and _call_name(node.func) == name]
+        visible = name in bound_names and bool(calls) and _replacement_calls_cover_fqn(calls, record.module_fqn)
         if visible:
             _record_materialized(
                 materialized,
@@ -501,6 +506,14 @@ def _verify_replacement_records(
         else:
             missing.append(f"{record.module_fqn} (replacement {name})")
     return missing
+
+
+def _replacement_calls_cover_fqn(calls: list[ast.Call], fqn: str) -> bool:
+    """Require exact coverage when emitted constructors name their observed paths."""
+    explicit = {keyword.value.value for call in calls for keyword in call.keywords
+                if keyword.arg == "module_fqn" and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, str) and keyword.value.value}
+    return not explicit or fqn in explicit
 
 
 def _wrapper_identity(record: Any) -> tuple[Any, str, str]:
@@ -523,6 +536,19 @@ def _wrapper_source_form(
     classes: dict[str, ast.ClassDef], host: ast.ClassDef, record: Any, replacements: Any
 ) -> str | None:
     """Return the concrete source form that materializes a wrapper."""
+    definition = getattr(record, "observed_definition", None)
+    if definition is not None:
+        return _observed_method_form(host, definition, getattr(record, "target_type", None))
+    source_form = _declared_wrapper_form(host, record)
+    if source_form is None or source_form == "observed_native_methods":
+        return source_form
+    return _wrapper_class_form(classes, host, record, replacements)
+
+
+def _wrapper_class_form(
+    classes: dict[str, ast.ClassDef], host: ast.ClassDef, record: Any, replacements: Any
+) -> str | None:
+    """Identify the class form after verifying the selected wrapper computation."""
     if (
         "forward" in _class_methods(host)
         and "cp_enable" in _class_state_names(host)
@@ -551,6 +577,87 @@ def _wrapper_source_form(
     if replacement_backed and {"_forward_impl", "forward"} <= _class_methods(host):
         return "replacement_forward_runtime_binding"
     return None
+
+
+def _declared_wrapper_form(host: ast.ClassDef, record: Any) -> str | None:
+    """Require computation from the selected wrapper, not an unrelated CP flag."""
+    wrapper = getattr(record, "wrapper", None)
+    if wrapper is None:
+        return "structural"
+    arguments = getattr(record, "factory_kwargs", {})
+    try:
+        spec = strategy_spec_for(
+            projected_target_path(wrapper), inner_wrapper=True,
+            construction_kwargs=tuple(f"{name}={value!r}" for name, value in sorted(arguments.items())),
+        )
+    except RuntimeError:
+        return None
+    if spec is None or spec.subclass_shell is None:
+        return None
+    if spec.definition is not None:
+        return _observed_method_form(host, spec.definition, getattr(record, "target_type", None))
+    expected = _wrapper_helper_calls(spec)
+    actual = _forward_calls(host)
+    visible = bool(expected) and all(
+        any(_native_call_visible(call, candidate) for candidate in actual) for call in expected
+    )
+    return "native_helper_calls" if visible else None
+
+
+def _wrapper_helper_calls(spec: Any) -> list[ast.Call]:
+    """Read imported computation calls from the selected native wrapper body."""
+    imports = {name for item in spec.imports for name in item.names}
+    return [node for node in ast.walk(ast.parse(spec.subclass_shell)) if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id in imports]
+
+
+def _forward_calls(host: ast.ClassDef) -> list[ast.Call]:
+    """Collect calls from the emitted dispatch and preserved local computation."""
+    methods = [node for node in host.body if isinstance(node, ast.FunctionDef)
+               and node.name in {"forward", "_forward_impl"}]
+    return [node for method in methods for node in ast.walk(method) if isinstance(node, ast.Call)]
+
+
+def _native_call_visible(expected: ast.Call, actual: ast.Call) -> bool:
+    """Match a native helper and its explicit literal configuration arguments."""
+    if ast.dump(expected.func) != ast.dump(actual.func):
+        return False
+    for index, argument in enumerate(expected.args):
+        if isinstance(argument, ast.Constant) or isinstance(argument, ast.Name) and argument.id == "self":
+            if index >= len(actual.args) or ast.dump(argument) != ast.dump(actual.args[index]):
+                return False
+    keywords = {item.arg: item.value for item in actual.keywords}
+    return all(item.arg in keywords and ast.dump(item.value) == ast.dump(keywords[item.arg])
+               for item in expected.keywords if isinstance(item.value, ast.Constant))
+
+
+def _observed_method_form(host: ast.ClassDef, definition: str, native_type: type | None) -> str | None:
+    """Verify each observed computation, allowing only the existing boundary extraction."""
+    native_base = f"{native_type.__module__}.{native_type.__name__}" if native_type is not None else ""
+    if any(ast.unparse(base) == native_base for base in host.bases):
+        definition = _imported_forward_definition(definition)
+    methods = {node.name: node for node in host.body if isinstance(node, ast.FunctionDef)}
+    for expected in ast.parse(definition).body:
+        if not isinstance(expected, ast.FunctionDef):
+            return None
+        if ast.get_docstring(expected) is not None:
+            expected.body[0].value.value = ast.get_docstring(expected)
+        candidates = [methods.get(expected.name)]
+        if expected.name == "forward":
+            candidates.append(methods.get("_forward_impl"))
+        matched = False
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            candidate = ast.parse(ast.unparse(candidate)).body[0]
+            candidate.name = expected.name
+            if ast.get_docstring(candidate) is not None:
+                candidate.body[0].value.value = ast.get_docstring(candidate)
+            if ast.dump(candidate) == ast.dump(expected):
+                matched = True
+        if not matched:
+            return None
+    return "observed_native_methods"
 
 
 def _verify_wrapper_records(
@@ -647,19 +754,9 @@ def _tree_has_local_record(tree: ast.AST, record: Any) -> bool:
 def _tree_has_wrapper_record(tree: ast.AST, record: Any, replacements: Any) -> bool:
     """Return whether one source tree materializes an inner-wrapper record."""
     _, class_name, _ = _wrapper_identity(record)
-    host = _class_index(tree).get(class_name)
-    if host is None or "forward" not in _class_methods(host):
-        return False
-    if "cp_enable" in _class_state_names(host) and _class_dispatch_reads_state(
-        host, "cp_enable"
-    ):
-        return True
-    target_type = getattr(record, "target_type", None)
-    replacement_backed = any(
-        item.module_fqn == record.module_fqn and item.replacement_type is target_type
-        for item in replacements
-    )
-    return replacement_backed and {"_forward_impl", "forward"} <= _class_methods(host)
+    classes = _class_index(tree)
+    host = classes.get(class_name)
+    return host is not None and _wrapper_source_form(classes, host, record, replacements) is not None
 
 
 def _class_dispatch_reads_state(host: ast.ClassDef, state_name: str) -> bool:
@@ -799,6 +896,16 @@ def _banner(meta: Any) -> str:
         "#",
         "",
     ]
+    for record in getattr(meta, "module_overrides", None) or ():
+        source_type = (record.get("module_type") or "unknown").rsplit(".", 1)[-1]
+        implementation = (record.get("construction") or {}).get("implementation")
+        target = (implementation or record.get("factory") or record.get("replacement_target") or "unknown")
+        target = target.replace(":", ".", 1).rsplit(".", 1)[-1]
+        for fqn in record.get("fqns") or (record.get("fqn"),):
+            if fqn is not None:
+                lines.insert(-1, f"#   {fqn}: {source_type} -> {target}")
+    if getattr(meta, "module_overrides", None):
+        lines.insert(-1, "#")
     return "\n".join(lines)
 
 

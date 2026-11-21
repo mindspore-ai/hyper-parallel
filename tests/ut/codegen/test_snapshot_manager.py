@@ -118,7 +118,6 @@ def test_recorded_boundary_edits_preserve_borrowed_snapshot():
     entry = {"is_boundary": True, "in_src": {"x": ["R"]}}
     meta = SimpleNamespace(
         param_plan={"block": entry}, boundary_classes={"block": "Block"},
-        external_state_classes=[],
     )
     recorded._mark_class_source_lowering_skipped(meta, "Block")
     assert "skip_source_lowering" not in entry, f"borrowed entry changed: {entry}"

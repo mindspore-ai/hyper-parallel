@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Optional
 
-from hyper_parallel.codegen.plan.observation import observe_emission_plan
+from hyper_parallel.codegen.plan.observation import observe_emission_plan, observe_final_forwards
 from hyper_parallel.codegen.snapshot import (
     CodegenSnapshot,
     CodegenStatus,
@@ -45,6 +45,7 @@ class CodegenBuildSession:
         self._replacements_recorded = False
         self._diagnostics_recorded = False
         self._finished = False
+        self._final_forwards_recorded = False
         self._snapshot: Optional[CodegenSnapshot] = None
 
     @property
@@ -104,6 +105,20 @@ class CodegenBuildSession:
             "loss_parallel": mesh.loss_parallel,
         }
         self.record_plan(observed_plan)
+
+    def observe_final_forwards(self, model: Any, originals: Mapping[str, Any]) -> None:
+        """Append factory-tail facts once, before freezing the existing native plan."""
+        self._require_open(CodegenStatus.DERIVED, CodegenStatus.NOT_REQUIRED)
+        if self._final_forwards_recorded:
+            raise RuntimeError("codegen final forwards have already been observed")
+        additions = observe_final_forwards(model, originals)
+        self._final_forwards_recorded = True
+        if additions:
+            if self._plan is None:
+                self._plan = observe_emission_plan(None, None).to_dict()
+            self._plan.setdefault("injections", []).extend(additions)
+            self._status = CodegenStatus.DERIVED
+            self._reason = None
 
     def record_diagnostics(self, diagnostics: Mapping[str, Any]) -> None:
         """Record optional counters and audit facts once."""

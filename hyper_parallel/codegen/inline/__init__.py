@@ -13,9 +13,3 @@
 # limitations under the License.
 # ============================================================================
 """YAML-driven inline source patches for generated modeling files."""
-
-from hyper_parallel.codegen.inline.pipeline import render_inline_modeling
-
-__all__ = [
-    "render_inline_modeling",
-]

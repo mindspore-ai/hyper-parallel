@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+from hyper_parallel.codegen.inline.component_source import observe_wrapper_source
+from hyper_parallel.codegen.inline.recognition import _function_source_qualname
 from hyper_parallel.codegen.plan.placements import (
     named_placement_to_dict,
     value_to_data,
@@ -42,7 +44,7 @@ class EmissionPlanObservation:
 
 
 def observe_emission_plan(plan: Any, model: Any) -> EmissionPlanObservation:
-    """Project a native sharding plan without changing or applying it."""
+    """Project native plan facts without executing wrapper factories or distributed operations."""
     if plan is None:
         return EmissionPlanObservation()
     return EmissionPlanObservation(
@@ -149,3 +151,23 @@ def _observe_nested_components(plan: Any, model: Any) -> list[dict[str, str]]:
 
 
 __all__ = ["EmissionPlanObservation", "observe_emission_plan"]
+
+
+def observe_final_forwards(model: Any, originals: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read only methods changed after inner construction; never replay their factories."""
+    additions = []
+    for fqn, original in originals.items():
+        target = model.get_submodule(fqn)
+        forward = target.forward
+        if getattr(forward, "__func__", forward) is getattr(original, "__func__", original):
+            continue
+        if getattr(original, "__self__", None) is not target:
+            raise RuntimeError(f"codegen outer factory replaced observed module {fqn!r}")
+        source = observe_wrapper_source(target, forward, vars(target), original_forward=original)
+        source.update(host_class=type(target).__name__,
+                      target_type=f"{type(target).__module__}:{type(target).__qualname__}")
+        function = getattr(forward, "__func__", forward)
+        qualname = _function_source_qualname(function)
+        additions.append({"match": fqn, "inner_target": "self", "observed_wrapper": source,
+                          "inner_wrapper": f"{function.__globals__['__name__']}.{qualname}"})
+    return additions

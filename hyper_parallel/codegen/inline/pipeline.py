@@ -29,46 +29,16 @@ from hyper_parallel.codegen.inline.ir import (
 )
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.definition_edits import drop_shadowed_definitions
+from hyper_parallel.codegen.inline.forward_edits import _parallel_state_prefix
+from hyper_parallel.codegen.emit.parallel import _cp_dispatch_call
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.framework_spec import (
     replacement_spec_for as replacement_spec,
     strategy_spec_for as strategy_spec,
 )
-from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
+from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches, rule_block_classes
 from hyper_parallel.codegen.inline.observations import collect_source_observations
 from hyper_parallel.codegen.inline.source_plan import build_source_patch_plan
-
-
-def render_inline_modeling(
-    source_text: str,
-    meta: Any,
-    model_type: str | None = None,
-    *,
-    patch_plan: Any = None,
-) -> str:
-    """Render the inline-patched modeling file for a frozen plan.
-
-    This is the only artifact route. A YAML target with no adapter declaration
-    is a hard error rather than a silent fallback, so an inline coverage gap
-    surfaces at generation time instead of degrading the artifact. A plan with
-    no inline rules needs no patch and the source is returned unchanged.
-
-    Args:
-        source_text: Modeling source the inline patches are applied to.
-        meta: Frozen plan metadata recorded by the generator.
-        model_type: Model family key used to resolve framework declarations.
-
-    Returns:
-        The rendered modeling source.
-    """
-
-    rendered, _ = render_inline_modeling_with_plan(
-        source_text,
-        meta,
-        model_type,
-        patch_plan=patch_plan,
-    )
-    return rendered
 
 
 def render_inline_modeling_with_plan(
@@ -97,11 +67,12 @@ def render_inline_modeling_with_plan(
         strategy_rules,
         model_type,
         _observed_boundary_classes(meta, patch_plan),
-        getattr(meta, "external_state_classes", None),
     )
     _add_recorded_forward_host_imports(source_text, patch_set, patch_plan)
     _materialize_imported_forward_hosts(source_text, patch_set)
-    rendered = apply_patch_set(source_text, patch_set)
+    model_class = (getattr(meta, "source", None) or {}).get("model_class")
+    root_class_name = model_class.rsplit(":", 1)[-1].rsplit(".", 1)[-1] if model_class else None
+    rendered = apply_patch_set(source_text, patch_set, root_class_name=root_class_name)
     # The copied modeling source brings its own decorated helpers that share
     # names with the library functions the artifact imports, and a local
     # definition wins over the import: the native path calls the library
@@ -113,7 +84,7 @@ def render_inline_modeling_with_plan(
     rendered = drop_shadowed_definitions(
         rendered, _library_import_names(rendered) & _decorated_names(source_text)
     )
-    normalized_meta = normalize_inline_meta(meta, strategy_rules, model_type)
+    normalized_meta = normalize_inline_meta(meta)
     return rendered, normalized_meta
 
 
@@ -214,29 +185,57 @@ def _materialize_imported_forward_hosts(
         rendered.add(patch.class_name)
         imported = patch_set.imports[import_index]
         other_names = tuple(name for name in imported.names if name != patch.class_name)
-        alias = f"_{patch.class_name}Base"
-        replacement_imports = []
-        if other_names:
-            replacement_imports.append(ImportPatch(imported.module, other_names))
-        replacement_imports.append(ImportPatch(
-            module="",
-            names=(),
-            raw=f"from {imported.module} import {patch.class_name} as {alias}",
-        ))
+        replacement_imports = [ImportPatch(imported.module, other_names)] if other_names else []
+        replacement_imports.append(ImportPatch("", (), raw=f"import {imported.module}"))
         patch_set.imports[import_index:import_index + 1] = replacement_imports
-        body = patch.body.replace(
-            "return self._forward_impl(__hp_forward_args__)",
-            "return super().forward(__hp_forward_args__)",
-        ).replace("__hp_forward_args__", "*args, **kwargs")
+        base = f"{imported.module}.{patch.class_name}"
+        if patch.definition is not None:
+            definition = _imported_forward_definition(patch.definition)
+            snippet = (f"class {patch.class_name}({base}):\n"
+                       + _parallel_state_prefix(definition) + textwrap.indent(definition, "    ") + "\n")
+            patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
+            continue
+        body, local = _imported_forward_source(patch.body)
+        state = _parallel_state_prefix(body)
         snippet = (
-            f"class {patch.class_name}({alias}):\n"
-            "    \"\"\"Generated source-visible parallel form.\"\"\"\n\n"
-            "    cp_enable = False\n\n"
+            f"class {patch.class_name}({base}):\n"
+            f"{state}"
+            f"{local}"
             "    def forward(self, *args, **kwargs):\n"
             f"{textwrap.indent(body.strip(), '        ')}\n"
         )
         patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
     patch_set.forward_extracts = remaining
+
+
+def _imported_forward_definition(definition: str) -> str:
+    """Bind the saved native method outside nested callbacks before rendering its real signature."""
+    parts = []
+    for node in ast.parse(definition).body:
+        if isinstance(node, ast.FunctionDef):
+            body = "\n".join(ast.unparse(statement) for statement in node.body)
+            body, local = _imported_forward_source(body)
+            node.body = ast.parse(body).body
+            if local:
+                parts.append(textwrap.dedent(local).strip())
+        parts.append(ast.unparse(node))
+    return "\n\n".join(parts)
+
+
+def _imported_forward_source(body: str) -> tuple[str, str]:
+    """Keep a helper's original-method callback separate from its imported host dispatch."""
+    dispatch = _cp_dispatch_call(body)
+    body = body.replace("__hp_forward_args__", "*args, **kwargs").replace(
+        "__hp_forward_positional__", "args",
+    ).replace("__hp_forward_keywords__", "kwargs")
+    if dispatch is not None:
+        local = ("    def _forward_impl(self, *args, **kwargs):\n"
+                 "        return super().forward(*args, **kwargs)\n\n")
+        return body, local
+    body = body.replace("self._forward_impl(", "original_forward(")
+    if "original_forward(" in body:
+        body = "original_forward = super().forward\n" + body
+    return body, ""
 
 
 def render_inline_strategies_for_source_unit(
@@ -261,24 +260,26 @@ def render_inline_strategies_for_source_unit(
         else rules
     )
     _require_inline_coverage(strategy_rules, model_type)
-    patches = build_strategy_patches(
-        strategy_rules,
-        model_type,
-        _observed_boundary_classes(meta, patch_plan),
-        getattr(meta, "external_state_classes", None),
-    )
     source_classes = {
         node.name
         for node in ast.parse(source_text).body
         if isinstance(node, ast.ClassDef)
     }
+    boundaries = _observed_boundary_classes(meta, patch_plan)
+    owned_rules = tuple(
+        rule for rule in strategy_rules
+        if ((rule.observed_wrapper or {}).get("host_class") in source_classes
+            or rule_block_classes(rule, boundaries) & source_classes)
+    )
+    patches = build_strategy_patches(
+        owned_rules, model_type, boundaries,
+    )
     patches.forward_extracts = [
         patch for patch in patches.forward_extracts
         if patch.class_name in source_classes
     ]
     if not patches.forward_extracts:
         return source_text
-    patches.module_snippets.clear()
     patches.constructor_replaces.clear()
     patches.class_removals.clear()
     return apply_patch_set(source_text, patches)
@@ -379,8 +380,11 @@ def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = No
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
             if target is None:
                 continue
+            if target == rule.inner_wrapper_target and rule.observed_wrapper is not None:
+                continue
             if strategy_spec(
-                target, model_type, inner_wrapper=target == rule.inner_wrapper_target
+                target, model_type, inner_wrapper=target == rule.inner_wrapper_target,
+                construction_kwargs=rule.construction_kwargs if target == rule.inner_wrapper_target else (),
             ) is not None:
                 continue
             # An inner_wrapper target has no runtime channel and stays

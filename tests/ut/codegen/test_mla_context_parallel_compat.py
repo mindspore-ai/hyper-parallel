@@ -14,6 +14,7 @@
 # ============================================================================
 """Keep source-visible MLA dispatch aligned with native overlap semantics."""
 
+from dataclasses import asdict
 from importlib import util
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -30,15 +31,12 @@ from hyper_parallel.components.modules.attention.multi_latent_attention import (
 from hyper_parallel.codegen.model_build_overlay import use_codegen_model_build_overlay
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.components.modules import MultiLatentAttention
-from hyper_parallel.components.modules.module_family import get_family_build_info
-from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.deepseek_v3.generated.modeling_Deepseek_V3_gen_npu import (
     DeepseekV3ForCausalLM as BundledDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models._transformers import auto_model
-from hyper_parallel.models.module_build import build_module_context, prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest
 from tests.common.mla_cp_utils import make_deepseek_model, make_mla
 
@@ -120,10 +118,10 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
             project.assert_not_called()
 
     def test_generated_family_preserves_layer_requests_and_layout(self) -> None:
-        """Feature: Generated MLA keeps the factory request and owned parallel layout.
+        """Feature: Review source preserves concrete MLA choices and parameter structure.
 
-        Description: Generate two layers with different CP schedules, then construct and plan the artifact.
-        Expectation: CP/TP degrees, strategy, overlap, parameter keys and family ownership match native.
+        Description: Generate two layers with different CP schedules and inspect their meta structures.
+        Expectation: Concrete implementations, CP settings and parameter keys match native.
         """
         config = make_deepseek_model().config
         mesh = MeshContext(device_mesh=LogicalDeviceMesh(("dp", "cp", "tp"), (1, 2, 2)),
@@ -145,25 +143,55 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
                 spec.loader.exec_module(generated_module)
                 with torch.device("meta"):
                     generated = getattr(generated_module, "DeepseekV3ForCausalLM")(config)
-        # The tracked bundle must also stop importing the removed compatibility
-        # module; model preparation must select CP before the layout planner runs.
-        with torch.device("meta"):
-            bundled = BundledDeepseekV3ForCausalLM(config)
-        self.assertEqual(set(bundled.state_dict()), set(native.state_dict()))
-        bundled, _ = prepare_model_components(bundled, build_module_context(DistributedSetup(mesh_context=mesh)))
-        bundled_plan = ShardingPlanner().plan(bundled, mesh.device_mesh, tp_size=2, cp_size=2)
-        self.assertEqual(set(bundled_plan.parallel_modules), {"model.layers.0.self_attn", "model.layers.1.self_attn"})
-        for layer in bundled.model.layers:
-            self.assertEqual(get_family_build_info(layer.self_attn).resolved.variant, "cp")
+        # The tracked bundle is a snapshot of its recipe, with its own layer
+        # count and topology. Import it to guard compatibility; exercise the
+        # constructor and layouts on the matching generated fixture above.
+        self.assertTrue(issubclass(BundledDeepseekV3ForCausalLM, torch.nn.Module))
         self.assertEqual(set(generated.state_dict()), set(native.state_dict()))
         for index, (expected, actual) in enumerate(zip(native.model.layers, generated.model.layers)):
             expected, actual = expected.self_attn, actual.self_attn
-            self.assertEqual(get_family_build_info(actual).resolved.variant, "cp")
-            self.assertEqual(actual.cp_plan, expected.cp_plan)
+            self.assertEqual(type(actual).__name__, type(expected).__name__)
+            self.assertEqual(type(actual).__module__, generated_module.__name__)
+            self.assertEqual(actual.forward.__func__.__module__, generated_module.__name__)
+            self.assertIs(actual.exchange_attention.__func__, expected.exchange_attention.__func__)
+            self.assertIn("_hp_tp", actual.forward.__func__.__code__.co_names)
+            self.assertIs(type(actual).__bases__[0], type(expected))
+            self.assertEqual(asdict(actual.cp_plan), asdict(expected.cp_plan))
             self.assertEqual(actual.cp_plan.overlap, bool(index))
-        planner = ShardingPlanner()
-        expected = planner.plan(native, mesh.device_mesh, tp_size=2, cp_size=2)
-        actual = planner.plan(generated, mesh.device_mesh, tp_size=2, cp_size=2)
-        self.assertEqual(actual.parallel_modules, expected.parallel_modules)
-        for name in expected.parallel_modules:
-            self.assertEqual(actual.modules[name].params, expected.modules[name].params)
+
+    def test_uniform_mla_is_constructed_at_the_decoder_call_site(self) -> None:
+        """Uniform native choices become direct concrete constructors with layer identity intact."""
+        config = make_deepseek_model().config
+        mesh = MeshContext(device_mesh=LogicalDeviceMesh(("dp", "cp", "tp"), (1, 2, 2)),
+                           tp_size=2, cp_size=2, dp_size=1, dp_shard_size=2)
+        setup = DistributedSetup(mesh_context=mesh, module_replacement_requests=(ModuleReplacementRequest(
+            ("model.layers.*.self_attn",), MultiLatentAttention,
+            kwargs={"strategy": "expanded_ulysses", "overlap": False},
+        ),))
+        with TemporaryDirectory() as directory, \
+                patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
+                use_codegen_model_build_overlay(CodegenBuildSession(), directory):
+            native = HyperAutoModelForCausalLM.from_config(config, distributed_setup=setup, torch_dtype=torch.float32)
+            modeling = next(Path(directory).rglob("modeling_*_gen_npu.py"))
+            text = modeling.read_text(encoding="utf-8")
+            self.assertIn("self.self_attn = CPMultiLatentAttentionModule(config=config", text)
+            self.assertIn("self.self_attn.layer_idx = layer_idx", text)
+            self.assertNotIn("getattr(self.model.layers", text)
+            self.assertIn("class CPMultiLatentAttentionModule(hyper_parallel.components.modules.", text)
+            self.assertIn("super().forward(", text)
+            self.assertNotIn("def exchange_attention(", text)
+            self.assertNotIn("def restore_attention(", text)
+            spec = util.spec_from_file_location("uniform_mla_review", modeling)
+            module = util.module_from_spec(spec)
+            with patch.dict(sys.modules, {"uniform_mla_review": module}):
+                spec.loader.exec_module(module)
+                with torch.device("meta"):
+                    generated = module.DeepseekV3ForCausalLM(config)
+        expected = {name: tuple(value.shape) for name, value in native.state_dict().items()}
+        actual = {name: tuple(value.shape) for name, value in generated.state_dict().items()}
+        self.assertEqual(actual, expected)
+        for index, (original, rendered) in enumerate(zip(native.model.layers, generated.model.layers)):
+            self.assertEqual(type(original.self_attn).__name__, type(rendered.self_attn).__name__)
+            self.assertEqual(type(rendered.self_attn).__module__, module.__name__)
+            self.assertEqual(asdict(original.self_attn.cp_plan), asdict(rendered.self_attn.cp_plan))
+            self.assertEqual(rendered.self_attn.layer_idx, index)

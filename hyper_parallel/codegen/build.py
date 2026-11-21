@@ -58,8 +58,9 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
     normalize_distributed_setup_overrides(distributed_setup, config)
 
     session = CodegenBuildSession()
-    with use_codegen_model_build_overlay(session, artifact_dir) as result, use_codegen_planner_overlay():
-        config.model.build(
+    with use_codegen_model_build_overlay(session, artifact_dir, defer_publish=True) as result, \
+            use_codegen_planner_overlay():
+        result.model = config.model.build(
             distributed_setup=distributed_setup,
             peft_config=config.peft,
             activation_checkpoint=config.activation_checkpoint.mode,

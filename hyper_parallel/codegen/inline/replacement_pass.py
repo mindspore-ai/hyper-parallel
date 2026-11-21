@@ -28,7 +28,9 @@ from hyper_parallel.codegen.inline.ir import (
     SourceObservation,
     ModuleSnippetPatch,
 )
-from hyper_parallel.codegen.inline.framework_spec import replacement_spec_for as replacement_spec
+from hyper_parallel.codegen.inline.framework_spec import (
+    observed_constructor_spec, replacement_spec_for as replacement_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,20 +64,21 @@ def build_replacement_patches(
     scopes_by_target: dict[tuple, set[str]] = defaultdict(set)
     fqns_by_target: dict[tuple, set[str]] = defaultdict(set)
     specs_by_target: dict[tuple, Any] = {}
+    source_fqns_by_target: dict[tuple, set[str]] = defaultdict(set)
+    shared_by_target: dict[tuple, list[tuple[str, ...]]] = defaultdict(list)
     for rule in rules:
         target = rule.replace_target
         if target is None:
             continue
-        spec = replacement_spec(target, model_type, module_type=rule.module_type)
+        spec = _rule_replacement_spec(rule, target, model_type)
         if spec is None:
             continue
-        # Different layer requests may use the same factory with different schedules.
-        # Keep their scopes separate rather than applying the first layer's arguments.
-        arguments = {item.split("=", 1)[0]: item for item in spec.keyword_args}
-        arguments.update({item.split("=", 1)[0]: item for item in rule.construction_kwargs})
-        spec = replace(spec, keyword_args=tuple(arguments.values()))
         key = (target, rule.module_type, spec.keyword_args)
         specs_by_target.setdefault(key, spec)
+        if rule.construction is not None:
+            source_fqns_by_target[key].update(rule.construction["source_fqns"])
+        if len(rule.shared_fqns) > 1:
+            shared_by_target[key].append(rule.shared_fqns)
         scopes_by_target[key].update(_scope_attrs(rule))
         fqns_by_target[key].update(fqn for fqn in rule.match if fqn)
     for target, spec in specs_by_target.items():
@@ -92,15 +95,19 @@ def build_replacement_patches(
                 ModuleSnippetPatch(f"# Codegen replacement: {spec.replacement_note}")
             )
         patch_set.module_snippets.extend(spec.snippets)
+        deferred = _requires_deferred_scope(spec, source_fqns_by_target[target],
+                                            scope_attrs, fqns_by_target[target], shared_by_target[target])
         patch_set.constructor_replaces.append(
             ConstructorReplacePatch(
                 old_ctor=spec.old_ctor,
                 new_ctor=spec.new_ctor,
-                mode=spec.mode,  # type: ignore[arg-type]
+                mode="wrap_source" if deferred else spec.mode,  # type: ignore[arg-type]
                 keyword_args=spec.keyword_args,
                 scope_attrs=scope_attrs,
                 scope_fqns=tuple(sorted(fqns_by_target[target])),
-                defer_to_fqns=spec.defer_to_fqns,
+                defer_to_fqns=deferred,
+                scope_complete=bool(source_fqns_by_target[target]) and not deferred,
+                shared_fqns=tuple(shared_by_target[target]),
             )
         )
         if spec.remove_class:
@@ -120,3 +127,22 @@ def _scope_attrs(rule: SourceObservation) -> tuple[str, ...]:
     """
 
     return tuple(sorted({fqn.rsplit(".", 1)[-1] for fqn in rule.match if fqn}))
+
+
+def _rule_replacement_spec(rule: SourceObservation, target: str, model_type: str | None) -> Any:
+    """Keep observed constructors separate from legacy declaration-only rules."""
+    if rule.construction is not None:
+        return observed_constructor_spec(rule)
+    spec = replacement_spec(target, model_type, module_type=rule.module_type)
+    if spec is None:
+        return None
+    arguments = {item.split("=", 1)[0]: item for item in spec.keyword_args}
+    arguments.update({item.split("=", 1)[0]: item for item in rule.construction_kwargs})
+    return replace(spec, keyword_args=tuple(arguments.values()))
+
+
+def _requires_deferred_scope(spec: Any, source_fqns: set[str], attrs: tuple[str, ...],
+                             matches: set[str], shared: list[tuple[str, ...]]) -> bool:
+    """Do not widen a partial or shared instance replacement into a class rewrite."""
+    available = {fqn for fqn in source_fqns if fqn.rsplit(".", 1)[-1] in attrs}
+    return spec.defer_to_fqns or bool(shared) or bool(source_fqns) and available != matches
