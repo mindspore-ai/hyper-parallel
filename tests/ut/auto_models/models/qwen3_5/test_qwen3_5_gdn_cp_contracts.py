@@ -130,6 +130,8 @@ class _TinyQwen35Model(nn.Module):
         self.config = SimpleNamespace(
             architectures=["Qwen3_5ForConditionalGeneration"]
         )
+        self.model = nn.Module()
+        self.model.visual = nn.Linear(8, 8, bias=False)
         self.linear_attn = _TinyGatedDeltaNet()
 
 
