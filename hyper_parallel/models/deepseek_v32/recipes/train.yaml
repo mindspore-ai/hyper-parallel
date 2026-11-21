@@ -3,8 +3,8 @@
 # The model configuration, tokenizer, and weights come from the official
 # Hugging Face checkpoint. Parallel topology sections are intentionally
 # omitted, so Trainer defaults keep TP/CP/EP/PP and FSDP degrees at 1. The
-# conditional CP override remains available and is activated only when a user
-# explicitly sets accelerator.cp_size greater than 1.
+# DSA family selects its CP member when accelerator.cp_size is greater than 1;
+# set the attention's kv_cp_size to the same value when enabling CP.
 #
 # DeepSeek-V3.2 is a very large model; running this recipe requires a device
 # with enough memory for the selected checkpoint and optimizer states. Local
@@ -47,22 +47,18 @@ plan_overrides:
       kind: module
       implementation:
         _target_: >-
-          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+          hyper_parallel.components.modules.DeepseekSparseAttention
+        kv_cp_size: 1
+        kv_cp_strategy: allgather
+        cp_comm_overlap: true
+        # null follows dsa_dense_warm_up; true/false fixes the stage.
+        dense_warmup: null
   - match: "*.mlp.experts"
     replace:
       kind: module
       implementation:
         _target_: >-
           hyper_parallel.components.modules.GroupedExperts
-  - match: "*.self_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
-        # null follows dsa_dense_warm_up; true/false forces one path for the full run.
-        dense_warmup: null
-
 mixed_precision:
   enabled: false
 

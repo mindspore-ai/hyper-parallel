@@ -24,8 +24,6 @@ models/deepseek_v32/
 ├── adapter/
 │   ├── conversion/
 │   │   └── module_replacement.py    # RMSNorm/DSA 工厂及历史专家入口
-│   ├── distributed/
-│   │   └── context_parallel.py      # DSA 的 CP wrapper
 │   ├── policies/
 │   │   └── sharding.py              # MLA 与 indexer 的 TP 分片规则
 │   ├── materialization.py           # 加载权重后恢复 RoPE 的 buffer
@@ -40,15 +38,15 @@ models/deepseek_v32/
 ## 功能
 
 - **NPU 模块替换**，由 recipe 的 `plan_overrides` 选用：`*.input_layernorm`、`*.post_attention_layernorm`、
-  `model.norm` 换成融合 `RMSNorm`；`*.self_attn` 换成 `DeepseekV32DSAAttention`，indexer 与稀疏 attention 走
+  `model.norm` 换成融合 `RMSNorm`；`*.self_attn` 换成 `DeepseekSparseAttention`，indexer 与稀疏 attention 走
   CANN 融合算子；`*.mlp.experts` 选择[路由专家模块族](../../components/modules/moe/grouped_experts/README.md)。
 - **并行**：FSDP、TP（含 loss parallel）、CP、EP。不支持 PP 和 sequence parallel。
-- **训练行为**与 Transformers 实现一致：
+- **训练行为**：
   - router 用 `e_score_correction_bias` 选专家（sigmoid 分数、分组 top-k），bias 保持初始值；
   - 没有负载均衡 loss；
   - 官方 checkpoint 的 MTP 层（第 61 层）加载时被忽略，不训练；
-  - 不训练 indexer，因为它的输出只用于不可导的 top-k 选择。
-- **数据**：每行是一条因果序列。DSA 不读取 `attention_mask` 的内容，不支持 padding mask、dropout 和 KV cache。
+  - indexer 支持 KL 辅助损失训练，默认关闭。
+- **数据**：支持因果序列和带显式边界的 packed 文档；不支持任意 padding mask、dropout 和 KV cache。
 
 ## 环境要求
 
@@ -74,21 +72,28 @@ torchrun --standalone --nproc_per_node=1 \
 
 ### 多卡
 
-用命令行覆盖设置并行拓扑。recipe 中 `when: cp` 的条目启用 DSA CP wrapper。
-两份普通专家配方均直接选择新专家族：
+用命令行覆盖设置并行拓扑。recipe 将整个 `*.self_attn` 模块替换为 `DeepseekSparseAttention`，在 `cp_size > 1`
+时自动选择 CP 成员。`kv_cp_size` 须与 `accelerator.cp_size` 一致；示例使用 `allgather` 并开启通信重叠。
+参数含义见 [稀疏注意力说明](../../components/modules/attention/deepseek_sparse_attention/readme.md)。
+保留 recipe 的其他模块替换；CP2 的 attention 条目如下。专家模块族根据作业 mesh 选择 local/EP 执行，保留原生
+MoE 的路由和共享专家逻辑，不要再叠加旧的 `deepseekv3_ep_compute_fn` 方法替换。
 
 ```yaml
 plan_overrides:
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.DeepseekSparseAttention
+        kv_cp_size: 2
+        kv_cp_strategy: allgather
+        cp_comm_overlap: true
   - match: "*.mlp.experts"
     replace:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
 ```
-
-模块族根据作业 mesh 选择 local/EP，父 MoE 保留原生 router 和共享专家。
-同一路径不再叠加旧 `deepseekv3_ep_compute_fn` 方法替换；当前普通 EP 路径按原生顺序执行共享分支，
-不包含旧 shared-expert overlap 选项。
 
 例如 8 卡、TP2 × CP2 × DP2、EP4：
 

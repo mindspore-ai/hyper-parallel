@@ -12,4 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Attention algorithms and their family-owned parallel implementations."""
+"""Attention families with explicit mathematical and parallel members."""
+
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention import (
+    CPDeepseekSparseAttentionModule, DeepseekSparseAttention, DeepseekSparseAttentionModule,
+)
+
+__all__ = [
+    "DeepseekSparseAttention", "DeepseekSparseAttentionModule", "CPDeepseekSparseAttentionModule",
+]
