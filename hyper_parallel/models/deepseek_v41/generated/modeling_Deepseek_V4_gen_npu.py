@@ -94,7 +94,7 @@ from hyper_parallel.models.deepseek_v41.vision import (
 )
 
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttention as _SharedCompressedDSAAttentionBase
+import hyper_parallel.components.modules.shared_compressed_dsa_attention
 from hyper_parallel.components.modules.engram.engram import Engram
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
@@ -110,11 +110,8 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import Deep
 
 # Codegen replacement: DeepseekV41MegaGate wraps DeepseekV41TopKRouter; the original class is kept as the wrapper input.
 
-class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
-    """Generated source-visible parallel form."""
-
+class SharedCompressedDSAAttention(hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention):
     def _forward_impl(self, *args, **kwargs):
-        original_forward = super().forward
         if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
             raise ValueError('shared attention parallel contexts are owned by the wrapper')
         call_kwargs = dict(kwargs)
@@ -122,7 +119,7 @@ class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
             call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
         if self._hyper_v41_shared_attention_tp_context is not None:
             call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
-        return original_forward(*args, **call_kwargs)
+        return super().forward(*args, **call_kwargs)
     def forward(self, *args, **kwargs):
         # [HYPER BOUNDARY] input redistribution
         args, kwargs = self._hp_boundary.redistribute_inputs(

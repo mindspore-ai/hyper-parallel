@@ -26,13 +26,13 @@
  #
  # Unless required by applicable law or agreed to in writing, software
  # distributed under the License is distributed on an "AS IS" BASIS,
-@@ -78,6 +92,47 @@
+@@ -78,6 +92,44 @@
      DeepseekV41VisionAligner,
      DeepseekV41VisionTower,
  )
 +
 +
-+from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttention as _SharedCompressedDSAAttentionBase
++import hyper_parallel.components.modules.shared_compressed_dsa_attention
 +from hyper_parallel.components.modules.engram.engram import Engram
 +from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
 +from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
@@ -48,11 +48,8 @@
 +
 +# Codegen replacement: DeepseekV41MegaGate wraps DeepseekV41TopKRouter; the original class is kept as the wrapper input.
 +
-+class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
-+    """Generated source-visible parallel form."""
-+
++class SharedCompressedDSAAttention(hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention):
 +    def _forward_impl(self, *args, **kwargs):
-+        original_forward = super().forward
 +        if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
 +            raise ValueError('shared attention parallel contexts are owned by the wrapper')
 +        call_kwargs = dict(kwargs)
@@ -60,7 +57,7 @@
 +            call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
 +        if self._hyper_v41_shared_attention_tp_context is not None:
 +            call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
-+        return original_forward(*args, **call_kwargs)
++        return super().forward(*args, **call_kwargs)
 +    def forward(self, *args, **kwargs):
 +        # [HYPER BOUNDARY] input redistribution
 +        args, kwargs = self._hp_boundary.redistribute_inputs(
@@ -74,7 +71,7 @@
  from hyper_parallel.models.materialization import register_rebuildable_buffer
 
  # Native model replacements are optional; an installed package's own failures propagate.
-@@ -395,7 +450,7 @@
+@@ -395,7 +447,7 @@
      shared_expert.forward = MethodType(_v41_shared_expert_forward, shared_expert)
 
 
@@ -83,7 +80,7 @@
          self: nn.Module,
          hidden_states: torch.Tensor,
          input_ids: torch.Tensor | None = None,
-@@ -414,6 +469,37 @@
+@@ -414,6 +466,37 @@
      routed = self.experts(hidden_states.view(-1, hidden_size), indices, weights)
      return routed.view(batch_size, sequence_length, hidden_size) + self.shared_experts(hidden_states)
 
@@ -121,7 +118,7 @@
 
  class DeepseekV41Compressor(nn.Module):
      """Non-overlapping V4.1 compressed-KV producer."""
-@@ -831,15 +917,16 @@
+@@ -831,15 +914,16 @@
          )
          for layer_idx in range(config.num_hidden_layers):
              layer = self.layers[layer_idx]
@@ -142,7 +139,7 @@
              layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
          for layer_id in getattr(config, "v41_engram_layer_ids", assets["layer_ids"]):
              self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
-@@ -1317,7 +1404,7 @@
+@@ -1317,7 +1401,7 @@
      dspark_config.num_local_experts = experts
      dspark_config.num_experts_per_tok = int(getattr(config, "v41_dspark_top_k", config.num_experts_per_tok))
      mlp = DeepseekV4DecoderLayer(dspark_config, 0).mlp
@@ -151,7 +148,7 @@
      mlp.forward = MethodType(_dspark_sparse_moe_forward, mlp)
      return mlp
 
-@@ -1345,6 +1432,26 @@
+@@ -1345,6 +1429,26 @@
              self.dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _build_dspark_mlp(config))
              self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
          self.post_init()
@@ -178,7 +175,7 @@
 
      @torch.no_grad()
      def _init_weights(self, module: nn.Module) -> None:
-@@ -1422,3 +1529,4 @@
+@@ -1422,3 +1526,4 @@
      "SharedAttentionCPContext",
      "SharedAttentionState",
  ]
