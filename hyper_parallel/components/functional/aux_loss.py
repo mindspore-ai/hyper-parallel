@@ -39,14 +39,17 @@ _AUX_LOSS_STATE: ContextVar[_AuxLossScaleState | None] = ContextVar("aux_loss_st
 
 
 @contextmanager
-def aux_loss_scale_context() -> Iterator[None]:
+def aux_loss_scale_context(scale: torch.Tensor | float = 1.0) -> Iterator[None]:
     """Isolate auxiliary gradient scaling for one forward/backward microstep.
 
     Call :func:`bind_aux_loss_scale` on the local scalar task loss before
     weighting it. Keep this context active through backward so checkpoint
     recomputation observes the same scale. Nested contexts are independent.
+
+    Args:
+        scale: Initial gradient multiplier for stages that do not compute the task loss.
     """
-    state = _AuxLossScaleState()
+    state = _AuxLossScaleState(scale=scale)
     token = _AUX_LOSS_STATE.set(state)
     try:
         yield

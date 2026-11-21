@@ -167,13 +167,16 @@ class MoEMonitorCallback:
         no autograd graph in production. Auxiliary loss remains observable
         when expert-bias updates are disabled.
         """
-        # Transparent wrappers expose the same router; its child owns the metric.
-        aux_losses = [
+        aux_losses = self.last_aux_losses()
+        return torch.stack(aux_losses).mean() if aux_losses else None
+
+    def last_aux_losses(self) -> list[torch.Tensor]:
+        """Return each local router metric once for aggregation across pipeline stages."""
+        return [
             module.last_aux_loss
             for module in self.model.modules()
             if not isinstance(module, ActivationWrapper) and getattr(module, "last_aux_loss", None) is not None
         ]
-        return torch.stack(aux_losses).mean() if aux_losses else None
 
     def on_step_end(self) -> None:
         """Update expert bias for all MoE layers in the model.

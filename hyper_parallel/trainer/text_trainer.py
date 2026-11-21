@@ -278,20 +278,24 @@ class TextTrainer:
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step in range(num_micro_steps):
-            self.base.model_reshard(micro_step, num_micro_steps)
-            self.base.configure_fsdp_gradient_sync(
-                micro_step,
-                num_micro_steps,
-            )
-            self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            loss, loss_dict = self.forward_backward_step(
-                data_iterator,
-            )
+        if getattr(self.base.model, "_hp_pipeline_partition", None) is not None:
+            batches = (self.base.get_batch(data_iterator) for _ in range(num_micro_steps))
+            total_loss, total_loss_dict = self.base.pipeline_forward_backward(batches, num_micro_steps)
+        else:
+            for micro_step in range(num_micro_steps):
+                self.base.model_reshard(micro_step, num_micro_steps)
+                self.base.configure_fsdp_gradient_sync(
+                    micro_step,
+                    num_micro_steps,
+                )
+                self.base.begin_fsdp_runtime_diagnostics(micro_step)
+                loss, loss_dict = self.forward_backward_step(
+                    data_iterator,
+                )
 
-            total_loss += loss.item()
-            for loss_name, loss_value in loss_dict.items():
-                total_loss_dict[loss_name] += loss_value.item()
+                total_loss += loss.item()
+                for loss_name, loss_value in loss_dict.items():
+                    total_loss_dict[loss_name] += loss_value.item()
 
         total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
         self.base.step_optimizers_and_schedulers()

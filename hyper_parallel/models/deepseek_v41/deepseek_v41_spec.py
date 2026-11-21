@@ -62,6 +62,13 @@ def _load_encoder_parallel_spec():
     return get_deepseek_v41_encoder_parallel_spec()
 
 
+def _load_pipeline():
+    """Load the model-owned stage protocol without importing the model eagerly."""
+    from hyper_parallel.models.deepseek_v41.adapter.pipeline import get_pipeline_spec  # pylint: disable=C0415
+
+    return get_pipeline_spec()
+
+
 def _load_loss():
     """Return the V4.1 model-integrated output-loss adapter."""
     from hyper_parallel.models.deepseek_v41.adapter import chunk_loss  # pylint: disable=C0415
@@ -97,6 +104,7 @@ MODEL_SPEC = ModelAdapterSpec(
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,
     loss=_load_loss,
+    pipeline_parallel=_load_pipeline,
 )
 
 register_custom_model(
