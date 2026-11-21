@@ -216,6 +216,14 @@ def _materialize_imported_forward_hosts(
         rendered.add(patch.class_name)
         imported = patch_set.imports[import_index]
         other_names = tuple(name for name in imported.names if name != patch.class_name)
+        if patch.definition is not None:
+            replacement_imports = [ImportPatch(imported.module, other_names)] if other_names else []
+            replacement_imports.append(ImportPatch("", (), raw=f"import {imported.module}"))
+            patch_set.imports[import_index:import_index + 1] = replacement_imports
+            snippet = (f"class {patch.class_name}({imported.module}.{patch.class_name}):\n"
+                       + textwrap.indent(patch.definition, "    ") + "\n")
+            patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
+            continue
         alias = f"_{patch.class_name}Base"
         replacement_imports = []
         if other_names:
@@ -285,7 +293,6 @@ def render_inline_strategies_for_source_unit(
     ]
     if not patches.forward_extracts:
         return source_text
-    patches.module_snippets.clear()
     patches.constructor_replaces.clear()
     patches.class_removals.clear()
     return apply_patch_set(source_text, patches)

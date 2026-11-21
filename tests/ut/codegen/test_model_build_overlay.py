@@ -192,8 +192,102 @@ def _state_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh, selection=Non
     )
 
 
+
+class _WeightedLayer(_ObservedLayer):
+    """Keep parameter identity observable through executor materialization."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(()))
+
+    def forward(self, value):
+        return value * self.weight * 2
+
+
+class _FlatExecutorBase(nn.Module):
+    """Flat native executor with inherited computation and runtime mesh metadata."""
+
+    def __init__(self, module, cp_mesh):
+        super().__init__()
+        self.module = module
+        self.cp_mesh = cp_mesh
+        self.cp_rank = cp_mesh.get_local_rank()
+        self.scale = 3
+
+    def _project(self, value):
+        return value * self.module.weight * self.scale + self.module.bias
+
+    def forward(self, value):
+        return self._project(value) + self.cp_rank
+
+
+class _FlatExecutor(_FlatExecutorBase):
+    """Exercise inherited forward and helper source discovery."""
+
+
+@inner_wrapper
+def _executor_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Return the executor selected by native construction exactly once."""
+    del mesh, tp_mesh, ep_mesh
+    _OBSERVED_CALLS.append(id(target_module))
+    executor = _FlatExecutor(target_module, cp_mesh)
+    original = target_module.forward
+
+    @wraps(original)
+    def selected(*args, **kwargs):
+        return executor(*args, **kwargs)
+
+    return _ForwardRewriteRequest(target_module, selected)
+
+
 class TestObservedWrapperConnection(unittest.TestCase):
     """Native factory decisions must survive the frozen plan and existing inline passes."""
+
+    def test_executor_is_visible_on_copied_and_imported_hosts_without_new_state(self):
+        """Use the production observation/inline path and preserve parameter ownership."""
+        for imported in (False, True):
+            with self.subTest(imported=imported):
+                _OBSERVED_CALLS.clear()
+                model = nn.Sequential(_WeightedLayer())
+                plan = SimpleNamespace(modules={"0": ModuleShardingSpec(
+                    is_boundary=True, inner_wrapper=_executor_wrapper, inner_target="self", region_dispatch=False,
+                )}, mesh_dim_names=("cp", "tp"), parallel_modules={})
+                context = SimpleNamespace(device_mesh=_ObservationMesh(("cp", "tp"), (2, 1)),
+                                          tp_size=1, cp_size=2, ep_size=1,
+                                          sequence_parallel=False, loss_parallel=False)
+                session = CodegenBuildSession()
+                session.record_source({"model_type": "test"})
+                session.observe_plan(plan, model, context)
+                payload = session.finish()._emission_view()["plan"]
+                json.dumps(payload)
+                rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
+                patches = build_strategy_patches(rules, boundary_classes={"0": "_WeightedLayer"})
+                source = ("class _WeightedLayer:\n    def __init__(self):\n        self.bias = 7\n"
+                          "    def forward(self, value):\n        return value * 2\n")
+                if imported:
+                    patches.imports.append(ImportPatch(__name__, ("_WeightedLayer",)))
+                    _materialize_imported_forward_hosts("", patches)
+                    source = ""
+                rendered = apply_patch_set(source, patches)
+                self.assertNotIn("executor(", rendered)
+                self.assertNotIn("self.module", rendered)
+                self.assertIn("def _project", rendered)
+                self.assertNotIn("_forward_impl", rendered)
+                with TemporaryDirectory() as directory:
+                    path = Path(directory) / "visible_executor.py"
+                    path.write_text(rendered, encoding="utf-8")
+                    spec = util.spec_from_file_location("visible_executor", path)
+                    module = util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    layer = module._WeightedLayer()
+                    parameter = model[0].weight
+                    layer.weight = parameter
+                    for rank in (0, 1):
+                        mesh = SimpleNamespace(get_local_rank=lambda value=rank: value)
+                        layer._hp_boundary = SimpleNamespace(compiled=SimpleNamespace(mesh={"cp": mesh}))
+                        self.assertEqual(layer.forward(5).item(), 22 + rank)
+                    self.assertIs(layer.weight, parameter)
+                self.assertEqual(_OBSERVED_CALLS, [id(model[0])])
 
     def test_optional_native_state_is_preserved_without_annotation_imports(self):
         """None state keeps its native field while None configuration remains literal."""

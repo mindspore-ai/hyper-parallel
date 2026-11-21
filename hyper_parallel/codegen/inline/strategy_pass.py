@@ -22,6 +22,7 @@ from typing import Collection, Mapping
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch,
     ImportPatch,
+    ModuleSnippetPatch,
     InlinePatchSet,
     SourceObservation,
     StrategySpec,
@@ -153,15 +154,16 @@ def _materialize_cp_forward(
         raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
     for host_class in sorted(host_classes):
         if host_class in subclassed:
-            if subclassed[host_class] != spec.subclass_shell:
+            if subclassed[host_class] != (spec.definition or spec.subclass_shell):
                 raise RuntimeError(f"codegen: conflicting CP bindings for source class {host_class!r}")
             continue
-        subclassed[host_class] = spec.subclass_shell
+        subclassed[host_class] = spec.definition or spec.subclass_shell
         patch_set.forward_extracts.append(
             ForwardExtractPatch(
                 class_name=host_class,
                 method_name=spec.method_name,
                 body=spec.subclass_shell,
+                definition=spec.definition,
                 merge_original_body=(
                     spec.subclass_shell.count("self._forward_impl(") == 1
                     and spec.subclass_shell.rstrip().endswith("return self._forward_impl(__hp_forward_args__)")
@@ -190,7 +192,11 @@ def _rule_strategy(
     if inner_wrapper and rule.observed_wrapper is not None:
         return StrategySpec(
             kind=CP_ATTENTION_KIND, subclass_shell=rule.observed_wrapper["body"],
-            imports=tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"]),
+            definition=rule.observed_wrapper.get("definition"),
+            imports=(tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"])
+                     + tuple(ImportPatch("", (), raw=line)
+                             for line in rule.observed_wrapper.get("source_imports", ()))),
+            snippets=tuple(ModuleSnippetPatch(text) for text in (rule.observed_wrapper.get("helpers"),) if text),
         )
     return strategy_spec(target, model_type, inner_wrapper=inner_wrapper,
                          construction_kwargs=rule.construction_kwargs if inner_wrapper else ())

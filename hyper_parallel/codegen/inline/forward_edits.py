@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import textwrap
 from collections.abc import Iterable
 
@@ -41,8 +42,20 @@ def forward_extract_edits(
         cls = index.find_class(patch.class_name)
         if cls is None:
             continue
+        if patch.definition is not None:
+            names = {node.name for node in ast.parse(patch.definition).body if isinstance(node, ast.FunctionDef)}
+            collisions = (names - {patch.method_name}) & cls.methods.keys()
+            if collisions:
+                raise RuntimeError(f"codegen executor methods collide with source methods {sorted(collisions)}")
         func = cls.methods.get(patch.method_name)
         if func is None:
+            if patch.definition is not None:
+                edits.append(TextEdit(cls.end_offset, cls.end_offset,
+                                      "\n" + textwrap.indent(patch.definition.strip(), "    ") + "\n"))
+            continue
+        if patch.definition is not None:
+            edits.append(TextEdit(func.def_offset, func.body_end,
+                                  textwrap.indent(patch.definition.strip(), "    ") + "\n"))
             continue
         body = _bind_forward_args(_bind_hidden_arg(patch.body, func), func)
         prefix = _parallel_state_prefix(body)
