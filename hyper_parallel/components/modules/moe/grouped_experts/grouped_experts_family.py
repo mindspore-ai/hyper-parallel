@@ -14,7 +14,7 @@
 # ============================================================================
 """Opt-in expert family using the shared module-family mechanism from PR #1523.
 
-Register local/EP and the planned Mega/MoonEP members in one family. Unfinished
+Register local/EP/Mega and the planned MoonEP member in one family. Unfinished
 kernels fail construction explicitly instead of falling back to local math.
 The MoE package exports the factory and config; the legacy production entry is unchanged.
 """
@@ -22,6 +22,7 @@ The MoE package exports the factory and config; the legacy production entry is u
 from __future__ import annotations
 
 from typing import Any
+import warnings
 
 from torch import nn
 
@@ -54,7 +55,18 @@ def validate_grouped_experts(
         num_experts = facts.num_experts
     if num_experts % member.axis_sizes["ep"]:
         raise ValueError("EP size must divide the global expert count")
-    if member.variant not in ("local", "ep"):
+    if member.selectors["megakernel"] and member.axis_sizes["ep"] == 1:
+        warnings.warn(
+            "megakernel=True requires EP>1; EP=1 falls back to ordinary GroupedExperts. "
+            "Mega transport options are ignored.",
+            UserWarning, stacklevel=3,
+        )
+    elif not member.selectors["megakernel"] and (
+            member.arguments.get("dispatch_mode", "push") != "push"
+            or member.arguments.get("initial_capacity_factor") is not None
+            or member.arguments.get("capacity_growth_factor") is not None):
+        raise ValueError("Mega transport options require megakernel=True")
+    if member.variant not in ("local", "ep", "ep_mega"):
         raise NotImplementedError(f"expert member {member.variant!r} is registered but execution is not implemented")
 
 
@@ -80,6 +92,8 @@ def GroupedExperts(  # pylint: disable=invalid-name
     *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Any = None, mesh: Any = None,
     megakernel: bool = False, moonep: bool = False,
+    dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
+    capacity_growth_factor: float | None = None,
 ) -> nn.Module:
     """Construct the local/EP member through the existing shared builder.
 
@@ -89,16 +103,21 @@ def GroupedExperts(  # pylint: disable=invalid-name
         module_fqn: Model-owned expert boundary.
         context: Framework construction facts.
         mesh: Existing job mesh, outside serialized family arguments.
-        megakernel: Select the reserved fused Mega member when True.
+        megakernel: Select fused Mega transport/compute for EP>1; EP=1 warns and uses local GMM.
         moonep: Select the reserved MoonEP execution member when True.
+        dispatch_mode: Mega transport policy, push or pull.
+        initial_capacity_factor: Mega push receive-capacity factor; None uses the backend default.
+        capacity_growth_factor: Mega push growth factor; None uses the backend default.
 
     Note:
         Local NPU grouped-GEMM and ordinary EP slot transport are implemented.
         Dense TP uses TP-extend-EP with complete expert matrices (ETP=1).
-        Selecting a registered Mega/MoonEP placeholder raises before parameter allocation.
+        Mega uses the optional HyperMulticore executor. MoonEP remains a placeholder.
     """
     return build_family(GroupedExperts, config=config, module=module, module_fqn=module_fqn,
-                        context=context, mesh=mesh, megakernel=megakernel, moonep=moonep)
+                        context=context, mesh=mesh, megakernel=megakernel, moonep=moonep,
+                        dispatch_mode=dispatch_mode, initial_capacity_factor=initial_capacity_factor,
+                        capacity_growth_factor=capacity_growth_factor)
 
 
 register_module_family(ModuleFamily(
@@ -106,7 +125,6 @@ register_module_family(ModuleFamily(
     variants={
         "local": "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.GroupedExpertsModule",
         "ep": "hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts.EPGroupedExperts",
-        "mega": "hyper_parallel.components.modules.moe.grouped_experts.mega_grouped_experts.MegaGroupedExperts",
         "ep_mega": ("hyper_parallel.components.modules.moe.grouped_experts.ep."
                     "ep_mega_grouped_experts.EPMegaGroupedExperts"),
         "ep_moonep": ("hyper_parallel.components.modules.moe.grouped_experts.ep."
@@ -116,7 +134,7 @@ register_module_family(ModuleFamily(
     selector_specs={"megakernel": SelectorSpec(bool, False), "moonep": SelectorSpec(bool, False)},
     variant_rules=(
         VariantRule({"megakernel": False, "moonep": False, "parallel": True}, "ep"),
-        VariantRule({"megakernel": True, "moonep": False, "parallel": False}, "mega"),
+        VariantRule({"megakernel": True, "moonep": False, "parallel": False}, "local"),
         VariantRule({"megakernel": True, "moonep": False, "parallel": True}, "ep_mega"),
         VariantRule({"megakernel": False, "moonep": True, "parallel": True}, "ep_moonep"),
     ),

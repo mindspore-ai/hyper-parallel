@@ -213,15 +213,14 @@ def resolve_family(request: FamilyRequest, *, context: Mapping[str, Any] | None 
 def _constructor_arguments(
     member: ResolvedFamily, config: Any, module: nn.Module | None, fqn: str, context: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Bind source or config construction arguments accepted by the selected member."""
+    """Project validated public options onto the selected member's explicit signature."""
     signature = inspect.signature(member.constructor)
     required = "config" if module is None else "module"
     if required not in signature.parameters:
         raise TypeError(f"member {member.variant!r} must explicitly accept {required}")
-    kwargs = dict(member.arguments)
-    unknown = set(kwargs) - set(signature.parameters)
-    if unknown:
-        raise TypeError(f"member {member.variant!r} does not accept {sorted(unknown)}")
+    # FamilyRequest checks public names; family validation sees every option before this point.
+    # Members need not declare options used only by another implementation in the family.
+    kwargs = {name: value for name, value in member.arguments.items() if name in signature.parameters}
     runtime = {"config": config, "module": module, "module_fqn": fqn, "context": context}
     kwargs.update({name: value for name, value in runtime.items() if name in signature.parameters})
     signature.bind(**kwargs)
@@ -314,6 +313,10 @@ def build_family(
 
     Returns:
         The concrete member with construction provenance. Logical/meta builds finish physical work at runtime.
+
+    Note:
+        The family validator receives all public options. Each concrete constructor receives
+        only the options it explicitly declares; unknown public argument names still raise.
     """
     request = _normalize_family_request(target, kwargs)
     arguments = dict(request.kwargs)

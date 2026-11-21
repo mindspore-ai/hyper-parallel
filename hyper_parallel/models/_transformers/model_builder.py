@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
+from hyper_parallel.components.modules.runtime import prepare_module_runtimes
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
     HuggingFaceCheckpointer,
 )
@@ -759,6 +760,7 @@ def apply_model_infrastructure(
     # 5): the Trainer never patches model dtype after construction.
     apply_model_init_dtype(model, model_init_dtype)
     validate_materialized_modules(model)
+    prepare_module_runtimes(model)
     if external is not None:
         external.check_identities()
 
