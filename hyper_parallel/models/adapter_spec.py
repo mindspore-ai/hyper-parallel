@@ -152,3 +152,4 @@ class ModelAdapterSpec:
     codegen: Optional[Callable[..., Any]] = None
     sharding: Optional[Callable[..., Any]] = None
     native_parallel: Optional[Callable[..., Any]] = None
+    pipeline_parallel: Optional[Callable[..., Any]] = None
