@@ -24,6 +24,7 @@ vendors/
 *.py[cod]
 *.whl
 .venv/
+.venv-uv/
 venv/
 .ipynb_checkpoints/
 

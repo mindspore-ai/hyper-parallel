@@ -10,7 +10,7 @@ For Python development, use an isolated environment, Git, a supported PyTorch in
 dependencies. The compiler, SDK, and build tools below apply when building native components:
 
 - Python 3.10 / 3.11 / 3.12
-- Development headers for the current Python, plus `setuptools`, `wheel`, and `pybind11`
+- Development headers for the current Python, `pybind11`, and [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - Git
 - GCC/G++ with C++17 support, GNU Make, binutils, coreutils, tar, sed, and awk
 - A complete CANN >= 9.1.0 toolkit/ops development environment for Ascend NPU development
@@ -50,7 +50,7 @@ source "$(command -v hyper_multicore_set_env.bash)"
 python your_program.py
 ```
 
-Running `python setup.py bdist_wheel` directly produces a core-only wheel. The setup/pip phase does not download or compile native dependencies. See the [Installation Guide](../installation.md) for HyperParallel build instructions, and [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) for Multicore dependencies and CANN custom OPP activation.
+Running `uv build --wheel` directly produces a core-only wheel. The setup/pip phase does not download or compile native dependencies. See the [Installation Guide](../installation.md) for HyperParallel build instructions, and [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) for Multicore dependencies and CANN custom OPP activation.
 
 ## Install Development Dependencies
 

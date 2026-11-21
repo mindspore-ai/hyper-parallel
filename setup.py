@@ -29,20 +29,6 @@ from setuptools.command.install import install
 ROOT_DIR = os.path.dirname(__file__)
 logger = logging.getLogger(__name__)
 
-TORCH26_REQUIRES = [
-    "torch==2.6.0",
-    "torch-npu==2.6.0.post3",
-]
-
-TORCH27_REQUIRES = [
-    "torch==2.7.1",
-    "torch-npu==2.7.1",
-]
-
-TORCH29_REQUIRES = [
-    "torch==2.9.1",
-    "torch-npu==2.9.1",
-]
 
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
@@ -92,22 +78,6 @@ def get_install_requires() -> list[str]:
         list, list of dependent packages.
     """
     return _read_requirements('requirements.txt')
-
-
-def get_extra_requires() -> dict[str, list[str]]:
-    """
-    Get optional framework requirements.
-
-    Returns:
-        dict, optional dependency groups keyed by extra name.
-    """
-    return {
-        "torch": list(TORCH29_REQUIRES),
-        "torch26": list(TORCH26_REQUIRES),
-        "torch27": list(TORCH27_REQUIRES),
-        "torch29": list(TORCH29_REQUIRES),
-        "all": list(TORCH29_REQUIRES),
-    }
 
 
 def update_permissions(path: str) -> None:
@@ -161,11 +131,9 @@ class EggInfo(egg_info):
 
     def run(self) -> None:
         """Regenerate package metadata and normalize its permissions."""
-        egg_info_dir = os.path.join(os.path.dirname(
-            __file__), 'hyper_parallel.egg-info')
-        shutil.rmtree(egg_info_dir, ignore_errors=True)
+        # Isolated metadata builds can run while pip still reads the checkout's metadata.
         super().run()
-        update_permissions(egg_info_dir)
+        update_permissions(self.egg_info)
 
 
 class BuildPy(build_py):
@@ -276,7 +244,6 @@ if __name__ == '__main__':
         distclass=BinaryDistribution,
         python_requires='>=3.10,<3.13',
         install_requires=get_install_requires(),
-        extras_require=get_extra_requires(),
         classifiers=[
             'Development Status :: 4 - Beta',
             'Environment :: Console',
