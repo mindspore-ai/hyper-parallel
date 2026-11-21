@@ -20,12 +20,13 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
+from hyper_parallel.components.modules import GatedDeltaNet
 import hyper_parallel as hp
 from hyper_parallel.components.functional.gated_delta_net_ascendc import chunk_gated_delta_rule_ascendc
-from hyper_parallel.distributed.context_parallel.gated_delta_net import (
-    GatedDeltaNetUlyssesCP, _differentiable_all_to_all_shard,
+from hyper_parallel.distributed.context_parallel.collectives import (
+    exchange_sequence_heads as _differentiable_all_to_all_shard,
 )
-from tests.torch.context_parallel._test_linear_tnd import _GDN, _assert_same, _execute, _isolation
+from tests.torch.context_parallel._test_linear_tnd import _GDN, _assert_same, _bind_family, _execute, _isolation
 
 
 def _core_inputs(tokens):
@@ -67,7 +68,7 @@ def _check_layer(mesh, length):
     rank, size = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(451)
     model = _GDN(96, 128).float().npu()
-    wrapper = GatedDeltaNetUlyssesCP(model, mesh, backend="ascendc")
+    wrapper = _bind_family(GatedDeltaNet, mesh, module=model, backend="ascendc", ulysses_degree=None)
     local = (torch.randn(length, 32) * .05).bfloat16().npu()
     grad_output = (torch.randn(length, 32) * .01).bfloat16().npu()
     tails = (0, length + length // 2 + 1, 3 * length, size * length - 1, size * length)

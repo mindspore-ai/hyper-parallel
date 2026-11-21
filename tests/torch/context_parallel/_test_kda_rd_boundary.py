@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 
 import hyper_parallel as hp
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd import KDAStateRecursiveDoubling
+from hyper_parallel.components.modules.attention.kimi_delta_attention.cp_recursive_doubling import KDAStateRecursiveDoubling
 
 
 def _assert_boundary(actual, expected):

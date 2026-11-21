@@ -25,6 +25,8 @@ from typing import Any
 import torch
 from torch.autograd.function import once_differentiable
 
+from hyper_parallel.components.modules.attention.linear_attention.sequence_layout import local_chunk_metadata
+
 
 @lru_cache(maxsize=1)
 def _load_ops():
@@ -54,42 +56,26 @@ def _load_ops():
     return ops
 
 
-def _packed_offsets(cu_seqlens, tokens):
-    """Freeze validated document offsets without a device-to-host transfer."""
-    if isinstance(cu_seqlens, torch.Tensor):
-        if (cu_seqlens.device.type != "cpu" or cu_seqlens.ndim != 1
-                or cu_seqlens.dtype not in (torch.int32, torch.int64)):
-            raise ValueError("Ascend C GDN cu_seqlens must be a one-dimensional CPU integer tensor or sequence.")
-        cu_seqlens = cu_seqlens.tolist()
-    if not isinstance(cu_seqlens, Sequence):
-        raise ValueError("Ascend C GDN cu_seqlens must be a CPU integer tensor or sequence.")
-    offsets = tuple(cu_seqlens)
-    if (len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != tokens
-            or any(not isinstance(value, int) or isinstance(value, bool) for value in offsets)
-            or any(start >= end for start, end in zip(offsets, offsets[1:]))):
-        raise ValueError("Ascend C GDN cu_seqlens must strictly increase from zero to the packed token count.")
-    return offsets
-
-
-def _packed_metadata(cu_seqlens, tokens):
-    """Derive canonical native chunk indices from immutable host offsets."""
-    if cu_seqlens is None:
-        return {}
-    offsets = _packed_offsets(cu_seqlens, tokens)
-    chunks = tuple(component
-                   for sequence, (start, end) in enumerate(zip(offsets, offsets[1:]))
-                   for chunk in range((end - start + 63) // 64)
-                   for component in (sequence, chunk))
-    return {"cu_seqlens": offsets, "chunk_indices": chunks}
-
-
 class _AscendCGDN(torch.autograd.Function):
     """Own each invocation's native backward intermediates independently."""
 
     @staticmethod
     def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 gate: torch.Tensor, beta: torch.Tensor, metadata: dict) -> torch.Tensor:
-        """Save only the tensors consumed by the native composite backward."""
+        """Save only the tensors consumed by the native composite backward.
+
+        Args:
+            ctx: Autograd context owning this invocation's saved tensors.
+            query: Query tensor after the caller's optional normalization.
+            key: Key tensor after the caller's optional normalization.
+            value: Value tensor in the same dense or packed layout.
+            gate: Effective log-decay before the chunk cumulative sum.
+            beta: Effective delta coefficient after the caller's sigmoid.
+            metadata: Host document boundaries and chunk indices, or an empty dict.
+
+        Returns:
+            Attention output in the input layout.
+        """
         scale = query.shape[-1] ** -0.5
         layout = "TND" if metadata else "BSND"
         result = _load_ops().chunk_gated_delta_rule_fwd(
@@ -114,7 +100,15 @@ class _AscendCGDN(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
-        """Return effective-input gradients without applying norm or sigmoid twice."""
+        """Return effective-input gradients without applying norm or sigmoid twice.
+
+        Args:
+            ctx: Context saved by forward for this invocation.
+            grad_output: Gradient of the attention output.
+
+        Returns:
+            Gradients for query, key, value, gate and beta, followed by None for metadata.
+        """
         query, key, value, gate_cumsum, beta, matrix_a = ctx.saved_tensors
         gradients = _load_ops().chunk_gated_delta_rule_bwd(
             query, key, value, gate_cumsum, beta, matrix_a, grad_output.contiguous(), ctx.scale,
@@ -158,5 +152,5 @@ def chunk_gated_delta_rule_ascendc(
         raise ValueError("GDN inputs must have shape [B,T,H,K].")
     if cu_seqlens is not None and query.shape[0] != 1:
         raise ValueError("Packed Ascend C GDN requires physical batch size one.")
-    metadata = _packed_metadata(cu_seqlens, query.shape[1])
+    metadata = local_chunk_metadata(cu_seqlens, query.shape[1])
     return _AscendCGDN.apply(query, key, value, g, beta, metadata), None

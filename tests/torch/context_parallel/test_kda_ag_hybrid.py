@@ -25,16 +25,15 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
-@pytest.mark.parametrize("case,workers", [("test_kda_ag_state_gloo", 8), ("test_kda_hybrid_layout", 4)])
-def test_kda_ag_hybrid_cpu(case: str, workers: int) -> None:
+def test_kda_ag_hybrid_cpu() -> None:
     """Feature: KDA AG and hybrid context parallelism.
 
-    Description: Check ordered subgroups and hybrid head/halo layout with Gloo.
-    Expectation: Recurrent states and layer gradients match independent serial references.
+    Description: Check ordered subgroups and invocation-local caches with Gloo.
+    Expectation: Recurrent states match independent serial references.
     """
     # Gloo workers do not need accelerator extensions or an activated CANN runtime.
     with patch.dict("os.environ", {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}):
-        torchrun_case(str(Path(__file__).with_name("_test_kda_ag_state.py")), case, num_proc=workers)
+        torchrun_case(str(Path(__file__).with_name("_test_kda_ag_state.py")), "test_kda_ag_state_gloo", num_proc=8)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",

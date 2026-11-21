@@ -12,18 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed adapters for Qwen3.5."""
+"""KimiDeltaAttention family and its complete local algorithm."""
+from .kimi_delta_attention_family import KimiDeltaAttention
+from .kimi_delta_attention import KimiDeltaAttentionModule
 
-from hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel import (
-    qwen3_5_gdn_p2p_cp_wrapper,
-    qwen3_5_gdn_ulysses_cp_wrapper,
-    qwen3_5_gdn_packed_local_wrapper,
-    qwen3_5_packed_decoder_wrapper,
-)
-
-__all__ = [
-    "qwen3_5_gdn_p2p_cp_wrapper",
-    "qwen3_5_gdn_ulysses_cp_wrapper",
-    "qwen3_5_gdn_packed_local_wrapper",
-    "qwen3_5_packed_decoder_wrapper",
-]
+__all__ = ["KimiDeltaAttention", "KimiDeltaAttentionModule"]

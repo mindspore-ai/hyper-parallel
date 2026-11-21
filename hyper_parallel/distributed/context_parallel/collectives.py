@@ -65,7 +65,18 @@ class _SeqAllToAll(torch.autograd.Function):
         scatter_dim: int,
         gather_dim: int,
     ) -> Tensor:
-        """Exchange tensor shards between the sequence and head dimensions."""
+        """Exchange tensor shards between the sequence and head dimensions.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            group: Existing communication group; no group is created here.
+            tensor: Input tensor whose autograd edge is preserved.
+            scatter_dim: Tensor dimension divided across the group.
+            gather_dim: Tensor dimension assembled across the group.
+
+        Returns:
+            Tensor with shards concatenated along gather_dim.
+        """
         ctx.group = group
         ctx.scatter_dim = scatter_dim
         ctx.gather_dim = gather_dim
@@ -87,7 +98,15 @@ class _SeqAllToAll(torch.autograd.Function):
         ctx: Any,
         grad_output: Tensor,
     ) -> tuple[None, Tensor, None, None]:
-        """Apply the inverse all-to-all to the output gradient."""
+        """Apply the inverse all-to-all to the output gradient.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            grad_output: Gradient in the forward output layout.
+
+        Returns:
+            Input gradient and None for the communication metadata.
+        """
         grad_input = _SeqAllToAll.apply(
             ctx.group, grad_output, ctx.gather_dim, ctx.scatter_dim)
         return None, grad_input, None, None
@@ -241,7 +260,20 @@ class _AsyncAllGatherWait(torch.autograd.Function):
         world_size: int,
         gather_dim: int,
     ) -> Tensor:
-        """Wait for a launched all-gather and expose its autograd edge."""
+        """Wait for a launched all-gather and expose its autograd edge.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            tensor: Input tensor whose autograd edge is preserved.
+            work: Handle for the already launched asynchronous collective.
+            output: Receive buffer owned by this invocation.
+            group: Existing communication group; no group is created here.
+            world_size: Number of participating ranks.
+            gather_dim: Tensor dimension assembled across the group.
+
+        Returns:
+            Gathered tensor after its communication completes.
+        """
         del tensor
         ctx.group = group
         ctx.world_size = world_size
@@ -254,7 +286,15 @@ class _AsyncAllGatherWait(torch.autograd.Function):
         ctx: Any,
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None, None, None]:
-        """SUM consumer gradients directly into each owner's sequence shard."""
+        """SUM consumer gradients directly into each owner's sequence shard.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            grad_output: Gradient in the forward output layout.
+
+        Returns:
+            Local summed gradient and None for non-tensor metadata.
+        """
         send = _move_dim_to_front(grad_output, ctx.gather_dim)
         output = grad_output.new_empty((send.shape[0] // ctx.world_size, *send.shape[1:]))
         work = dist.reduce_scatter_tensor(
@@ -286,7 +326,21 @@ class _AsyncUlyssesWait(torch.autograd.Function):
         seq_dim: int,
         head_dim: int,
     ) -> Tensor:
-        """Wait for a launched A2A and expose its autograd edge."""
+        """Wait for a launched A2A and expose its autograd edge.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            tensor: Input tensor whose autograd edge is preserved.
+            work: Handle for the already launched asynchronous collective.
+            output: Receive buffer owned by this invocation.
+            group: Existing communication group; no group is created here.
+            world_size: Number of participating ranks.
+            seq_dim: Tensor dimension representing tokens.
+            head_dim: Tensor dimension representing attention heads.
+
+        Returns:
+            Exchanged tensor after its communication completes.
+        """
         del tensor
         ctx.group = group
         ctx.world_size = world_size
@@ -300,7 +354,15 @@ class _AsyncUlyssesWait(torch.autograd.Function):
         ctx: Any,
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None, None, None, None]:
-        """Apply the inverse A2A to restore the input-gradient layout."""
+        """Apply the inverse A2A to restore the input-gradient layout.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            grad_output: Gradient in the forward output layout.
+
+        Returns:
+            Input gradient and None for non-tensor metadata.
+        """
         send = _prepare_ulysses_send(
             grad_output,
             scatter_dim=ctx.seq_dim,
@@ -365,7 +427,16 @@ def async_cp_allgather_launch(
     gather_dim: int,
     cp_mesh: DeviceMesh,
 ) -> AsyncCPCollective:
-    """Launch an asynchronous all-gather along gather_dim."""
+    """Launch an asynchronous all-gather along gather_dim.
+
+    Args:
+        tensor: Input tensor whose autograd edge is preserved.
+        gather_dim: Tensor dimension assembled across the group.
+        cp_mesh: Context-parallel mesh owning the communication group.
+
+    Returns:
+        Collective handle whose wait method exposes the gathered tensor.
+    """
     world_size = cp_mesh.size()
     if world_size <= 1:
         return AsyncCPCollective(
@@ -393,7 +464,17 @@ def async_ulysses_seq_to_head_launch(
     head_dim: int,
     cp_mesh: DeviceMesh,
 ) -> AsyncCPCollective:
-    """Launch an asynchronous Ulysses sequence-to-head A2A."""
+    """Launch an asynchronous Ulysses sequence-to-head A2A.
+
+    Args:
+        tensor: Input tensor whose autograd edge is preserved.
+        seq_dim: Tensor dimension representing tokens.
+        head_dim: Tensor dimension representing attention heads.
+        cp_mesh: Context-parallel mesh owning the communication group.
+
+    Returns:
+        Collective handle whose wait method exposes the exchanged tensor.
+    """
     world_size = cp_mesh.size()
     if world_size <= 1:
         return AsyncCPCollective(
@@ -561,7 +642,18 @@ class _AllGatherAlongDim(torch.autograd.Function):
         group: Any,
         cp_size: int,
     ) -> Tensor:
-        """All-gather the tensor along cp_dim in CP-rank order."""
+        """All-gather the tensor along cp_dim in CP-rank order.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            t: Local input shard.
+            cp_dim: Sequence dimension gathered across ranks.
+            group: Existing communication group; no group is created here.
+            cp_size: Number of ranks in the context-parallel group.
+
+        Returns:
+            Tensor assembled in CP-rank order.
+        """
         ctx.cp_dim = cp_dim
         ctx.group = group
         ctx.cp_size = cp_size
@@ -575,7 +667,15 @@ class _AllGatherAlongDim(torch.autograd.Function):
         ctx: Any,
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None]:
-        """Sum the gradient across ranks and take this rank's chunk."""
+        """Sum the gradient across ranks and take this rank's chunk.
+
+        Args:
+            ctx: Autograd context for this collective invocation.
+            grad_output: Gradient in the forward output layout.
+
+        Returns:
+            This rank's summed gradient and None for metadata.
+        """
         # reduce-scatter: sum the gradient across ranks, take this rank's chunk
         grad = grad_output.contiguous().clone()
         dist.all_reduce(grad, group=ctx.group)
@@ -679,6 +779,18 @@ def hybrid_cp_attention(
 
     ``attention_kwargs`` are forwarded unchanged. Mask construction and other
     model-input semantics belong to the caller's input-preparation contract.
+
+    Args:
+        attention_fn: Local attention callable consuming exchanged Q/K/V.
+        query: Query tensor with layout [B,H,T,D].
+        key: Key tensor with layout [B,H,T,D].
+        value: Value tensor with layout [B,H,T,D].
+        attention_kwargs: Model-prepared arguments forwarded to the attention callable.
+        cp_mesh: Context-parallel mesh owning the communication group.
+        ulysses_degree: Size of the head-exchange subgroup.
+
+    Returns:
+        Attention output restored to the original local query layout.
     """
     _validate_ulysses_head_counts(
         query, key, value, ulysses_degree, "Hybrid CP"
@@ -700,3 +812,67 @@ def hybrid_cp_attention(
             f"the local query shape {local_shape}"
         )
     return output
+
+
+
+def exchange_sequence_heads(
+    tensor: torch.Tensor,
+    device_mesh: DeviceMesh,
+    *,
+    split_dim: int,
+    concat_dim: int,
+) -> torch.Tensor:
+    """Redistribute a local tensor from concat-dim shard to split-dim shard.
+
+    Args:
+        tensor: Tensor to reshape or redistribute without changing token order.
+        device_mesh: Device mesh used for sequence/head redistribution.
+        split_dim: Tensor dimension divided across the participating ranks.
+        concat_dim: Tensor dimension assembled from the participating ranks.
+    """
+    split_count = device_mesh.size()
+    if split_count == 1:
+        return tensor
+
+    original_shape = tuple(tensor.shape)
+    if original_shape[split_dim] % split_count != 0:
+        raise ValueError(
+            f"Linear-attention all-to-all split dimension {split_dim} with size "
+            f"{original_shape[split_dim]} must be divisible by cp_size "
+            f"{split_count}."
+        )
+    split_size = original_shape[split_dim] // split_count
+    final_shape = list(original_shape)
+    final_shape[split_dim] = split_size
+    final_shape[concat_dim] *= split_count
+
+    reshape_dims = list(original_shape)
+    reshape_dims[split_dim] = split_count
+    reshape_dims.insert(split_dim + 1, split_size)
+    permutation = list(range(len(reshape_dims)))
+    permutation.remove(split_dim)
+    permutation.insert(0, split_dim)
+    all_to_all_input = tensor.reshape(reshape_dims).permute(permutation).contiguous()
+    all_to_all_input = all_to_all_input.flatten(0, 1)
+
+    split_length = all_to_all_input.shape[0] // split_count
+    splits = [split_length] * split_count
+    output = communication.differentiable_all_to_all_single(
+        all_to_all_input,
+        splits,
+        splits,
+        group=device_mesh.get_group(),
+    )
+
+    output_reshape = list(output.shape)
+    output_reshape[0] = split_count
+    output_reshape.insert(1, output.shape[0] // split_count)
+    permutation = list(range(len(output_reshape)))
+    rank_dimension = permutation.pop(0)
+    permutation.insert(concat_dim, rank_dimension)
+    output = output.reshape(output_reshape).permute(permutation).contiguous()
+
+    output_shape = list(output.shape)
+    output_shape[concat_dim] *= output_shape[concat_dim + 1]
+    output_shape.pop(concat_dim + 1)
+    return output.reshape(output_shape).view(final_shape)
