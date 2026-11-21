@@ -71,9 +71,8 @@ def build_strategy_patches(
     (the EP strategy) applies to every class the rule's match selects in
     ``boundary_classes``: the block class is a per-model fact, so the patch is
     materialized per artifact rather than cached in the capability spec.  A
-    spec that carries a ``subclass_shell`` (inline CP) instead materializes an
-    in-artifact subclass of the attention host plus a scoped constructor swap,
-    and never a forward extract — the host keeps its compiled boundary.  A
+    spec that carries a ``subclass_shell`` (inline CP) emits a forward rewrite
+    while preserving the local implementation and compiled boundary. A
     declared strategy that selects no boundary fails fast — a silently
     unmaterialized strategy is an artifact that only looks distributed.
     """

@@ -82,7 +82,6 @@ class InnerWrapperTarget:
 
     helper_module: str | None = None
     helper_name: str | None = None
-    state_attr: str | None = None
     inline_body: str | None = None
     extra_imports: tuple[tuple[str, str], ...] = ()
 
@@ -257,7 +256,6 @@ def inner_wrapper_target(
     return InnerWrapperTarget(
         helper_module=module_name,
         helper_name=helper_name,
-        state_attr=_cp_mesh_companion_attr(tree),
         inline_body=inline_body,
         extra_imports=_body_imports(inline_body, module_name, module_functions - {helper_name}),
     )
@@ -489,65 +487,6 @@ def _forward_helper_name(tree: ast.AST, replacement_name: str) -> str | None:
             if isinstance(child, ast.Return) and isinstance(child.value, ast.Call):
                 if isinstance(child.value.func, ast.Name):
                     return child.value.func.id
-    return None
-
-
-def _cp_mesh_companion_attr(tree: ast.AST) -> str | None:
-    """Return the companion attribute whose value is the wrapper's CP mesh."""
-    return (
-        _cp_mesh_dict_attr(tree)
-        or _cp_mesh_setattr_attr(tree)
-        or _cp_mesh_assignment_attr(tree)
-    )
-
-
-def _cp_mesh_dict_attr(tree: ast.AST) -> str | None:
-    """Return the CP mesh attribute declared in companion_attrs."""
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.keyword) or node.arg != "companion_attrs":
-            continue
-        if not isinstance(node.value, ast.Dict):
-            continue
-        for key, value in zip(node.value.keys, node.value.values):
-            if (
-                isinstance(key, ast.Constant)
-                and isinstance(key.value, str)
-                and isinstance(value, ast.Name)
-                and value.id == "cp_mesh"
-            ):
-                return key.value
-    return None
-
-
-def _cp_mesh_setattr_attr(tree: ast.AST) -> str | None:
-    """Return the CP mesh attribute installed through setattr."""
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "setattr"
-            and len(node.args) == 3
-            and isinstance(node.args[1], ast.Constant)
-            and isinstance(node.args[1].value, str)
-            and isinstance(node.args[2], ast.Name)
-            and node.args[2].id == "cp_mesh"
-        ):
-            return node.args[1].value
-    return None
-
-
-def _cp_mesh_assignment_attr(tree: ast.AST) -> str | None:
-    """Return the CP mesh attribute installed through assignment."""
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = node.value
-        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
-        if not isinstance(value, ast.Name) or value.id != "cp_mesh":
-            continue
-        for target in targets:
-            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-                return target.attr
     return None
 
 

@@ -132,7 +132,6 @@ class StrategySpec:
     method_name: str = "forward"
     body_template: str | None = None
     subclass_shell: str | None = None
-    subclass_state_attr: str | None = None
     definition: str | None = None
     snippets: tuple[ModuleSnippetPatch, ...] = ()
     strip_boundary_subpatterns: tuple[str, ...] = ()

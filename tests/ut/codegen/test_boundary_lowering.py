@@ -395,7 +395,6 @@ def test_framework_inner_wrapper_resolves_without_model_adapter_path():
 
     assert spec is not None
     assert spec.subclass_shell is not None
-    assert spec.subclass_state_attr == "_hp_sdpa_hf_cp_mesh"
     assert spec.imports[0].names == ("sdpa_hf_cp_forward",)
 
 
