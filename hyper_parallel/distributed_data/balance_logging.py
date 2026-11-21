@@ -76,6 +76,12 @@ def format_balance_stats(stats: dict[str, Any], step: int) -> str:
         )
         if "accepted_objective" in stats:
             lines.append(f"  accepted_objective={stats['accepted_objective']:.12g}")
+    for window in stats.get("windows", ()):
+        lines.append(
+            f"  micro_batches={window['first_micro_batch']}-{window['last_micro_batch']}, "
+            f"original={window['original_objective']:.12g}, candidate={window['candidate_objective']:.12g}, "
+            f"relative_gain={window['relative_gain']:.12g}, accepted={window['accepted']}"
+        )
     ranks = stats["group_ranks"]
     if "rounds" in stats:
         for round_stats in stats["rounds"]:

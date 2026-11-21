@@ -25,6 +25,7 @@ from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMeta
 from hyper_parallel.distributed_data.locality import _create_locality_groups, _fixed_rank_groups
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data.topology import DataTopology
+from tests.common.mark_utils import arg_mark
 
 
 class TestDistributedDataPublicApi(unittest.TestCase):
@@ -174,6 +175,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must divide the root mesh size"):
             _fixed_rank_groups(topology, 3)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_locality_groups_use_nodes_or_fixed_rank_order(self) -> None:
         """Feature: Local balancing group discovery.
         Description: Build node-based and fixed-size groups with mocked WORLD communication.
@@ -184,6 +186,8 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             with self.subTest(group_size=group_size), patch(
                     "hyper_parallel.distributed_data.locality.dist",
             ) as distributed, patch(
+                    "hyper_parallel.distributed_data.transport.dist", distributed,
+            ), patch(
                     "hyper_parallel.distributed_data.locality.all_gather_control_object",
                     return_value=[(0, "node-a"), (1, "node-b"), (2, "node-a"), (3, "node-b")],
             ) as gather, patch.dict("os.environ", {"GROUP_RANK": "node-a"}):
@@ -198,11 +202,13 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
                 if group_size is None:
                     gather.assert_called_once()
+                    distributed.destroy_process_group.assert_called_once_with(gather.call_args.kwargs["group"])
                     self.assertEqual(gather.call_args.args[0], (0, "node-a"))
                     expected_groups = [[0, 1, 2, 3], [0, 2], [1, 3]]
                     self.assertEqual(groups.data_plane_ranks, (0, 2))
                 else:
                     gather.assert_not_called()
+                    distributed.destroy_process_group.assert_not_called()
                     expected_groups = [[0, 1], [2, 3]]
                     self.assertEqual(groups.data_plane_ranks, (0, 1))
                 self.assertEqual(

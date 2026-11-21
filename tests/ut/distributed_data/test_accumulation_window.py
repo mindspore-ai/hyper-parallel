@@ -20,6 +20,7 @@ import unittest
 from itertools import product
 from threading import Event, current_thread
 from contextlib import nullcontext
+from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
 import torch
@@ -32,6 +33,7 @@ from hyper_parallel.distributed_data.batch_sampler import _ReaderPlanInput
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
+from tests.common.mark_utils import arg_mark
 
 
 class _Mesh:
@@ -43,7 +45,7 @@ class _Mesh:
 def _loader(
         *, metadata_mode: bool = False, window: int = 3, broadcast_plan: bool = True,
         samples: object = None, accumulation: int = 10, workers: int = 0, persistent_workers: bool = True,
-        device: str = "cpu", log_balance: bool = False, device_prefetch_depth: int = 1,
+        device: str = "cpu", log_balance: bool = False, device_prefetch_depth: int = 1, use_data_process: bool = True,
 ) -> object:
     """Build the native loader with independent planning and optimizer windows."""
     if samples is None:
@@ -61,6 +63,7 @@ def _loader(
             balance_window_size=window, metadata_mode=metadata_mode, broadcast_plan=broadcast_plan,
             log_balance=log_balance,
             device_prefetch_depth=device_prefetch_depth,
+            use_data_process=use_data_process,
         ),
         dataloader_kwargs={"num_workers": workers, "persistent_workers": workers > 0 and persistent_workers},
         batch_sampler=sampler, cost_model=lambda item: item.cost, device=device, **options,
@@ -73,24 +76,25 @@ def _ids(batch: tuple[dict, ...]) -> list[int]:
 
 
 class _GatedDataset:
-    """Hold the next window's first read until the test releases it."""
+    """Hold the selected sample read until the test releases it."""
 
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, gate_at: int = 6) -> None:
         """Initialize a controlled future read and optional callback failure."""
         self.started = Event()
         self.release = Event()
         self.reads = []
         self.thread = None
         self.error = error
+        self.gate_at = gate_at
 
     def __len__(self) -> int:
         """Return three complete optimizer windows."""
         return 18
 
     def __getitem__(self, index: int) -> dict:
-        """Record a read and gate the first sample in the second window."""
+        """Record the read and wait when it reaches the selected index."""
         self.reads.append(index)
-        if index == 6:
+        if index == self.gate_at:
             self.thread = current_thread()
             self.started.set()
             if not self.release.wait(timeout=10):
@@ -103,6 +107,7 @@ class _GatedDataset:
 class TestAccumulationWindow(unittest.TestCase):
     """Verify joint planning without changing optimizer sample membership."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_window_stops_at_optimizer_and_epoch_boundaries(self) -> None:
         """Feature: Bounded accumulation windows.
         Description: Plan 22 micro-batches with accumulation ten and a three-round window.
@@ -115,14 +120,14 @@ class TestAccumulationWindow(unittest.TestCase):
                         DataPlaneTransport, "communication_backend", new_callable=PropertyMock, return_value=backend,
                 ):
                     counts = []
-                    original = loader._plan_native_batch
+                    original = loader._source._plan_native_batch
 
-                    def record(metadata: list[_ReaderPlanInput], record_count=counts.append, original=original) -> object:
+                    def record(metadata: list[_ReaderPlanInput], record_count: Any=counts.append, original: Any=original) -> object:
                         """Record source-window size before planning."""
                         record_count(len(metadata[0].original_batches))
                         return original(metadata)
 
-                    with patch.object(loader, "_plan_native_batch", side_effect=record):
+                    with patch.object(loader._source, "_plan_native_batch", side_effect=record):
                         batches = []
                         for batch in loader:
                             batches.append(_ids(batch))
@@ -208,6 +213,7 @@ class TestAccumulationWindow(unittest.TestCase):
         self.assertEqual(planner.last_balance_decision["original_objective"], 18)
         self.assertEqual(planner.last_balance_decision["accepted_objective"], 10)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_next_window_read_overlaps_all_current_micro_batches(self) -> None:
         """Feature: Two-window source buffering.
         Description: Block the next optimizer window after the current window's first batch is delivered.
@@ -228,7 +234,7 @@ class TestAccumulationWindow(unittest.TestCase):
                         self.assertNotEqual(dataset.thread, current_thread())
                         self.assertEqual(dataset.reads, list(range(7)))
                         state = loader.state_dict()
-                        reader = loader._dataset_reader
+                        reader = loader._source._dataset_reader
                         self.assertEqual(reader._sampler.consumed_samples, 12)
                         self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 0)
                         self.assertNotIn("dataset_reader", state)
@@ -250,6 +256,7 @@ class TestAccumulationWindow(unittest.TestCase):
                         [_ids(batch) for batch in restored], [list(range(i, i + 2)) for i in range(0, 18, 2)],
                     )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_completed_prefetch_is_bounded_and_excluded_from_checkpoint(self) -> None:
         """Feature: Bounded speculative source progress.
         Description: Finish the next window read before consuming the current window.
@@ -259,7 +266,7 @@ class TestAccumulationWindow(unittest.TestCase):
         dataset.release.set()
         with _loader(samples=dataset, accumulation=3) as loader:
             self.assertEqual(_ids(next(loader)), [0, 1])
-            reader = loader._dataset_reader
+            reader = loader._source._dataset_reader
             loader.wait_for_prefetch()
             self.assertEqual(dataset.reads, list(range(12)))
             self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
@@ -323,10 +330,11 @@ class TestAccumulationWindow(unittest.TestCase):
                     restored.load_state_dict(state)
                     self.assertEqual([_ids(batch) for batch in restored], expected)
 
-    def test_window_thread_binds_device_before_reading(self) -> None:
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_caller_binds_device_before_reading(self) -> None:
         """Feature: Rank-local device context for speculative reads.
         Description: Read three windows with a mocked nonzero CUDA device.
-        Expectation: The source thread binds its device once before constructing DataLoader iterators.
+        Expectation: The caller binds its device before issuing the first data request.
         """
         bindings = []
         read_threads = []
@@ -340,7 +348,7 @@ class TestAccumulationWindow(unittest.TestCase):
             """Check device selection before the future window creates its workers."""
             thread = current_thread()
             read_threads.append(thread)
-            self.assertIn((thread, torch.device("cuda:3")), bindings)
+            self.assertEqual(bindings[0][1], torch.device("cuda:3"))
             return original_iter(dataloader)
 
         module = Mock()
@@ -356,11 +364,12 @@ class TestAccumulationWindow(unittest.TestCase):
         self.assertIs(read_threads[0], read_threads[1])
         self.assertIs(read_threads[1], read_threads[2])
         self.assertEqual(len(bindings), 1)
-        self.assertEqual(bindings, [(read_threads[0], torch.device("cuda:3"))])
-        self.assertIn((read_threads[1], torch.device("cuda:3")), bindings)
+        self.assertIs(bindings[0][0], current_thread())
+        self.assertIsNot(bindings[0][0], read_threads[0])
         self.assertFalse(read_threads[1].is_alive())
 
-    def test_window_thread_device_failure_reaches_consumer(self) -> None:
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_caller_device_failure_reaches_consumer(self) -> None:
         """Feature: Source thread initialization failures.
         Description: Fail device selection before any source read begins.
         Expectation: The first delivery raises the original error without hanging or advancing progress.
@@ -376,9 +385,10 @@ class TestAccumulationWindow(unittest.TestCase):
             self.assertIs(failure.exception, error)
             self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_nonpersistent_workers_exit_normally_after_future_reads(self) -> None:
         """Feature: Forked workers in the window reader.
-        Description: Recreate Dataset workers for every source window on the background thread.
+        Description: Recreate Dataset workers for every window in the data source.
         Expectation: All samples are delivered and every worker exits with code zero.
         """
         workers = []

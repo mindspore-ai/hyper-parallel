@@ -106,7 +106,7 @@ def _resolve_load_balance(
     """Validate the balancing block and reject obsolete Dataset-side settings."""
     removed_options = {
         "load_balance", "distributed_dataloader", "balance_window_size", "device_prefetch_depth",
-        "log_balance", "min_balance_gain", "repack_sequences",
+        "log_balance", "min_balance_gain", "repack_sequences", "use_data_process",
     }.intersection(data_config)
     if removed_options:
         raise ValueError(f"Move data_config balancing options {sorted(removed_options)} to dataloader.load_balance")

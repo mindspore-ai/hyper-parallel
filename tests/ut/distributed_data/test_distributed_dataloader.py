@@ -32,6 +32,7 @@ from hyper_parallel.distributed_data.batch_sampler import _ReaderPlanInput
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import DistributedPackingPlan, SampleKey, WorkloadCost
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
+from tests.common.mark_utils import arg_mark
 
 
 class _StandaloneMesh:
@@ -49,14 +50,17 @@ def _steps():
 
 
 def _native_loader(**options):
+    """Build a single-rank CPU loader with its native source bound for direct reads."""
     samples = [step[0] for step in _steps()]
     options.setdefault("communication_backend", "gloo")
-    return build_distributed_dataloader(
+    loader = build_distributed_dataloader(
         samples, _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=1, **options),
         batch_sampler=_sampler(size=len(samples), local_batch_size=1),
         metadata_fn=lambda row: SampleMetadata(sum(sample["tokens"] for sample in row)),
         device="cpu", cost_model=lambda metadata: metadata.cost,
     )
+    loader._source.bind_transport(loader._data_plane)
+    return loader
 
 
 def _sampler(size=6, local_batch_size=2):
@@ -83,10 +87,11 @@ def _window_reader_inputs(source_bins, reference_bins, local_size):
 class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
     """Verify that each native sampler plan consumes one complete step."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_collectives_and_construction_share_one_producer(self) -> None:
         """Feature: Independent single-round prefetch.
         Description: Consume steps with implicit or repeated explicit prefetch hooks.
-        Expectation: Reads, planning, communication and staging all run on one background thread.
+        Expectation: The isolated source runs on its worker while model broadcasts remain on the caller.
         """
         for explicit, broadcast_plan in product((False, True), repeat=2):
             with self.subTest(explicit=explicit, broadcast_plan=broadcast_plan), _native_loader(
@@ -94,7 +99,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             ) as loader:
                 events = []
 
-                def record(name: str, callback: Callable[..., Any], record_event=events.append) -> Callable[..., Any]:
+                def record(
+                        name: str, callback: Callable[..., Any], record_event: Any = events.append,
+                ) -> Callable[..., Any]:
                     """Record stage ownership without changing its behavior."""
                     def run(*args: Any, **kwargs: Any) -> Any:
                         """Record the producer thread before running a stage."""
@@ -103,9 +110,11 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     return run
 
                 with patch.object(
-                        loader, "_prepare_local_metadata", side_effect=record("read", loader._prepare_local_metadata),
+                        loader._source, "_prepare_local_metadata",
+                        side_effect=record("read", loader._source._prepare_local_metadata),
                 ), patch.object(
-                        loader, "_build_plan_control", side_effect=record("plan", loader._build_plan_control),
+                        loader._source, "_build_plan_control",
+                        side_effect=record("plan", loader._source._build_plan_control),
                 ), patch.object(
                         loader._data_plane, "all_gather_object",
                         side_effect=record("gather", loader._data_plane.all_gather_object),
@@ -116,49 +125,47 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         loader._data_plane, "begin_exchange_prepared",
                         side_effect=record("exchange", loader._data_plane.begin_exchange_prepared),
                 ), patch.object(
-                        loader, "_stage_batch", side_effect=record("stage", loader._stage_batch),
-                ), patch.object(
                         loader, "_broadcast_batch", side_effect=record("model_broadcast", loader._broadcast_batch),
                 ):
                     self.assertEqual(next(loader)[0][0]["id"], 0)
-                    worker = loader._prefetch_thread
+                    worker = loader._worker
                     if explicit:
                         for _ in range(2):
                             loader.prefetch()
                     loader.wait_for_prefetch()
                     self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
                     self.assertEqual(next(loader)[0][0]["id"], 2)
-                    self.assertIs(worker, loader._prefetch_thread)
+                    self.assertIs(worker, loader._worker)
                     self.assertEqual(len(list(loader)), 1)
                 self.assertEqual({name for name, _ in events},
-                                 {"read", "plan", "gather", "exchange", "stage", "model_broadcast"})
-                self.assertEqual({thread for _, thread in events}, {worker})
-                self.assertIsNot(worker, current_thread())
+                                 {"read", "plan", "gather", "exchange", "model_broadcast"})
+                self.assertEqual({thread for name, thread in events if name != "model_broadcast"}, {worker.thread})
+                self.assertEqual({thread for name, thread in events if name == "model_broadcast"}, {current_thread()})
+                self.assertIsNot(worker.thread, current_thread())
 
-
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_single_round_hooks_and_checkpoint_do_not_wait_for_future_work(self) -> None:
         """Feature: Nonblocking single-round training hooks.
         Description: Hold the next step at each data preparation stage without calling Trainer hooks.
         Expectation: Background preparation starts automatically and hooks/checkpoints return while it is blocked.
         """
-        for stage in ("read", "gather", "plan", "exchange", "stage", "broadcast"):
+        for stage in ("read", "gather", "plan", "exchange"):
             with self.subTest(stage=stage), _native_loader() as loader:
                 started, release = Event(), Event()
                 owner, method = {
-                    "read": (loader, "_prepare_local_metadata"),
+                    "read": (loader._source, "_prepare_local_metadata"),
                     "gather": (loader._data_plane, "gather_object_to_planner"),
-                    "plan": (loader, "_build_plan_control"),
+                    "plan": (loader._source, "_build_plan_control"),
                     "exchange": (loader._data_plane, "begin_exchange_prepared"),
-                    "stage": (loader, "_stage_batch"),
-                    "broadcast": (loader, "_broadcast_batch"),
                 }[stage]
                 original = getattr(owner, method)
 
                 def gated(
-                        *args: Any, loader=loader, started=started, release=release, original=original, **kwargs: Any,
+                        *args: Any, loader: Any = loader, started: Any = started, release: Any = release,
+                        original: Any = original, **kwargs: Any,
                 ) -> Any:
                     """Hold the next step until foreground checks finish."""
-                    if loader._step == 1:
+                    if loader._source._step == 1:
                         started.set()
                         if not release.wait(5):
                             raise RuntimeError("future stage timed out")
@@ -178,7 +185,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 finally:
                     release.set()
 
-
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_metadata_wait_error_reaches_consumer(self) -> None:
         """Feature: Metadata completion error propagation.
         Description: Fail metadata gathering for the next single-round step.
@@ -190,7 +197,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
 
             def gather(value: Any) -> Any:
                 """Fail only the speculative step's metadata exchange."""
-                if loader._step == 1:
+                if loader._source._step == 1:
                     raise failure
                 return original(value)
 
@@ -203,6 +210,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
 
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_non_planner_rank_builds_batches_without_plan_broadcast(self) -> None:
         """Feature: Independent planning on every data-plane rank.
         Description: Run online and metadata loading through both prefetch paths on a non-Planner rank.
@@ -229,10 +237,11 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 ), patch.object(
                         loader._data_plane, "gather_object_to_planner",
                         side_effect=AssertionError("central gather used"),
-                ), patch.object(loader._planner, "plan", wraps=loader._planner.plan) as plan:
+                ), patch.object(loader._source._planner, "plan", wraps=loader._source._planner.plan) as plan:
                     self.assertEqual(list(loader), [(0, 1), (2, 3), (4, 5)])
                     self.assertEqual(plan.call_count, 3)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_sampler_paths_stage_h2d_before_model_broadcast(self) -> None:
         """Feature: Shared sampler H2D staging.
         Description: Consume and checkpoint online and metadata sampler batches.
@@ -245,7 +254,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 accelerator.Event.return_value.query.return_value = False
                 copies = []
 
-                def move(batch: Any, device: torch.device, record_copy=copies.append) -> dict[str, Any]:
+                def move(batch: Any, device: torch.device, record_copy: Any=copies.append) -> dict[str, Any]:
                     """Record an asynchronous copy without requiring accelerator hardware."""
                     record_copy((batch, device, current_thread().name))
                     return {"data": batch, "storage": Mock()}
@@ -282,6 +291,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         self.assertEqual(len(copies), 2)
                         self.assertEqual(next(loader)["data"], (2, 3))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_plan_preserves_source_groups_and_filters_non_readers(self) -> None:
         """Feature: Native sampler planning.
         Description: Non-reader ranks in a non-contiguous group are filtered without changing selected indices.
@@ -298,13 +308,13 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             data_parallel_size=2, seq_len=10, local_batch_size=1, cost_model=lambda metadata: metadata.cost,
         )
         with (
-                patch.object(loader, "_dataset_reader_ranks", frozenset((2, 6))),
-                patch.object(loader, "_topology", replace(loader._topology, constructor_ranks=(2, 6))),
+                patch.object(loader._source, "_dataset_reader_ranks", frozenset((2, 6))),
+                patch.object(loader._source, "_topology", replace(loader._topology, constructor_ranks=(2, 6))),
                 patch.object(loader._data_plane, "_ranks", (2, 4, 6)),
-                patch.object(loader, "_planner", planner),
+                patch.object(loader._source, "_planner", planner),
                 patch.object(planner, "plan", wraps=planner.plan) as plan_step,
         ):
-            plan = loader._build_plan_control(gathered_metadata)
+            plan = loader._source._build_plan_control(gathered_metadata)
 
         samples = plan_step.call_args.args[0]
         self.assertEqual(tuple(item.key for item in samples), (first.key, second.key))
@@ -312,6 +322,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertEqual(plan_step.call_args.kwargs["reference_bins"], ((first.key,), (second.key,)))
         self.assertEqual(set(plan.selected_keys), {first.key, second.key})
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_reader_only_rank_routes_payloads_without_constructing(self) -> None:
         """Feature: Separate data-plane roles.
         Description: Process an assigned plan on an online or metadata Reader without Constructor ownership.
@@ -319,27 +330,27 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         """
         for metadata_mode in (False, True):
             with self.subTest(metadata_mode=metadata_mode), _native_loader() as loader:
-                loader._dataset_reader.prepare_next_step(1)
-                samples = loader._dataset_reader.metadata()
-                plan = loader._planner.plan(samples, reference_bins=((samples[0].key,),), step=0)
+                loader._source._dataset_reader.prepare_next_step(1)
+                samples = loader._source._dataset_reader.metadata()
+                plan = loader._source._planner.plan(samples, reference_bins=((samples[0].key,),), step=0)
                 transport = Mock()
                 transport.exchange_prepared.return_value = {}
                 constructor = Mock()
                 direct_reader = Mock()
                 with (
-                        patch.object(loader, "_topology", replace(
+                        patch.object(loader._source, "_topology", replace(
                             loader._topology, constructor_rank=1, constructor_ranks=(1,),
                         )),
-                        patch.object(loader, "_metadata_mode", metadata_mode),
-                        patch.object(loader, "_data_plane", transport),
-                        patch.object(loader, "_data_constructor", constructor),
-                        patch.object(loader, "_direct_sample_loader", direct_reader),
-                        patch.object(loader, "_next_plan_control", return_value=plan),
+                        patch.object(loader._source, "_metadata_mode", metadata_mode),
+                        patch.object(loader._source, "_data_plane", transport),
+                        patch.object(loader._source, "_data_constructor", constructor),
+                        patch.object(loader._source, "_direct_sample_loader", direct_reader),
+                        patch.object(loader._source, "_next_plan_control", return_value=plan),
                 ):
-                    self.assertIsNone(loader._produce_on_data_plane())
+                    self.assertIsNone(loader._source._produce_on_data_plane())
                 constructor.construct.assert_not_called()
                 direct_reader.fetch_samples.assert_not_called()
-                self.assertEqual(loader._pending_local_keys, {samples[0].key})
+                self.assertEqual(loader._source._pending_local_keys, {samples[0].key})
                 if metadata_mode:
                     transport.prepare_exchange.assert_not_called()
                     transport.exchange_prepared.assert_not_called()
@@ -347,6 +358,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     transport.prepare_exchange.assert_called_once_with({1: [(samples[0].key, _steps()[0][0])]})
                     transport.exchange_prepared.assert_called_once_with(transport.prepare_exchange.return_value)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_readers_must_exhaust_at_the_same_step(self) -> None:
         """Feature: Native sampler exhaustion.
         Description: Dataset Reader ranks reach EOF at different rounds.
@@ -357,14 +369,15 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         partial = (_ReaderPlanInput((sample,), (((sample.key,),),)), _ReaderPlanInput())
         exhausted = (_ReaderPlanInput(), _ReaderPlanInput())
         with (
-                patch.object(loader, "_dataset_reader_ranks", frozenset((0, 1))),
-                patch.object(loader, "_topology", replace(loader._topology, constructor_ranks=(0, 1))),
+                patch.object(loader._source, "_dataset_reader_ranks", frozenset((0, 1))),
+                patch.object(loader._source, "_topology", replace(loader._topology, constructor_ranks=(0, 1))),
                 patch.object(loader._data_plane, "_ranks", (0, 1)),
         ):
             with self.assertRaisesRegex(ValueError, "exhausted at different"):
-                loader._build_plan_control(partial)
-            self.assertIsNone(loader._build_plan_control(exhausted))
+                loader._source._build_plan_control(partial)
+            self.assertIsNone(loader._source._build_plan_control(exhausted))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_window_reference_preserves_source_groups_and_mesh_order(self) -> None:
         """Feature: Reader-owned original layouts.
         Description: Plan repeated and split records with collective ranks in a different order from DP ranks.
@@ -389,14 +402,14 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 expected_plans = planner.plan_window(expected_samples, reference_bins=reference_bins, step=6)
                 expected_decision = dict(planner.last_balance_decision)
                 with (
-                        patch.object(loader, "_topology", replace(loader._topology, constructor_ranks=(6, 2))),
-                        patch.object(loader, "_dataset_reader_ranks", frozenset((2, 6))),
+                        patch.object(loader._source, "_topology", replace(loader._topology, constructor_ranks=(6, 2))),
+                        patch.object(loader._source, "_dataset_reader_ranks", frozenset((2, 6))),
                         patch.object(loader._data_plane, "_ranks", (2, 4, 6)),
-                        patch.object(loader, "_planner", planner),
-                        patch.object(loader, "_step", 6),
+                        patch.object(loader._source, "_planner", planner),
+                        patch.object(loader._source, "_step", 6),
                         patch.object(planner, "plan_window", wraps=planner.plan_window) as plan_window,
                 ):
-                    plans = loader._build_plan_control((inputs[1], _ReaderPlanInput(), inputs[0]))
+                    plans = loader._source._build_plan_control((inputs[1], _ReaderPlanInput(), inputs[0]))
                 self.assertEqual(plan_window.call_args.kwargs["reference_bins"], reference_bins)
                 self.assertEqual(plan_window.call_args.args[0], expected_samples)
                 self.assertEqual(plans, expected_plans)
@@ -409,6 +422,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         for plan in plans for batch in plan.local_batches for packing_bin in batch
                     ), reference_bins)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_original_layout_rejects_unequal_or_incomplete_windows(self) -> None:
         """Feature: Source-window shape validation.
         Description: Supply unequal round counts or an incomplete local batch.
@@ -425,20 +439,21 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             planner = DynamicPackingPlanner(
                 data_parallel_size=2, seq_len=16, local_batch_size=2, cost_model=lambda metadata: metadata.cost,
             )
-            with patch.object(loader, "_planner", planner):
+            with patch.object(loader._source, "_planner", planner):
                 for other in invalid:
                     with self.subTest(batches=other.original_batches), self.assertRaisesRegex(
                             ValueError, "equal complete micro-batch windows",
                     ):
-                        loader._plan_native_batch([full, other])
+                        loader._source._plan_native_batch([full, other])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_missing_payload_fails_before_committing_reader(self) -> None:
         """Feature: Native payload validation.
         Description: The Reader returns an incomplete selected payload set.
         Expectation: Construction fails before advancing the sampler cursor.
         """
         loader = _native_loader()
-        reader = loader._dataset_reader
+        reader = loader._source._dataset_reader
 
         with patch.object(reader, "selected_payloads", return_value=()):
             with self.assertRaisesRegex(ValueError, "payload keys do not match"):
@@ -446,16 +461,17 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
 
         self.assertEqual(reader.batch_position, 0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_active_step_requires_non_none_batch(self) -> None:
         """Feature: Native batch construction.
         Description: The constructor returns the end-of-stream sentinel for an active step.
         Expectation: The loader rejects the invalid non-None batch contract.
         """
         loader = _native_loader()
-        with patch.object(loader._data_constructor, "construct", return_value=None):
+        with patch.object(loader._source._data_constructor, "construct", return_value=None):
             with self.assertRaisesRegex(ValueError, "non-None batch"):
                 next(loader)
-        self.assertEqual(loader._dataset_reader.batch_position, 0)
+        self.assertEqual(loader._source._dataset_reader.batch_position, 0)
 
     def test_metadata_mode_requires_batch_sampler(self) -> None:
         """Feature: Producer-defined step boundaries.
@@ -500,6 +516,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 metadata_fn=lambda _: SampleMetadata(1),
             )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_native_metadata_plans_before_reads_without_payload_exchange(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: One sampler yield supplies indices; only assigned samples are materialized.
@@ -524,14 +541,14 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             batch_sampler=_sampler(), metadata=[SampleMetadata(1)] * 6,
             device="cpu", cost_model=lambda metadata: metadata.cost,
         )
-        original_plan = loader._planner.plan
+        original_plan = loader._source._planner.plan
 
         def plan(*args: Any, **kwargs: Any) -> DistributedPackingPlan:
             """Record planning before the first payload read."""
             events.append(("plan", None))
             return original_plan(*args, **kwargs)
 
-        with patch.object(loader._planner, "plan", side_effect=plan), patch.object(
+        with patch.object(loader._source._planner, "plan", side_effect=plan), patch.object(
                 loader._data_plane, "exchange_prepared", side_effect=AssertionError("metadata must skip A2A"),
         ), patch.object(
                 loader._data_plane, "gather_object_to_planner",
@@ -547,13 +564,14 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertEqual(broadcast.call_count, 2)
         self.assertEqual(len(broadcast.call_args.args[0].selected_keys), 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_sampler_steps_do_not_borrow_future_samples(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: Sampler rounds control membership without a read-ahead selector.
         Expectation: Each delivered round preserves its samples and advances one committed step.
         """
         loader = _native_loader()
-        reader = loader._dataset_reader
+        reader = loader._source._dataset_reader
         with patch.object(reader, "prepare_next_step", wraps=reader.prepare_next_step) as prepare:
             for position in range(3):
                 batch = next(loader)
@@ -564,13 +582,14 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 self.assertEqual(prepare.call_count, position + 2)
         self.assertFalse(hasattr(loader, "_step_sample_selector"))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_planner_exception_propagates_before_broadcast(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: Planner failure must not be turned into a refill request.
         Expectation: Planning failure is raised directly instead of broadcasting control data.
         """
         loader = _native_loader()
-        with patch.object(loader._planner, "plan", side_effect=ValueError("bad plan")), patch.object(
+        with patch.object(loader._source._planner, "plan", side_effect=ValueError("bad plan")), patch.object(
                 loader._data_plane, "broadcast_from_planner",
         ) as broadcast:
             with self.assertRaisesRegex(ValueError, "bad plan"):
@@ -589,29 +608,31 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         loader.set_epoch(1)
         self.assertEqual(list(loader), expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_double_buffer_reuses_worker_and_preserves_pending_result(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: The background producer prepares exactly one next step while training consumes.
         Expectation: The same worker prepares the next uncommitted step.
         """
         loader = _native_loader()
-        reader = loader._dataset_reader
+        reader = loader._source._dataset_reader
         next(loader)
-        thread = loader._prefetch_thread
+        thread = loader._worker
         loader.wait_for_prefetch()
         self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
         batch = next(loader)
         self.assertEqual(sorted(sample["id"] for row in batch for sample in row), [2, 3])
-        self.assertIs(loader._prefetch_thread, thread)
+        self.assertIs(loader._worker, thread)
         list(loader)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_background_error_is_raised_by_foreground(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: A producer exception wakes the consuming thread instead of hanging it.
         Expectation: The consumer receives the original background exception.
         """
         loader = _native_loader()
-        with patch.object(loader, "_prepare_next_batch", side_effect=RuntimeError("reader failed")):
+        with patch.object(loader._source, "_prepare_next_batch", side_effect=RuntimeError("reader failed")):
             with self.assertRaisesRegex(RuntimeError, "reader failed"):
                 next(loader)
 

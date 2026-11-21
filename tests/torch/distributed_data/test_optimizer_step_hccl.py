@@ -23,18 +23,17 @@ from tests.common.mark_utils import arg_mark
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-@pytest.mark.parametrize("accumulation,device_depth", ((1, 1), (3, 0), (3, 1), (3, 2), (5, 2)))
-def test_optimizer_step_loading_hccl(accumulation: int, device_depth: int) -> None:
+@pytest.mark.parametrize("source", ("online", "metadata"))
+def test_optimizer_step_loading_hccl(source: str) -> None:
     """Feature: Window double buffering on NPU.
     Description: Prepare next-window inputs while DP2/TP2 ranks compute and issue model-group collectives.
     Expectation: H2D, A2A, TP broadcasts and complete-step checkpoint replay preserve exact samples.
 
     Args:
-        accumulation: Micro-batches prepared per optimizer step.
-        device_depth: Future micro-batches staged on Device.
+        source: Online or precomputed metadata case to run on four NPUs.
     """
-    # Separate workers prevent successive configurations from wrapping NPU stream pools.
+    # Give each source mode its own NPU stream pools.
     torchrun_case(
         file_name=str(Path(__file__).with_name("_test_optimizer_step_hccl.py")),
-        case_name=f"test_optimizer_step_loading_hccl[{accumulation}-{device_depth}]", num_proc=4,
+        case_name=f"test_optimizer_step_loading_hccl[{source}]", num_proc=4,
     )

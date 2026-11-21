@@ -19,44 +19,41 @@ the candidate's relative objective improvement is strictly greater than
 retain the original distribution. Metadata gathering and planning still occur
 when sample exchange is skipped.
 
-With HCCL, source loading starts one step ahead. Metadata and payload
-collectives are issued by the training thread on an independent data stream;
-control and payload groups are separate from model groups. CPU planning,
-decoding and collation run in the producer. H2D uses a copy stream, and the
-consumer waits on its ready event without a host event synchronization.
-Pinned copy sources are retained until completion, including early close.
-Gloo keeps its complete background producer.
+By default, both HCCL and Gloo run source loading, metadata exchange, planning, payload
+encoding/exchange, decoding and collation in one independent data process.
+HCCL communicators belong to that process and are separate from training groups.
+The parent receives CPU tensors through PyTorch shared-storage reducers. Its training
+thread pins them and submits H2D on a copy stream. The training stream
+waits only for the current batch's copy event. Pinned sources remain alive until
+their copies complete, including during early close.
 
-To overlap the full pipeline with model computation, call the two optional
-hooks on **every rank at the same training boundaries**:
+Set `use_data_process=False` to run these operations in the training process
+when each step is requested. In this mode, the prefetch hooks do not read the
+next step. The external source retains its own DataLoader worker settings.
+
+Ordinary iteration requests the next complete step automatically:
 
 ```python
 for microbatches in loader:
-    for index, batch in enumerate(microbatches):
+    for batch in microbatches:
         loss = forward(batch)
-        if index == 0:
-            loader.prefetch_plan()  # HCCL metadata, then background CPU planner
         loss.backward()
-        if index == 0:
-            loader.prefetch()       # HCCL plan/payload, then decode/collate/H2D
-        log_loss(loss.item())       # Host synchronization belongs after launch
 ```
 
-`prefetch()` completes `prefetch_plan()` if needed; repeated calls before
-consumption do not advance the source twice. Ordinary `next(loader)` also
-completes omitted hooks, preserving the iteration contract. Without early
-hooks, accelerator data exchange starts only when the batch is requested.
-The first step has no prior compute to overlap. Source exhaustion stops
-speculative work. To limit iteration, truncate the external source before
-wrapping it, for example with `itertools.islice(source, train_steps)`. All ranks
-must still consume equal step counts.
+`prefetch()` and the compatibility hook `prefetch_plan()` are identical,
+idempotent requests for the full pipeline. They need no forward/backward timing.
+The first accelerator delivery also submits H2D for the next step, if present.
+Each subsequent delivery stages the successor if its CPU data is ready. Otherwise its H2D waits until a later call.
+The child keeps preparing the next CPU step while the caller trains. Truncate the external
+source before wrapping it to limit iteration; all ranks must consume equal step
+counts. Metadata AG uses contiguous receive buffers with one bulk D2H for lengths
+and one for the gathered payload, independent of the group size. Object encoding
+still uses pickle; arbitrary metadata is supported.
 
-Launch these hooks while previously submitted device computation is still
-pending. A separate group alone does not create overlap: using the model's
-current stream, calling device-wide synchronization, or launching after a
-blocking loss read can remove that window. Metadata sizes and the plan still
-need to reach the host, and payload encoding/split exchange run on the caller;
-the amount hidden depends on the remaining compute and shared bandwidth.
+When using a data process, sources and callbacks must be serializable before iteration. Tensor IPC consumes
+CPU shared memory; HCCL requires a separate child listener port range and device
+context. See [Data process requirements](README.md#data-process-requirements) for
+serialization, RNG, memory, lifecycle and deployment details.
 
 ## External-step integration
 
@@ -74,9 +71,18 @@ from hyper_parallel.distributed_data import (
     build_distributed_dataloader,
 )
 
+class LimitedSteps:
+    def __init__(self, source, steps):
+        self.source, self.steps = source, steps
+
+    def __iter__(self):
+        return islice(self.source, self.steps)
+
+
 config = DistributedDatasetConfig(
     seq_len=seq_len,
     local_batch_size=microbatches_per_step,
+    balance_window_size=2,
     packing_budgets=packing_budgets,
     min_balance_gain=0.0,
     balance_group_size=1024,
@@ -91,7 +97,7 @@ def pack_samples(samples, seq_len):
 
 with closing(build_distributed_dataloader(
     None, mesh, config,
-    external_step_source=islice(source, train_steps),
+    external_step_source=LimitedSteps(source, train_steps),
     metadata_fn=lambda sample: SampleMetadata(len(sample["input_ids"]), features=sample["metadata"]),
     pack_fn=pack_samples,
     collate_fn=list,
@@ -137,6 +143,12 @@ with closing(build_distributed_dataloader(
 
 - Each source yield contains `local_batch_size` non-empty raw-sample bins.
   Source sampling, worker count and `prefetch_factor` remain source concerns.
+- The default `balance_window_size=1` scores the complete local step on each rank.
+  A larger value treats each bin as one microbatch and groups consecutive bins
+  within the source yield. With five bins and a window of two, HP plans
+  `2 + 2 + 1`, tests the gain for each window, then collates all five bins once.
+  Each window keeps its original samples. The step uses one metadata gather,
+  one optional plan broadcast and at most one payload exchange.
 - Omit `cost_model` to construct `DefaultCostModel(model_config)` automatically.
   An explicit callback replaces it. Missing default-model dimensions are an
   error, never a fallback to metadata cost. Supply the actual `mlp_layer_types`.
@@ -153,6 +165,10 @@ with closing(build_distributed_dataloader(
   `WorkloadCost.llm` component for compatibility (`cost_component=llm`). Decision
   fields `original`, `candidate` and `relative_gain` use the algorithm's actual
   objective, which may depend on different components and need not be additive.
+  For windowed steps these scores sum the per-window objectives. Each window
+  reports its one-based range and decision. The step's `relative_gain` compares
+  all candidates to the original, while `accepted_objective` sums the layouts
+  actually delivered.
 - H2D selects the current NPU/CUDA device automatically; `device` can specify it.
   CPU-only execution keeps host batches. Use compute-stream synchronization,
   not device-wide synchronization, to avoid draining the next step's copy.
