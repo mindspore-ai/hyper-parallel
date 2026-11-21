@@ -45,6 +45,8 @@ __all__ = ["render_component_source", "observe_wrapper_source"]
 
 def observe_wrapper_source(
     target: Any, forward: Callable[..., Any], companions: dict[str, Any], *, original_forward: Any, cp_mesh: Any,
+    source_bindings: dict[str, str] | None = None,
+    preserve_signature: bool = False,
 ) -> dict[str, Any]:
     """Lower a native rewrite while its closure is alive; retain source strings only.
 
@@ -55,13 +57,7 @@ def observe_wrapper_source(
     if getattr(forward, "__func__", forward) is getattr(original_forward, "__func__", original_forward):
         return {"body": None, "imports": []}
     function = getattr(forward, "__func__", forward)
-    node = ast.parse(textwrap.dedent(inspect.getsource(function.__code__))).body[0]
-    node.decorator_list = []
-    _strip_annotations(node)
-    captures: dict[str, Any] = dict(inspect.getclosurevars(forward).nonlocals)
-    if ("cp_mesh" in captures and captures["cp_mesh"] is not cp_mesh
-            and not any(value is captures["cp_mesh"] for value in companions.values())):
-        raise RuntimeError("codegen cannot bind an observed mesh that differs from the native CP argument")
+    node, captures = _wrapper_capture(function, companions, cp_mesh, source_bindings)
     delegated = _delegate_executor(node, captures, target)
     if delegated is not None:
         return _executor_source(delegated, target, cp_mesh)
@@ -75,7 +71,8 @@ def observe_wrapper_source(
               + textwrap.indent(ast.unparse(node), "    ")
               + f"\n    return _ForwardRewriteRequest({target_name}, {node.name}, companion_attrs={{{attrs}}})\n")
     tree = ast.parse(source).body[0]
-    body = _observed_body(tree, node.name, function, target_name, literals)
+    body = (_nested_forward_body(tree, node.name, target_name=target_name, literals=literals)
+            if preserve_signature else _observed_body(tree, node.name, function, target_name, literals))
     if body is None:
         raise RuntimeError(f"codegen cannot lower observed forward {forward.__qualname__}")
     globals_used = _referenced_global_names(ast.unparse(node)) - set(captures)
@@ -83,7 +80,40 @@ def observe_wrapper_source(
     imports = [(owner, name) for name in sorted(globals_used & function.__globals__.keys())]
     if "_get_cp_submesh" in body:
         imports.append(("hyper_parallel.distributed._builder.applier", "_get_cp_submesh"))
-    return {"body": body, "imports": imports}
+    observed = {"body": body, "imports": imports}
+    if preserve_signature:
+        observed["definition"] = _wrapper_definition(node, body, getattr(forward, "__self__", None) is target)
+    return observed
+
+
+def _wrapper_capture(function: Any, companions: dict, cp_mesh: Any, source_bindings: dict | None) -> tuple:
+    """Read the real code object, checking native mesh identity before source binding."""
+    node = ast.parse(textwrap.dedent(inspect.getsource(function.__code__))).body[0]
+    node.decorator_list = []
+    _strip_annotations(node)
+    if source_bindings:
+        start = 1 if ast.get_docstring(node) is not None else 0
+        assignments = "\n".join(f"{name} = {value}" for name, value in source_bindings.items())
+        node.body[start:start] = ast.parse(assignments).body
+    captures = dict(inspect.getclosurevars(function).nonlocals)
+    if ("cp_mesh" in captures and captures["cp_mesh"] is not cp_mesh
+            and not any(value is captures["cp_mesh"] for value in companions.values())):
+        raise RuntimeError("codegen cannot bind an observed mesh that differs from the native CP argument")
+    return node, captures
+
+
+def _wrapper_definition(node: ast.FunctionDef, body: str, bound: bool) -> str:
+    """Keep the wrapper's actual call contract, including keyword-only forwarding."""
+    node.name = "forward"
+    if not bound:
+        parameters = node.args.posonlyargs if node.args.posonlyargs else node.args.args
+        parameters.insert(0, ast.arg(arg="self"))
+    if node.args.vararg:
+        body = body.replace("__hp_forward_positional__", node.args.vararg.arg)
+    if node.args.kwarg:
+        body = body.replace("__hp_forward_keywords__", node.args.kwarg.arg)
+    node.body = ast.parse(body).body
+    return ast.unparse(ast.fix_missing_locations(node))
 
 
 def _closure_bindings(function: Any, captures: dict[str, Any], companions: dict[str, Any]) -> tuple[dict, dict]:

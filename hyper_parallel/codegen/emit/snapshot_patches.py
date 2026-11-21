@@ -178,11 +178,13 @@ def _inner_wrapper_patch(
             "snapshot inner_wrapper requires an observed replacement or "
             f"boundary class for {module_fqn!r}"
         )
+    definition = (injection.get("observed_wrapper") or {}).get("definition")
     return {
         "module_fqn": module_fqn,
         "target_fqn": injection.get("inner_target") or "self",
-        "wrapper": import_target_path(wrapper),
+        "wrapper": None if definition else import_target_path(wrapper),
         "target_type": target_type,
+        **({"observed_definition": definition} if definition else {}),
     }
 
 

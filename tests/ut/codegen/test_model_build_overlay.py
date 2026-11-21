@@ -39,6 +39,9 @@ from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.ir import ImportPatch
 from hyper_parallel.codegen.inline.pipeline import _materialize_imported_forward_hosts
+from hyper_parallel.codegen.emit.snapshot_patches import emission_patches_from_snapshot_payload
+from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
+from hyper_parallel.codegen.emit.modeling import verify_recorded_patch_bundle
 from hyper_parallel.distributed.recipe_spec import inner_wrapper, ModuleShardingSpec
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest, _commit_forward_rewrite
 from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
@@ -97,6 +100,21 @@ class _TiedModel(nn.Module):
 
 
 _OBSERVED_CALLS = []
+
+
+def _bind_factory_tail(model, mesh=None):
+    """Represent an outer factory that appends a native-style input transform."""
+    original_forward = model.forward
+    cp_rank = getattr(mesh, "cp_rank", 0)
+    cp_size = getattr(mesh, "cp_size", 1)
+
+    @wraps(original_forward)
+    def tail(*args, **kwargs):
+        if args:
+            raise TypeError("factory tail accepts only keyword arguments")
+        return original_forward(**kwargs) + cp_rank + cp_size
+
+    model.forward = tail
 
 
 class _ObservedLayer(nn.Module):
@@ -258,7 +276,8 @@ class TestObservedWrapperConnection(unittest.TestCase):
                 session = CodegenBuildSession()
                 session.record_source({"model_type": "test"})
                 session.observe_plan(plan, model, context)
-                payload = session.finish()._emission_view()["plan"]
+                snapshot = session.finish()._emission_view()
+                payload = snapshot["plan"]
                 json.dumps(payload)
                 rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
                 patches = build_strategy_patches(rules, boundary_classes={"0": "_WeightedLayer"})
@@ -269,6 +288,13 @@ class TestObservedWrapperConnection(unittest.TestCase):
                     _materialize_imported_forward_hosts("", patches)
                     source = ""
                 rendered = apply_patch_set(source, patches)
+                emission = emission_patches_from_meta(SimpleNamespace(
+                    emission_patches=emission_patches_from_snapshot_payload(snapshot),
+                ))
+                verify_recorded_patch_bundle({"model.py": rendered}, patch_plan=emission)
+                with self.assertRaisesRegex(RuntimeError, "not materialized"):
+                    verify_recorded_patch_bundle({"model.py": rendered.replace(" * 3", " * 9")},
+                                                 patch_plan=emission)
                 self.assertNotIn("executor(", rendered)
                 self.assertNotIn("self.module", rendered)
                 self.assertIn("def _project", rendered)
@@ -488,6 +514,84 @@ class TestModelBuildOverlay(unittest.TestCase):
         handle.start()
         self.addCleanup(handle.stop)
         register_linear_family()
+
+    def test_outer_factory_publishes_only_after_success_and_restores_overlay(self):
+        """Factory-tail facts are included; an outer failure cannot publish an early bundle."""
+        original_build = auto_model._BaseHyperAutoModelClass.__dict__["_build_model"]
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                session = CodegenBuildSession()
+                mesh = MeshContext()
+                mesh.device_mesh = _ObservationMesh(("dp", "cp", "tp"), (1, 1, 1))
+                publisher = "hyper_parallel.codegen.model_build_overlay.ensure_codegen_artifact_from_snapshot"
+                with patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \
+                        patch(publisher) as emit:
+                    try:
+                        with use_codegen_model_build_overlay(session, defer_publish=True) as result:
+                            result.model = HyperAutoModelForCausalLM.from_config(
+                                FamilyModelConfig(), model_factory=_MethodModel, torch_dtype=torch.float32,
+                                distributed_setup=DistributedSetup(mesh_context=mesh),
+                            )
+                            self.assertIsNone(result.snapshot)
+                            emit.assert_not_called()
+                            _bind_factory_tail(result.model, mesh)
+                            if fail:
+                                raise ValueError("outer factory failure")
+                    except ValueError as exc:
+                        self.assertTrue(fail)
+                        self.assertEqual(str(exc), "outer factory failure")
+                    self.assertIsNone(result.model)
+                    self.assertIs(auto_model._BaseHyperAutoModelClass.__dict__["_build_model"], original_build)
+                    if fail:
+                        emit.assert_not_called()
+                        self.assertIsNone(result.snapshot)
+                    else:
+                        emit.assert_called_once()
+                        self.assertIs(session.finish(), result.snapshot)
+                        injection = result.snapshot._emission_view()["plan"]["injections"][0]
+                        self.assertIn("cp_size = 1", injection["observed_wrapper"]["body"])
+
+    def test_final_factory_cp_coordinates_are_dynamic_without_new_model_fields(self):
+        """Render a late closure through the existing source pipeline for several DP/TP ranks."""
+        model = _ObservedLayer()
+        mesh = MeshContext(dp_size=2, tp_size=2, cp_size=2)
+        mesh.device_mesh = _ObservationMesh(("dp", "cp", "tp"), (2, 2, 2))
+        originals = {"": model.forward}
+        _bind_factory_tail(model, mesh)
+        session = CodegenBuildSession()
+        session.record_source({"model_type": "test"})
+        session.mark_not_required("pure_data_parallel")
+        session.observe_final_forwards(model, originals, mesh)
+        with self.assertRaisesRegex(RuntimeError, "already been observed"):
+            session.observe_final_forwards(model, originals, mesh)
+        snapshot = session.finish()._emission_view()
+        payload = snapshot["plan"]
+        rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
+        emission = emission_patches_from_meta(SimpleNamespace(
+            emission_patches=emission_patches_from_snapshot_payload(snapshot),
+        ))
+        for imported in (False, True):
+            with self.subTest(imported=imported):
+                patches = build_strategy_patches(rules)
+                source = "class _ObservedLayer:\n    def forward(self, value):\n        return value * 2\n"
+                if imported:
+                    patches.imports.append(ImportPatch(__name__, ("_ObservedLayer",)))
+                    _materialize_imported_forward_hosts("", patches)
+                    source = ""
+                rendered = apply_patch_set(source, patches)
+                verify_recorded_patch_bundle({"model.py": rendered}, patch_plan=emission)
+                self.assertIn("torch.distributed.get_rank() // 2 % 2", rendered)
+                with TemporaryDirectory() as directory:
+                    path = Path(directory) / "factory_tail.py"
+                    path.write_text(rendered, encoding="utf-8")
+                    spec = util.spec_from_file_location("factory_tail", path)
+                    module = util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    for rank in range(8):
+                        with patch.object(torch.distributed, "get_rank", return_value=rank):
+                            self.assertEqual(module._ObservedLayer().forward(value=5), 12 + rank // 2 % 2)
+                            with self.assertRaisesRegex(TypeError, "only keyword"):
+                                module._ObservedLayer().forward(5)
 
     def test_defaults_and_legacy_rules_share_one_plan_and_snapshot_order(self):
         """Default and legacy requests share compilation and preserve observed installation order."""

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+import inspect
 from typing import Any
 from types import MethodType
 
@@ -211,7 +212,8 @@ def _observe_wrapper_results(injections: list[dict[str, Any]], plan: Any, model:
 
 def _observed_target_source(target: Any, forward: Any, companions: dict, original: Any, cp_mesh: Any) -> dict:
     """Keep the exact native target identity alongside its source, not its parent boundary."""
-    source = observe_wrapper_source(target, forward, companions, original_forward=original, cp_mesh=cp_mesh)
+    source = observe_wrapper_source(target, forward, companions, original_forward=original, cp_mesh=cp_mesh,
+                                    preserve_signature=True)
     source["host_class"] = type(target).__name__
     source["target_type"] = f"{type(target).__module__}:{type(target).__qualname__}"
     return source
@@ -223,3 +225,46 @@ def _validate_observed_target(entry: dict, target: Any, boundary: Any) -> None:
     body = (entry.get("observed_wrapper") or {}).get("body") or ""
     if target is not boundary and "self._hp_boundary" in body:
         raise RuntimeError(f"codegen observed child target at {entry['match']!r} without its own mesh binding")
+
+
+def observe_final_forwards(model: Any, originals: dict[str, Any], context: Any) -> list[dict[str, Any]]:
+    """Read only methods changed after inner construction; never replay their factories."""
+    additions = []
+    for fqn, original in originals.items():
+        target = model.get_submodule(fqn)
+        forward = target.forward
+        if getattr(forward, "__func__", forward) is getattr(original, "__func__", original):
+            continue
+        if getattr(original, "__self__", None) is not target:
+            raise RuntimeError(f"codegen outer factory replaced observed module {fqn!r}")
+        bindings = _final_cp_bindings(forward, context)
+        source = observe_wrapper_source(target, forward, vars(target), original_forward=original,
+                                        cp_mesh=getattr(context, "cp_mesh", None), source_bindings=bindings,
+                                        preserve_signature=True)
+        source.update(host_class=type(target).__name__,
+                      target_type=f"{type(target).__module__}:{type(target).__qualname__}")
+        if "cp_rank" in bindings:
+            source["source_imports"] = ["import torch"]
+            source["imports"] = [item for item in source["imports"] if item[1] != "torch"]
+        function = getattr(forward, "__func__", forward)
+        additions.append({"match": fqn, "inner_target": "self", "observed_wrapper": source,
+                          "inner_wrapper": f"{function.__globals__['__name__']}.{function.__code__.co_qualname}"})
+    return additions
+
+
+def _final_cp_bindings(forward: Any, context: Any) -> dict[str, str]:
+    """Express captured CP coordinates from the native contiguous dp/cp/tp topology."""
+    captures = inspect.getclosurevars(forward).nonlocals
+    bindings = {}
+    if "cp_size" in captures:
+        if captures["cp_size"] != context.cp_size:
+            raise RuntimeError("codegen outer factory captured a different CP size")
+        bindings["cp_size"] = repr(context.cp_size)
+    if "cp_rank" in captures:
+        mesh = context.device_mesh
+        if (tuple(mesh.mesh_dim_names) != ("dp", "cp", "tp")
+                or tuple(mesh.rank_list) != tuple(range(mesh.size()))
+                or captures["cp_rank"] != context.cp_rank):
+            raise RuntimeError("codegen outer factory CP coordinate has no proven source binding")
+        bindings["cp_rank"] = f"torch.distributed.get_rank() // {context.tp_size} % {context.cp_size}"
+    return bindings

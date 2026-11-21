@@ -217,11 +217,12 @@ def _materialize_imported_forward_hosts(
         imported = patch_set.imports[import_index]
         other_names = tuple(name for name in imported.names if name != patch.class_name)
         if patch.definition is not None:
+            definition = patch.definition.replace("self._forward_impl(", "super().forward(")
             replacement_imports = [ImportPatch(imported.module, other_names)] if other_names else []
             replacement_imports.append(ImportPatch("", (), raw=f"import {imported.module}"))
             patch_set.imports[import_index:import_index + 1] = replacement_imports
             snippet = (f"class {patch.class_name}({imported.module}.{patch.class_name}):\n"
-                       + textwrap.indent(patch.definition, "    ") + "\n")
+                       + textwrap.indent(definition, "    ") + "\n")
             patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
             continue
         alias = f"_{patch.class_name}Base"

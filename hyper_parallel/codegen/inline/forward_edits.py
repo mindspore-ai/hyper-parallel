@@ -21,7 +21,7 @@ import textwrap
 from collections.abc import Iterable
 
 from hyper_parallel.codegen.astkit.edits import TextEdit, replace_function_body
-from hyper_parallel.codegen.astkit.index import FunctionInfo, build_source_index
+from hyper_parallel.codegen.astkit.index import ClassInfo, FunctionInfo, build_source_index
 from hyper_parallel.codegen.emit.parallel import _build_forward_impl_edit
 from hyper_parallel.codegen.inline.ir import ForwardExtractPatch
 
@@ -43,19 +43,10 @@ def forward_extract_edits(
         if cls is None:
             continue
         if patch.definition is not None:
-            names = {node.name for node in ast.parse(patch.definition).body if isinstance(node, ast.FunctionDef)}
-            collisions = (names - {patch.method_name}) & cls.methods.keys()
-            if collisions:
-                raise RuntimeError(f"codegen executor methods collide with source methods {sorted(collisions)}")
+            edits.append(_definition_edit(source_text, cls, patch))
+            continue
         func = cls.methods.get(patch.method_name)
         if func is None:
-            if patch.definition is not None:
-                edits.append(TextEdit(cls.end_offset, cls.end_offset,
-                                      "\n" + textwrap.indent(patch.definition.strip(), "    ") + "\n"))
-            continue
-        if patch.definition is not None:
-            edits.append(TextEdit(func.def_offset, func.body_end,
-                                  textwrap.indent(patch.definition.strip(), "    ") + "\n"))
             continue
         body = _bind_forward_args(_bind_hidden_arg(patch.body, func), func)
         prefix = _parallel_state_prefix(body)
@@ -67,6 +58,24 @@ def forward_extract_edits(
             edits.append(impl)
         edits.extend(replace_function_body(source_text, func, body, indent="        "))
     return edits
+
+
+def _definition_edit(source_text: str, cls: ClassInfo, patch: ForwardExtractPatch) -> TextEdit:
+    """Install actual native methods, preserving the old method only when called."""
+    names = {node.name for node in ast.parse(patch.definition).body if isinstance(node, ast.FunctionDef)}
+    collisions = (names - {patch.method_name}) & cls.methods.keys()
+    if collisions:
+        raise RuntimeError(f"codegen observed methods collide with source methods {sorted(collisions)}")
+    definition = textwrap.indent(patch.definition.strip(), "    ") + "\n"
+    func = cls.methods.get(patch.method_name)
+    if func is None:
+        return TextEdit(cls.end_offset, cls.end_offset, "\n" + definition)
+    if "self._forward_impl(" in patch.definition:
+        impl = _build_forward_impl_edit(source_text, func)
+        if impl is None or "_forward_impl" in cls.methods:
+            raise RuntimeError("codegen cannot preserve the original method for the observed wrapper")
+        definition = impl.replacement + "\n" + definition
+    return TextEdit(func.def_offset, func.body_end, definition)
 
 
 def _parallel_state_prefix(body: str) -> str:

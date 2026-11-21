@@ -16,10 +16,10 @@
 
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import random
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 
@@ -50,6 +50,7 @@ class CodegenModelBuildResult:
 
     artifact_layout: Optional[Any] = None
     snapshot: Optional[Any] = None
+    model: Optional[Any] = field(default=None, repr=False)
 
 
 @contextmanager
@@ -237,7 +238,10 @@ def _publish_session(
     return session.finish(_publish)
 
 
-def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[str], result: CodegenModelBuildResult):
+def _codegen_build_model(
+    session: CodegenBuildSession, artifact_dir: Optional[str], result: CodegenModelBuildResult,
+    on_observed: Optional[Callable[..., None]] = None,
+):
     """Create the classmethod used only while the CLI constructs a meta model."""
     def _build_model(
         cls,
@@ -327,9 +331,12 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
             model, distributed_setup, getattr(distributed_setup, "low_precision_config", None),
         )
         _observe_plan(model, mesh, sharding_planner, is_hf_model, session)
-        snapshot = _publish_session(session, artifact_dir, result)
-        result.snapshot = snapshot
-        model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
+        if on_observed is not None:
+            on_observed(model, mesh)
+        else:
+            snapshot = _publish_session(session, artifact_dir, result)
+            result.snapshot = snapshot
+            model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
         model.train()
         return model
 
@@ -340,22 +347,40 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
 def use_codegen_model_build_overlay(
     session: CodegenBuildSession,
     artifact_dir: Optional[str] = None,
+    *,
+    defer_publish: bool = False,
 ) -> Iterator[CodegenModelBuildResult]:
     """Temporarily replace AutoModel's final build step for offline codegen.
 
     Args:
         session: Build session receiving native observations and emitted artifacts.
         artifact_dir: Optional output directory for generated sources.
+        defer_publish: Observe and publish after the configured outer factory returns.
     """
     model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
     original = model_class.__dict__["_build_model"]
     result = CodegenModelBuildResult()
+    pending = []
+
+    def _defer(model: Any, mesh: Any) -> None:
+        """Keep live references only inside this factory observation scope."""
+        result.model = model
+        pending.append((model, mesh, {fqn: module.forward for fqn, module in model.named_modules()}))
+
     model_class._build_model = classmethod(  # pylint: disable=protected-access
-        _codegen_build_model(session, artifact_dir, result)
+        _codegen_build_model(session, artifact_dir, result, _defer if defer_publish else None)
     )
     try:
         yield result
+        if pending:
+            model, mesh, originals = pending.pop()
+            if result.model is not model:
+                raise RuntimeError("codegen outer factory returned a different model root")
+            session.observe_final_forwards(model, originals, mesh)
+            result.snapshot = _publish_session(session, artifact_dir, result)
     finally:
+        pending.clear()
+        result.model = None
         model_class._build_model = original  # pylint: disable=protected-access
 
 
