@@ -963,6 +963,50 @@ class SwapManager:
         group.release_cpu_buffers()
         group._storages.clear()
 
+    def reset_after_device_restart(self, modules: Iterable[Any]) -> None:
+        """Discard failed activations while preserving model swap wiring.
+
+        Call only after device restart and after the training thread has parked.
+        Synchronizing the device fences old transfers without querying their
+        potentially invalid events. Failure leaves buffers owned by the old run.
+
+        Args:
+            modules: This model's modules carrying registered swap-group names.
+        """
+        modules = tuple(modules)
+        names = {vars(module)["_swap_group_name"] for module in modules}
+        if not names:
+            return
+        _backend.get_device_handle().synchronize()
+        pools = {}
+        for module in modules:
+            pool = vars(module).get("cpu_pool")
+            if pool is not None:
+                pools[id(pool)] = pool
+        for name in names:
+            group = self._groups.get(name)
+            if group is None:
+                continue
+            for storage in group._storages:
+                for tensor in storage.iter_swap_tensors():
+                    if tensor.cpu_pool is not None:
+                        pools[id(tensor.cpu_pool)] = tensor.cpu_pool
+                storage.release_cpu_buffers()
+                storage.clear()
+            for bucket in group._packed_buckets.values():
+                pool = bucket["cpu_pool"]
+                if pool is not None:
+                    pools[id(pool)] = pool
+            group.release_cpu_buffers()
+            replacement = SwapGroup(name)
+            replacement.is_last_group = group.is_last_group
+            self._groups[name] = replacement
+        for pool in pools.values():
+            pool.reset_after_device_restart()
+        for module in modules:
+            vars(module).pop("_swap_state", None)
+        self._copy_stream = None
+
     def get_current_group_name(self) -> str:
         """Return the name of the currently active swap group."""
         return self._current_group_name.get()

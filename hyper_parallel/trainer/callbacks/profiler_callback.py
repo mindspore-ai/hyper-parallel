@@ -46,7 +46,7 @@ class ProfilerCallback(Callback):
     """
 
     def __init__(self, trainer: "BaseTrainer") -> None:
-        """Build the profiler selected by ``TrainerConfig.profiler``.
+        """Prepare and validate the configuration without creating backend resources.
 
         Args:
             trainer: Trainer that owns the callback lifecycle.
@@ -60,6 +60,7 @@ class ProfilerCallback(Callback):
         self._is_profiler_started = False
         self._metadata_recorded = False
         self._training_step = 0
+        self._resume_step: Optional[int] = None
 
         if not self.config.enable:
             return
@@ -68,8 +69,10 @@ class ProfilerCallback(Callback):
         self.start_step, self.stop_step = self._normalize_steps()
         self.level = self._normalize_level()
 
-        rank = trainer.global_rank
-        if not self._is_profile_required(rank):
+    def _create_profiler(self) -> None:
+        """Create a fresh backend session for the remaining configured window."""
+        rank = self.trainer.global_rank
+        if not self._is_profile_required(rank) or self._training_step >= self.stop_step:
             return
 
         self._device_type, self._profiler_module = self._resolve_profiler_module()
@@ -98,6 +101,32 @@ class ProfilerCallback(Callback):
             profile_kwargs["experimental_config"] = self._get_npu_experimental_config()
         self.profiler = self._profiler_module.profile(**profile_kwargs)
 
+    def state_dict(self) -> dict[str, int]:
+        """Protect session-relative progress without serializing backend resources."""
+        return {"training_step": self._training_step}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        """Stage committed progress; backend recreation belongs to the main thread."""
+        self._resume_step = state["training_step"]
+
+    def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
+        """Create the initial or restored profiler before the next training step.
+
+        Args:
+            state: Restored Trainer counters; profiling uses its own session-relative count.
+            **kwargs: Additional callback context.
+        """
+        del state, kwargs
+        if not self.config.enable:
+            return
+        if self._resume_step is not None:
+            self._stop()
+            self._training_step = self._resume_step
+            self._resume_step = None
+            self._metadata_recorded = False
+        if self.profiler is None:
+            self._create_profiler()
+
     def on_step_begin(
         self,
         state: TrainerState,
@@ -112,13 +141,15 @@ class ProfilerCallback(Callback):
             **kwargs: Additional callback context supplied by the trainer.
         """
         del state, micro_batches, kwargs
+        if not self.config.enable:
+            return
+        self._training_step += 1
         if self.profiler is None:
             return
 
-        self._training_step += 1
         if not self._is_profiler_started:
             self._start()
-        if self._training_step == self.start_step:
+        if self._training_step >= self.start_step:
             self._record_metadata()
 
     def on_step_end(
@@ -222,12 +253,13 @@ class ProfilerCallback(Callback):
         return level
 
     def _get_schedule(self) -> Any:
+        warmup = min(self.config.warmup_steps, max(0, self.start_step - self._training_step - 1))
         return self._profiler_module.schedule(
             wait=0,
-            warmup=self.config.warmup_steps,
-            active=self.stop_step - self.start_step + 1,
+            warmup=warmup,
+            active=self.stop_step - max(self.start_step, self._training_step + 1) + 1,
             repeat=1,
-            skip_first=self.start_step - self.config.warmup_steps,
+            skip_first=max(1, self.start_step - warmup - self._training_step),
         )
 
     def _is_profile_required(self, rank: int) -> bool:
@@ -272,8 +304,8 @@ class ProfilerCallback(Callback):
 
     def _start(self) -> None:
         self.profiler.start()
-        self.profiler.step()
         self._is_profiler_started = True
+        self.profiler.step()
 
     def _record_metadata(self) -> None:
         """Record distributed topology metadata once per profiling session."""
@@ -297,13 +329,12 @@ class ProfilerCallback(Callback):
 
     def _stop(self) -> None:
         """Stop the profiler session and release its resources."""
-        profiler = self.profiler
+        if self.profiler is not None and self._is_profiler_started:
+            # A stopped device can make finalization fail. Retain the handle so
+            # recovery retries cleanup before opening another backend session.
+            self.profiler.stop()
         self.profiler = None
-        try:
-            if profiler is not None and self._is_profiler_started:
-                profiler.stop()
-        finally:
-            self._is_profiler_started = False
+        self._is_profiler_started = False
 
 
 __all__ = ["ProfilerCallback"]

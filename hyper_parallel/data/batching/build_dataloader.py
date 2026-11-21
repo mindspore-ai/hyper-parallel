@@ -453,9 +453,22 @@ class FixedBatchDataLoader(StatefulDataLoader):
             if callable(enable_source_resume):
                 enable_source_resume()
 
+    def _get_iterator(self) -> Any:
+        """Rebuild a saved iterator without advancing its loader seed stream again."""
+        if self.next_iter_state is None:
+            return super()._get_iterator()
+        # torchdata restores the saved worker seed after constructing the iterator.
+        # Preserve the generator too, so a later epoch receives the original seed.
+        generator_state = self.generator.get_state()
+        try:
+            return super()._get_iterator()
+        finally:
+            self.generator.set_state(generator_state)
+
     def state_dict(self) -> dict[str, Any]:
         """Save the native delivered cursor alongside torchdata's worker state."""
         state = super().state_dict()
+        state["_hp_generator_state"] = self.generator.get_state()
         if "_snapshot" not in state:
             return state
         snapshot = state["_snapshot"]["_main_snapshot"]
@@ -478,6 +491,12 @@ class FixedBatchDataLoader(StatefulDataLoader):
         Args:
             state_dict: State saved by the ordinary or balanced native loader.
         """
+        # The training frame may still retain the old iterator during rollback.
+        # Stop its producers before torchdata drops the loader's iterator reference.
+        iterator = self._iterator
+        if self.num_workers > 0 and iterator is not None:
+            # torchdata exposes worker shutdown only through its iterator's private API.
+            iterator._shutdown_workers()  # pylint: disable=protected-access
         sampler = get_sampler_checkpoint_state(state_dict)
         snapshot = state_dict.get("_snapshot", {}).get("_main_snapshot", {})
         native_sampler = sampler if sampler is not None else snapshot.get("_index_sampler_state")
@@ -489,6 +508,9 @@ class FixedBatchDataLoader(StatefulDataLoader):
             if isinstance(native_sampler, Mapping) and native_sampler.get("epoch") is not None:
                 self.set_epoch(native_sampler["epoch"])
             super().load_state_dict(state_dict)
+            generator_state = state_dict.get("_hp_generator_state")
+            if generator_state is not None:
+                self.generator.set_state(generator_state)
             return
         if sampler is None:
             raise ValueError("Balanced checkpoint has no native sampler cursor on this rank")

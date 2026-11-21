@@ -22,7 +22,7 @@ Forward:  proj hooks launch async A2A → attn pre-hook waits Q/K/V → attn hoo
 Backward: autograd backward launches async A2A → proj pre-hooks wait before GEMMs
 """
 from functools import partial
-from typing import Optional
+from typing import Any, Optional
 
 from hyper_parallel.core.context_parallel.context_parallel import (
     ContextParallel,
@@ -43,6 +43,29 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.context_parallel import utils
 from hyper_parallel.core.context_parallel.utils import Module, Tensor
+
+
+class _AsyncCPState:
+    """Own the slot containers shared by projection and attention hooks."""
+
+    def __init__(self, forward_slots: dict[str, Any], backward_slots: dict[str, list]) -> None:
+        """Bind existing containers without changing the hook-owned identities."""
+        self.forward_slots = forward_slots
+        self.backward_slots = backward_slots
+
+    def reset_after_device_restart(self) -> None:
+        """Discard failed work after the caller has quiesced device communication.
+
+        Forward slots hold one task per key, with None representing no task.
+        Keep the keys because consumers index them directly. Backward slots
+        hold task lists captured by hook closures; clear each list in place
+        because replacing it would leave the hook referencing the old tasks.
+        Neither cleanup path waits on obsolete Work objects.
+        """
+        for key in self.forward_slots:
+            self.forward_slots[key] = None
+        for slots in self.backward_slots.values():
+            slots.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +336,7 @@ class AsyncContextParallel(ContextParallel):
         group = co_submesh.get_group()
         fwd_ag_slots = {"k": None, "v": None}
         bwd_ag_slots = {"k": [], "v": []}
+        setattr(module, "_context_parallel_async_state", _AsyncCPState(fwd_ag_slots, bwd_ag_slots))
         self._register_ag_proj_hooks(
             k_proj,
             v_proj,
@@ -352,6 +376,7 @@ class AsyncContextParallel(ContextParallel):
         """Register Pure Ulysses or Hybrid async A2A hooks."""
         fwd_slots = {"q": None, "k": None, "v": None}
         bwd_slots = {"q": [], "k": [], "v": []}
+        setattr(module, "_context_parallel_async_state", _AsyncCPState(fwd_slots, bwd_slots))
 
         if co == 1:
             ds_submesh = _ensure_1d(device_mesh)

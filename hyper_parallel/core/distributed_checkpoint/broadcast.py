@@ -36,6 +36,7 @@ from hyper_parallel.core.distributed_checkpoint.utils import (
     logger,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.high_availability.groups import GroupRegistry
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
@@ -177,9 +178,15 @@ def _build_broadcast_groups(
 
     groups = dict(supplied)
     owned = set()
+    create_group = dist.new_group
+    registry = getattr(create_group, "__self__", None)
+    if isinstance(registry, GroupRegistry):
+        # These groups are destroyed when loading finishes, so they must not
+        # enter the persistent recovery catalog or its sealed-group checks.
+        create_group = registry.call_original_new_group
     for group_ranks in wanted:
         # Both inputs to this came from the gather, so every rank takes the same branch.
-        fresh = dist.new_group(ranks=list(group_ranks)) if group_ranks in absent_somewhere else None
+        fresh = create_group(ranks=list(group_ranks)) if group_ranks in absent_somewhere else None
         if group_ranks not in needed:
             continue
         if fresh is None:

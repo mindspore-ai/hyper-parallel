@@ -1420,6 +1420,46 @@ class StateSwapAdapter:
             self._checkpoint_active = False
             self._checkpoint_broadcasted = False
 
+    def recovery_state(self, param: Any) -> Dict[str, Any]:
+        """Return committed local state values from their authoritative storage."""
+        state = dict(self.optimizer.state.get(param, {}))
+        for key in self._configured_state_keys():
+            slot = self._slots.get((id(param), key))
+            if slot is None or not slot.swappable:
+                continue
+            if slot.event is not None or not self.has_host_mirror(slot):
+                raise RuntimeError(f"Swap slot {key!r} has not finished writing its CPU mirror.")
+            state[key] = slot.cpu_tensor
+        return state
+
+    def clear_recovery_slots(self) -> None:
+        """Forget receiver slots before binding the donor's state layout."""
+        self._slots.clear()
+        self._packed_state_bindings.clear()
+        self.runtime.invalidate_packed_layout()
+
+    def step_state_device(self, param: Any, group: Dict[str, Any]) -> Any:
+        """Return the local device for a scalar optimizer step tensor."""
+        del group
+        return param.device
+
+    def allocate_recovery_state(self, param: Any, key: str, dtype: torch.dtype) -> Any:
+        """Allocate a moment and bind a slot using the local swap policy."""
+        param_local = self.runtime._storage_tensor(param)
+        tensor = _restore_dtensor_metadata(param, torch.empty_like(param_local, dtype=dtype))
+        if key not in self._configured_state_keys():
+            return tensor
+        slot = self._make_slot(key, tensor)
+        self._slots[(id(param), key)] = slot
+        if not slot.swappable:
+            return tensor
+        slot.cpu_tensor = self.runtime.make_zero_cpu_tensor_like(tensor)
+        self.runtime.release_device_storage(slot)
+        slot.state = "host"
+        if slot.packed:
+            slot.bind_tensor(slot.cpu_tensor)
+        return slot.tensor
+
     def all_slots(self) -> Iterable[SwapSlot]:
         """Iterate known swap slots."""
         return tuple(self._ordered_slots())
@@ -1617,7 +1657,7 @@ class StateSwapAdapter:
             exported_state = {}
             for key in self._state_keys_for_param(param):
                 slot = self._slots.get((id(param), key))
-                if self.has_host_mirror(slot, key, saved_state):
+                if key in saved_state and self.has_host_mirror(slot):
                     local_copy = slot.cpu_tensor.detach().clone()
                     exported_state[key] = _restore_dtensor_metadata(param, local_copy)
             for key, value in saved_state.items():
@@ -1655,20 +1695,9 @@ class StateSwapAdapter:
         return copy.deepcopy(value)
 
     @staticmethod
-    def has_host_mirror(slot: Optional[SwapSlot], key: str, saved_state: Dict[str, Any]) -> bool:
-        """Return whether ``slot`` currently owns the authoritative CPU mirror for ``key``.
-
-        A slot qualifies only when it has been offloaded to host *and* still
-        holds a CPU mirror: after :meth:`export_swappable_state`'s device-side
-        fast path, the live tensor may be a storage-released placeholder, so the
-        CPU mirror is the only source of the real optimizer values.
-        """
-        return (
-            slot is not None
-            and slot.state == "host"
-            and slot.cpu_tensor is not None
-            and key in saved_state
-        )
+    def has_host_mirror(slot: Optional[SwapSlot]) -> bool:
+        """Return whether the slot is host-resident and holds a CPU mirror."""
+        return slot is not None and slot.state == "host" and slot.cpu_tensor is not None
 
     def strip_swappable_state(self, state_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
         """Split Adam state tensors out before delegating to Torch loading.

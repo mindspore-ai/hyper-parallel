@@ -533,6 +533,17 @@ class DistributedCheckpointer(CheckpointerBase):
         finally:
             self._async_save_response = None
 
+    def abort_async_save(self) -> None:
+        """Discard an in-flight checkpoint before process recovery.
+
+        Completed checkpoints remain published. The attempted save-step marker
+        belongs to the callback and is retained even when persistence is dropped.
+        """
+        if self._async_save_response is None:
+            return
+        self._async_save_response.abort()
+        self._async_save_response = None
+
     def raise_for_failed_async_save(self) -> None:
         """Re-raise an in-flight async save's failure as soon as it is known.
 

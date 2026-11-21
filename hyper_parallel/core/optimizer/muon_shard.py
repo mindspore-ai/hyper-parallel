@@ -149,7 +149,7 @@ def _allgather_shapes_for_group(
 def build_param_shard_metadata_for_group(
         hsdp_group: HSDPCommGroup,
 ) -> Dict[torch.Tensor, ParamShardMeta]:
-    """Build per-parameter shard metadata before HSDP batching."""
+    """Build per-parameter shard metadata and refresh existing records in place."""
     # pylint: disable=too-many-locals
     layout_spec = hsdp_group.layout_spec
     shard_pgs = hsdp_group.shard_pgs
@@ -193,13 +193,10 @@ def build_param_shard_metadata_for_group(
         current_shapes = next_shapes
 
     param_to_meta: Dict[torch.Tensor, ParamShardMeta] = {}
-    updated_records = []
     for record, stage_metas in zip(hsdp_group.records, stage_metas_per_param):
         shard_meta = make_param_shard_meta(record.param, stage_metas)
+        record.shard_meta = shard_meta
         param_to_meta[record.param] = shard_meta
-        updated_records.append(record.__class__(index=record.index, param=record.param, shard_meta=shard_meta))
-
-    hsdp_group.records = updated_records
     return param_to_meta
 
 

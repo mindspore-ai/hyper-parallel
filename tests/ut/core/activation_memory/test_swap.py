@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for activation swap module (SwapTensor, Storage, SwapGroup, SwapManager)."""
 import contextlib
+import copy
 import importlib
 import os
 import threading
@@ -22,6 +23,9 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from hyper_parallel.core.activation_memory.pinned_memory_pool import PinnedMemoryPool
+from hyper_parallel.high_availability.adapters import ModelRecoveryAdapter
+from hyper_parallel.distributed.attention_swap import apply_attention_swap
 
 swap_module = importlib.import_module("hyper_parallel.core.activation_memory.swap")
 from hyper_parallel.core.activation_memory.swap import (  # noqa: E402
@@ -1395,6 +1399,160 @@ class TestSwapManager(unittest.TestCase):
         group._offload_event.synchronize.assert_called_once_with()
         group._load_event.synchronize.assert_called_once_with()
         self.assertNotIn("group_a", mgr._groups)
+
+    def test_recovery_reset_discards_old_events_and_preserves_wiring(self) -> None:
+        """Feature: Activation swap resumes after discarding an interrupted iteration.
+
+        Description: Leave stale activations, events and a pre-backward flag in a wired layer pair.
+        Expectation: Device quiescence precedes release, old events are untouched, and the same hooks run again.
+        """
+        manager = SwapManager()
+        first, second = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
+        manager.set_forward_prefetch_layer(first, second)
+        first._swap_state = "pre_backward"
+        second._swap_state = "backward"
+        names = [first._swap_group_name, second._swap_group_name]
+        original_handles = [getattr(first, attr) for attr in manager._FORWARD_PREFETCH_HOOK_HANDLE_ATTRS]
+        original_parameters = list(first.parameters())
+        old_group = manager._groups[names[0]]
+        old_events = [MagicMock(), MagicMock()]
+        old_group._offload_event, old_group._load_event = old_events
+        old_group._seen_dedup_keys.add("stale")
+        storage = Storage()
+        storage[0].append(SwapTensor(torch.ones(2), "old-activation"))
+        old_group._storages.append(storage)
+        manager.ensure_group("other-model")
+        other = manager._groups["other-model"]
+        observed = []
+        self.mock_plat.get_device_handle.return_value.synchronize.side_effect = lambda: observed.append("sync")
+        with patch.object(storage, "release_cpu_buffers", side_effect=lambda: observed.append("release")):
+            manager.reset_after_device_restart((first, second))
+        self.assertEqual(observed, ["sync", "release"])
+        self.assertEqual(list(storage.values()), [])
+        self.assertIs(manager._groups["other-model"], other)
+        self.assertFalse(manager.is_last_group(names[0]))
+        self.assertTrue(manager.is_last_group(names[1]))
+        self.assertNotIn("_swap_state", vars(first))
+        self.assertNotIn("_swap_state", vars(second))
+        self.assertFalse(manager._groups[names[0]]._storages)
+        self.assertFalse(manager._groups[names[0]]._seen_dedup_keys)
+        for event in old_events:
+            event.synchronize.assert_not_called()
+            event.wait.assert_not_called()
+            event.query.assert_not_called()
+        for attr, handle in zip(manager._FORWARD_PREFETCH_HOOK_HANDLE_ATTRS, original_handles):
+            self.assertIs(getattr(first, attr), handle)
+        for actual, expected in zip(first.parameters(), original_parameters):
+            self.assertIs(actual, expected)
+        for _ in range(2):
+            second(first(torch.ones(1, 2))).sum().backward()
+            self.assertEqual(first._swap_state, "backward")
+            self.assertEqual(second._swap_state, "backward")
+            manager.reset_after_device_restart((first, second))
+
+    def test_failed_recovery_quiescence_keeps_old_buffers_owned(self) -> None:
+        """Feature: Failed device quiescence must not recycle activation buffers.
+
+        Description: Fail synchronization before recovery discards a group's state.
+        Expectation: Old storage and module flags remain intact, and no host buffer is released.
+        """
+        manager = SwapManager()
+        module = torch.nn.Linear(2, 2)
+        module._swap_group_name = "owned"
+        module._swap_state = "pre_backward"
+        manager.ensure_group("owned")
+        storage = MagicMock()
+        group = manager._groups["owned"]
+        group._storages.append(storage)
+        self.mock_plat.get_device_handle.return_value.synchronize.side_effect = RuntimeError("not quiescent")
+        with self.assertRaisesRegex(RuntimeError, "not quiescent"):
+            manager.reset_after_device_restart((module,))
+        self.assertIs(manager._groups["owned"], group)
+        self.assertEqual(module._swap_state, "pre_backward")
+        storage.release_cpu_buffers.assert_not_called()
+
+    @patch(
+        "hyper_parallel.core.activation_memory.pinned_memory_pool._backend.alloc_tensor_buffer",
+        side_effect=lambda numel, dtype, **kwargs: torch.empty(numel, dtype=dtype),
+    )
+    def test_recovery_recycles_group_and_individual_pooled_buffers(self, allocate: MagicMock) -> None:
+        """Feature: Activation recovery returns host allocations from every transfer path.
+
+        Description: Interrupt individual and packed transfers with an additional already-pending buffer.
+        Expectation: Reuse all three allocations after reset without querying obsolete events.
+        """
+        self.mock_plat.alloc_tensor_buffer = _build_mock_platform().alloc_tensor_buffer
+        manager = SwapManager()
+        pool = PinnedMemoryPool(3072)
+        individual, packed, pending = [pool.acquire(16) for _ in range(3)]
+        event = MagicMock()
+        event.query.side_effect = RuntimeError("obsolete event")
+        event.synchronize.side_effect = RuntimeError("obsolete event")
+        pool.release(pending, event=event)
+        module = torch.nn.Linear(2, 2)
+        module._swap_group_name = "pooled"
+        module.cpu_pool = pool
+        manager.ensure_group("pooled")
+        tensor = SwapTensor(torch.ones(4), "individual", cpu_pool=pool)
+        tensor.val_cpu = individual.view(torch.float32)
+        tensor._cpu_pool_buffer = individual
+        storage = Storage()
+        storage[0].append(tensor)
+        group = manager._groups["pooled"]
+        group._storages.append(storage)
+        group._group_cpu_buf = {"packed": packed}
+        group._packed_buckets = {"packed": {"cpu_pool": pool}}
+        manager.reset_after_device_restart((module,))
+        recycled = [pool.acquire(16) for _ in range(3)]
+        self.assertEqual({value.data_ptr() for value in recycled},
+                         {value.data_ptr() for value in (individual, packed, pending)})
+        self.assertEqual(pool.total_allocated, 3072)
+        event.query.assert_not_called()
+        event.synchronize.assert_not_called()
+        self.assertEqual(allocate.call_count, 3)
+
+    def test_attention_wrappers_resume_backward_after_repeated_interruptions(self) -> None:
+        """Feature: Resume real attention-wrapper autograd after interrupted backward.
+
+        Description: Interrupt a wired attention layer in pre-backward twice and run the recovery adapter.
+        Expectation: Hooks stay installed, parameters stay identical, and resumed gradients match a clean model.
+        """
+        class Layer(torch.nn.Module):
+            """Small attention-shaped layer using actual CPU autograd."""
+
+            def __init__(self) -> None:
+                """Create the attention submodule expected by the wrapping API."""
+                super().__init__()
+                self.self_attn = torch.nn.Linear(2, 2)
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                """Apply the attention projection and a nonlinear activation."""
+                return self.self_attn(value).tanh()
+
+        model = torch.nn.Sequential(Layer(), Layer())
+        reference = copy.deepcopy(model)
+        inputs = torch.ones(1, 2, requires_grad=True)
+        reference(inputs).sum().backward()
+        apply_attention_swap(model, "attention")
+        adapter = ModelRecoveryAdapter(model)
+        identities = list(model.parameters())
+
+        def _interrupt(module, grad_input):
+            del module, grad_input
+            raise RuntimeError("FORCE STOP")
+
+        for _ in range(2):
+            with model[0].self_attn.register_full_backward_pre_hook(_interrupt):
+                with self.assertRaisesRegex(RuntimeError, "FORCE STOP"):
+                    model(inputs).sum().backward()
+            self.assertEqual(model[0].self_attn._swap_state, "pre_backward")
+            adapter.abort_iteration()
+            adapter.reset_after_device_restart(MagicMock())
+            model.zero_grad(set_to_none=True)
+            model(inputs).sum().backward()
+            for parameter, identity, expected in zip(model.parameters(), identities, reference.parameters()):
+                self.assertIs(parameter, identity)
+                torch.testing.assert_close(parameter.grad, expected.grad)
 
     def test_is_last_group_default(self):
         """Test is_last_group returns False by default."""

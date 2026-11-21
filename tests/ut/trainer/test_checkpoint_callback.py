@@ -36,6 +36,7 @@ from hyper_parallel.trainer.callbacks.checkpoint_callback import (
     _cleanup_muon_checkpoint_state,
     _state_leaf_keys,
 )
+from hyper_parallel.high_availability.groups import GroupRegistry
 from hyper_parallel.trainer.state import TrainerState
 
 _CALLBACK_MODULE = "hyper_parallel.trainer.callbacks.checkpoint_callback"
@@ -108,6 +109,116 @@ class _FakeCheckpointer:
 
 class TestCheckpointerCallbackRestore(unittest.TestCase):
     """Verify what each restore mode reads back into the trainer."""
+
+    def test_surviving_worker_skips_initial_checkpoint_during_reentry(self) -> None:
+        """Feature: Checkpoint initialization runs once per callback instance.
+
+        Description: Load a checkpoint, advance live state, then reenter the same start callback.
+        Expectation: Reentry does not load again or overwrite live state, independently of group generation.
+        """
+        with tempfile.TemporaryDirectory() as restore_from:
+            trainer = self._build_trainer(restore_from, False)
+            checkpointer = _FakeCheckpointer()
+            with patch(f"{_CALLBACK_MODULE}.build_checkpointer", return_value=checkpointer), \
+                    patch(f"{_CALLBACK_MODULE}.initialize_optimizer_state", return_value=True):
+                callback = CheckpointerCallback(trainer)
+                with patch.object(checkpointer, "load", wraps=checkpointer.load) as load, \
+                        patch(f"{_CALLBACK_MODULE}.is_recovery_reboot", return_value=False):
+                    callback.on_train_begin(trainer.state)
+                    trainer.state.global_step = 8
+                    callback.on_train_begin(trainer.state)
+                load.assert_called_once()
+                self.assertEqual(trainer.state.global_step, 8)
+                self.assertTrue(callback._initial_checkpoint_processed)
+
+    def test_initial_checkpoint_absence_is_processed_once(self) -> None:
+        """Feature: An initial start without a checkpoint is still handled once.
+
+        Description: Complete the start callback without a restore path and enter it again.
+        Expectation: Path discovery is not repeated during recovery reentry.
+        """
+        trainer = self._build_trainer("/unused/checkpoints", False)
+        with patch(f"{_CALLBACK_MODULE}.build_checkpointer"):
+            callback = CheckpointerCallback(trainer)
+            with patch.object(callback, "_resolve_restore_path", return_value=None) as resolve:
+                callback.on_train_begin(trainer.state)
+                callback.on_train_begin(trainer.state)
+            resolve.assert_called_once()
+            callback.checkpointer.load.assert_not_called()
+            self.assertTrue(callback._initial_checkpoint_processed)
+
+    def test_reentry_refreshes_time_deadline_without_loading_again(self) -> None:
+        """Feature: Early return preserves normal time-based checkpoint initialization.
+
+        Description: Enter the callback twice with time-based saving enabled and no restore path.
+        Expectation: Initial path discovery runs once while the deadline refreshes on both entries.
+        """
+        trainer = self._build_trainer("/unused/checkpoints", False)
+        with patch(f"{_CALLBACK_MODULE}.build_checkpointer"):
+            callback = CheckpointerCallback(trainer)
+            callback._save_time_interval_seconds = 60
+
+            def _resolve() -> None:
+                self.assertEqual(callback._next_time_save, 160.0)
+
+            with (
+                patch.object(callback, "_resolve_restore_path", side_effect=_resolve) as resolve,
+                patch(f"{_CALLBACK_MODULE}.is_recovery_reboot", return_value=False) as reboot,
+                patch(f"{_CALLBACK_MODULE}.time.monotonic", side_effect=[100.0, 200.0]),
+            ):
+                callback.on_train_begin(trainer.state)
+                self.assertEqual(callback._next_time_save, 160.0)
+                callback.on_train_begin(trainer.state)
+                self.assertEqual(callback._next_time_save, 260.0)
+            resolve.assert_called_once_with()
+            reboot.assert_called_once_with()
+
+    def test_failed_initial_checkpoint_can_be_retried(self) -> None:
+        """Feature: Failed initialization is not marked as completed.
+
+        Description: Fail path discovery, retry successfully without a checkpoint, then reenter again.
+        Expectation: The failure propagates, the retry executes, and later calls skip loading.
+        """
+        trainer = self._build_trainer("/unused/checkpoints", False)
+        with patch(f"{_CALLBACK_MODULE}.build_checkpointer"):
+            callback = CheckpointerCallback(trainer)
+            with patch.object(callback, "_resolve_restore_path",
+                              side_effect=[RuntimeError("restore failed"), None]) as resolve:
+                with self.assertRaisesRegex(RuntimeError, "restore failed"):
+                    callback.on_train_begin(trainer.state)
+                self.assertFalse(callback._initial_checkpoint_processed)
+                callback.on_train_begin(trainer.state)
+                callback.on_train_begin(trainer.state)
+            self.assertEqual(resolve.call_count, 2)
+            self.assertTrue(callback._initial_checkpoint_processed)
+
+    def test_replacement_skips_disk_restore_after_replica_rollback(self) -> None:
+        """Feature: Checkpoint callback initialization on a replacement worker.
+
+        Description: Run the original begin hook with a configured checkpoint after device repair.
+        Expectation: Configuration logging executes without path discovery or disk load, preserving restored state.
+        """
+        trainer = self._build_trainer("/unused/checkpoints", True)
+        trainer.state.global_step = 8
+        checkpointer = MagicMock()
+        with patch(f"{_CALLBACK_MODULE}.build_checkpointer", return_value=checkpointer), \
+                patch(f"{_CALLBACK_MODULE}.logger") as log:
+            callback = CheckpointerCallback(trainer)
+            with GroupRegistry() as registry, \
+                    patch.object(callback, "_resolve_restore_path", return_value=None) as resolve:
+                registry.reboot = True
+                registry.sealed = True
+                callback.on_train_begin(trainer.state)
+            resolve.assert_not_called()
+            self.assertTrue(callback._initial_checkpoint_processed)
+            with patch.object(callback, "_resolve_restore_path") as resolve_again:
+                callback.on_train_begin(trainer.state)
+            resolve_again.assert_not_called()
+        checkpointer.load.assert_not_called()
+        self.assertEqual(trainer.state.global_step, 8)
+        self.assertEqual(trainer.model.state_dict(), {"weight": 1})
+        self.assertTrue(any(str(call.args[0]).startswith("Checkpoint configuration:")
+                            for call in log.info.call_args_list))
 
     @staticmethod
     def _build_trainer(restore_from: str, restore_train_state: bool) -> SimpleNamespace:
@@ -632,6 +743,32 @@ class TestHuggingFaceCheckpointCallback(unittest.TestCase):
             chat_template=None,
             train_steps=1,
         )
+
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.build_checkpointer")
+    def test_async_save_interrupted_before_return_keeps_previous_marker(self, build_checkpointer: MagicMock) -> None:
+        """Feature: Async deduplication. Description: Interrupt save before it returns.
+        Expectation: The marker stays unchanged, allowing this step to be retried.
+        """
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            config = CheckpointingConfig(
+                save_ckpt=True,
+                is_async=True,
+                checkpoint_dir=checkpoint_dir,
+                save_optimizer=False,
+                save_train_state=False,
+            )
+            trainer = self._build_trainer(config)
+            callback = CheckpointerCallback(trainer)
+
+            def interrupted(*args, **kwargs):
+                del args, kwargs
+                self.assertEqual(callback._last_saved_step, -1)
+                raise RuntimeError("FORCE STOP")
+
+            build_checkpointer.return_value.save.side_effect = interrupted
+            with self.assertRaisesRegex(RuntimeError, "FORCE STOP"):
+                callback._save_checkpoint(TrainerState(global_step=8))
+            self.assertEqual(callback._last_saved_step, -1)
 
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.CheckpointManager")
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.build_checkpointer")
