@@ -485,19 +485,21 @@ def _cp_strategy_spec(target: str, *, construction_kwargs: tuple[str, ...] = ())
     resolved = inner_wrapper_target(target, construction_kwargs=construction_kwargs)
     if resolved is None:
         return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    imports = tuple(ImportPatch(module, (name,)) for module, name in resolved.extra_imports)
+    if resolved.helper_module and resolved.helper_name:
+        imports = (ImportPatch(resolved.helper_module, (resolved.helper_name,)), *imports)
     if resolved.inline_body is not None:
         return StrategySpec(
             kind=CP_ATTENTION_KIND,
             subclass_shell=resolved.inline_body,
             subclass_state_attr=resolved.state_attr,
-            imports=(ImportPatch(resolved.helper_module, (resolved.helper_name,)),)
-            if resolved.helper_module and resolved.helper_name else (),
+            imports=imports,
         )
     return StrategySpec(
         kind=CP_ATTENTION_KIND,
         subclass_shell=cp_dispatch_shell_body(resolved.helper_name),
         subclass_state_attr=resolved.state_attr,
-        imports=(ImportPatch(resolved.helper_module, (resolved.helper_name,)),),
+        imports=imports,
     )
 
 

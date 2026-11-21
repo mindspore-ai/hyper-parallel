@@ -84,6 +84,7 @@ class InnerWrapperTarget:
     helper_name: str | None = None
     state_attr: str | None = None
     inline_body: str | None = None
+    extra_imports: tuple[tuple[str, str], ...] = ()
 
 
 def class_name_of(qualified_type: str | None) -> str | None:
@@ -246,16 +247,29 @@ def inner_wrapper_target(
         )
         if inline_body is None:
             return None
-        return InnerWrapperTarget(inline_body=inline_body)
+        return InnerWrapperTarget(
+            inline_body=inline_body, extra_imports=_body_imports(inline_body, module_name, module_functions),
+        )
+    inline_body = _helper_keyword_body(
+        request_owner, replacement_name, _module_function(tree, helper_name),
+        _wrapper_literals(factory_node, construction_kwargs),
+    )
     return InnerWrapperTarget(
         helper_module=module_name,
         helper_name=helper_name,
         state_attr=_cp_mesh_companion_attr(tree),
-        inline_body=_helper_keyword_body(
-            request_owner, replacement_name, _module_function(tree, helper_name),
-            _wrapper_literals(factory_node, construction_kwargs),
-        ),
+        inline_body=inline_body,
+        extra_imports=_body_imports(inline_body, module_name, module_functions - {helper_name}),
     )
+
+
+def _body_imports(body: str | None, module: str, functions: set[str]) -> tuple[tuple[str, str], ...]:
+    """Keep native helpers referenced by the lowered closure visible in its new module."""
+    names = {node.id for node in ast.walk(ast.parse(body or "")) if isinstance(node, ast.Name)}
+    imports = [(module, name) for name in sorted(names & functions)]
+    if "_get_cp_submesh" in names:
+        imports.append(("hyper_parallel.distributed._builder.applier", "_get_cp_submesh"))
+    return tuple(imports)
 
 
 def _single_helper_delegate(
@@ -362,7 +376,7 @@ def _helper_keyword_body(
     for item in ast.walk(lowered):
         if isinstance(item, ast.Call) and isinstance(item.func, ast.Name) and item.func.id == helper.name:
             names = _keyword_names(item)
-            if names - {"self"}:
+            if names - {"self", "_get_cp_submesh"}:
                 raise RuntimeError(f"codegen: helper delegate has unresolved keyword names {sorted(names - {'self'})}")
             item.args = [ast.Name(id="self", ctx=ast.Load()), ast.Name(id="__hp_forward_args__", ctx=ast.Load())]
             item.keywords = [keyword for keyword in item.keywords if keyword.arg is not None]
@@ -548,6 +562,15 @@ def _captured_forward_names(tree: ast.AST, name: str) -> set[str]:
     return set()
 
 
+def _uses_native_cp_argument(tree: ast.FunctionDef) -> bool:
+    """Do not reinterpret an unrelated local or reassigned mesh as native CP."""
+    return (
+        "cp_mesh" in {item.arg for item in (*tree.args.posonlyargs, *tree.args.args, *tree.args.kwonlyargs)}
+        and not any(isinstance(item, ast.Name) and item.id == "cp_mesh" and isinstance(item.ctx, ast.Store)
+                    for item in ast.walk(tree))
+    )
+
+
 def _nested_forward_body(
     tree: ast.AST, replacement_name: str | None, *, target_name: str | None = None,
     literals: dict[str, Any] | None = None,
@@ -577,6 +600,7 @@ def _nested_forward_body(
     if original_forward is None:
         return None
     captured = _captured_forward_names(tree, replacement_name)
+    runtime_cp = _uses_native_cp_argument(tree)
     variadic = {}
     if forward.args.vararg:
         variadic[forward.args.vararg.arg] = "__hp_forward_positional__"
@@ -594,6 +618,11 @@ def _nested_forward_body(
                 return ast.copy_location(ast.Name(id="self", ctx=node.ctx), node)
             if literals is not None and node.id in captured and node.id in literals:
                 return ast.copy_location(ast.parse(repr(literals[node.id]), mode="eval").body, node)
+            if runtime_cp and node.id == "cp_mesh" and node.id in captured and node.id not in companion_attrs:
+                return ast.copy_location(ast.parse(
+                    "_get_cp_submesh(self._hp_boundary.compiled.mesh, "
+                    "self._hp_boundary.compiled.mesh_dim_names)", mode="eval",
+                ).body, node)
             attr = companion_attrs.get(node.id)
             if attr is None:
                 return node

@@ -150,12 +150,6 @@ def _materialize_cp_forward(
     host_classes = rule_block_classes(rule, boundary_classes)
     if not host_classes:
         raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
-    helper_names = [name for patch in spec.imports for name in patch.names]
-    if len(helper_names) > 1:
-        raise ValueError(
-            f"codegen: CP strategy {target!r} carries multiple helper "
-            f"imports for one subclass shell: {helper_names}"
-        )
     for host_class in sorted(host_classes):
         if host_class in subclassed:
             if subclassed[host_class] != spec.subclass_shell:
