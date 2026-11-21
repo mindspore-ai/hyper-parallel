@@ -101,7 +101,9 @@ def render_inline_modeling_with_plan(
     )
     _add_recorded_forward_host_imports(source_text, patch_set, patch_plan)
     _materialize_imported_forward_hosts(source_text, patch_set)
-    rendered = apply_patch_set(source_text, patch_set)
+    model_class = (getattr(meta, "source", None) or {}).get("model_class")
+    root_class_name = model_class.rsplit(":", 1)[-1].rsplit(".", 1)[-1] if model_class else None
+    rendered = apply_patch_set(source_text, patch_set, root_class_name=root_class_name)
     # The copied modeling source brings its own decorated helpers that share
     # names with the library functions the artifact imports, and a local
     # definition wins over the import: the native path calls the library
@@ -214,6 +216,15 @@ def _materialize_imported_forward_hosts(
         rendered.add(patch.class_name)
         imported = patch_set.imports[import_index]
         other_names = tuple(name for name in imported.names if name != patch.class_name)
+        if patch.definition is not None:
+            definition = patch.definition.replace("self._forward_impl(", "super().forward(")
+            replacement_imports = [ImportPatch(imported.module, other_names)] if other_names else []
+            replacement_imports.append(ImportPatch("", (), raw=f"import {imported.module}"))
+            patch_set.imports[import_index:import_index + 1] = replacement_imports
+            snippet = (f"class {patch.class_name}({imported.module}.{patch.class_name}):\n"
+                       + textwrap.indent(definition, "    ") + "\n")
+            patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
+            continue
         alias = f"_{patch.class_name}Base"
         replacement_imports = []
         if other_names:
@@ -225,13 +236,18 @@ def _materialize_imported_forward_hosts(
         ))
         patch_set.imports[import_index:import_index + 1] = replacement_imports
         body = patch.body.replace(
-            "return self._forward_impl(__hp_forward_args__)",
-            "return super().forward(__hp_forward_args__)",
-        ).replace("__hp_forward_args__", "*args, **kwargs")
+            "self._forward_impl(",
+            "original_forward(",
+        ).replace("__hp_forward_args__", "*args, **kwargs").replace(
+            "__hp_forward_positional__", "args",
+        ).replace("__hp_forward_keywords__", "kwargs")
+        if "original_forward(" in body:
+            body = "original_forward = super().forward\n" + body
+        state = "    cp_enable = False\n\n" if "self.cp_enable" in body else ""
         snippet = (
             f"class {patch.class_name}({alias}):\n"
             "    \"\"\"Generated source-visible parallel form.\"\"\"\n\n"
-            "    cp_enable = False\n\n"
+            f"{state}"
             "    def forward(self, *args, **kwargs):\n"
             f"{textwrap.indent(body.strip(), '        ')}\n"
         )
@@ -278,7 +294,6 @@ def render_inline_strategies_for_source_unit(
     ]
     if not patches.forward_extracts:
         return source_text
-    patches.module_snippets.clear()
     patches.constructor_replaces.clear()
     patches.class_removals.clear()
     return apply_patch_set(source_text, patches)
@@ -379,8 +394,11 @@ def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = No
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
             if target is None:
                 continue
+            if target == rule.inner_wrapper_target and rule.observed_wrapper is not None:
+                continue
             if strategy_spec(
-                target, model_type, inner_wrapper=target == rule.inner_wrapper_target
+                target, model_type, inner_wrapper=target == rule.inner_wrapper_target,
+                construction_kwargs=rule.construction_kwargs if target == rule.inner_wrapper_target else (),
             ) is not None:
                 continue
             # An inner_wrapper target has no runtime channel and stays

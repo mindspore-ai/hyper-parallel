@@ -26,30 +26,19 @@
  #
  # Unless required by applicable law or agreed to in writing, software
  # distributed under the License is distributed on an "AS IS" BASIS,
-@@ -47,7 +61,7 @@
- from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
- from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
- from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
--from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
-+from hyper_multicore import MegaGate
- from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
-     accumulate_router_load,
-     sequence_load_balancing_loss,
-@@ -76,6 +90,53 @@
+@@ -78,6 +92,44 @@
      DeepseekV41VisionAligner,
      DeepseekV41VisionTower,
  )
 +
 +
-+from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttention as _SharedCompressedDSAAttentionBase
++import hyper_parallel.components.modules.shared_compressed_dsa_attention
++from hyper_parallel.components.modules.engram.engram import Engram
 +from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
 +from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
-+from hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement import HostEngramModule
 +
 +
 +
-+
-+# Codegen replacement: HostEngramModule wraps DeepseekV41Engram; the original class is kept as the wrapper input.
 +
 +# Codegen replacement: SharedCompressedDSAAttention wraps DeepseekV41Attention; the original class is kept as the wrapper input.
 +
@@ -59,23 +48,16 @@
 +
 +# Codegen replacement: DeepseekV41MegaGate wraps DeepseekV41TopKRouter; the original class is kept as the wrapper input.
 +
-+class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
-+    """Generated source-visible parallel form."""
-+
-+    cp_enable = False
-+
++class SharedCompressedDSAAttention(hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention):
 +    def _forward_impl(self, *args, **kwargs):
-+        if self.cp_enable:
-+            if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
-+                raise ValueError('shared attention parallel contexts are owned by the wrapper')
-+            call_kwargs = dict(kwargs)
-+            if self._hyper_v41_shared_attention_cp_context is not None:
-+                call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
-+            if self._hyper_v41_shared_attention_tp_context is not None:
-+                call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
-+            return super().forward(*args, **call_kwargs)
-+
-+        return super().forward(*args, **kwargs)
++        if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
++            raise ValueError('shared attention parallel contexts are owned by the wrapper')
++        call_kwargs = dict(kwargs)
++        if self._hyper_v41_shared_attention_cp_context is not None:
++            call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
++        if self._hyper_v41_shared_attention_tp_context is not None:
++            call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
++        return super().forward(*args, **call_kwargs)
 +    def forward(self, *args, **kwargs):
 +        # [HYPER BOUNDARY] input redistribution
 +        args, kwargs = self._hp_boundary.redistribute_inputs(
@@ -88,8 +70,8 @@
 +        return outputs
  from hyper_parallel.models.materialization import register_rebuildable_buffer
 
- _FULL_MODEL_MODE = "full"
-@@ -395,7 +456,7 @@
+ # Native model replacements are optional; an installed package's own failures propagate.
+@@ -395,7 +447,7 @@
      shared_expert.forward = MethodType(_v41_shared_expert_forward, shared_expert)
 
 
@@ -98,7 +80,7 @@
          self: nn.Module,
          hidden_states: torch.Tensor,
          input_ids: torch.Tensor | None = None,
-@@ -414,6 +475,37 @@
+@@ -414,6 +466,37 @@
      routed = self.experts(hidden_states.view(-1, hidden_size), indices, weights)
      return routed.view(batch_size, sequence_length, hidden_size) + self.shared_experts(hidden_states)
 
@@ -136,29 +118,28 @@
 
  class DeepseekV41Compressor(nn.Module):
      """Non-overlapping V4.1 compressed-KV producer."""
-@@ -830,15 +922,16 @@
+@@ -831,15 +914,16 @@
          )
          for layer_idx in range(config.num_hidden_layers):
              layer = self.layers[layer_idx]
 -            layer.attn_hc = DeepseekV41PipelinedHyperConnection(layer.attn_hc)
 -            layer.ffn_hc = DeepseekV41PipelinedHyperConnection(layer.ffn_hc)
 -            layer.self_attn = DeepseekV41Attention(config, layer_idx)
-+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={})
-+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={})
-+            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={})
++            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={}, token_tile=32)
++            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={}, token_tile=32)
++            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={}, indexer_balance_block_size=None, indexer_load_balance='none', indexer_zigzag_min_length=None, main_kv_comm='all_gather', use_fused_ops=True)
              layer.forward = MethodType(_v41_decoder_layer_forward, layer)
 -            layer.mlp.gate = DeepseekV41TopKRouter(config)
 +            layer.mlp.gate = DeepseekV41MegaGate(module=DeepseekV41TopKRouter(config), module_fqn='', context={})
-             bind_shared_expert_forward(layer.mlp.shared_experts)
+             layer.mlp.shared_experts = SharedExpertModule(
+                 module=layer.mlp.shared_experts, preserve_source_layout=True,
+                 activation_dtype="float32", swiglu_limit=layer.mlp.shared_experts.limit,
+             )
 +            layer.mlp._forward_impl = MethodType(_v41_sparse_moe_forward_hp_impl, layer.mlp)
              layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
          for layer_id in getattr(config, "v41_engram_layer_ids", assets["layer_ids"]):
--            self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
-+            self.layers[layer_id].engram = HostEngramModule(module=DeepseekV41Engram(config, layer_id, assets), module_fqn='', context={})
-         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-         self.vision = None
-@@ -1313,7 +1406,7 @@
+             self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
+@@ -1317,7 +1401,7 @@
      dspark_config.num_local_experts = experts
      dspark_config.num_experts_per_tok = int(getattr(config, "v41_dspark_top_k", config.num_experts_per_tok))
      mlp = DeepseekV4DecoderLayer(dspark_config, 0).mlp
@@ -167,10 +148,20 @@
      mlp.forward = MethodType(_dspark_sparse_moe_forward, mlp)
      return mlp
 
-@@ -1341,6 +1434,16 @@
+@@ -1345,6 +1429,26 @@
              self.dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _build_dspark_mlp(config))
              self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
          self.post_init()
++        _hp_replacement_cache = {}
++        for _hp_fqn in ('model.layers.1.engram', 'model.layers.14.engram'):
++            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
++            _hp_parent = self.get_submodule(_hp_parent_fqn)
++            _hp_source = getattr(_hp_parent, _hp_name)
++            _hp_key = id(_hp_source)
++            if _hp_key not in _hp_replacement_cache:
++                _hp_replacement_cache[_hp_key] = Engram(
++                    module=_hp_source, module_fqn=_hp_fqn, context={'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1}, engram_storage_backend='host')
++            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 +        _hp_replacement_cache = {}
 +        for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts', 'model.layers.10.mlp.experts', 'model.layers.11.mlp.experts', 'model.layers.12.mlp.experts', 'model.layers.13.mlp.experts', 'model.layers.14.mlp.experts', 'model.layers.15.mlp.experts', 'model.layers.16.mlp.experts', 'model.layers.17.mlp.experts', 'model.layers.18.mlp.experts', 'model.layers.19.mlp.experts', 'model.layers.2.mlp.experts', 'model.layers.20.mlp.experts', 'model.layers.21.mlp.experts', 'model.layers.22.mlp.experts', 'model.layers.23.mlp.experts', 'model.layers.24.mlp.experts', 'model.layers.25.mlp.experts', 'model.layers.26.mlp.experts', 'model.layers.27.mlp.experts', 'model.layers.28.mlp.experts', 'model.layers.29.mlp.experts', 'model.layers.3.mlp.experts', 'model.layers.30.mlp.experts', 'model.layers.31.mlp.experts', 'model.layers.32.mlp.experts', 'model.layers.33.mlp.experts', 'model.layers.34.mlp.experts', 'model.layers.35.mlp.experts', 'model.layers.36.mlp.experts', 'model.layers.37.mlp.experts', 'model.layers.38.mlp.experts', 'model.layers.39.mlp.experts', 'model.layers.4.mlp.experts', 'model.layers.5.mlp.experts', 'model.layers.6.mlp.experts', 'model.layers.7.mlp.experts', 'model.layers.8.mlp.experts', 'model.layers.9.mlp.experts'):
 +            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
@@ -179,12 +170,12 @@
 +            _hp_key = id(_hp_source)
 +            if _hp_key not in _hp_replacement_cache:
 +                _hp_replacement_cache[_hp_key] = DeepseekV41MegaMoeExperts(
-+                    module=_hp_source, module_fqn=_hp_fqn, context={})
++                    module=_hp_source, module_fqn=_hp_fqn, context={}, capacity_growth_factor=None, dispatch_mode='push', initial_capacity_factor=None, initializer_range=0.02)
 +            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
      @torch.no_grad()
      def _init_weights(self, module: nn.Module) -> None:
-@@ -1418,3 +1521,4 @@
+@@ -1422,3 +1526,4 @@
      "SharedAttentionCPContext",
      "SharedAttentionState",
  ]

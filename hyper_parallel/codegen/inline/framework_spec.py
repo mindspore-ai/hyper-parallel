@@ -307,7 +307,7 @@ def _build_replacement_spec(
 #: repeated lookup returns the same object (callers may compare identity) and
 #: the expensive fused-attention render runs once.
 _REPLACEMENT_CACHE: dict[tuple[str | None, Any, str | None], ReplacementSpec | None] = {}
-_STRATEGY_CACHE: dict[tuple[str | None, str | None, bool], StrategySpec | None] = {}
+_STRATEGY_CACHE: dict[tuple[str | None, str | None, bool, tuple[str, ...]], StrategySpec | None] = {}
 
 
 def replacement_spec_for(
@@ -430,6 +430,7 @@ def strategy_spec_for(
     model_type: str | None = None,
     *,
     inner_wrapper: bool = False,
+    construction_kwargs: tuple[str, ...] = (),
 ) -> StrategySpec | None:
     """Resolve a strategy target from structure.
 
@@ -442,25 +443,28 @@ def strategy_spec_for(
         target: Import path of the selected strategy.
         model_type: Optional source model type.
         inner_wrapper: Whether the strategy wraps the existing forward boundary.
+        construction_kwargs: Literal arguments already recorded for the selected wrapper.
     """
     if target is None:
         return None
     model_type = _family_key(model_type, target)
-    key = (target, model_type, inner_wrapper)
+    key = (target, model_type, inner_wrapper, construction_kwargs)
     if key in _STRATEGY_CACHE:
         return _STRATEGY_CACHE[key]
-    spec = _resolve_strategy_spec(target, inner_wrapper)
+    spec = _resolve_strategy_spec(target, inner_wrapper, construction_kwargs)
     _STRATEGY_CACHE[key] = spec
     return spec
 
 
-def _resolve_strategy_spec(target: str, inner_wrapper: bool) -> StrategySpec | None:
+def _resolve_strategy_spec(
+    target: str, inner_wrapper: bool, construction_kwargs: tuple[str, ...],
+) -> StrategySpec | None:
     if inner_wrapper:
-        return _cp_strategy_spec(target)
+        return _cp_strategy_spec(target, construction_kwargs=construction_kwargs)
     return None
 
 
-def _cp_strategy_spec(target: str) -> StrategySpec:
+def _cp_strategy_spec(target: str, *, construction_kwargs: tuple[str, ...] = ()) -> StrategySpec:
     """Build the CP strategy spec: an in-place dispatch shell plus imports.
 
     A recognizable inner forward rewrite participates in inline CP: the
@@ -478,20 +482,24 @@ def _cp_strategy_spec(target: str) -> StrategySpec:
     Families without an inline helper keep the original framework CP
     strategy (imports only), preserving the runtime wrapper path.
     """
-    resolved = inner_wrapper_target(target)
+    resolved = inner_wrapper_target(target, construction_kwargs=construction_kwargs)
     if resolved is None:
         return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    imports = tuple(ImportPatch(module, (name,)) for module, name in resolved.extra_imports)
+    if resolved.helper_module and resolved.helper_name:
+        imports = (ImportPatch(resolved.helper_module, (resolved.helper_name,)), *imports)
     if resolved.inline_body is not None:
         return StrategySpec(
             kind=CP_ATTENTION_KIND,
             subclass_shell=resolved.inline_body,
-            imports=(),
+            subclass_state_attr=resolved.state_attr,
+            imports=imports,
         )
     return StrategySpec(
         kind=CP_ATTENTION_KIND,
         subclass_shell=cp_dispatch_shell_body(resolved.helper_name),
         subclass_state_attr=resolved.state_attr,
-        imports=(ImportPatch(resolved.helper_module, (resolved.helper_name,)),),
+        imports=imports,
     )
 
 

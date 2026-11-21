@@ -6,7 +6,7 @@
 #   source       : transformers.models.qwen3_moe.modeling_qwen3_moe
 #   architecture : Qwen3MoeForCausalLM
 #   parallel_dims: tp=2 cp=2 ep=2 pp=1 sp=True loss_parallel=True
-#   injections   : 2 rule(s)
+#   injections   : 4 rule(s)
 #   runtime      : mesh / FSDP2 / PP / AC / compile still handled by runtime
 #
 # [HYPER PLAN] training derives a live plan from its YAML and this model;
@@ -66,13 +66,9 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 
-from hyper_parallel.components.modules import GroupedExperts, RMSNorm
+from hyper_parallel.components.modules import GroupedExperts
 from hyper_parallel.components.modules.attention.grouped_query_attention.grouped_query_attention_family import GroupedQueryAttention
-
-
-
-
-# Codegen replacement: RMSNorm wraps Qwen3MoeRMSNorm; the original class is kept as the wrapper input.
+from hyper_parallel.components.modules.rms_norm import RMSNorm
 
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
@@ -355,8 +351,8 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
             self.mlp = Qwen3MoeSparseMoeBlock(config)
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = RMSNorm(module=Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context=None)
-        self.post_attention_layernorm = RMSNorm(module=Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context=None)
+        self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -497,7 +493,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(module=Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context=None)
+        self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -662,17 +658,27 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
         _hp_replacement_cache = {}
-        for _hp_fqn in ('model.layers.0.self_attn', 'model.layers.1.self_attn'):
+        for _hp_fqn in ('model.layers.0.input_layernorm', 'model.layers.0.post_attention_layernorm', 'model.layers.1.input_layernorm', 'model.layers.1.post_attention_layernorm', 'model.layers.2.input_layernorm', 'model.layers.2.post_attention_layernorm', 'model.layers.3.input_layernorm', 'model.layers.3.post_attention_layernorm', 'model.norm'):
+            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
+            _hp_parent = self.get_submodule(_hp_parent_fqn)
+            _hp_source = getattr(_hp_parent, _hp_name)
+            _hp_key = id(_hp_source)
+            if _hp_key not in _hp_replacement_cache:
+                _hp_replacement_cache[_hp_key] = RMSNorm(
+                    module=_hp_source, module_fqn=_hp_fqn, cast_order=None, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1}, fp32_weight=None, use_fused_ops=True)
+            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
+        _hp_replacement_cache = {}
+        for _hp_fqn in ('model.layers.0.self_attn', 'model.layers.1.self_attn', 'model.layers.2.self_attn', 'model.layers.3.self_attn'):
             _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
             _hp_parent = self.get_submodule(_hp_parent_fqn)
             _hp_source = getattr(_hp_parent, _hp_name)
             _hp_key = id(_hp_source)
             if _hp_key not in _hp_replacement_cache:
                 _hp_replacement_cache[_hp_key] = GroupedQueryAttention(
-                    module=_hp_source, module_fqn=_hp_fqn, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1}, overlap=False, ulysses_degree=1)
+                    module=_hp_source, module_fqn=_hp_fqn, context={'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1}, fuse_qkv=True, overlap=False, ulysses_degree=1)
             setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
         _hp_replacement_cache = {}
-        for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts'):
+        for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts', 'model.layers.2.mlp.experts', 'model.layers.3.mlp.experts'):
             _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
             _hp_parent = self.get_submodule(_hp_parent_fqn)
             _hp_source = getattr(_hp_parent, _hp_name)

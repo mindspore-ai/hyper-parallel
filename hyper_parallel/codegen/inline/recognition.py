@@ -34,9 +34,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 import inspect
 import os
+import symtable
 import sys
 import textwrap
 from typing import Any
+
+from hyper_parallel.distributed.recipe_spec import WRAPPER_CONTEXT
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,7 @@ class InnerWrapperTarget:
     helper_name: str | None = None
     state_attr: str | None = None
     inline_body: str | None = None
+    extra_imports: tuple[tuple[str, str], ...] = ()
 
 
 def class_name_of(qualified_type: str | None) -> str | None:
@@ -210,7 +214,9 @@ def _factory_arguments(
     return tuple(arguments)
 
 
-def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
+def inner_wrapper_target(
+    factory_path: str | None, *, construction_kwargs: tuple[str, ...] = (),
+) -> InnerWrapperTarget | None:
     """Recover an inner wrapper's emitted helper contract from its source."""
     if not factory_path:
         return None
@@ -236,15 +242,147 @@ def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     if not helper_name or helper_name not in module_functions:
-        inline_body = _nested_forward_body(request_owner, replacement_name)
+        inline_body = _nested_forward_body(
+            request_owner, replacement_name, target_name=_original_forward_target(request_owner),
+        )
         if inline_body is None:
             return None
-        return InnerWrapperTarget(inline_body=inline_body)
+        return InnerWrapperTarget(
+            inline_body=inline_body, extra_imports=_body_imports(inline_body, module_name, module_functions),
+        )
+    inline_body = _helper_keyword_body(
+        request_owner, replacement_name, _module_function(tree, helper_name),
+        _wrapper_literals(factory_node, construction_kwargs),
+    )
     return InnerWrapperTarget(
         helper_module=module_name,
         helper_name=helper_name,
         state_attr=_cp_mesh_companion_attr(tree),
+        inline_body=inline_body,
+        extra_imports=_body_imports(inline_body, module_name, module_functions - {helper_name}),
     )
+
+
+def _body_imports(body: str | None, module: str, functions: set[str]) -> tuple[tuple[str, str], ...]:
+    """Keep native helpers referenced by the lowered closure visible in its new module."""
+    names = {node.id for node in ast.walk(ast.parse(body or "")) if isinstance(node, ast.Name)}
+    imports = [(module, name) for name in sorted(names & functions)]
+    if "_get_cp_submesh" in names:
+        imports.append(("hyper_parallel.distributed._builder.applier", "_get_cp_submesh"))
+    return tuple(imports)
+
+
+def _single_helper_delegate(
+    tree: ast.AST, replacement_name: str, helper_name: str,
+) -> tuple[ast.FunctionDef, ast.Call | None]:
+    """Identify a pure return call without discarding surrounding control flow."""
+    forward = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == replacement_name)
+    body = forward.body[1:] if ast.get_docstring(forward) is not None else forward.body
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return forward, None
+    call = body[0].value
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id == helper_name and any(item.arg is not None for item in call.keywords)):
+        return forward, None
+    return forward, call
+
+
+def _positional_contract(args: ast.arguments, excluded: set[str]) -> tuple[tuple[str, bool, str | None], ...]:
+    """Compare names, positional-only constraints and default expressions."""
+    parameters = (*args.posonlyargs, *args.args)
+    defaults = [None] * (len(parameters) - len(args.defaults)) + list(args.defaults)
+    return tuple((item.arg, index < len(args.posonlyargs), ast.dump(value) if value is not None else None)
+                 for index, (item, value) in enumerate(zip(parameters, defaults)) if item.arg not in excluded)
+
+
+def _keyword_names(call: ast.Call) -> set[str]:
+    """Collect symbols referenced by explicitly supplied helper keywords."""
+    return {node.id for item in call.keywords if item.arg is not None
+            for node in ast.walk(item.value) if isinstance(node, ast.Name)}
+
+
+def _forwards_parameters(args: ast.arguments, call: ast.Call) -> bool:
+    """Ensure the token can replace the native delegate's argument forwarding."""
+    names = [item.arg for item in (*args.posonlyargs, *args.args)]
+    if [ast.unparse(item) for item in call.args[1:]] != names:
+        return False
+    kwargs = [ast.unparse(item.value) for item in call.keywords if item.arg is None]
+    if kwargs != ([args.kwarg.arg] if args.kwarg else []):
+        return False
+    return not set(names).intersection(_keyword_names(call))
+
+
+def _helper_signature_matches(forward: ast.FunctionDef, helper: ast.FunctionDef, call: ast.Call) -> bool:
+    """Reject signature adaptation rather than changing positional/default behavior."""
+    if forward.args.vararg or forward.args.kwonlyargs:
+        return False
+    parameters = (*helper.args.posonlyargs, *helper.args.args)
+    if not parameters:
+        return False
+    excluded = {item.arg for item in call.keywords if item.arg is not None} | {parameters[0].arg}
+    if _positional_contract(forward.args, set()) != _positional_contract(helper.args, excluded):
+        return False
+    return _forwards_parameters(forward.args, call)
+
+
+def _original_forward_target(tree: ast.AST | None) -> str | None:
+    """Find the owner whose original forward the wrapper saves."""
+    if tree is None:
+        return None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "forward" and isinstance(node.value.value, ast.Name)):
+            return node.value.value.id
+    return None
+
+
+def _wrapper_literals(factory: ast.FunctionDef, construction_kwargs: tuple[str, ...]) -> dict[str, Any]:
+    """Read only literal native defaults and recorded overrides, never runtime resources."""
+    parameters = (*factory.args.posonlyargs, *factory.args.args)
+    values = {}
+    for parameter, value in zip(parameters[len(parameters) - len(factory.args.defaults):], factory.args.defaults):
+        if parameter.arg in WRAPPER_CONTEXT:
+            continue
+        try:
+            values[parameter.arg] = ast.literal_eval(value)
+        except (ValueError, TypeError):
+            continue
+    for argument in construction_kwargs:
+        name, text = argument.split("=", 1)
+        if name in WRAPPER_CONTEXT:
+            raise ValueError(f"codegen: native runtime argument {name!r} cannot be frozen as configuration")
+        values[name] = ast.literal_eval(text)
+    return values
+
+
+def _helper_keyword_body(
+    tree: ast.AST, replacement_name: str, helper: ast.FunctionDef, literals: dict[str, Any],
+) -> str | None:
+    """Keep explicit keywords only when native argument forwarding is preserved."""
+    forward, call = _single_helper_delegate(tree, replacement_name, helper.name)
+    if call is None:
+        return None
+    if not _helper_signature_matches(forward, helper, call):
+        raise RuntimeError(f"codegen: helper delegate {replacement_name!r} is not an argument passthrough")
+    target = _original_forward_target(tree)
+    if target is None:
+        raise RuntimeError(
+            f"codegen: cannot preserve helper arguments for {replacement_name!r} without its target binding"
+        )
+    if not call.args or not isinstance(call.args[0], ast.Name) or call.args[0].id != target:
+        raise RuntimeError(f"codegen: helper delegate {replacement_name!r} has a different target")
+    lowered = ast.parse(_nested_forward_body(tree, replacement_name, target_name=target, literals=literals))
+    for item in ast.walk(lowered):
+        if isinstance(item, ast.Call) and isinstance(item.func, ast.Name) and item.func.id == helper.name:
+            names = _keyword_names(item)
+            if names - {"self", "_get_cp_submesh"}:
+                raise RuntimeError(f"codegen: helper delegate has unresolved keyword names {sorted(names - {'self'})}")
+            item.args = [ast.Name(id="self", ctx=ast.Load()), ast.Name(id="__hp_forward_args__", ctx=ast.Load())]
+            item.keywords = [keyword for keyword in item.keywords if keyword.arg is not None]
+    active = ast.unparse(ast.fix_missing_locations(lowered))
+    return (f"if self.cp_enable:\n{textwrap.indent(active, '    ')}\n\n"
+            "return self._forward_impl(__hp_forward_args__)")
 
 
 def _module_function(tree: ast.Module, name: str) -> ast.AST | None:
@@ -413,15 +551,36 @@ def _cp_mesh_assignment_attr(tree: ast.AST) -> str | None:
     return None
 
 
-def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | None:
+def _captured_forward_names(tree: ast.AST, name: str) -> set[str]:
+    """Read lexical captures without importing or executing the wrapper."""
+    pending = list(symtable.symtable(ast.unparse(tree), "<codegen wrapper>", "exec").get_children())
+    while pending:
+        scope = pending.pop()
+        if scope.get_name() == name and scope.get_type() == "function":
+            return set(scope.get_frees())
+        pending.extend(scope.get_children())
+    return set()
+
+
+def _uses_native_cp_argument(tree: ast.FunctionDef) -> bool:
+    """Do not reinterpret an unrelated local or reassigned mesh as native CP."""
+    return (
+        "cp_mesh" in {item.arg for item in (*tree.args.posonlyargs, *tree.args.args, *tree.args.kwonlyargs)}
+        and not any(isinstance(item, ast.Name) and item.id == "cp_mesh" and isinstance(item.ctx, ast.Store)
+                    for item in ast.walk(tree))
+    )
+
+
+def _nested_forward_body(
+    tree: ast.AST, replacement_name: str | None, *, target_name: str | None = None,
+    literals: dict[str, Any] | None = None,
+) -> str | None:
     """Lower a closure-backed rewrite into an imported-host dispatch body.
 
-    A custom wrapper may build its replacement forward as a nested closure
-    instead of delegating to a module-level helper.  The closure remains
-    source-visible when its captured values are also published through the
-    request's ``companion_attrs`` mapping.  In that form, replace captured
-    state reads with instance attributes and the saved original forward with
-    ``super().forward``; the imported-host materializer supplies the subclass.
+    Keep the native control flow, including packed and exception branches.
+    Captured published state becomes instance attributes; the saved forward
+    calls the preserved source method. CP dispatch belongs to the helper path,
+    not to every closure (some wrappers run at CP1 or TP-only).
     """
     if not replacement_name:
         return None
@@ -440,12 +599,30 @@ def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | N
     original_forward = _original_forward_binding(tree)
     if original_forward is None:
         return None
+    captured = _captured_forward_names(tree, replacement_name)
+    runtime_cp = _uses_native_cp_argument(tree)
+    variadic = {}
+    if forward.args.vararg:
+        variadic[forward.args.vararg.arg] = "__hp_forward_positional__"
+    if forward.args.kwarg:
+        variadic[forward.args.kwarg.arg] = "__hp_forward_keywords__"
 
     class ClosureBindings(ast.NodeTransformer):
         """Rewrite captured closure bindings to generated-instance state."""
 
         def visit_Name(self, node: ast.Name) -> ast.AST:  # pylint: disable=invalid-name
             """Rewrite a referenced symbol into its resolved source form."""
+            if node.id in variadic and isinstance(node.ctx, ast.Load):
+                return ast.copy_location(ast.Name(id=variadic[node.id], ctx=node.ctx), node)
+            if node.id == target_name:
+                return ast.copy_location(ast.Name(id="self", ctx=node.ctx), node)
+            if literals is not None and node.id in captured and node.id in literals:
+                return ast.copy_location(ast.parse(repr(literals[node.id]), mode="eval").body, node)
+            if runtime_cp and node.id == "cp_mesh" and node.id in captured and node.id not in companion_attrs:
+                return ast.copy_location(ast.parse(
+                    "_get_cp_submesh(self._hp_boundary.compiled.mesh, "
+                    "self._hp_boundary.compiled.mesh_dim_names)", mode="eval",
+                ).body, node)
             attr = companion_attrs.get(node.id)
             if attr is None:
                 return node
@@ -463,33 +640,30 @@ def _nested_forward_body(tree: ast.AST, replacement_name: str | None) -> str | N
             node = self.generic_visit(node)
             if isinstance(node.func, ast.Name) and node.func.id == original_forward:
                 node.func = ast.Attribute(
-                    value=ast.Call(
-                        func=ast.Name(id="super", ctx=ast.Load()),
-                        args=[],
-                        keywords=[],
-                    ),
-                    attr="forward",
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr="_forward_impl",
                     ctx=ast.Load(),
                 )
             return node
 
-    body = list(forward.body)
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(body[0].value, ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        body = body[1:]
+    body = forward.body[1:] if ast.get_docstring(forward) is not None else forward.body
     lowered = [ClosureBindings().visit(ast.fix_missing_locations(node)) for node in body]
     if not lowered:
         return None
-    active = "\n".join(ast.unparse(node) for node in lowered)
-    return (
-        "if self.cp_enable:\n"
-        f"{textwrap.indent(active, '    ')}\n\n"
-        "return self._forward_impl(__hp_forward_args__)"
-    )
+    _require_bound_captures(captured, lowered, replacement_name)
+    return "\n".join(ast.unparse(node) for node in lowered)
+
+
+def _require_bound_captures(captured: set[str], statements: list[ast.stmt], name: str) -> None:
+    """Reject emitted closure state without a source-visible binding."""
+    unresolved = sorted(captured & {
+        node.id for statement in statements for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    })
+    if unresolved:
+        raise RuntimeError(
+            f"codegen: cannot inline {name!r}; unresolved captured state {unresolved}"
+        )
 
 
 def _companion_attr_bindings(tree: ast.AST) -> dict[str, str]:

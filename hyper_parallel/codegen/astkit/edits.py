@@ -98,6 +98,9 @@ def replace_function_body(
         for line in new_body.splitlines(keepends=True)
     ]
     replacement = "".join(body_lines)
+    # Composed source can place the next class directly after the consumed newline.
+    if not replacement.endswith("\n") and source_text[func.body_end:func.body_end + 1] not in ("", "\n", "\r"):
+        replacement += "\n"
     return (TextEdit(func.body_start, func.body_end, replacement),)
 
 

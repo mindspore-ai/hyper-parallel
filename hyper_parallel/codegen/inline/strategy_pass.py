@@ -21,11 +21,13 @@ from typing import Collection, Mapping
 
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch,
+    ImportPatch,
+    ModuleSnippetPatch,
     InlinePatchSet,
     SourceObservation,
     StrategySpec,
 )
-from hyper_parallel.codegen.inline.framework_spec import strategy_spec_for as strategy_spec
+from hyper_parallel.codegen.inline.framework_spec import CP_ATTENTION_KIND, strategy_spec_for as strategy_spec
 
 
 def rule_block_classes(
@@ -80,18 +82,18 @@ def build_strategy_patches(
     patch_set = InlinePatchSet()
     emitted: dict[tuple[str, str], str] = {}
     imported: set[tuple[str, bool]] = set()
-    subclassed: set[str] = set()
+    subclassed: dict[str, str] = {}
     for rule in rules:
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
             if target is None:
                 continue
             inner_wrapper = target == rule.inner_wrapper_target
-            spec = strategy_spec(target, model_type, inner_wrapper=inner_wrapper)
+            spec = _rule_strategy(rule, target, model_type, inner_wrapper)
             if spec is None:
                 continue
+            patch_set.imports.extend(spec.imports)
             if (target, inner_wrapper) not in imported:
                 imported.add((target, inner_wrapper))
-                patch_set.imports.extend(spec.imports)
                 patch_set.module_snippets.extend(spec.snippets)
             if spec.subclass_shell is not None:
                 _materialize_cp_forward(
@@ -143,28 +145,29 @@ def _materialize_cp_forward(
     target: str,
     model_type: str | None,
     boundary_classes: Mapping[str, str] | None,
-    subclassed: set[str],
+    subclassed: dict[str, str],
 ) -> None:
     """Materialize CP dispatch in the original host class exactly once."""
-    host_classes = rule_block_classes(rule, boundary_classes)
+    host_classes = ({rule.observed_wrapper["host_class"]} if rule.observed_wrapper is not None
+                    else rule_block_classes(rule, boundary_classes))
     if not host_classes:
         raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
-    helper_names = [name for patch in spec.imports for name in patch.names]
-    if len(helper_names) > 1:
-        raise ValueError(
-            f"codegen: CP strategy {target!r} carries multiple helper "
-            f"imports for one subclass shell: {helper_names}"
-        )
     for host_class in sorted(host_classes):
         if host_class in subclassed:
+            if subclassed[host_class] != (spec.definition or spec.subclass_shell):
+                raise RuntimeError(f"codegen: conflicting CP bindings for source class {host_class!r}")
             continue
-        subclassed.add(host_class)
+        subclassed[host_class] = spec.definition or spec.subclass_shell
         patch_set.forward_extracts.append(
             ForwardExtractPatch(
                 class_name=host_class,
                 method_name=spec.method_name,
                 body=spec.subclass_shell,
-                merge_original_body=True,
+                definition=spec.definition,
+                merge_original_body=(
+                    spec.subclass_shell.count("self._forward_impl(") == 1
+                    and spec.subclass_shell.rstrip().endswith("return self._forward_impl(__hp_forward_args__)")
+                ),
             )
         )
 
@@ -180,3 +183,20 @@ def _unmaterialized_strategy_error(
         "materialized; check the match pattern or the plan's "
         "boundary coverage"
     )
+
+
+def _rule_strategy(
+    rule: SourceObservation, target: str, model_type: str | None, inner_wrapper: bool,
+) -> StrategySpec | None:
+    """Prefer the native constructor result when the build has observed it."""
+    if inner_wrapper and rule.observed_wrapper is not None:
+        return StrategySpec(
+            kind=CP_ATTENTION_KIND, subclass_shell=rule.observed_wrapper["body"],
+            definition=rule.observed_wrapper.get("definition"),
+            imports=(tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"])
+                     + tuple(ImportPatch("", (), raw=line)
+                             for line in rule.observed_wrapper.get("source_imports", ()))),
+            snippets=tuple(ModuleSnippetPatch(text) for text in (rule.observed_wrapper.get("helpers"),) if text),
+        )
+    return strategy_spec(target, model_type, inner_wrapper=inner_wrapper,
+                         construction_kwargs=rule.construction_kwargs if inner_wrapper else ())

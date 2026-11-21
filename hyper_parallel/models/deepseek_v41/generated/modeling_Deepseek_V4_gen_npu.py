@@ -58,10 +58,12 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.modules.shared_expert import SharedExpertModule
+from hyper_parallel.components.modules.swiglu_mlp import swiglu_activation
+from hyper_parallel.components.modules.router import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
-from hyper_multicore import MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
@@ -92,15 +94,13 @@ from hyper_parallel.models.deepseek_v41.vision import (
 )
 
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttention as _SharedCompressedDSAAttentionBase
+import hyper_parallel.components.modules.shared_compressed_dsa_attention
+from hyper_parallel.components.modules.engram.engram import Engram
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
-from hyper_parallel.components.modules.engram.host_engram import HostEngramModule
 
 
 
-
-# Codegen replacement: HostEngramModule wraps DeepseekV41Engram; the original class is kept as the wrapper input.
 
 # Codegen replacement: SharedCompressedDSAAttention wraps DeepseekV41Attention; the original class is kept as the wrapper input.
 
@@ -110,23 +110,16 @@ from hyper_parallel.components.modules.engram.host_engram import HostEngramModul
 
 # Codegen replacement: DeepseekV41MegaGate wraps DeepseekV41TopKRouter; the original class is kept as the wrapper input.
 
-class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
-    """Generated source-visible parallel form."""
-
-    cp_enable = False
-
+class SharedCompressedDSAAttention(hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention):
     def _forward_impl(self, *args, **kwargs):
-        if self.cp_enable:
-            if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
-                raise ValueError('shared attention parallel contexts are owned by the wrapper')
-            call_kwargs = dict(kwargs)
-            if self._hyper_v41_shared_attention_cp_context is not None:
-                call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
-            if self._hyper_v41_shared_attention_tp_context is not None:
-                call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
-            return super().forward(*args, **call_kwargs)
-
-        return super().forward(*args, **kwargs)
+        if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
+            raise ValueError('shared attention parallel contexts are owned by the wrapper')
+        call_kwargs = dict(kwargs)
+        if self._hyper_v41_shared_attention_cp_context is not None:
+            call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
+        if self._hyper_v41_shared_attention_tp_context is not None:
+            call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
+        return super().forward(*args, **call_kwargs)
     def forward(self, *args, **kwargs):
         # [HYPER BOUNDARY] input redistribution
         args, kwargs = self._hp_boundary.redistribute_inputs(
@@ -138,6 +131,14 @@ class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
         outputs = self._hp_boundary.redistribute_outputs(outputs)
         return outputs
 from hyper_parallel.models.materialization import register_rebuildable_buffer
+
+# Native model replacements are optional; an installed package's own failures propagate.
+try:
+    from hyper_multicore import MegaGate as CORE_MEGA_GATE
+except ModuleNotFoundError as error:
+    if error.name != "hyper_multicore":
+        raise
+    CORE_MEGA_GATE = None
 
 _FULL_MODEL_MODE = "full"
 _VALIDATION_CROP_MODE = "validation_crop"
@@ -252,13 +253,9 @@ class DeepseekV41Engram(nn.Module):
 
 def _router_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
     """Convert router logits to the released nonnegative expert scores."""
-    if scoring_func == "sqrtsoftplus":
-        return functional.softplus(logits).sqrt()  # pylint: disable=not-callable
-    if scoring_func == "softmax":
-        return logits.softmax(dim=-1)
-    if scoring_func == "sigmoid":
-        return logits.sigmoid()
-    raise ValueError(f"Unsupported V4.1 router scoring function: {scoring_func!r}")
+    if scoring_func not in ("sqrtsoftplus", "softmax", "sigmoid"):
+        raise ValueError(f"Unsupported V4.1 router scoring function: {scoring_func!r}")
+    return routing_scores(logits, scoring_func)
 
 
 def _apply_router_training_state(
@@ -380,11 +377,10 @@ class DeepseekV41TopKRouter(nn.Module):
                     self.bias_vl.unsqueeze(0),
                     self.bias.unsqueeze(0),
                 )
-        indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
-        weights = scores.gather(1, indices)
-        if self.top_k > 1:
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)
-        weights = weights * self.routed_scaling_factor
+        weights, indices = select_topk_scores(
+            scores, top_k=self.top_k, correction_bias=correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor, normalize_topk=self.top_k > 1,
+        )
         weights = _apply_router_training_state(
             self,
             hidden_states,
@@ -431,12 +427,7 @@ def deepseek_v41_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> t
         FP32 activation. The caller restores its projection input dtype before
         the down projection, keeping this math shared by routed and shared experts.
     """
-    gate = gate.float()
-    up = up.float()
-    if limit > 0:
-        gate = gate.clamp(max=limit)
-        up = up.clamp(min=-limit, max=limit)
-    return functional.silu(gate) * up
+    return swiglu_activation(gate, up, limit=limit, activation_dtype="float32")
 
 
 def _v41_shared_expert_forward(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -686,7 +677,8 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
     if isinstance(module, (DeepseekV41Engram, EngramModule)):
         module.q_weight.fill_(1.0)
         module.k_weight.fill_(1.0)
-    elif isinstance(module, (DeepseekV41TopKRouter, MegaGate)):
+    elif (isinstance(module, DeepseekV41TopKRouter)
+          or (CORE_MEGA_GATE is not None and isinstance(module, CORE_MEGA_GATE))):
         nn.init.normal_(module.weight, mean=0.0, std=std)
         tokens_per_expert = getattr(module, "tokens_per_expert", None)
         if tokens_per_expert is not None:
@@ -922,16 +914,19 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
-            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={})
-            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={})
-            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={})
+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={}, token_tile=32)
+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={}, token_tile=32)
+            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={}, indexer_balance_block_size=None, indexer_load_balance='none', indexer_zigzag_min_length=None, main_kv_comm='all_gather', use_fused_ops=True)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
             layer.mlp.gate = DeepseekV41MegaGate(module=DeepseekV41TopKRouter(config), module_fqn='', context={})
-            bind_shared_expert_forward(layer.mlp.shared_experts)
+            layer.mlp.shared_experts = SharedExpertModule(
+                module=layer.mlp.shared_experts, preserve_source_layout=True,
+                activation_dtype="float32", swiglu_limit=layer.mlp.shared_experts.limit,
+            )
             layer.mlp._forward_impl = MethodType(_v41_sparse_moe_forward_hp_impl, layer.mlp)
             layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in getattr(config, "v41_engram_layer_ids", assets["layer_ids"]):
-            self.layers[layer_id].engram = HostEngramModule(module=DeepseekV41Engram(config, layer_id, assets), module_fqn='', context={})
+            self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.vision = None
@@ -1435,6 +1430,16 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
         self.post_init()
         _hp_replacement_cache = {}
+        for _hp_fqn in ('model.layers.1.engram', 'model.layers.14.engram'):
+            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
+            _hp_parent = self.get_submodule(_hp_parent_fqn)
+            _hp_source = getattr(_hp_parent, _hp_name)
+            _hp_key = id(_hp_source)
+            if _hp_key not in _hp_replacement_cache:
+                _hp_replacement_cache[_hp_key] = Engram(
+                    module=_hp_source, module_fqn=_hp_fqn, context={'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1}, engram_storage_backend='host')
+            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
+        _hp_replacement_cache = {}
         for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts', 'model.layers.10.mlp.experts', 'model.layers.11.mlp.experts', 'model.layers.12.mlp.experts', 'model.layers.13.mlp.experts', 'model.layers.14.mlp.experts', 'model.layers.15.mlp.experts', 'model.layers.16.mlp.experts', 'model.layers.17.mlp.experts', 'model.layers.18.mlp.experts', 'model.layers.19.mlp.experts', 'model.layers.2.mlp.experts', 'model.layers.20.mlp.experts', 'model.layers.21.mlp.experts', 'model.layers.22.mlp.experts', 'model.layers.23.mlp.experts', 'model.layers.24.mlp.experts', 'model.layers.25.mlp.experts', 'model.layers.26.mlp.experts', 'model.layers.27.mlp.experts', 'model.layers.28.mlp.experts', 'model.layers.29.mlp.experts', 'model.layers.3.mlp.experts', 'model.layers.30.mlp.experts', 'model.layers.31.mlp.experts', 'model.layers.32.mlp.experts', 'model.layers.33.mlp.experts', 'model.layers.34.mlp.experts', 'model.layers.35.mlp.experts', 'model.layers.36.mlp.experts', 'model.layers.37.mlp.experts', 'model.layers.38.mlp.experts', 'model.layers.39.mlp.experts', 'model.layers.4.mlp.experts', 'model.layers.5.mlp.experts', 'model.layers.6.mlp.experts', 'model.layers.7.mlp.experts', 'model.layers.8.mlp.experts', 'model.layers.9.mlp.experts'):
             _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
             _hp_parent = self.get_submodule(_hp_parent_fqn)
@@ -1442,7 +1447,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             _hp_key = id(_hp_source)
             if _hp_key not in _hp_replacement_cache:
                 _hp_replacement_cache[_hp_key] = DeepseekV41MegaMoeExperts(
-                    module=_hp_source, module_fqn=_hp_fqn, context={})
+                    module=_hp_source, module_fqn=_hp_fqn, context={}, capacity_growth_factor=None, dispatch_mode='push', initial_capacity_factor=None, initializer_range=0.02)
             setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
     @torch.no_grad()

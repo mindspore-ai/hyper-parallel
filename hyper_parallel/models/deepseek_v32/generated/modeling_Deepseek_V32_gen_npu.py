@@ -57,16 +57,13 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 
-from hyper_parallel.components.modules import DeepseekV32DSAAttention, GroupedExperts, RMSNorm
+from hyper_parallel.components.modules import DeepseekV32DSAAttention, GroupedExperts
+from hyper_parallel.components.modules.rms_norm import RMSNorm
 
 
 
-
-# Codegen replacement: RMSNorm wraps DeepseekV32RMSNorm; the original class is kept as the wrapper input.
 
 # Codegen replacement: DeepseekV32DSAAttention wraps DeepseekV32Attention; the original class is kept as the wrapper input.
-
-# Codegen replacement: GroupedExperts wraps DeepseekV32Experts; the original class is kept as the wrapper input.
 
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 
@@ -607,7 +604,7 @@ class DeepseekV32MoE(nn.Module):
     def __init__(self, config: DeepseekV32Config):
         super().__init__()
         self.config = config
-        self.experts = GroupedExperts(module=DeepseekV32Experts(config), module_fqn='', context=None)
+        self.experts = DeepseekV32Experts(config)
         self.gate = DeepseekV32TopkRouter(config)
         self.shared_experts = DeepseekV32MLP(
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
@@ -634,8 +631,8 @@ class DeepseekV32DecoderLayer(GradientCheckpointingLayer):
         else:
             self.mlp = DeepseekV32MLP(config)
 
-        self.input_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
-        self.post_attention_layernorm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps), module_fqn='', context=None)
+        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
@@ -712,7 +709,7 @@ class DeepseekV32Model(DeepseekV32PreTrainedModel):
         self.layers = nn.ModuleList(
             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(module=DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context=None)
+        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -792,6 +789,26 @@ class DeepseekV32ForCausalLM(DeepseekV32PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+        _hp_replacement_cache = {}
+        for _hp_fqn in ('model.layers.0.input_layernorm', 'model.layers.0.post_attention_layernorm', 'model.layers.1.input_layernorm', 'model.layers.1.post_attention_layernorm', 'model.layers.2.input_layernorm', 'model.layers.2.post_attention_layernorm', 'model.layers.3.input_layernorm', 'model.layers.3.post_attention_layernorm', 'model.norm'):
+            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
+            _hp_parent = self.get_submodule(_hp_parent_fqn)
+            _hp_source = getattr(_hp_parent, _hp_name)
+            _hp_key = id(_hp_source)
+            if _hp_key not in _hp_replacement_cache:
+                _hp_replacement_cache[_hp_key] = RMSNorm(
+                    module=_hp_source, module_fqn=_hp_fqn, cast_order=None, context={'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1}, fp32_weight=None, use_fused_ops=True)
+            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
+        _hp_replacement_cache = {}
+        for _hp_fqn in ('model.layers.3.mlp.experts',):
+            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
+            _hp_parent = self.get_submodule(_hp_parent_fqn)
+            _hp_source = getattr(_hp_parent, _hp_name)
+            _hp_key = id(_hp_source)
+            if _hp_key not in _hp_replacement_cache:
+                _hp_replacement_cache[_hp_key] = GroupedExperts(
+                    module=_hp_source, module_fqn=_hp_fqn, context=None)
+            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
     @can_return_tuple
     @auto_docstring
