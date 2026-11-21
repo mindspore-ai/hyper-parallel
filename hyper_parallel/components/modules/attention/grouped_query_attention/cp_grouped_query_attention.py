@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import accumulate
+from math import gcd
 from typing import Any
 
 import torch
@@ -145,6 +146,7 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
         super().__init__(config=config, module=module, fuse_qkv=fuse_qkv)
         self.overlap = overlap
         self.ulysses_degree = ulysses_degree
+        self.kv_head_repeats = 1
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
         """Request borrowed CP resources in addition to the shared TP boundary."""
@@ -155,7 +157,7 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
                                   validate=validate_gqa_layout)
 
     def bind_parallel(self, binding: Any) -> None:
-        """Bind U/A axes once and validate TP-local KV-head divisibility.
+        """Bind U/A axes and derive the minimum uniform KV replication after TP.
 
         Args:
             binding: Final module layout and the existing job's TP/CP resources.
@@ -167,14 +169,19 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
         self.ulysses_degree = degree if self.ulysses_degree is None else self.ulysses_degree
         if self.ulysses_degree < 1 or degree % self.ulysses_degree:
             raise ValueError("GQA Ulysses degree must divide CP degree")
-        if self.num_heads % self.ulysses_degree or self.num_key_value_heads % self.ulysses_degree:
-            raise ValueError("GQA Ulysses degree must divide TP-local Q and KV heads; use KV AG or a smaller U")
+        if self.num_heads % self.ulysses_degree:
+            raise ValueError("GQA Ulysses degree must divide TP-local Q heads")
+        self.kv_head_repeats = self.ulysses_degree // gcd(self.ulysses_degree, self.num_key_value_heads)
         self.ulysses_context, self.query_context = self.cp_context.split(self.ulysses_degree)
         self.all_gather_degree = degree // self.ulysses_degree
 
     def _transfer_input(self, tensor: torch.Tensor, *, is_query: bool) -> tuple[torch.Tensor, Any]:
         """Keep Q local for KV AG; otherwise exchange this ready operand along U."""
         if self.ulysses_degree > 1:
+            if not is_query and self.kv_head_repeats > 1:
+                # Keep contiguous query groups mapped to their original KV head.
+                # Repeat only to lcm(KV heads, U), not Q heads; autograd sums replica gradients.
+                tensor = tensor.repeat_interleave(self.kv_head_repeats, dim=2)
             if self.overlap:
                 return tensor, self.ulysses_context.launch_sequence_to_head(tensor)
             return self.ulysses_context.sequence_to_head(tensor), None
