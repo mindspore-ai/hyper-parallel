@@ -52,10 +52,9 @@ stay valid when combined with the body replacement), and the public
 - ``region`` (EP MoE local region): redistribute in, call the explicit
   factory-named attribute materialized by source emission, redistribute out.
 
-A CP inner-wrapper boundary is ``generic`` in the generated code: the wrapper
-is installed at runtime by ``hp_apply_inner_wrapper`` (it mutates
-``target.forward`` in place — not a bindable callable), and runs inside the
-``_forward_impl`` call.
+A CP inner-wrapper boundary is ``generic`` in the generated code. Its dispatch
+runs between boundary entry and exit; helpers can call the preserved local
+``_forward_impl`` without entering the dispatch again.
 
 The lowerer is a pure function over the source text + the frozen plan.  It
 returns the patched text.  Structural work (finding a class / its forward /
@@ -63,8 +62,10 @@ the import block) is delegated to :mod:`astkit`.
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
+import textwrap
 from typing import Any, Iterator, Optional
 
 from hyper_parallel.codegen.astkit.edits import (
@@ -122,6 +123,7 @@ def lower_forward_boundaries(
     if _plan_field(frozen_plan, "status") == "not_required":
         raise ValueError("codegen emit: not_required snapshot has no parallel boundaries")
     edits: list[TextEdit] = []
+    index = build_source_index(source_text)
     for class_name, form, emitted, func, injection, deferred_bias in iter_emitted_forms(
         source_text,
         frozen_plan,
@@ -144,8 +146,12 @@ def lower_forward_boundaries(
                     "identity forward has no exit hook to re-add them"
                 )
             continue
+        host = index.find_class(class_name)
+        dispatch = (_cp_dispatch_call(source_text[func.body_start:func.body_end])
+                    if "_forward_impl" in host.methods else None)
         body = _build_forward_body(
-            source_text, injection, func, form, emitted, deferred_bias
+            source_text, injection, func, form, emitted, deferred_bias,
+            inner_compute=ast.unparse(dispatch) if dispatch is not None else None,
         )
         # Keep the original forward as ``_forward_impl``. The
         # extracted method is inserted BEFORE the ``def forward`` (zero-width
@@ -154,7 +160,7 @@ def lower_forward_boundaries(
         # incremental-shift validation in ``_apply_edits`` passes.  The static
         # form additionally prefixes the class marker naming the form.
         marker = _TP_FORM_MARKER_LINE if emitted == FORM_TP_COLLECTIVE else None
-        impl = _build_forward_impl_edit(source_text, func, prefix=marker)
+        impl = None if dispatch is not None else _build_forward_impl_edit(source_text, func, prefix=marker)
         if impl is not None:
             edits.append(impl)
         edits.extend(replace_function_body(source_text, func, body, indent=""))
@@ -595,6 +601,26 @@ def _build_forward_impl_edit(
     return TextEdit(func.def_offset, func.def_offset, impl)
 
 
+def _cp_dispatch_call(source_body: str) -> Optional[ast.Call]:
+    """Recognize our passthrough CP shell and bind it to redistributed arguments."""
+    match ast.parse(textwrap.dedent(source_body)).body:
+        case [ast.If(test=ast.Attribute(value=ast.Name(id="self"), attr="cp_enable"),
+                     body=[ast.Return(value=ast.Call(args=[ast.Name(id="self"), *forwarded]) as call)], orelse=[]),
+              ast.Return(value=ast.Call(func=ast.Attribute(value=ast.Name(id="self"), attr="_forward_impl"),
+                                        args=original_args, keywords=original_kwargs))]:
+            if [ast.dump(arg) for arg in forwarded] != [ast.dump(arg) for arg in original_args]:
+                return None
+            originals = {ast.dump(keyword) for keyword in original_kwargs}
+            if not originals <= {ast.dump(keyword) for keyword in call.keywords}:
+                return None
+            call.args = [ast.Name(id="self", ctx=ast.Load()),
+                         ast.Starred(value=ast.Name(id="args", ctx=ast.Load()), ctx=ast.Load())]
+            call.keywords = [keyword for keyword in call.keywords if ast.dump(keyword) not in originals]
+            call.keywords.append(ast.keyword(arg=None, value=ast.Name(id="kwargs", ctx=ast.Load())))
+            return ast.fix_missing_locations(call)
+    return None
+
+
 def _build_forward_body(
     source_text: str,
     injection: Optional[dict[str, Any]],
@@ -602,6 +628,7 @@ def _build_forward_body(
     form: BoundaryForm,
     emitted: str,
     deferred_bias: bool = False,
+    inner_compute: Optional[str] = None,
 ) -> str:
     """Render the rewritten forward body for one boundary class.
 
@@ -631,11 +658,9 @@ def _build_forward_body(
             "builder recording must mark it skip_source_lowering so runtime "
             "can install the trainer's native Phase C wrapper"
         )
-    # A generic boundary (including an inner-wrapper one — the CP wrapper is
-    # installed at runtime by ``hp_apply_inner_wrapper`` and weaves into
-    # this forward) redistributes through the compiled plan, annotated with
-    # what each side's transitions lower to.
-    return _render_plain_redistribute(input_redist, out_redist, form)
+    # Keep source-visible CP dispatch inside the boundary and outside the
+    # preserved local implementation that its helper may call back into.
+    return _render_plain_redistribute(input_redist, out_redist, form, inner_compute)
 
 
 def _render_input_redistribute(func: FunctionInfo) -> str:
@@ -704,7 +729,7 @@ def _ordered_notes(notes: dict[str, str]) -> list[str]:
 
 
 def _render_plain_redistribute(
-    input_redist: str, out_redist: str, form: BoundaryForm
+    input_redist: str, out_redist: str, form: BoundaryForm, inner_compute: Optional[str] = None,
 ) -> str:
     """Generic boundary: annotated redistribute around the original forward.
 
@@ -714,13 +739,17 @@ def _render_plain_redistribute(
     fallback owns), so a reader sees what the boundary communicates without
     re-deriving the plan.
     """
+    compute = "        outputs = self._forward_impl(*args, **kwargs)"
+    if inner_compute is not None:
+        compute = (f"        if self.cp_enable:\n            outputs = {inner_compute}\n"
+                   "        else:\n            outputs = self._forward_impl(*args, **kwargs)")
     return "\n".join([
         "        # [HYPER BOUNDARY] input redistribution",
         *_ordered_notes(form.in_notes),
         input_redist,
         "",
         "        # [HYPER BOUNDARY] original forward body (now ``_forward_impl``)",
-        "        outputs = self._forward_impl(*args, **kwargs)",
+        compute,
         "",
         "        # [HYPER BOUNDARY] output redistribution",
         *_ordered_notes(form.out_notes),

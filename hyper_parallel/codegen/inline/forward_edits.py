@@ -50,9 +50,6 @@ def forward_extract_edits(
             continue
         body = _bind_forward_args(_bind_hidden_arg(patch.body, func), func)
         prefix = _parallel_state_prefix(body)
-        if patch.merge_original_body:
-            edits.extend(_merged_forward_edits(source_text, patch, func, body, prefix))
-            continue
         impl = _build_forward_impl_edit(source_text, func, prefix=prefix)
         if impl is not None:
             edits.append(impl)
@@ -86,30 +83,6 @@ def _parallel_state_prefix(body: str) -> str:
         if f"self.{axis}_enable" in body
     ]
     return "\n".join(lines) + "\n\n" if lines else ""
-
-
-def _merged_forward_edits(
-    source_text: str,
-    patch: ForwardExtractPatch,
-    func: FunctionInfo,
-    body: str,
-    prefix: str,
-) -> list[TextEdit]:
-    """Merge dispatch with the original body when no separate impl is needed."""
-    fallback = _forward_impl_fallback(func)
-    if fallback not in body:
-        raise RuntimeError(
-            f"codegen: merged strategy for {patch.class_name}."
-            f"{patch.method_name} has no original-forward fallback"
-        )
-    dispatch = body.replace(fallback, "", 1).rstrip()
-    original = textwrap.dedent(source_text[func.body_start:func.body_end]).rstrip()
-    edits = list(replace_function_body(
-        source_text, func, f"{dispatch}\n\n{original}", indent="        "
-    ))
-    if prefix:
-        edits.insert(0, TextEdit(func.def_offset, func.def_offset, prefix))
-    return edits
 
 
 def _bind_hidden_arg(body: str, func: FunctionInfo) -> str:
@@ -148,17 +121,6 @@ def _bind_forward_args(body: str, func: FunctionInfo) -> str:
         bindings.append("forward_kwargs = {" + ", ".join(keywords) + "}")
         body = body.replace("__hp_forward_keywords__", "forward_kwargs")
     return "\n".join([*bindings, body.replace(token, ", ".join(args))])
-
-
-def _forward_impl_fallback(func: FunctionInfo) -> str:
-    """Render the dispatch-shell fallback that calls the extracted method."""
-    args = list(func.param_names)
-    if func.vararg_name:
-        args.append(f"*{func.vararg_name}")
-    args.extend(f"{name}={name}" for name in func.kwonly_names)
-    if func.kwarg_name:
-        args.append(f"**{func.kwarg_name}")
-    return f"return self._forward_impl({', '.join(args)})"
 
 
 __all__ = ["forward_extract_edits"]

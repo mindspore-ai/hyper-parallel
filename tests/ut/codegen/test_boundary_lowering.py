@@ -61,7 +61,9 @@ from hyper_parallel.codegen.inline.pipeline import (
     _add_recorded_forward_host_imports,
     _materialize_imported_forward_hosts,
     _observed_boundary_classes,
+    render_inline_modeling_with_plan,
 )
+from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
 from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.framework_spec import cp_dispatch_shell_body
@@ -129,7 +131,10 @@ def test_unbound_executor_closure_is_rejected_before_source_emission(factory):
 
 @pytest.mark.parametrize("override", [None, False, True])
 @pytest.mark.parametrize("imported", [False, True])
-def test_helper_delegate_preserves_bound_keyword_and_original_fallback(monkeypatch, tmp_path, override, imported):
+@pytest.mark.parametrize("boundary_enabled", [False, True])
+def test_helper_delegate_preserves_bound_keyword_and_original_fallback(
+    monkeypatch, tmp_path, override, imported, boundary_enabled,
+):
     """A single helper call retains the native target, override and user kwargs."""
     wrapper_source = '''
 def kernel(module, value, *, enabled=None, **kwargs):
@@ -169,17 +174,27 @@ def kernel(module, value, *, enabled=None, **kwargs):
         module_spec.loader.exec_module(module)
         return module
 
+    calls = []
     if imported:
         base = _load("helper_base", helper_source + source)
         monkeypatch.setitem(sys.modules, "demo", base)
         patches.imports.append(ImportPatch("demo", ("Attention", "kernel")))
         _materialize_imported_forward_hosts("", patches)
-        module = _load("helper_delegate", apply_patch_set("", patches))
+        rendered = apply_patch_set("", patches)
         calls = base.calls
     else:
-        module = _load("helper_delegate", helper_source + apply_patch_set(source, patches))
+        rendered = helper_source + apply_patch_set(source, patches)
+    if boundary_enabled:
+        _, entries, classes = _boundary("attn", "Attention")
+        rendered = lower_forward_boundaries(rendered, {
+            "param_plan": entries, "injections": [], "mesh_dim_names": ("cp", "tp"),
+        }, boundary_classes=classes)
+    module = _load("helper_delegate", rendered)
+    if not imported:
         calls = module.calls
     attention = module.Attention()
+    attention._hp_boundary = SimpleNamespace(redistribute_inputs=lambda arguments: arguments,
+                                            redistribute_outputs=lambda output: output)
     attention.cp_enable = True
     assert attention.forward(3, token=7) == (6 if override else 3)
     assert calls == [(attention, override, {"token": 7})]
@@ -893,7 +908,7 @@ def test_cp_dispatch_rewrites_same_class_without_constructor_swap():
         )
 
 
-def test_same_class_cp_and_boundary_merge_into_one_forward_impl():
+def test_same_class_cp_and_boundary_keep_pure_forward_impl():
     """A source-owned CP host keeps one method after boundary lowering."""
     patches = InlinePatchSet(
         forward_extracts=[
@@ -901,7 +916,6 @@ def test_same_class_cp_and_boundary_merge_into_one_forward_impl():
                 class_name="Alpha",
                 method_name="forward",
                 body=cp_dispatch_shell_body("kimi_cp_forward"),
-                merge_original_body=True,
             )
         ]
     )
@@ -930,9 +944,97 @@ def test_same_class_cp_and_boundary_merge_into_one_forward_impl():
 
     assert methods.count("_forward_impl") == 1
     assert methods.count("forward") == 1
-    assert "return kimi_cp_forward(self, x)" in rendered
+    local = next(node for node in host.body if isinstance(node, ast.FunctionDef) and node.name == "_forward_impl")
+    assert ast.unparse(local.body[0]) == "return x * 2"
+    assert "outputs = kimi_cp_forward(self, *args, **kwargs)" in rendered
     assert "return self._forward_impl(x)" not in rendered
     assert "return x * 2" in rendered
+
+
+@pytest.mark.parametrize("cp_enabled", [False, True])
+@pytest.mark.parametrize("boundary_enabled", [False, True])
+@pytest.mark.parametrize("imported", [False, True])
+def test_sdpa_helper_preserves_local_forward_and_boundary_order(
+    monkeypatch, tmp_path, cp_enabled, boundary_enabled, imported,
+):
+    """A real callback helper reaches local attention once, using redistributed inputs."""
+    source = '''from torch import nn
+import torch.nn.functional as F
+
+class Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def forward(self, hidden_states, position_embeddings=None, attention_mask=None, *extra, required=0, **kwargs):
+        self.events.append(("local", position_embeddings, attention_mask, extra, required, kwargs))
+        if kwargs.get("fail"):
+            raise ValueError("local failure")
+        return F.scaled_dot_product_attention(hidden_states, hidden_states, hidden_states)
+'''
+
+    def load(name, text):
+        path = tmp_path / f"{name}.py"
+        path.write_text(text, encoding="utf-8")
+        spec = util.spec_from_file_location(name, path)
+        module = util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    wrapper = "hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper"
+    meta = SimpleNamespace(injections=[{"match": "attn", "inner_wrapper": wrapper, "inner_target": "self"}],
+                           boundary_classes={"attn": "Attention"}, external_state_classes=[], module_overrides=[])
+    if imported:
+        base = load("sdpa_base", source)
+        monkeypatch.setitem(sys.modules, "sdpa_base", base)
+        patches = build_strategy_patches(collect_source_observations(meta), boundary_classes=meta.boundary_classes)
+        patches.imports.append(ImportPatch("sdpa_base", ("Attention",)))
+        _materialize_imported_forward_hosts("", patches)
+        rendered = apply_patch_set("", patches)
+    else:
+        rendered, _ = render_inline_modeling_with_plan(source, meta)
+    if boundary_enabled:
+        _, entries, classes = _boundary("attn", "Attention")
+        entries["attn"]["in_src"] = {"hidden_states": {"cp": "S(1)"}}
+        entries["attn"]["in_dst"] = {"hidden_states": {"cp": "R"}}
+        rendered = lower_forward_boundaries(rendered, {"param_plan": entries, "injections": meta.injections,
+            "mesh_dim_names": ("cp",)}, boundary_classes=classes)
+    model = load("sdpa_generated", rendered).Attention()
+    model.cp_enable = cp_enabled
+    model._hp_sdpa_hf_cp_mesh = object()  # Resource binding belongs to the test, not generation.
+    native_sdpa = cp_wrappers.F.scaled_dot_product_attention
+
+    def communicate(original, mesh, query, key, value, kwargs):
+        assert mesh is model._hp_sdpa_hf_cp_mesh
+        model.events.append("cp")
+        return original(query, key, value, **kwargs)
+
+    def enter(arguments):
+        model.events.append("in")
+        args, kwargs = arguments
+        return (args[0] * 2, *args[1:]), {**kwargs, "required": kwargs["required"] + 1}
+
+    def leave(output):
+        model.events.append("out")
+        return output + 3
+
+    model._hp_boundary = SimpleNamespace(redistribute_inputs=enter, redistribute_outputs=leave)
+    monkeypatch.setattr(cp_wrappers, "_cp_sdpa_call", communicate)
+    inputs = torch.randn(1, 1, 2, 4)
+    output = model(inputs, "positions", None, "extra", required=7, token=9)
+    local_inputs = inputs * 2 if boundary_enabled else inputs
+    expected = native_sdpa(local_inputs, local_inputs, local_inputs) + (3 if boundary_enabled else 0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    local_event = ("local", "positions", None, ("extra",), 8 if boundary_enabled else 7, {"token": 9})
+    assert model.events == (["in"] if boundary_enabled else []) + [local_event] + (
+        ["cp"] if cp_enabled else []) + (["out"] if boundary_enabled else [])
+    assert cp_wrappers.F.scaled_dot_product_attention is native_sdpa
+    assert "cp_enable" not in model._forward_impl.__code__.co_names
+    model.events.clear()
+    with pytest.raises(ValueError, match="local failure"):
+        model(inputs, required=7, fail=True)
+    assert cp_wrappers.F.scaled_dot_product_attention is native_sdpa
+    assert "out" not in model.events
 
 
 def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
@@ -958,7 +1060,6 @@ def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
                     class_name="Alpha",
                     method_name="forward",
                     body=cp_dispatch_shell_body("kimi_cp_forward"),
-                    merge_original_body=True,
                 )
             ]
         ),
@@ -1079,9 +1180,9 @@ def test_imported_cp_host_is_rendered_as_same_name_class():
     assert "class MLAAttention(demo.components.MLAAttention):" in rendered
     assert "class HPCodegen" not in rendered
     assert "if self.cp_enable:" in rendered
-    assert "return original_forward(*args, **kwargs)" in rendered
-    assert "original_forward = super().forward" in rendered
-    assert "def _forward_impl" not in rendered
+    assert "return super().forward(*args, **kwargs)" in rendered
+    assert rendered.count("def _forward_impl(") == 1
+    assert "return self._forward_impl(*args, **kwargs)" in rendered
 
 
 def test_observed_replacement_supplies_missing_cp_host_import():
@@ -1198,9 +1299,9 @@ def test_imported_cp_host_and_boundary_share_one_forward_impl():
 
     assert methods.count("_forward_impl") == 1
     assert methods.count("forward") == 1
-    assert "return mla_cp_forward(self, *args, **kwargs)" in rendered
-    assert "return original_forward(*args, **kwargs)" in rendered
-    assert "original_forward = super().forward" in rendered
+    assert "outputs = mla_cp_forward(self, *args, **kwargs)" in rendered
+    assert "return super().forward(*args, **kwargs)" in rendered
+    assert "outputs = self._forward_impl(*args, **kwargs)" in rendered
     assert "return self._forward_impl(*args, **kwargs)" not in rendered
 
 

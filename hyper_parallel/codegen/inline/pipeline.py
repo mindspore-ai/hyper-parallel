@@ -30,6 +30,7 @@ from hyper_parallel.codegen.inline.ir import (
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.definition_edits import drop_shadowed_definitions
 from hyper_parallel.codegen.inline.forward_edits import _parallel_state_prefix
+from hyper_parallel.codegen.emit.parallel import _cp_dispatch_call
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.framework_spec import (
     replacement_spec_for as replacement_spec,
@@ -227,23 +228,33 @@ def _materialize_imported_forward_hosts(
                        + textwrap.indent(definition, "    ") + "\n")
             patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
             continue
-        body = patch.body.replace(
-            "self._forward_impl(",
-            "original_forward(",
-        ).replace("__hp_forward_args__", "*args, **kwargs").replace(
-            "__hp_forward_positional__", "args",
-        ).replace("__hp_forward_keywords__", "kwargs")
-        if "original_forward(" in body:
-            body = "original_forward = super().forward\n" + body
+        body, local = _imported_forward_source(patch.body)
         state = _parallel_state_prefix(body)
         snippet = (
             f"class {patch.class_name}({base}):\n"
             f"{state}"
+            f"{local}"
             "    def forward(self, *args, **kwargs):\n"
             f"{textwrap.indent(body.strip(), '        ')}\n"
         )
         patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
     patch_set.forward_extracts = remaining
+
+
+def _imported_forward_source(body: str) -> tuple[str, str]:
+    """Keep a helper's original-method callback separate from its imported host dispatch."""
+    dispatch = _cp_dispatch_call(body)
+    body = body.replace("__hp_forward_args__", "*args, **kwargs").replace(
+        "__hp_forward_positional__", "args",
+    ).replace("__hp_forward_keywords__", "kwargs")
+    if dispatch is not None:
+        local = ("    def _forward_impl(self, *args, **kwargs):\n"
+                 "        return super().forward(*args, **kwargs)\n\n")
+        return body, local
+    body = body.replace("self._forward_impl(", "original_forward(")
+    if "original_forward(" in body:
+        body = "original_forward = super().forward\n" + body
+    return body, ""
 
 
 def render_inline_strategies_for_source_unit(

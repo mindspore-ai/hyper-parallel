@@ -79,7 +79,6 @@ class ForwardExtractPatch:
     class_name: str
     method_name: str
     body: str
-    merge_original_body: bool = False
     definition: str | None = None
 
 
