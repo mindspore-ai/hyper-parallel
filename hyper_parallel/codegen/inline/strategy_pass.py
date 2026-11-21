@@ -22,7 +22,6 @@ from typing import Collection, Mapping
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch,
     ImportPatch,
-    ModuleSnippetPatch,
     InlinePatchSet,
     SourceObservation,
     StrategySpec,
@@ -188,15 +187,12 @@ def _unmaterialized_strategy_error(
 def _rule_strategy(
     rule: SourceObservation, target: str, model_type: str | None, inner_wrapper: bool,
 ) -> StrategySpec | None:
-    """Prefer the native constructor result when the build has observed it."""
+    """Use an already-installed factory-tail method or the declared wrapper source."""
     if inner_wrapper and rule.observed_wrapper is not None:
         return StrategySpec(
             kind=CP_ATTENTION_KIND, subclass_shell=rule.observed_wrapper["body"],
             definition=rule.observed_wrapper.get("definition"),
-            imports=(tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"])
-                     + tuple(ImportPatch("", (), raw=line)
-                             for line in rule.observed_wrapper.get("source_imports", ()))),
-            snippets=tuple(ModuleSnippetPatch(text) for text in (rule.observed_wrapper.get("helpers"),) if text),
+            imports=tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"]),
         )
     return strategy_spec(target, model_type, inner_wrapper=inner_wrapper,
                          construction_kwargs=rule.construction_kwargs if inner_wrapper else ())

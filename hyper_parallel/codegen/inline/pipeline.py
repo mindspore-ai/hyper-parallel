@@ -285,6 +285,7 @@ def render_inline_strategies_for_source_unit(
     ]
     if not patches.forward_extracts:
         return source_text
+    patches.module_snippets.clear()
     patches.constructor_replaces.clear()
     patches.class_removals.clear()
     return apply_patch_set(source_text, patches)

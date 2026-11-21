@@ -46,10 +46,9 @@ def observe_emission_plan(plan: Any, model: Any) -> EmissionPlanObservation:
     """Project native plan facts without executing wrapper factories or distributed operations."""
     if plan is None:
         return EmissionPlanObservation()
-    injections = _observe_injections(plan)
     return EmissionPlanObservation(
         param_plan=_observe_boundary_plan(plan),
-        injections=injections,
+        injections=_observe_injections(plan),
         boundary_classes=_observe_boundary_classes(plan, model),
         boundary_types=_observe_boundary_types(plan, model),
         nested_components=_observe_nested_components(plan, model),

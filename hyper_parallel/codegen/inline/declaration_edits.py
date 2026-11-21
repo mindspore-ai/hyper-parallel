@@ -40,7 +40,7 @@ def declaration_edits(
             "\n" + "\n".join(lines) + "\n",
             default_offset=docstring_end or 0,
         ))
-    parts = list(dict.fromkeys(snippet.text.strip("\n") for snippet in snippets if snippet.text.strip()))
+    parts = [snippet.text.strip("\n") for snippet in snippets if snippet.text.strip()]
     if parts:
         edits.append(insert_after_imports(
             source_text,
