@@ -16,7 +16,7 @@
 """Unit tests for the Muon optimizer."""
 
 from typing import Tuple, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -29,7 +29,9 @@ from hyper_parallel.core.optimizer.muon import (
     _NS_LEGACY_COEFFS,
     zeropower_via_newtonschulz5,
 )
+from hyper_parallel.core.optimizer.muon_shard import build_pad_ns_inputs, fused_allgather_dtensor_params
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
+from hyper_parallel.core.optimizer.sharding_category import ParamLayoutSpec
 
 
 def _plain_ns_group(**overrides):
@@ -230,6 +232,56 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+@pytest.mark.parametrize("local_error", [False, True])
+def test_muon_async_gather_waits_after_local_work(local_error: bool) -> None:
+    """Feature: Run independent Muon work during an asynchronous gather.
+
+    Description: Mock a gather whose output only becomes readable when its work is waited on.
+    Expectation: Local work runs before the wait, including when local work raises.
+    """
+    calls = MagicMock()
+    if local_error:
+        calls.local_work.side_effect = RuntimeError("local work failed")
+    group = MagicMock()
+    layout = ParamLayoutSpec(tensor_ndim=2, shard_axes=((0, 0),), replicate_mesh_dims=())
+    local = torch.arange(1, 3, dtype=torch.bfloat16).view(1, 2)
+
+    def gather(output, packed, *, group, async_op):
+        """Expose gathered data only when the caller waits for the handle."""
+        calls.launch(group, async_op)
+        calls.wait.side_effect = lambda: output.copy_(packed.repeat(2))
+        return calls
+
+    with patch("hyper_parallel.core.optimizer.muon_shard.dist") as dist:
+        dist.get_world_size.return_value = 2
+        dist.all_gather_into_tensor.side_effect = gather
+        if local_error:
+            with pytest.raises(RuntimeError, match="local work failed"):
+                fused_allgather_dtensor_params([local], [group], layout, while_gathering=calls.local_work)
+        else:
+            result, = fused_allgather_dtensor_params([local], [group], layout, while_gathering=calls.local_work)
+            torch.testing.assert_close(result, local.repeat(2, 1), rtol=0, atol=0)
+
+    expected = [call.launch(group, True), call.local_work(), call.wait()]
+    assert calls.mock_calls == expected, f"expected {expected}, got {calls.mock_calls}"
+
+
+def test_muon_pad_ns_inputs_uses_fallback_only_without_real_inputs() -> None:
+    """Feature: Match the communication dtype when a rank has no valid gradient.
+
+    Description: Construct padding for float32 parameters with and without a real NS input.
+    Expectation: An explicit fallback controls empty input batches; real inputs take precedence.
+    """
+    first = torch.nn.Parameter(torch.ones(2, 2))
+    second = torch.nn.Parameter(torch.ones(2, 2))
+    inputs = build_pad_ns_inputs([first], {}, fallback_dtype=torch.bfloat16)
+    torch.testing.assert_close(inputs[0], torch.zeros((2, 2), dtype=torch.bfloat16))
+
+    reference = torch.ones((2, 2), dtype=torch.float64)
+    inputs = build_pad_ns_inputs([first, second], {first: reference}, fallback_dtype=torch.bfloat16)
+    torch.testing.assert_close(inputs[1], torch.zeros_like(reference))
 
 
 @pytest.mark.parametrize("mode", ["legacy", "vanilla"])
