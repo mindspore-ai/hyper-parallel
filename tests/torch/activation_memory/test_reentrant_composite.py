@@ -28,15 +28,10 @@ _WORKER = str(Path(__file__).with_name("reentrant_composite_cases.py").resolve()
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_fsdp_checkpoint_exclude() -> None:
-    """Compare wrapper and explicit API gradients in disjoint two-rank groups."""
-    cases = [
-        TorchCase(_WORKER, "test_fsdp_checkpoint_wrapper_exclude", num_proc=2),
-        TorchCase(_WORKER, "test_fsdp_checkpoint_api_exclude", num_proc=2),
-    ]
+    """Check the checkpoint wrapper and explicit API against eager on two ranks."""
     budget = int(os.environ.get("HYPER_PARALLEL_TEST_CARD_COUNT", "8"))
     if budget < 2:
         pytest.skip("FSDP checkpoint exclusion requires two NPU cards")
     if budget > 8:
         raise ValueError("HYPER_PARALLEL_TEST_CARD_COUNT must be at most 8")
-    for offset in range(0, len(cases), budget // 2):
-        parallel_run(cases[offset:offset + budget // 2], global_num_proc=budget)
+    parallel_run([TorchCase(_WORKER, "test_fsdp_checkpoint_exclude_matrix", num_proc=2)], global_num_proc=2)

@@ -88,6 +88,16 @@ def _close(actual: torch.Tensor, expected: torch.Tensor, label: str) -> None:
                                msg=lambda detail: f"rank {dist.get_rank()} {label}: {detail}")
 
 
+def test_fsdp_checkpoint_exclude_matrix() -> None:
+    """Run both checkpoint entry points with fresh models on the same two ranks."""
+    rank, device_id = init_dist()
+    try:
+        for mode in ("wrapper", "api"):
+            _run_steps(mode, rank, device_id)
+    finally:
+        dist.destroy_process_group()
+
+
 def _run(mode: str) -> None:
     """Compare two sharded steps to a replicated eager reference on both ranks."""
     rank, device_id = init_dist()

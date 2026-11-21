@@ -35,57 +35,6 @@ def test_clip_grad_norm_training_5step():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_main_grad():
-    """
-    Feature: main_grad support for clip_grad_norm_
-    Description:
-        Verify clip_grad_norm_ reads param.main_grad when param.grad is None.
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_main_grad", 12364, 8)
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_frozen_params():
-    """
-    Feature: frozen param handling for clip_grad_norm_
-    Description:
-        Verify clip_grad_norm_ correctly skips frozen params.
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_frozen_params", 12365, 8)
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_replicate_params():
-    """
-    Feature: clip_grad_norm_ with mixed FSDP-sharded + replicate_params
-    Description:
-        Replicate-grad norms must not be all-reduced over the shard group.
-        Otherwise replicate norm² is multiplied by shard_world_size,
-        inflating the reported global norm.
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_replicate_params", 12367, 8)
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_multi_group():
-    """
-    Feature: multi-grad-group parameter ordering stability
-    Description:
-        8-layer model wrapped per-layer with fully_shard creates multiple
-        grad_groups. Verify norm stacking uses original parameter order
-        (not grad_group iteration order) to avoid float32 non-associative
-        ULP diffs on non-rank-0 ranks.
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_multi_group", 12366, 8)
-    ])
+def test_clip_grad_norm_edge_cases() -> None:
+    """Share one eight-rank job across the HSDP and replicated-parameter clip checks."""
+    parallel_run([TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_edge_cases", num_proc=8)])

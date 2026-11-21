@@ -25,5 +25,5 @@ _CASES = str(Path(__file__).with_name("reentrant_checkpoint_cases.py"))
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="unessential")
 def test_reentrant_timing_observation() -> None:
-    """Report warm host submission and synchronization-inclusive timings."""
+    """Guard warmed host submission and synchronized step performance."""
     parallel_run([TorchCase(_CASES, "test_timing_observation", num_proc=1)])

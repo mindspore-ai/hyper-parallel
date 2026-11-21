@@ -379,3 +379,10 @@ def test_rowwise_unsupported_module_raises_npu():
 
     with pytest.raises(NotImplementedError):
         style.apply(module, mesh)
+
+
+def test_colwise_precision_and_unsupported_styles_npu() -> None:
+    """Check Colwise precision and both unsupported NPU styles on the same mesh."""
+    test_colwise_linear_fwd_bwd_precision_npu()
+    test_colwise_unsupported_module_raises_npu()
+    test_rowwise_unsupported_module_raises_npu()

@@ -38,17 +38,20 @@ import os
 
 import shutil
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, Union
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.distributed_checkpoint import load, save
 from hyper_parallel.core.distributed_checkpoint.broadcast import _MAX_BROADCASTS_IN_FLIGHT
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.distributed_checkpoint.standard_planner import StandardSavePlanner
+from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
@@ -479,3 +482,21 @@ def test_dcp_load_pp4_tied_parameter_skips_the_middle_stages() -> None:
         specs=_tied_specs(_PP4, (0, 3)),
         seed=61,
     )
+
+
+@pytest.mark.parametrize("check", [
+    pytest.param(test_dcp_load_pp_stages_hold_different_parameters, id="pp2-stage-local"),
+    pytest.param(test_dcp_load_pp_stage_without_replicated_shards, id="pp2-no-replicas"),
+    pytest.param(test_dcp_load_pp_stages_interleave_in_the_shard_order, id="pp2-interleaved"),
+    pytest.param(test_dcp_load_pp_tied_parameter_spans_both_stages, id="pp2-world-group"),
+    pytest.param(test_dcp_load_pp4_stages_hold_different_parameters, id="pp4-stage-local"),
+    pytest.param(test_dcp_load_pp4_tied_parameter_skips_the_middle_stages, id="pp4-distant-tie"),
+])
+def test_dcp_load_pipeline_stage_matrix(check: Callable[[], None], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Share rank startup while each scenario starts with fresh stage groups and plans."""
+    # The planner keys on state-dict names, which can repeat across the PP2 and PP4 cases.
+    monkeypatch.setattr(StandardSavePlanner, "cached_save_result", {})
+    # Keep the rendezvous group, but rebuild the per-stage groups for every scenario.
+    clear_device_mesh_cache()
+    check()
+    dist.barrier()
