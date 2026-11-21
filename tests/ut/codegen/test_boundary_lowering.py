@@ -1389,6 +1389,18 @@ def test_tp_collective_falls_back_to_generic_on_variadic_signature():
     assert "self._hp_boundary.redistribute_outputs" in text
 
 
+def test_generic_boundary_keeps_adjacent_composed_class_separate():
+    """A consumed trailing newline cannot join a return to the following class."""
+    source = ("class Alpha:\n    def forward(self, x, **kwargs):\n        return x\n"
+              "class Beta:\n    def forward(self, x):\n        return x + 1\n")
+    plan, classes = _single_plan(_tp_collective_entry())
+    plan["mesh_dim_names"] = ("tp",)
+    text = lower_forward_boundaries(source, plan, boundary_classes=classes)
+    tree = ast.parse(text)
+    assert [node.name for node in tree.body if isinstance(node, ast.ClassDef)] == ["Alpha", "Beta"]
+    assert "return outputs\nclass Beta" in text
+
+
 def test_tp_collective_allows_kwargs_and_tuple_output():
     """HF-style ``**kwargs`` and tuple output can still expose bare TP ops.
 
