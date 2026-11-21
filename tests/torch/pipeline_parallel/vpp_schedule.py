@@ -326,6 +326,26 @@ def test_vpp_deep_warmup():
                        pp_model[1].mlp_layers[str(stage_index+4)].weight.cpu().detach().numpy())
 
 
+def test_vpp_npu_warmup_shapes() -> None:
+    """Check PP-domain RNG, every microbatch output and both local weight gradients."""
+    for micro in (8, 12):
+        standalone_model = SimpleMLP(8, 16, 16)
+        standalone_loss = run_standalone(micro, standalone_model)
+        pp_loss, pp_model = run_parallel(micro)
+        stage_index = get_stage_index(4)
+        if stage_index == 3:
+            assert len(pp_loss) == micro, f"Expected {micro} outputs, got {len(pp_loss)}"
+            torch.testing.assert_close(
+                torch.cat(pp_loss, dim=0).detach().cpu(), standalone_loss.detach().cpu(), rtol=1e-6, atol=1e-8,
+            )
+        for chunk, layer_index in zip(pp_model, (stage_index, stage_index + 4), strict=True):
+            reference = standalone_model.mlp_layers[str(layer_index)].weight
+            weight = chunk.mlp_layers[str(layer_index)].weight
+            torch.testing.assert_close(weight.detach().cpu(), reference.detach().cpu(), rtol=1e-6, atol=1e-8)
+            assert weight.grad is not None and reference.grad is not None, f"Missing gradient for layer {layer_index}"
+            torch.testing.assert_close(weight.grad.detach().cpu(), reference.grad.detach().cpu())
+
+
 def test_vpp_dxdw_split():
     """Torch split backward should match full-model input and parameter gradients."""
     micro = 8

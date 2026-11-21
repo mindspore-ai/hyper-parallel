@@ -24,20 +24,16 @@ _WORKER = str(Path(__file__).resolve().parent / "reentrant_checkpoint_worker.py"
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="unessential")
-def test_reentrant_checkpoint_split_pp2():
-    """Two ranks, two virtual chunks and overlapped split backward."""
-    parallel_run([TorchCase(_WORKER, "test_reentrant_pp2", num_proc=2)])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
-          essential_mark="unessential")
-def test_reentrant_checkpoint_split_pp4():
-    """Four ranks, two virtual chunks and overlapped split backward."""
-    parallel_run([TorchCase(_WORKER, "test_reentrant_pp4", num_proc=4)])
+def test_reentrant_checkpoint_split_small_meshes() -> None:
+    """Exercise PP2 and PP4 on disjoint devices for an independent Level1 run."""
+    parallel_run([
+        TorchCase(_WORKER, "test_reentrant_pp2", num_proc=2),
+        TorchCase(_WORKER, "test_reentrant_pp4", num_proc=4),
+    ], global_num_proc=6)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="unessential")
 def test_reentrant_checkpoint_split_pp8():
-    """Eight ranks, two virtual chunks and overlapped split backward."""
+    """Exercise eight-rank split backward beyond the PP2/PP4 Level0 cases."""
     parallel_run([TorchCase(_WORKER, "test_reentrant_pp8", num_proc=8)])
