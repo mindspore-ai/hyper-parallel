@@ -28,6 +28,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequ
 # Optimizer runtime is Torch-only; the legacy checker still flags core imports.
 import torch
 
+from hyper_parallel.core.utils import simulation
+
 logger = logging.getLogger(__name__)
 
 # Logical optimizer-state keys every swap family in this codebase understands.
@@ -627,7 +629,12 @@ class PipelineSwapRuntime:
         afterwards, because the host view now owns the only valid values.
         """
         total_numel = sum(slot.numel for slot in dtype_slots)
-        host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=True)
+        try:
+            host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=True)
+        except RuntimeError:
+            # No live device runtime (logical simulation on a zero-device
+            # host); pinning only affects DMA speed, not the byte account.
+            host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu")
         host_offset = 0
         for slot in dtype_slots:
             flat_view = host_buffer.narrow(0, host_offset, slot.numel)
@@ -778,6 +785,11 @@ class PipelineSwapRuntime:
     @staticmethod
     def device_handle() -> Any:
         """Return the Torch device module (``torch.npu``) that owns streams and events."""
+        if simulation.is_device_runtime_simulated():
+            # Logical simulation: streams and events complete in program
+            # order, keeping the swap pipeline's host-visible storage
+            # lifecycle without touching an accelerator runtime.
+            return simulation.simulated_device_handle()
         try:
             return getattr(torch, _DEVICE_TYPE)
         except AttributeError as error:
@@ -868,7 +880,8 @@ class PipelineSwapRuntime:
         # FSDP may leave gradient reductions/reshards queued on auxiliary
         # streams.  A current-stream event cannot cover those streams, so the
         # device-wide synchronization is required before optimizer reads state.
-        getattr(torch, first_slot.device.type).synchronize(first_slot.device)
+        if not simulation.is_device_runtime_simulated():
+            getattr(torch, first_slot.device.type).synchronize(first_slot.device)
         self._packed_tail_event = None
         self._packed_batch_plans = [self._build_packed_batch_plan(batch) for batch in batches]
         dtype_layouts, total_bytes, device = self._packed_layout(self._packed_batch_plans)

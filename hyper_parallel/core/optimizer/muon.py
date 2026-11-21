@@ -33,6 +33,7 @@ from hyper_parallel.core.optimizer.sharding_category import (
     build_owner_by_size,
 )
 from hyper_parallel.core.optimizer.muon_shard import (
+    _comm_device_for_group,
     _debug_param_shard_metadata,
     build_pad_ns_inputs,
     build_param_shard_metadata_for_group,
@@ -41,6 +42,7 @@ from hyper_parallel.core.optimizer.muon_shard import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 # Legacy: single-coefficient quintic NS (Keller Jordan / Moonlight).
 # Same (a, b, c) applied every step; typically 5 steps.
@@ -807,7 +809,7 @@ class Muon(BaseDistributedOptimizer):
             )
 
         for reshaped_input in reshaped_inputs:
-            if reshaped_input.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+            if reshaped_input.untyped_storage() is not working_input.untyped_storage():
                 raise ValueError("reshape_fn must return views that share storage with the working NS input tensor")
 
         return working_input, reshaped_inputs
@@ -832,7 +834,7 @@ class Muon(BaseDistributedOptimizer):
             """Write reshaped NS updates back into the views and the working input."""
             for reshaped_input, update in zip(reshaped_inputs, updates):
                 reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
-            if output.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+            if output.untyped_storage() is not working_input.untyped_storage():
                 output.copy_(working_input)
 
         return working_input, NSInputTransform(tensors=reshaped_inputs, restore=restore_view_updates)
@@ -1021,7 +1023,7 @@ class Muon(BaseDistributedOptimizer):
         for param in p_list:
             update = ns_inputs[param].view(state["origin_shapes"][param])
             working_input = state["working_inputs"][param]
-            if working_input.untyped_storage().data_ptr() != update.untyped_storage().data_ptr():
+            if working_input.untyped_storage() is not update.untyped_storage():
                 update.copy_(working_input)
             state["restored"][param] = update
         return state["restored"]
@@ -1096,9 +1098,7 @@ class Muon(BaseDistributedOptimizer):
 
         for p in p_list:
             reshaped_update = ns_inputs[p].view(state["origin_shapes"][p])
-
-            if (state["working_inputs"][p].untyped_storage().data_ptr()
-                    != reshaped_update.untyped_storage().data_ptr()):
+            if state["working_inputs"][p].untyped_storage() is not reshaped_update.untyped_storage():
                 reshaped_update.copy_(state["working_inputs"][p])
             state["restored"][p] = reshaped_update
 
@@ -1117,6 +1117,12 @@ class Muon(BaseDistributedOptimizer):
         weight_decay = group["weight_decay"]
         shard_sizes, local_coords, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
         device = to_local_if_dtensor(valid_params[0].data).device
+        # The relay broadcast runs on the shard groups' backend; with CPU
+        # offload the parameter locals are on host, so stage the pack buffers
+        # on the first real shard group's device instead.
+        first_pg = next((pg for pg in shard_pgs if pg is not None), None)
+        if first_pg is not None:
+            device = _comm_device_for_group(first_pg, device)
 
         coord_groups: Dict[Tuple[int, ...], List[torch.nn.Parameter]] = defaultdict(list)
         for p in valid_params:
@@ -1176,6 +1182,10 @@ class Muon(BaseDistributedOptimizer):
 
                 local_param = to_local_if_dtensor(p.data)
                 all_local_params.append(local_param)
+                if update_to_apply.device != local_param.device:
+                    # CPU offload: updates were broadcast on the accelerator
+                    # while the parameter local lives on host.
+                    update_to_apply = update_to_apply.to(local_param.device)
                 all_update_shards.append(update_to_apply.view(local_param.shape))
 
         if not all_local_params:
