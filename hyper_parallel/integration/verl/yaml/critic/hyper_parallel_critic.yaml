@@ -1,0 +1,6 @@
+defaults:
+  - critic
+  - _self_
+
+_target_: hyper_parallel.integration.verl.config.HyperParallelCriticConfig
+strategy: hyper_parallel

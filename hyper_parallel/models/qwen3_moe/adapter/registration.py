@@ -18,8 +18,29 @@ Providers remain lazy so registry discovery does not import model
 implementations, trainer/data modules, or backend dependencies.
 """
 
+import torch
+from torch import nn
+
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.materialization import register_rebuildable_buffer
 from hyper_parallel.models.registry import register_model_adapter
+
+
+def _register_rotary_materialization(model: nn.Module) -> None:
+    """Retain native RoPE buffers across to_empty without reinitializing weights.
+
+    Args:
+        model: Qwen3-MoE model before storage materialization.
+    """
+    for module in model.modules():
+        if type(module).__name__ != "Qwen3MoeRotaryEmbedding":
+            continue
+        with torch.device("cpu"):
+            reference = type(module)(module.config, device="cpu")
+        for name, value in reference.named_buffers(recurse=False):
+            register_rebuildable_buffer(
+                module, name, value=value.to(dtype=module.get_buffer(name).dtype), persistent=False,
+            )
 
 
 def _load_replacements():
@@ -69,6 +90,7 @@ QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     expert_parallel=_load_expert_parallel,
     loss=_load_loss,
     codegen=_load_codegen,
+    materialization=_register_rotary_materialization,
 )
 
 register_model_adapter(QWEN3_MOE_ADAPTER_SPEC)

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 __all__ = [
     "vocab_parallel_cross_entropy_local",
+    "entropy_from_logits",
     "distributed_log_softmax",
     "distributed_nll_loss_forward",
     "DistributedCrossEntropyFunction",
@@ -464,3 +465,67 @@ def vocab_parallel_cross_entropy_local(
         mesh,
         mesh_dim,
     )
+
+def entropy_from_logits(logits: Tensor, *, mesh: DeviceMesh, chunk_size: Optional[int] = None) -> Tensor:
+    """Return FP32 per-token entropy; optionally process ``chunk_size`` tokens at a time.
+
+    With ``chunk_size=None`` (the default), process all tokens together.
+    """
+    if mesh.ndim != 1:
+        raise ValueError("Vocabulary-parallel entropy requires a one-dimensional vocabulary mesh")
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError("chunk_size must be positive or None")
+    return _VocabParallelEntropy.apply(logits, mesh, chunk_size)
+
+
+class _VocabParallelEntropy(torch.autograd.Function):
+    """Compute shard-local entropy gradients with optional token chunking."""
+
+    @staticmethod
+    def forward(ctx: Any, logits: Tensor, mesh: "DeviceMesh", chunk_size: Optional[int]) -> Tensor:
+        """Sum vocabulary-local entropy contributions without gathering logits."""
+        flat = logits.reshape(-1, logits.shape[-1])
+        entropy = torch.empty(
+            flat.shape[0],
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        needs_backward = ctx.needs_input_grad[0]
+        chunk_size = chunk_size if chunk_size is not None else max(flat.shape[0], 1)
+        for start in range(0, flat.shape[0], chunk_size):
+            values = flat[start : start + chunk_size].float()
+            local_log_probs = distributed_log_softmax(
+                values,
+                dim=-1,
+                mesh=mesh,
+                mesh_dim=0,
+            )
+            local_probabilities = local_log_probs.exp()
+            local_entropy = -(local_probabilities * local_log_probs).sum(dim=-1)
+            torch.distributed.all_reduce(local_entropy, group=mesh.get_group())
+            entropy[start : start + len(values)] = local_entropy
+        if needs_backward:
+            ctx.save_for_backward(logits, entropy)
+            ctx.mesh = mesh
+            ctx.chunk_size = chunk_size
+        return entropy.reshape(logits.shape[:-1])
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[Tensor, None, None]:
+        """Recompute local probabilities and return the logits-shard gradient."""
+        logits, entropy = ctx.saved_tensors
+        flat = logits.reshape(-1, logits.shape[-1])
+        gradient = torch.empty_like(flat)
+        grad = grad_output.reshape(-1)
+        for start in range(0, flat.shape[0], ctx.chunk_size):
+            end = start + ctx.chunk_size
+            log_probs = distributed_log_softmax(
+                flat[start:end].float(),
+                dim=-1,
+                mesh=ctx.mesh,
+                mesh_dim=0,
+            )
+            local = -log_probs.exp() * (log_probs + entropy[start:end, None])
+            local.mul_(grad[start:end, None])
+            gradient[start:end].copy_(local)
+        return gradient.reshape(logits.shape), None, None

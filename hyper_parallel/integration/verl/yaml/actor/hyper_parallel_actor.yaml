@@ -1,0 +1,14 @@
+defaults:
+  - actor
+  - /engine@engine: hyper_parallel
+  - /checkpoint@checkpoint: hyper_parallel
+  - _self_
+
+_target_: hyper_parallel.integration.verl.config.HyperParallelActorConfig
+strategy: hyper_parallel
+calculate_sum_pi_squared: false
+use_prefix_grouper: false
+use_torch_compile: false
+
+optim:
+  _target_: verl.workers.config.OptimizerConfig

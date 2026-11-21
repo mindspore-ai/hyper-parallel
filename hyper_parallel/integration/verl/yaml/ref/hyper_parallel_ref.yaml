@@ -1,0 +1,9 @@
+defaults:
+  - ref
+  - /engine@engine: hyper_parallel
+  - /checkpoint@checkpoint: hyper_parallel
+  - _self_
+
+_target_: hyper_parallel.integration.verl.config.HyperParallelActorConfig
+engine:
+  forward_only: true
