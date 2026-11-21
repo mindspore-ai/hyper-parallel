@@ -72,10 +72,6 @@ class TokenChoiceTopKRouterModule(nn.Module):
         elif limited is not None:
             raise ValueError("num_limited_groups requires num_expert_groups")
 
-    def reset_parameters(self) -> None:
-        """Initialize the gate after meta materialization."""
-        self.gate.reset_parameters()
-
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

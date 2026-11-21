@@ -36,7 +36,7 @@ models/kimi_k26/
 │   │   └── cropped_model.py         # 模型构建入口 build_cropped_kimi_vlm（recipe 的 model._target_）
 │   └── registration.py              # ModelAdapterSpec：sharding_rules + loss
 └── recipes/
-    ├── train.yaml                   # 4 超节点 / 512 卡主线配方（实测最优形状）
+    ├── train.yaml                   # 4 超节点 / 512 卡 GroupedExperts 训练配方
     ├── run_kimi_k26_4sn.sh          # 多机启动脚本（默认 64 节点 × 8 卡）
     └── prepare_kimi_vlm_data.py     # 生成演示图文数据（离线自测用）
 ```
@@ -64,7 +64,8 @@ models/kimi_k26/
 - **模型构建**（`adapter/validation/cropped_model.py`）：校验 `config.model_type` 属于
   `KIMI_MODEL_TYPES`，截断文本塔层数 / 专家数后经 HyperParallel 模型构建入口并行化，并支持
   `freeze_patterns` 在 plan/FSDP 推导前冻结模块（视觉塔冻结可一并去掉其反向与激活）。
-- **EP 计算工厂**（`adapter/distributed/ep_compute.py`）：家族自组合的
+- **GroupedExperts**：主线配方保留原生 router 和共享专家，并替换文本塔的路由专家。
+- **旧版 benchmark EP 计算工厂**（`adapter/distributed/ep_compute.py`）：家族自组合的
   `deepseekv3_sigmoid_group_shared` 原型（与 `models/qwen3_moe/adapter/distributed/` 同放置），
   经框架公开的 `build_ep_compute` 组合，因此框架层不需要任何改动。`fix_router: true` 切到
   框架的**均衡路由**（`routing.make_balanced_router`，由骨架统一解析）：真实路由的 token
@@ -116,8 +117,8 @@ models/kimi_k26/
 
 `recipes/train.yaml` 是**主线规模：4 超节点 / 512 卡**的配方，形状
 `cp 1 × dp_shard 512（= edp 4 × ep 128）`、`GBS 512 = 512 × MBS 1`、序列长度 8192；
-它是本族在 4SN 上实测的最优配置：最小步时 **18.2617 s**，padded 吞吐 **228,873 tok/s**，
-峰值 allocated **39.19 GB**（无 activation swap——`edp=4` 已把专家参数摊薄到每卡 1/4）。
+此前在该拓扑下使用均衡路由测得最小步时 **18.2617 s**、padded 吞吐 **228,873 tok/s**，
+以及峰值 allocated **39.19 GB**（关闭 activation swap）。
 
 ```bash
 # 每个节点执行一次，NODE_RANK 0..NNODES-1

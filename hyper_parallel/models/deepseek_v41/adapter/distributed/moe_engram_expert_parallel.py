@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from functools import partial
 import inspect
 from types import MethodType
 from typing import Any, Callable
@@ -34,6 +36,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts, _swiglu_limit,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
+from hyper_parallel.models.replacement import module_replacement
 
 
 def _deepseek_v41_unclamped_gate(gate_up: torch.Tensor) -> torch.Tensor:
@@ -106,6 +109,38 @@ def _configure_router_statistics(gate: Any, mesh: Any, tp_mesh: Any, cp_mesh: An
     return sequence_groups
 
 
+@module_replacement
+def replace_deepseek_v41_grouped_experts(
+        *, module: torch.nn.Module, module_fqn: str, context: Mapping[str, Any],
+) -> torch.nn.Module:
+    """Adopt the packed V4.1 projections with native FP32 clamped SwiGLU.
+
+    Args:
+        module: Original routed experts with the packed Transformers layout.
+        module_fqn: Path of the routed experts in the model.
+        context: Builder context for selecting the local or EP member.
+
+    Returns:
+        GroupedExperts family member preserving the source parameters.
+
+    Note:
+        The source uses the Transformers 5.11+ packed expert contract. Only
+        the activation differs: clamp and SwiGLU use the model's FP32 helper.
+        Parameter packing, router decisions and shared experts are unchanged.
+    """
+    # Load the optional grouped-expert kernels only when this replacement is selected.
+    from hyper_parallel.components.modules import GroupedExperts  # pylint: disable=C0415
+    from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (  # pylint: disable=C0415
+        GroupedExpertsModule,
+    )
+
+    source = GroupedExpertsModule(
+        module=module, module_fqn=module_fqn, context=context,
+        activation=partial(deepseek_v41_swiglu, limit=module.limit),
+    )
+    return GroupedExperts(module=source, module_fqn=module_fqn, context=context)
+
+
 def _router(
         module: Any,
         hidden_states: torch.Tensor,
@@ -142,7 +177,15 @@ def _routed_and_shared_forward(
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
     def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route with statistics over the current token partitions."""
+        """Route with statistics over the current token partitions.
+
+        Args:
+            target: MoE block exposing the learned router.
+            states: Token activations on the current partition.
+
+        Returns:
+            Selected expert indices and differentiable routing weights.
+        """
         return _router(
             target, states, image_mask, router_token_mask, router_sequence_ids,
             router_num_sequences, sequence_partition_groups=sequence_partition_groups,
@@ -395,7 +438,15 @@ def deepseek_v41_megamoe_compute_fn(
             local_image_mask = local_image_mask.contiguous()
 
         def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            """Keep training metadata attached to the learned gate before balancing."""
+            """Keep training metadata attached to the learned gate before balancing.
+
+            Args:
+                target: MoE block exposing the learned router.
+                states: Token activations on the current partition.
+
+            Returns:
+                Selected expert indices and differentiable routing weights.
+            """
             return _router(
                 target, states, local_image_mask,
                 router_token_mask=_local_router_metadata(router_token_mask, states, tp_mesh),

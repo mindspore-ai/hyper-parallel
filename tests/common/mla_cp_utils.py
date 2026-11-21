@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -203,15 +204,18 @@ def make_deepseek_model(*, dtype: torch.dtype = torch.float32, npu_dimensions: b
     return DeepseekV3ForCausalLM(config).to(dtype=dtype)
 
 
-def replace_and_load_mla(model: nn.Module) -> tuple[nn.Module, list[Any]]:
+def replace_and_load_mla(
+    model: nn.Module, *, factory: Callable[..., nn.Module] = MultiLatentAttention,
+) -> tuple[nn.Module, list[Any]]:
     """Use the real replacement matcher and its declared checkpoint converters.
 
     Args:
         model: Source model whose attention modules will be replaced.
+        factory: MLA family preserving the source attention and checkpoint contract.
     """
     original = deepcopy(model.state_dict())
     rule = ModuleReplacementSpec(
-        match=("model.layers.*.self_attn",), factory=MultiLatentAttention, module_type=DeepseekV3Attention,
+        match=("model.layers.*.self_attn",), factory=factory, module_type=DeepseekV3Attention,
     )
     plan = compile_module_replacements(model, [rule])
     model, transforms = apply_module_replacements(model, plan, weights_mapping=[])

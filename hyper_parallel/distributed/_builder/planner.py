@@ -232,6 +232,7 @@ class ShardingPlanner:
         mesh: DeviceMesh,
         model: Any,
         param_ndims: Dict[str, int],
+        boundary_types: Optional[Dict[str, str]] = None,
     ) -> None:
         """Materialize template-derived boundary specs into a plan."""
         if not self._derive:
@@ -241,7 +242,7 @@ class ShardingPlanner:
             )
             return
         for boundary_fqn, group in boundary_groups.items():
-            boundary_type = self._infer_boundary_type(boundary_fqn, group)
+            boundary_type = (boundary_types or {}).get(boundary_fqn) or self._infer_boundary_type(boundary_fqn, group)
             if self._templates.get(boundary_type) is None:
                 logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue
@@ -254,6 +255,7 @@ class ShardingPlanner:
                 loss_parallel,
                 mesh_dim_names,
                 param_ndims=param_ndims,
+                ep_size=ep_extend or 1,
             )
             if spec is None:
                 continue
@@ -301,15 +303,56 @@ class ShardingPlanner:
         names = {name for name, _ in model.named_modules()}
         return tuple(root for root in spec.isolated_subtrees if root in names)
 
-    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=(), excluded_names=()):
-        """Classify model parameters and group them into candidate boundaries."""
-        param_roles = {name: role for name, role in self._classify_all_params(model, arch).items()
-                       if name not in excluded_names}
-        regular_roles = {
-            name: role for name, role in param_roles.items()
-            if not any(name.startswith(root + ".") for root in isolated_roots)
-        }
-        return param_roles, self._group_by_boundary(regular_roles)
+    @staticmethod
+    def _manages_expert_transport(spec, protocol) -> bool:
+        """Recognize complete matrices and stage-owned transport from existing declarations."""
+        if spec.is_boundary or any((spec.in_src, spec.in_dst, spec.out_src, spec.out_dst)):
+            return False
+        for axes in spec.params.values():
+            for axis, placement in axes.items():
+                if placement == Replicate():
+                    continue
+                if axis != EP or placement != Shard(0):
+                    return False
+                if protocol is None or protocol.binding_kind not in ("ep", "mesh"):
+                    return False
+        return True
+
+    def _routed_moe_boundaries(self, roles, owned) -> dict[str, str]:
+        """Select parent templates before expert ownership hides the MoE structure."""
+        managed = set()
+        for fqn, spec in owned.specs.items():
+            if self._manages_expert_transport(spec, owned.parallel.get(fqn)):
+                managed.update(f"{fqn}.{name}" if fqn else name for name in spec.params)
+        if not managed:
+            return {}
+        result = {}
+        for fqn, group in self._group_by_boundary(roles).items():
+            experts = {name for name, role in group if role == ParamRole.MOE_EXPERT}
+            if (fqn not in owned.specs and experts and experts <= managed
+                    and self._infer_boundary_type(fqn, group) == "moe_mlp"):
+                result[fqn] = "moe_mlp_routed"
+        return result
+
+    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=(), *, owned):
+        """Keep MoE structure visible while assigning each parameter to one layout owner."""
+        all_roles = self._classify_all_params(model, arch)
+        isolated_prefixes = tuple(root + "." for root in isolated_roots)
+        regular_roles = {name: role for name, role in all_roles.items() if not name.startswith(isolated_prefixes)}
+        boundary_types = self._routed_moe_boundaries(regular_roles, owned)
+        routed_prefixes = tuple(root + "." for root in boundary_types)
+        param_roles = {name: role for name, role in all_roles.items() if name not in owned.owned_names}
+        remaining = {name: role for name, role in param_roles.items()
+                     if not name.startswith(isolated_prefixes + routed_prefixes)}
+        groups = self._group_by_boundary(remaining)
+        for root in boundary_types:
+            groups[root] = [(name, role) for name, role in regular_roles.items()
+                            if name.startswith(root + ".") and name not in owned.owned_names]
+            # The parent template owns complete replicated math, including otherwise-special parameters.
+            for name, role in groups[root]:
+                if role == ParamRole.SPECIAL:
+                    param_roles[name] = ParamRole.REPLICATED
+        return param_roles, groups, boundary_types
 
     def plan(
         self,
@@ -430,8 +473,8 @@ class ShardingPlanner:
         )
         owned = collect_owned_layouts(model, layout_context, resolve_model_adapter(model))
         isolated_roots = self._resolve_isolated_roots(model, arch) if self._derive else ()
-        param_roles, boundary_groups = self._classify_boundary_groups(
-            model, arch, isolated_roots, excluded_names=owned.owned_names,
+        param_roles, boundary_groups, boundary_types = self._classify_boundary_groups(
+            model, arch, isolated_roots, owned=owned,
         )
 
         # Phase 3+4: semantic inference + template-fills I/O
@@ -457,6 +500,7 @@ class ShardingPlanner:
             mesh=mesh,
             model=model,
             param_ndims=param_metadata[0],
+            boundary_types=boundary_types,
         )
 
         for root in isolated_roots:

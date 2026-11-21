@@ -20,9 +20,8 @@ doc §5.3) but now declare/construct the generic high-performance
 model-local forward functions; the NPU kernels live in ``functional`` — no
 second family implementation exists here.
 
-The factories stay importable on CPU-only checkouts: the ``modules``
-package wraps NPU-only ``functional`` backends, so it is imported lazily
-inside each factory body.
+The legacy factories keep their lazy backend imports. Recipes can select the
+routed GroupedExperts family directly for packed experts.
 """
 
 __all__ = [

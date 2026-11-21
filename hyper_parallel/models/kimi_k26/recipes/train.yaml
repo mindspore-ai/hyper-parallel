@@ -1,8 +1,7 @@
 # Kimi-K2.6 多模态训练配方（主线规模：4 超节点 / 512 卡 Ascend NPU，hccl backend）。
 #
 # 拓扑：cp 1 × dp_shard 512（= edp 4 × ep 128），GBS 512 = 512 × MBS 1，序列长度 8192。
-# 这是本族在 4SN 上实测的最优形状：最小步时 18.2617 s，padded 吞吐 228,873 tok/s，
-# 峰值 allocated 39.19 GB（无 activation swap：edp=4 已把专家参数摊薄到每卡 1/4）。
+# 该拓扑沿用旧版均衡路由 benchmark 的配置。当前 GroupedExperts 路径使用模型原生路由。
 #
 # 依赖 Kimi-K2.6 多模态 checkpoint：用 transformers 原生 kimi_k25 实现 + 原生 processor
 # （image_grid_thw 协议），因此 model 与 dataset.model_assets 都保持 trust_remote_code:
@@ -88,22 +87,12 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.RMSNorm
         use_fused_ops: true
 
-  # 文本塔 MoE 走 EP（deepseekv3 archetype；排除 first_k_dense_replace=1 的稠密 layer0）
-  - match: "model.language_model.layers.[123456789]*.mlp.forward"
-    when: ep
+  # 文本塔保留原始 router 和共享专家，仅由专家族执行路由专家计算与 EP 运输。
+  # 当前配置 first_k_dense_replace=1，只匹配第 1 层开始的 MoE 专家。
+  - match: "model.language_model.layers.[123456789]*.mlp.experts"
     replace:
-      kind: method
-      implementation:
-        # 家族自带的 EP 工厂（adapter/distributed/ep_compute.py）：fix_router=true 使用均衡路由，
-        # 避免真实路由的 token 倾斜把最忙的 rank 打爆显存 / 拖慢整步。
-        # ⚠️ 该模式是 benchmark-only：忽略 gate 分数，loss/grad_norm/专家命中分布无意义，
-        # 正确性与收敛性验证必须置 false（此时回落到框架的 sigmoid-group 真实路由）。
-        _target_: hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute.kimi_k26_ep_compute_fn
-        fix_router: true
-        use_grouped_gemm: true
-        # 2SN 参考数值是在共享专家重叠下测的：关掉会让 routed 分支暴露整段交换
-        # （GBS 256 实测 +2.28 GB 峰值、步时 +22%）。
-        overlap_shared_expert: true
+      kind: module
+      implementation: hyper_parallel.components.modules.GroupedExperts
 
   # 视觉塔 27 层 × 6 个模块在 TP 下全部 replicate：用 glob 收敛，等价于逐层展开的 162 条。
   # 本模型 FQN 空间里 layers.<i> 下只有 attn.* / mlp.*，`*` 跨点号不会命中别的子模块。

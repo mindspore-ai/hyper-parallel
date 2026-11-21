@@ -38,10 +38,12 @@ _UNEVEN_A2A_BACKENDS = ("nccl", "hccl")
 
 
 def ep_exchange_counts(counts: torch.Tensor, group: Any) -> torch.Tensor:
-    """Exchange one integer count per peer, waiting before reading the result.
+    """Exchange integer count rows per peer, waiting before reading the result.
 
     Args:
         counts: Non-differentiable send counts in process-group rank order.
+            Shape [EP] exchanges one count per peer; [EP, fields] may include
+            per-peer protocol metadata alongside each count.
         group: Expert-parallel process group.
 
     Returns:
@@ -96,7 +98,15 @@ class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-me
         recv_counts: list[int],
         group: Any,
     ) -> torch.Tensor:  # pylint: disable=arguments-differ
-        """Run the ragged all_to_all and retain the counts for backward."""
+        """Run the ragged all_to_all and retain the counts for backward.
+
+        Args:
+            ctx: Autograd context retaining the exchange plan.
+            x: Peer-major payload, split along dimension zero.
+            send_counts: Rows sent to each peer.
+            recv_counts: Rows received from each peer.
+            group: Existing expert-parallel process group.
+        """
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
         ctx.group = group
@@ -109,7 +119,12 @@ class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-me
         ctx: Any,
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None]:  # pylint: disable=arguments-differ
-        """Swap send/recv counts and re-run the self-inverse ragged all_to_all."""
+        """Swap send/recv counts and re-run the self-inverse ragged all_to_all.
+
+        Args:
+            ctx: Saved forward exchange plan.
+            grad_output: Gradients in received peer-major order.
+        """
         grad = _EPAllToAllUneven.apply(
             grad_output.contiguous(), ctx.recv_counts, ctx.send_counts, ctx.group)
         return grad, None, None, None
@@ -159,7 +174,15 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         recv_counts: list[int],
         group: Any,
     ) -> torch.Tensor:  # pylint: disable=arguments-differ
-        """Exchange padded expert-token chunks and retain counts for backward."""
+        """Exchange padded expert-token chunks and retain counts for backward.
+
+        Args:
+            ctx: Autograd context retaining counts and padding size.
+            x: Peer-major payload, split along dimension zero.
+            send_counts: Valid rows sent to each peer.
+            recv_counts: Valid rows received from each peer.
+            group: Existing expert-parallel process group.
+        """
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
         ctx.group = group
@@ -175,7 +198,12 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         ctx: Any,
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None]:  # pylint: disable=arguments-differ
-        """Reverse the exchange: pad by recv_counts, a2a_single, unpad by send_counts."""
+        """Reverse the exchange: pad by recv_counts, a2a_single, unpad by send_counts.
+
+        Args:
+            ctx: Saved forward counts and padding size.
+            grad_output: Gradients in received peer-major order.
+        """
         # backward = reversed a2a: pad by recv_counts -> a2a_single -> unpad by send_counts
         recv = _EPAllToAllPadded._pad_and_exchange(
             grad_output.contiguous(), ctx.recv_counts, ctx.pad_to, ctx.group)
@@ -191,10 +219,18 @@ def ep_all_to_all(
 ) -> torch.Tensor:
     """Unified entry for EP token exchange (autograd-differentiable).
 
-    send_counts/recv_counts: list[int], length ep_size, row counts per dest/src rank.
     NCCL/HCCL use variable splits. Other backends pad each segment for the exchange.
     The eager entry returns a materialized tensor. Graph capture records the
     functional exchange and its consumer wait.
+
+    Args:
+        x: Payload split along dimension zero.
+        send_counts: Rows sent to each peer, in process-group rank order.
+        recv_counts: Rows received from each peer, in process-group rank order.
+        group: Existing expert-parallel process group.
+
+    Returns:
+        Received payload with sum(recv_counts) rows.
     """
     if _is_tracing_or_compiling():
         # Keep the autograd wrapper; its first consumer inserts the stream wait.

@@ -301,28 +301,61 @@ class LocalScaleExperts(nn.Module):
         return {"representation": "expert_major_scale_v1", "probability": "output"}
 
 
+@dataclass(frozen=True)
+class EPExpertOperands(ExpertOperands):
+    """Transported expert operands plus the per-call inverse mappings."""
+
+    transport: tuple[list[int], list[int], torch.Tensor]
+    source_inverse: torch.Tensor
+    top_k: int
+
+
+def _permute_routed_slots(hidden_states, expert_indices, routing_weights):
+    """Prepare fixture routes in expert-major order."""
+    top_k = expert_indices.shape[1]
+    ids, order = expert_indices.reshape(-1).sort(stable=True)
+    rows = torch.arange(order.numel(), device=order.device)
+    source_inverse = torch.empty_like(order).scatter_(0, order, rows)
+    hidden = hidden_states.index_select(0, order // top_k)
+    weights = routing_weights.reshape(-1).index_select(0, order)
+    return hidden, ids, weights, source_inverse
+
+
+def _sum_routed_slots(values, source_inverse, top_k):
+    """Restore fixture routes and sum top-k outputs per token."""
+    values = values.index_select(0, source_inverse)
+    return values.reshape(-1, top_k, values.shape[-1]).sum(dim=1)
+
+
 class EPScaleExperts(LocalScaleExperts):
     """Only dispatch/combine change the inherited expert computation path."""
 
     def dispatch(self, hidden_states: torch.Tensor, expert_indices: torch.Tensor,
-                 routing_weights: torch.Tensor) -> Any:
-        """Transport already-selected slots.
+                 routing_weights: torch.Tensor) -> EPExpertOperands:
+        """Prepare and transport already-selected routes.
 
         Args:
             hidden_states: Source token activations.
             expert_indices: Global expert IDs.
             routing_weights: Final probabilities with gradients.
         """
-        return self.ep_context.dispatch(hidden_states, expert_indices, routing_weights)
+        slots, ids, weights, source_inverse = _permute_routed_slots(hidden_states, expert_indices, routing_weights)
+        hidden, counts, weights, send, recv, recv_inverse = self.ep_context.dispatch(slots, ids, weights)
+        local_ids = torch.arange(counts.numel(), device=counts.device).repeat_interleave(
+            counts, output_size=hidden.shape[0],
+        )
+        return EPExpertOperands(hidden, local_ids, weights, (send, recv, recv_inverse),
+                                source_inverse, expert_indices.shape[1])
 
-    def combine(self, values: torch.Tensor, batch: Any) -> torch.Tensor:
+    def combine(self, values: torch.Tensor, batch: EPExpertOperands) -> torch.Tensor:
         """Return weighted expert slots to source tokens.
 
         Args:
             values: Expert-major slot outputs.
-            batch: Dispatch result with its per-call receipt.
+            batch: Dispatch result with its per-call slot mappings.
         """
-        return self.ep_context.combine(values, batch.receipt)
+        slots = self.ep_context.combine(values, *batch.transport)
+        return _sum_routed_slots(slots, batch.source_inverse, batch.top_k)
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
         """Declare balanced expert ownership and explicit stage signatures."""

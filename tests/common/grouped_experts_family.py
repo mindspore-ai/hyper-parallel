@@ -143,7 +143,9 @@ def family_config(**selectors: Any) -> TrainerConfig:
             "replace": {
                 "kind": "module",
                 "source_type": "tests.common.grouped_experts_family.PackedExperts",
-                "implementation": {"_target_": "hyper_parallel.components.modules.GroupedExperts", **selectors},
+                "implementation": {
+                    "_target_": "hyper_parallel.components.modules.grouped_experts.GroupedExperts", **selectors,
+                },
             },
         }],
     })

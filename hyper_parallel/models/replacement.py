@@ -30,8 +30,10 @@ from torch import nn
 
 from hyper_parallel.components.modules.family import resolve_module_family_target
 from hyper_parallel.components.modules.module_family import (
-    FamilyRequest, _module_aliases, build_family, get_family_build_info, get_module_family,
+    FamilyRequest, _module_aliases, _validate_initialization_contract,
+    build_family, get_family_build_info, get_module_family,
 )
+from hyper_parallel.models.build_context import collect_module_contexts
 
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
@@ -458,7 +460,14 @@ def _replacement_rule_id(spec: ModuleReplacementSpec, index: int) -> str:
 def describe_replacement_declarations(
     specs: Iterable[ModuleReplacementSpec],
 ) -> tuple[dict[str, Any], ...]:
-    """Project normalized replacement rules to JSON-safe declarations."""
+    """Project normalized replacement rules to JSON-safe declarations.
+
+    Args:
+        specs: Normalized module replacement rules in application order.
+
+    Returns:
+        Serializable rule declarations for replacement snapshots and code generation.
+    """
     return tuple(
         {
             "rule_id": _replacement_rule_id(spec, index),
@@ -726,9 +735,11 @@ def _prepare_replacement_target(
         module_fqn=target.module_fqns[0],
         context=context,
     )
+    requires_reset = _validate_initialization_contract(replacement)
     transforms = []
-    if getattr(replacement, "make_transforms", None) is not None:
-        transforms = replacement.make_transforms()
+    make_transforms = getattr(replacement, "make_transforms", None)
+    if callable(make_transforms):
+        transforms = make_transforms()
     if not isinstance(transforms, list) or any(
         not isinstance(transform, (WeightRenaming, WeightConverter))
         for transform in transforms
@@ -745,7 +756,7 @@ def _prepare_replacement_target(
         target.module_fqns[0],
         has_weight_transforms=bool(transforms),
     )
-    if transforms and callable(getattr(replacement, "reset_parameters", None)):
+    if requires_reset:
         replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
     if transforms and weights_mapping is None:
         raise ValueError(
@@ -756,8 +767,9 @@ def _prepare_replacement_target(
 
 def _prepare_replacement_batches(plan, context, weights_mapping):
     """Prepare all atomic candidates together or one legacy candidate at a time."""
-    candidates = ((target, *_prepare_replacement_target(target, context, weights_mapping))
-                  for target in plan.targets)
+    contexts = tuple(context["module_contexts"][target.module_fqns[0]] for target in plan.targets)
+    candidates = ((target, *_prepare_replacement_target(target, target_context, weights_mapping))
+                  for target, target_context in zip(plan.targets, contexts))
     if plan.atomic:
         yield list(candidates)
     else:
@@ -783,11 +795,15 @@ def apply_module_replacements(
         model: Model tree whose source boundaries are finalized.
         plan: Precompiled aliases, source constraints and installation policy.
         weights_mapping: Mutable mapping receiving successful checkpoint transforms.
-        context: Read-only logical job context.
+        context: Read-only logical job context. Factories receive module_configs and
+            num_layers propagated from model to child before sharding. A single downward
+            pass prepares per-module contexts when the caller has not supplied them.
         capture_checkpoint_metadata: Whether source shapes are retained for loading.
     """
 
     context = MappingProxyType(dict(context or {}))
+    if "module_contexts" not in context:
+        context = MappingProxyType({**context, "module_contexts": collect_module_contexts(model, context)})
     source_shapes = None
     extra_transforms: list[WeightRenaming | WeightConverter] = []
     for prepared in _prepare_replacement_batches(plan, context, weights_mapping):

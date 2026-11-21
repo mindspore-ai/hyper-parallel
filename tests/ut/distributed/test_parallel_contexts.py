@@ -25,6 +25,23 @@ from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
 from tests.common.mark_utils import arg_mark
 
 
+def _permute_routed_slots(hidden_states, expert_indices, routing_weights):
+    """Prepare selected routes in expert-major order for context-only tests."""
+    top_k = expert_indices.shape[1]
+    ids, order = expert_indices.reshape(-1).sort(stable=True)
+    rows = torch.arange(order.numel(), device=order.device)
+    source_inverse = torch.empty_like(order).scatter_(0, order, rows)
+    hidden = hidden_states.index_select(0, order // top_k)
+    weights = routing_weights.reshape(-1).index_select(0, order)
+    return hidden, ids, weights, source_inverse
+
+
+def _sum_routed_slots(values, source_inverse, top_k):
+    """Restore source-route order and sum top-k outputs for context-only tests."""
+    values = values.index_select(0, source_inverse)
+    return values.reshape(-1, top_k, values.shape[-1]).sum(dim=1)
+
+
 class TestParallelContexts(unittest.TestCase):
     """Exercise per-call ownership, gradients and zero-slot semantics on CPU."""
 
@@ -58,59 +75,74 @@ class TestParallelContexts(unittest.TestCase):
     )
     def test_ep_probabilities_have_gradients_and_zero_slots_are_executed(self):
         """Feature: Expert-slot probability semantics.
-        Description: Dispatch selected slots, compute weighted outputs and combine them through the receipt.
-        Expectation: Zero-probability slots execute, input/probability gradients match and receipts cannot be reused.
+        Description: Dispatch selected slots, compute weighted outputs and restore the source tokens.
+        Expectation: Zero-probability slots execute and token/probability gradients match the reference.
         """
         context = EPContext(self._mesh(), num_experts=2)
         tokens = torch.tensor([[1., 2.], [3., 4.]], requires_grad=True)
         ids = torch.tensor([[1, 0], [1, 1]])
         weights = torch.tensor([[0., 0.7], [0.2, 0.4]], requires_grad=True)
-        batch = context.dispatch(tokens, ids, weights)
-        self.assertEqual(batch.hidden_states.shape[0], 4)
-        output = context.combine(batch.hidden_states * batch.routing_weights[:, None], batch.receipt)
+        slots, expert_ids, slot_weights, source_inverse = _permute_routed_slots(tokens, ids, weights)
+        hidden, counts, local_weights, *transport = context.dispatch(slots, expert_ids, slot_weights)
+        self.assertEqual(hidden.shape[0], 4)
+        torch.testing.assert_close(counts, torch.tensor([1, 3]))
+        restored = context.combine(hidden * local_weights[:, None], *transport)
+        output = _sum_routed_slots(restored, source_inverse, ids.shape[1])
         expected = tokens * weights.sum(dim=1, keepdim=True)
         torch.testing.assert_close(output, expected)
         actual_grad = torch.autograd.grad(output.sum(), (tokens, weights), retain_graph=True)
         expected_grad = torch.autograd.grad(expected.sum(), (tokens, weights))
         for actual, reference in zip(actual_grad, expected_grad):
             torch.testing.assert_close(actual, reference)
-        with self.assertRaisesRegex(ValueError, "consumed"):
-            context.combine(batch.hidden_states, batch.receipt)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
         card_mark="onecard", essential_mark="essential",
     )
-    def test_ep_empty_tokens_and_invalid_receipts(self):
-        """Feature: Empty expert batches and receipt ownership.
-        Description: Dispatch an empty batch and attempt cross-context receipt consumption and invalid expert IDs.
-        Expectation: Empty gradients retain their shapes while invalid ownership and IDs fail explicitly.
+    def test_ep_empty_tokens_and_invalid_transport(self):
+        """Feature: Empty expert batches and combine argument validation.
+        Description: Dispatch an empty batch and combine it with its per-call split sizes and inverse mapping.
+        Expectation: Empty gradients retain their shapes while an invalid mapping or expert ID is rejected.
         """
         context = EPContext(self._mesh(), num_experts=2)
         tokens = torch.empty(0, 3, requires_grad=True)
-        batch = context.dispatch(tokens, torch.empty(0, 2, dtype=torch.long), torch.empty(0, 2, requires_grad=True))
-        other = EPContext(self._mesh(), num_experts=2)
-        with self.assertRaisesRegex(ValueError, "another context"):
-            other.combine(batch.hidden_states, batch.receipt)
-        output = context.combine(batch.hidden_states, batch.receipt)
+        hidden, _, _, send, recv, recv_inverse = context.dispatch(tokens, torch.empty(0, dtype=torch.long))
+        with self.assertRaisesRegex(ValueError, "recv_inverse"):
+            context.combine(hidden, send, recv, recv_inverse.long())
+        output = context.combine(hidden, send, recv, recv_inverse)
         self.assertEqual(output.shape, (0, 3))
         output.sum().backward()
         self.assertEqual(tokens.grad.shape, tokens.shape)
-        with self.assertRaisesRegex(ValueError, "expert ID"):
-            context.dispatch(torch.ones(1, 3), torch.tensor([[-1]]), torch.ones(1, 1))
+        with self.assertRaisesRegex(RuntimeError, "out of bounds"):
+            context.dispatch(torch.ones(1, 3), torch.tensor([-1]))
 
-
-    def test_ep_interleaved_dispatches_keep_independent_receipts(self):
-        """Two outstanding calls may combine in reverse order without sharing routing state."""
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_ep_interleaved_dispatches_keep_independent_mappings(self):
+        """Feature: Independent EP call metadata.
+        Description: Dispatch two calls and combine them in reverse order.
+        Expectation: Each call restores its own tokens and gradients without shared routing state.
+        """
         context = EPContext(self._mesh(), num_experts=2)
         first = torch.tensor([[1., 2.], [3., 4.]], requires_grad=True)
         second = torch.tensor([[5., 6.]], requires_grad=True)
         first_weights = torch.tensor([[0.2, 0.7], [0.4, 0.3]], requires_grad=True)
         second_weights = torch.tensor([[0.8, 0.1]], requires_grad=True)
-        one = context.dispatch(first, torch.tensor([[1, 0], [0, 1]]), first_weights)
-        two = context.dispatch(second, torch.tensor([[1, 0]]), second_weights)
-        result_two = context.combine(two.hidden_states * two.routing_weights[:, None], two.receipt)
-        result_one = context.combine(one.hidden_states * one.routing_weights[:, None], one.receipt)
+        first_ids, second_ids = torch.tensor([[1, 0], [0, 1]]), torch.tensor([[1, 0]])
+        first_slots, first_experts, first_probs, first_inverse = _permute_routed_slots(
+            first, first_ids, first_weights,
+        )
+        second_slots, second_experts, second_probs, second_inverse = _permute_routed_slots(
+            second, second_ids, second_weights,
+        )
+        first_hidden, _, first_probs, *first_transport = context.dispatch(first_slots, first_experts, first_probs)
+        second_hidden, _, second_probs, *second_transport = context.dispatch(second_slots, second_experts, second_probs)
+        result_two = context.combine(second_hidden * second_probs[:, None], *second_transport)
+        result_one = context.combine(first_hidden * first_probs[:, None], *first_transport)
+        result_two = _sum_routed_slots(result_two, second_inverse, second_ids.shape[1])
+        result_one = _sum_routed_slots(result_one, first_inverse, first_ids.shape[1])
         expected_one = first * first_weights.sum(dim=1, keepdim=True)
         expected_two = second * second_weights.sum(dim=1, keepdim=True)
         torch.testing.assert_close(result_one, expected_one)
@@ -121,5 +153,3 @@ class TestParallelContexts(unittest.TestCase):
                                        (first, second, first_weights, second_weights))
         for gradient, reference in zip(actual, expected):
             torch.testing.assert_close(gradient, reference)
-        with self.assertRaisesRegex(ValueError, "consumed"):
-            context.combine(one.hidden_states, one.receipt)

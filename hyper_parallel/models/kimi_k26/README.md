@@ -36,7 +36,7 @@ models/kimi_k26/
 │   │   └── cropped_model.py         # build_cropped_kimi_vlm model builder (recipe model._target_)
 │   └── registration.py              # ModelAdapterSpec: sharding_rules + loss
 └── recipes/
-    ├── train.yaml                   # Main recipe: 4 SuperPoDs / 512 devices, best measured configuration
+    ├── train.yaml                   # GroupedExperts training recipe for 4 SuperPoDs / 512 devices
     ├── run_kimi_k26_4sn.sh          # Multinode launcher: 64 nodes × 8 devices by default
     └── prepare_kimi_vlm_data.py     # Generate demo image-text data for offline self-tests
 ```
@@ -64,7 +64,8 @@ Data transformations also reside in this family: `adapter/data/transform_fn.py` 
 - **Model construction** (`adapter/validation/cropped_model.py`): Check that `config.model_type` belongs to
   `KIMI_MODEL_TYPES`, truncate text-tower layer/expert counts, then parallelize through HyperParallel's model builder. Supports
   `freeze_patterns` before plan/FSDP inference; freezing the vision tower also removes its backward computation and activations.
-- **EP compute factory** (`adapter/distributed/ep_compute.py`): The family composes its own
+- **GroupedExperts**: The main recipe keeps the native router and shared expert and replaces the text tower's routed experts.
+- **Legacy benchmark EP compute factory** (`adapter/distributed/ep_compute.py`): The family composes its own
   `deepseekv3_sigmoid_group_shared` prototype, colocated as in `models/qwen3_moe/adapter/distributed/`,
   through the public `build_ep_compute` interface, requiring no framework changes. `fix_router: true` selects the framework's
   **balanced routing** (`routing.make_balanced_router`, resolved by the shared skeleton): measured token skew with real routing loads the busiest rank to 6.3 times the mean,
@@ -116,8 +117,8 @@ Data transformations also reside in this family: `adapter/data/transform_fn.py` 
 
 `recipes/train.yaml` targets the **main scale of 4 SuperPoDs / 512 devices**, with
 `cp 1 × dp_shard 512 (= edp 4 × ep 128)`, `GBS 512 = 512 × MBS 1`, and sequence length 8192.
-This is the family's best measured 4SN configuration: minimum step time **18.2617 s**, padded throughput **228,873 tok/s**,
-and peak allocated memory **39.19 GB**, without activation swap; `edp=4` reduces each device's share of expert parameters to one quarter.
+The previous balanced-routing benchmark at this topology measured a minimum step time of **18.2617 s**,
+padded throughput of **228,873 tok/s**, and peak allocated memory of **39.19 GB** without activation swap.
 
 ```bash
 # Run once on each node, with NODE_RANK from 0 to NNODES-1.

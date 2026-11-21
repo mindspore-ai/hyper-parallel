@@ -63,6 +63,11 @@ class LocalLinear(nn.Module):
             self.weight.fill_(0.125)
             self.bias.fill_(0.25)
 
+    @staticmethod
+    def make_transforms() -> list:
+        """Declare that canonical checkpoint parameters need no conversion."""
+        return []
+
     # Preserve the nn.Linear input keyword across local and parallel replacements.
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Evaluate the complete mathematical operation.

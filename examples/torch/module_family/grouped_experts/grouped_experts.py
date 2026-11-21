@@ -65,6 +65,15 @@ class GroupedExpertsModule(nn.Module):
         nn.init.normal_(self.gate_up, mean=0.0, std=0.1)
         nn.init.normal_(self.down, mean=0.0, std=0.1)
 
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
+
     def dispatch(self, inputs: ExpertInputs) -> Any:
         """Preserve the ordinary local inputs without communication.
 

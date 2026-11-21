@@ -131,6 +131,15 @@ class GateModule(nn.Module):
         """Initialize the projection after direct/meta construction."""
         nn.init.normal_(self.weight, std=self.initializer_range)
 
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
+
     def forward(self, hidden_states: torch.Tensor,
                 correction_bias: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
         """Return flattened logits, scaled weights and selected expert IDs."""
@@ -208,6 +217,15 @@ class MegaGateModule(GateModule):
         nn.init.zeros_(self.bias)
         if self.bias_vl is not None:
             nn.init.zeros_(self.bias_vl)
+
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
 
     def _apply(self, fn: Any, recurse: bool = True) -> MegaGateModule:
         """Preserve declared FP32 parameters and gradients during conversion."""

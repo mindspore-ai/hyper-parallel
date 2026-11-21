@@ -725,7 +725,7 @@ class TestModuleReplacements(unittest.TestCase):
         specs = _recipe_specs()
         self.assertEqual([spec.factory.__name__ for spec in specs],
                          ["replace_qwen3_moe_rms_norm", "GroupedQueryAttention",
-                          "replace_qwen3_moe_grouped_experts"])
+                          "GroupedExperts"])
         self.assertEqual(specs[0].match, ("*.input_layernorm", "*.post_attention_layernorm", "model.norm"))
         self.assertEqual([spec.module_type.__name__ for spec in specs],
                          ["Qwen3MoeRMSNorm", "Qwen3MoeAttention", "Qwen3MoeExperts"])

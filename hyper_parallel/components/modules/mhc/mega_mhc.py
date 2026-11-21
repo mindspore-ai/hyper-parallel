@@ -75,6 +75,15 @@ class MegaMhcModule(nn.Module):
         nn.init.zeros_(self.bias)
         nn.init.ones_(self.norm_weight)
 
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
+
     def _apply(self, fn: Any, recurse: bool = True) -> MegaMhcModule:
         """Preserve declared FP32 parameters and gradients during conversion."""
         # The predictor uses FP32 even when the enclosing model uses BF16.

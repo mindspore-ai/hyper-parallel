@@ -23,7 +23,7 @@ models/deepseek_v32/
 ├── __init__.py
 ├── adapter/
 │   ├── conversion/
-│   │   └── module_replacement.py    # 替换工厂：RMSNorm、DSA attention、GroupedExperts
+│   │   └── module_replacement.py    # RMSNorm/DSA 工厂及历史专家入口
 │   ├── distributed/
 │   │   └── context_parallel.py      # DSA 的 CP wrapper
 │   ├── policies/
@@ -41,7 +41,7 @@ models/deepseek_v32/
 
 - **NPU 模块替换**，由 recipe 的 `plan_overrides` 选用：`*.input_layernorm`、`*.post_attention_layernorm`、
   `model.norm` 换成融合 `RMSNorm`；`*.self_attn` 换成 `DeepseekV32DSAAttention`，indexer 与稀疏 attention 走
-  CANN 融合算子；`*.mlp.experts` 换成 `GroupedExperts`。
+  CANN 融合算子；`*.mlp.experts` 选择[路由专家模块族](../../components/modules/moe/grouped_experts/README.md)。
 - **并行**：FSDP、TP（含 loss parallel）、CP、EP。不支持 PP 和 sequence parallel。
 - **训练行为**与 Transformers 实现一致：
   - router 用 `e_score_correction_bias` 选专家（sigmoid 分数、分组 top-k），bias 保持初始值；
@@ -52,7 +52,8 @@ models/deepseek_v32/
 
 ## 环境要求
 
-- Transformers 需要包含 `deepseek_v32`：`requirements.txt` 要求 `transformers>=5.11.0`，验证版本 5.13.1。
+- Transformers 需要包含 `deepseek_v32`：`requirements.txt` 要求 `transformers>=5.11.0`，既有原生模型验证记录为
+  5.13.1；本轮新专家族核对了 5.13.1 源码接口，尚未重跑硬件数值和多卡验收。
 - 昇腾 NPU，DSA 算子依赖 CANN 与 `cann_ops_transformer`，见
   [functional README](../../components/functional/README.md#deepseek-v32-dsa)。
 - 权重：`from_pretrained` 可以直接加载官方 FP8 checkpoint（读取时反量化），也可以加载 BF16 checkpoint。第 61 层
@@ -73,22 +74,21 @@ torchrun --standalone --nproc_per_node=1 \
 
 ### 多卡
 
-用命令行覆盖设置并行拓扑。recipe 里 `when: cp` 的条目在 `cp_size > 1` 时启用 DSA 的 CP wrapper。EP 需要加一个
-`when: ep` 条目，只匹配 MoE 层，即 `i >= first_k_dense_replace` 的 `model.layers.<i>.mlp.forward`（官方 config 为
-第 3–60 层）：
+用命令行覆盖设置并行拓扑。recipe 中 `when: cp` 的条目启用 DSA CP wrapper。
+两份普通专家配方均直接选择新专家族：
 
 ```yaml
 plan_overrides:
-  - match: "model.layers.[3-9].mlp.forward"
-    when: ep
+  - match: "*.mlp.experts"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
-        use_grouped_gemm: true
-        overlap_shared_expert: true
-  # 再用 match: "model.layers.[1-9][0-9].mlp.forward" 写一条同样的条目，覆盖第 10–60 层。
+        _target_: hyper_parallel.components.modules.GroupedExperts
 ```
+
+模块族根据作业 mesh 选择 local/EP，父 MoE 保留原生 router 和共享专家。
+同一路径不再叠加旧 `deepseekv3_ep_compute_fn` 方法替换；当前普通 EP 路径按原生顺序执行共享分支，
+不包含旧 shared-expert overlap 选项。
 
 例如 8 卡、TP2 × CP2 × DP2、EP4：
 
@@ -100,7 +100,7 @@ torchrun --standalone --nproc_per_node=8 \
   --fsdp_config.dp_shard_size=2 --fsdp_config.edp_shard_size=2
 ```
 
-需要满足：`tp_size > 1` 时 `ep_size` 也要大于 1（MoE 层的专家只按 EP 切分）；`world_size = tp × cp × dp`；
+专家矩阵保持完整（ETP=1），EP 仅切专家维。需要满足：`world_size = tp × cp × dp`；
 `n_routed_experts` 能被 `ep_size` 整除；`global_batch_size` 能被 `micro_batch_size × dp` 整除。
 
 ### 8 层裁剪模型的 8 卡 recipe

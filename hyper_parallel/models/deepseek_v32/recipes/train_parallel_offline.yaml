@@ -68,7 +68,7 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+        _target_: hyper_parallel.components.modules.GroupedExperts
   - match: "*.self_attn.forward"
     when: cp
     replace:
@@ -76,15 +76,6 @@ plan_overrides:
       implementation:
         _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
         dense_warmup: null
-  # MoE layers of the crop: layers 3-7 (first_k_dense_replace = 3).
-  - match: "model.layers.[3-7].mlp.forward"
-    when: ep
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
-        use_grouped_gemm: true
-        overlap_shared_expert: true
 
 mixed_precision:
   enabled: false
