@@ -14,6 +14,7 @@
 # ============================================================================
 """CPU contracts for the routed grouped-expert family."""
 
+from itertools import product
 from types import SimpleNamespace
 from typing import Optional
 import unittest
@@ -59,6 +60,12 @@ def _cpu_unpermute(
         return source_slots
     source_slots = source_slots.reshape(*probabilities.shape, values.shape[-1])
     return (source_slots * probabilities.unsqueeze(-1)).sum(dim=1)
+
+
+def _cpu_swiglu(inputs: torch.Tensor) -> torch.Tensor:
+    """Emulate the existing fused SwiGLU boundary for hardware-independent routing tests."""
+    gate, up = inputs.chunk(2, dim=-1)
+    return F.silu(gate) * up
 
 
 def _cpu_grouped_matmul(
@@ -195,9 +202,15 @@ class TestRoutedGroupedExperts(unittest.TestCase):
         Expectation: Outputs and all differentiable inputs and parameters agree.
         """
         expert_ids = torch.tensor([[3, 0], [1, 3], [0, 2]], dtype=torch.int64)
-        for mode in ("output", "before_fc2"):
-            with self.subTest(mode=mode):
-                config = GroupedExpertsConfig(4, 6, 5, routing_weight_mode=mode, num_layers=1)
+        for mode, limit in product(("output", "before_fc2"), (None, 0.0, -1.0)):
+            with self.subTest(mode=mode, limit=limit):
+                if limit is None:
+                    config = GroupedExpertsConfig(4, 6, 5, routing_weight_mode=mode, num_layers=1)
+                else:
+                    with self.assertWarnsRegex(UserWarning, "disables clamping"):
+                        config = GroupedExpertsConfig(
+                            4, 6, 5, routing_weight_mode=mode, num_layers=1, swiglu_limit=limit,
+                        )
                 candidate = GroupedExpertsModule(config=config).to(torch.float64)
                 hidden = torch.randn(3, 6, dtype=torch.float64, requires_grad=True)
                 probabilities = torch.randn(3, 2, dtype=torch.float64).softmax(-1).requires_grad_()
@@ -215,8 +228,12 @@ class TestRoutedGroupedExperts(unittest.TestCase):
                 ), patch(
                     "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.grouped_matmul",
                     side_effect=_cpu_grouped_matmul,
-                ):
+                ), patch(
+                    "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.npu_swiglu",
+                    side_effect=_cpu_swiglu,
+                ) as activation:
                     actual = candidate(hidden, expert_ids, probabilities)
+                activation.assert_called_once()
                 expected = _reference_forward(
                     reference_hidden,
                     expert_ids,
@@ -430,9 +447,10 @@ class TestRoutedGroupedExperts(unittest.TestCase):
         self.assertIs(type(local), GroupedExpertsModule)
         self.assertIs(type(parallel), EPGroupedExperts)
         self.assertEqual(parallel.parallel_module_spec().binding_kind, "ep")
-        for selectors in ({"megakernel": True}, {"moonep": True, "context": {"ep_size": 2}}):
-            with self.subTest(selectors=selectors), self.assertRaises(NotImplementedError):
-                GroupedExperts(config=config, **selectors)
+        with self.assertRaisesRegex(ValueError, "top_k"):
+            GroupedExperts(config=config, megakernel=True, context={"ep_size": 2})
+        with self.assertRaises(NotImplementedError):
+            GroupedExperts(config=config, moonep=True, context={"ep_size": 2})
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",

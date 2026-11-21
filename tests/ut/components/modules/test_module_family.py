@@ -26,7 +26,7 @@ from torch import nn
 
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.components.modules.module_family import (
-    FamilyRequest, build_family, collect_family_modules, get_family_build_info, validate_family_context,
+    FamilyRequest, ResolvedFamily, build_family, collect_family_modules, get_family_build_info, validate_family_context,
 )
 from hyper_parallel.trainer.config.replacement import ReplacementTarget
 from tests.common.mark_utils import arg_mark
@@ -42,6 +42,27 @@ def BackendLinear(
     """Test that backend is an ordinary target selector consumed before construction."""
     return build_family(BackendLinear, config=config, module=module, module_fqn=module_fqn,
                         context=context, backend=backend)
+
+
+def TunedLinear(
+    *, config: LinearConfig | None = None, module: nn.Module | None = None, module_fqn: str = "",
+    context: Mapping[str, Any] | None = None, workspace_size: int = 64,
+) -> nn.Module:
+    """Expose a public option consumed only by the parallel member."""
+    return build_family(TunedLinear, config=config, module=module, module_fqn=module_fqn,
+                        context=context, workspace_size=workspace_size)
+
+
+class TunedParallelLinear(ParallelLinear):
+    """Accept an implementation-specific option without changing ordinary members."""
+
+    def __init__(
+        self, *, config: LinearConfig | None = None, module: nn.Module | None = None, module_fqn: str = "",
+        context: Mapping[str, Any] | None = None, workspace_size: int = 64,
+    ) -> None:
+        """Record the tuning option while retaining the shared parameter contract."""
+        super().__init__(config=config, module=module, module_fqn=module_fqn, context=context)
+        self.workspace_size = workspace_size
 
 
 class TestModuleFamilyConstruction(unittest.TestCase):
@@ -103,6 +124,58 @@ class TestModuleFamilyConstruction(unittest.TestCase):
         self.assertIs(type(parallel), ParallelLinear)
         self.assertEqual(target.to_dict(), {"_target_": "tests.common.module_family_fixtures.LinearFamily"})
         self.assertIs(type(LinearFamily(config=LinearConfig(), kernel="megakernel")), MegaLinear)
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_member_specific_options_are_validated_before_signature_projection(self) -> None:
+        """Feature: Member-specific public options.
+        Description: Validate direct/deferred requests before projecting constructor arguments.
+        Expectation: Applicable options arrive unchanged; invalid options and typos raise.
+        """
+        validated = []
+
+        def _validate(
+            *, config: LinearConfig | None, module: nn.Module | None,
+            context: Mapping[str, Any], member: ResolvedFamily,
+        ) -> None:
+            """Reject invalid tuning before constructing any selected member."""
+            del config, module, context
+            validated.append(dict(member.arguments))
+            if member.arguments.get("workspace_size", 64) <= 0:
+                raise ValueError("workspace_size must be positive")
+
+        registry.register_module_family(registry.ModuleFamily(
+            name="tuned_linear", baseline=TunedLinear,
+            variants={"local": "tests.common.module_family_fixtures.LocalLinear",
+                      "parallel": f"{__name__}.TunedParallelLinear"},
+            default_variant="local", parallel_axis="ep",
+            variant_rules=(registry.VariantRule({"parallel": True}, "parallel"),), validate=_validate,
+        ))
+        for size, expected in ((1, LocalLinear), (2, TunedParallelLinear)):
+            for workspace_size in (64, 128):
+                with self.subTest(ep_size=size, workspace_size=workspace_size):
+                    context = {"ep_size": size}
+                    direct = TunedLinear(config=LinearConfig(), context=context, workspace_size=workspace_size)
+                    source = nn.Linear(4, 3)
+                    source.load_state_dict(direct.state_dict())
+                    target = ReplacementTarget(TunedLinear, target_path=f"{__name__}.TunedLinear",
+                                               workspace_size=workspace_size)
+                    converted = target.build(module=source, context=context)
+                    for candidate in (direct, converted):
+                        self.assertIs(type(candidate), expected)
+                        if size > 1:
+                            self.assertEqual(candidate.workspace_size, workspace_size)
+                        else:
+                            self.assertFalse(hasattr(candidate, "workspace_size"))
+                    self.assertEqual(validated[-2:], [{"workspace_size": workspace_size}] * 2)
+                    self.assertIs(converted.weight, source.weight)
+                    torch.testing.assert_close(direct(torch.ones(2, 4)), converted(torch.ones(2, 4)))
+        with self.assertRaisesRegex(ValueError, "workspace_size must be positive"):
+            TunedLinear(config=LinearConfig(), workspace_size=0)
+        with self.assertRaisesRegex(TypeError, "unknown replacement arguments"):
+            ReplacementTarget(TunedLinear, target_path=f"{__name__}.TunedLinear", workspace_siz=64)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
