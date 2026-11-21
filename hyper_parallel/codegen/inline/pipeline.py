@@ -29,6 +29,7 @@ from hyper_parallel.codegen.inline.ir import (
 )
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.definition_edits import drop_shadowed_definitions
+from hyper_parallel.codegen.inline.forward_edits import _parallel_state_prefix
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.framework_spec import (
     replacement_spec_for as replacement_spec,
@@ -216,25 +217,16 @@ def _materialize_imported_forward_hosts(
         rendered.add(patch.class_name)
         imported = patch_set.imports[import_index]
         other_names = tuple(name for name in imported.names if name != patch.class_name)
+        replacement_imports = [ImportPatch(imported.module, other_names)] if other_names else []
+        replacement_imports.append(ImportPatch("", (), raw=f"import {imported.module}"))
+        patch_set.imports[import_index:import_index + 1] = replacement_imports
+        base = f"{imported.module}.{patch.class_name}"
         if patch.definition is not None:
             definition = patch.definition.replace("self._forward_impl(", "super().forward(")
-            replacement_imports = [ImportPatch(imported.module, other_names)] if other_names else []
-            replacement_imports.append(ImportPatch("", (), raw=f"import {imported.module}"))
-            patch_set.imports[import_index:import_index + 1] = replacement_imports
-            snippet = (f"class {patch.class_name}({imported.module}.{patch.class_name}):\n"
+            snippet = (f"class {patch.class_name}({base}):\n"
                        + textwrap.indent(definition, "    ") + "\n")
             patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
             continue
-        alias = f"_{patch.class_name}Base"
-        replacement_imports = []
-        if other_names:
-            replacement_imports.append(ImportPatch(imported.module, other_names))
-        replacement_imports.append(ImportPatch(
-            module="",
-            names=(),
-            raw=f"from {imported.module} import {patch.class_name} as {alias}",
-        ))
-        patch_set.imports[import_index:import_index + 1] = replacement_imports
         body = patch.body.replace(
             "self._forward_impl(",
             "original_forward(",
@@ -243,10 +235,9 @@ def _materialize_imported_forward_hosts(
         ).replace("__hp_forward_keywords__", "kwargs")
         if "original_forward(" in body:
             body = "original_forward = super().forward\n" + body
-        state = "    cp_enable = False\n\n" if "self.cp_enable" in body else ""
+        state = _parallel_state_prefix(body)
         snippet = (
-            f"class {patch.class_name}({alias}):\n"
-            "    \"\"\"Generated source-visible parallel form.\"\"\"\n\n"
+            f"class {patch.class_name}({base}):\n"
             f"{state}"
             "    def forward(self, *args, **kwargs):\n"
             f"{textwrap.indent(body.strip(), '        ')}\n"

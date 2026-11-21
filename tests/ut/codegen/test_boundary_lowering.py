@@ -542,7 +542,7 @@ def test_closure_cp_wrapper_materializes_imported_replacement_host(monkeypatch):
     rendered = apply_patch_set(SOURCE_TEXT, patches)
 
     ast.parse(rendered)
-    assert "class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):" in rendered
+    assert "class SharedCompressedDSAAttention(demo.components.SharedCompressedDSAAttention):" in rendered
     assert "if self.cp_enable:" not in rendered
     assert "self._hyper_v41_shared_attention_cp_context" in rendered
     assert "return original_forward(*args, **call_kwargs)" in rendered
@@ -1075,8 +1075,8 @@ def test_imported_cp_host_is_rendered_as_same_name_class():
     _materialize_imported_forward_hosts(SOURCE_TEXT, patches)
     rendered = apply_patch_set(SOURCE_TEXT, patches)
 
-    assert "from demo.components import MLAAttention as _MLAAttentionBase" in rendered
-    assert "class MLAAttention(_MLAAttentionBase):" in rendered
+    assert "import demo.components" in rendered
+    assert "class MLAAttention(demo.components.MLAAttention):" in rendered
     assert "class HPCodegen" not in rendered
     assert "if self.cp_enable:" in rendered
     assert "return original_forward(*args, **kwargs)" in rendered
@@ -1107,8 +1107,8 @@ def test_observed_replacement_supplies_missing_cp_host_import():
     _materialize_imported_forward_hosts(SOURCE_TEXT, patches)
     rendered = apply_patch_set(SOURCE_TEXT, patches)
 
-    assert "from demo.components import ObservedAttention as _ObservedAttentionBase" in rendered
-    assert "class ObservedAttention(_ObservedAttentionBase):" in rendered
+    assert "import demo.components" in rendered
+    assert "class ObservedAttention(demo.components.ObservedAttention):" in rendered
     assert "return observed_cp_forward(self, *args, **kwargs)" in rendered
 
 

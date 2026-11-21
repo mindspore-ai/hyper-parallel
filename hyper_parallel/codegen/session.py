@@ -94,7 +94,7 @@ class CodegenBuildSession:
 
     def observe_plan(self, plan: Any, model: Any, mesh: Any) -> None:
         """Observe a native planner result without exposing codegen to the builder."""
-        observed_plan = observe_emission_plan(plan, model, mesh).to_dict()
+        observed_plan = observe_emission_plan(plan, model).to_dict()
         observed_plan["parallel_dims"] = {
             "dp_size": getattr(mesh, "dp_size", 1),
             "tp_size": mesh.tp_size,
@@ -106,12 +106,12 @@ class CodegenBuildSession:
         }
         self.record_plan(observed_plan)
 
-    def observe_final_forwards(self, model: Any, originals: Mapping[str, Any], mesh: Any) -> None:
+    def observe_final_forwards(self, model: Any, originals: Mapping[str, Any]) -> None:
         """Append factory-tail facts once, before freezing the existing native plan."""
         self._require_open(CodegenStatus.DERIVED, CodegenStatus.NOT_REQUIRED)
         if self._final_forwards_recorded:
             raise RuntimeError("codegen final forwards have already been observed")
-        additions = observe_final_forwards(model, originals, mesh)
+        additions = observe_final_forwards(model, originals)
         self._final_forwards_recorded = True
         if additions:
             if self._plan is None:

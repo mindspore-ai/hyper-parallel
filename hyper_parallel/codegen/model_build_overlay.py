@@ -240,7 +240,7 @@ def _publish_session(
 
 def _codegen_build_model(
     session: CodegenBuildSession, artifact_dir: Optional[str], result: CodegenModelBuildResult,
-    on_observed: Optional[Callable[..., None]] = None,
+    on_observed: Optional[Callable[[Any], None]] = None,
 ):
     """Create the classmethod used only while the CLI constructs a meta model."""
     def _build_model(
@@ -332,7 +332,7 @@ def _codegen_build_model(
         )
         _observe_plan(model, mesh, sharding_planner, is_hf_model, session)
         if on_observed is not None:
-            on_observed(model, mesh)
+            on_observed(model)
         else:
             snapshot = _publish_session(session, artifact_dir, result)
             result.snapshot = snapshot
@@ -362,10 +362,10 @@ def use_codegen_model_build_overlay(
     result = CodegenModelBuildResult()
     pending = []
 
-    def _defer(model: Any, mesh: Any) -> None:
+    def _defer(model: Any) -> None:
         """Keep live references only inside this factory observation scope."""
         result.model = model
-        pending.append((model, mesh, {fqn: module.forward for fqn, module in model.named_modules()}))
+        pending.append((model, {fqn: module.forward for fqn, module in model.named_modules()}))
 
     model_class._build_model = classmethod(  # pylint: disable=protected-access
         _codegen_build_model(session, artifact_dir, result, _defer if defer_publish else None)
@@ -373,10 +373,10 @@ def use_codegen_model_build_overlay(
     try:
         yield result
         if pending:
-            model, mesh, originals = pending.pop()
+            model, originals = pending.pop()
             if result.model is not model:
                 raise RuntimeError("codegen outer factory returned a different model root")
-            session.observe_final_forwards(model, originals, mesh)
+            session.observe_final_forwards(model, originals)
             result.snapshot = _publish_session(session, artifact_dir, result)
     finally:
         pending.clear()
