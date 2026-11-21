@@ -2,7 +2,8 @@
 
 This example runs native `TextTrainer` / `GraphCompiler` training on eight Ascend
 NPUs with **FSDP4 + TP2/SP + EP2** (expert EDP4), FP32, sequence length 2304,
-micro batch size 1, global batch size 8, and 30 optimizer steps. Dataset packing,
+micro batch size 1, global batch size 8, and 30 Muon optimizer steps. Full
+recomputation, dataset packing,
 DSA Compressor, and Indexer are enabled; CP and PP are disabled.
 
 The recipe was validated with a four-layer, 16-expert, text-only model with reduced
@@ -74,8 +75,20 @@ python -m torch.distributed.run --nproc_per_node=8 --master_port=29743 \
 ```
 
 Keep `model.torch_dtype` and `model_init_dtype` consistent when changing precision.
-The default FP32 recipe completed a ten-step functional run on the cropped model;
-this does not establish full-model memory requirements or numerical parity.
+The cropped recipe does not establish full-model memory requirements or long-run
+convergence; validation scope and dated results are recorded in the guide below.
+
+## Muon with Graph Training
+
+The default YAML uses Muon for eligible matrix parameters and AdamW for fallback
+parameters. Forward/backward run in the joint graph; optimizer updates remain eager.
+The optimizer binds final TP/EP/FSDP layouts after compilation. FP32 optimizer
+views share model storage; optional FP32 main weights own only the local shard.
+
+See the [development and validation guide](../../../../docs/guide/deepseek_v41_graph_muon.md)
+for BF16 overrides, implementation details, correctness and memory/performance
+results. Optimizer checkpoint restore currently requires compiled and bound layouts;
+cold restore before the first compilation is not yet integrated.
 
 ## Compressor, Indexer, and Packing
 
