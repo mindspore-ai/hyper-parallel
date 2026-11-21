@@ -255,7 +255,7 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+        _target_: hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
         use_fused_ops: false
 ```
 

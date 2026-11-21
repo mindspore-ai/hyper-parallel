@@ -33,12 +33,13 @@ except ImportError as exc:
 
 from hyper_multicore import MegaMoeExperts
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
+    SharedCompressedPackedSequence,
+)
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
     deepseek_v41_megamoe_compute_fn,
 )
-from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE
@@ -103,13 +104,15 @@ class TestV41SharedExpert(unittest.TestCase):
         """
         torch.manual_seed(1250)
         module = DeepseekV41Compressor(_config(), 2)
-        reference = copy.deepcopy(module)
+        reference = DeepseekV41Compressor(_config(), 2)
+        reference.load_state_dict(module.state_dict(), strict=True)
         hidden = torch.randn(1, 8, 16, requires_grad=True)
         separate_hidden = hidden.detach().clone().requires_grad_()
         angles = torch.randn(1, 8, 2)
         embeddings = (angles.cos(), angles.sin())
-        plan = document_compression_plan((0, 3, 8), 2, 8, 1, 0)
-        actual = module(hidden, plan.positions(*embeddings, None), block_plan=plan)
+        packed = SharedCompressedPackedSequence(torch.tensor([0, 3, 8]), 0, 8, 8)
+        plan = packed.block_plan(2)
+        actual = module(hidden, packed.compressed_positions(plan, embeddings), block_plan=plan)
         documents = [reference(separate_hidden[:, start:end],
                                tuple(value[:, start:end] for value in embeddings))
                      for start, end in ((0, 3), (3, 8))]
@@ -190,7 +193,8 @@ class TestV41SharedExpert(unittest.TestCase):
                 "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
                 mock_open(read_data='{"layer_ids": []}')):
             reference = DeepseekV41Model(config)
-        shifted = copy.deepcopy(reference)
+            shifted = DeepseekV41Model(config)
+        shifted.load_state_dict(reference.state_dict(), strict=True)
         for layer in shifted.layers:
             layer.attn_hc = DeepseekV41HyperMegaMhc(module=layer.attn_hc)
             layer.ffn_hc = DeepseekV41HyperMegaMhc(module=layer.ffn_hc)

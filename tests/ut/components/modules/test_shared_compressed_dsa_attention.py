@@ -20,11 +20,27 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from hyper_parallel.core.dtensor.placement_types import Shard
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
-from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import reference_sparse_attention
+from hyper_parallel.components.modules import CompressedSparseAttention2
+from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
+from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding, validate_parallel_module
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer as attention
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer_kl_loss as loss_impl
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
+    compressed_sparse_attention2_family as family,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
+    SharedCompressedPackedSequence,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
+    compressed_sparse_attention2 as attention_impl,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    reference_sparse_attention,
+)
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
@@ -50,7 +66,7 @@ def _source(index_source=False):
                   "candidate_block_size": 1, "loss_coeff": .001}
         for name, value in values.items():
             setattr(module.indexer, name, value)
-    return module
+    return attention_impl.CompressedSparseAttention2Module(module=module)
 
 
 class TestSharedCompressedFusionPolicy(unittest.TestCase):
@@ -82,9 +98,9 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
 
     def test_kl_required_mode_never_invokes_reference(self):
         """Reject unsupported active KL before entering the reference function."""
-        with patch.object(attention._SharedCompressedIndexerKLLoss, "apply") as reference:
+        with patch.object(loss_impl._SharedCompressedIndexerKLLoss, "apply") as reference:
             with self.assertRaisesRegex(RuntimeError, "Fused KL requires NPU inputs; got device=cpu"):
-                attention.shared_compressed_indexer_kl_loss(
+                loss_impl.shared_compressed_indexer_kl_loss(
                     self.query, self.key, self.weights, torch.ones(1, 1, 2, 128), self.key,
                     self.indices, torch.zeros(1), attention_scale=1., loss_coeff=1.,
                     use_fused=True, query_segments=((0, 2, 0, 2, 0),),
@@ -93,16 +109,16 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
 
     def test_attention_required_mode_never_invokes_fallback(self):
         """Unsupported explicit fusion must leave the reference path untouched."""
-        module = attention.SharedCompressedDSAAttention(_source(), use_fused_ops=True)
+        module = CompressedSparseAttention2(module=_source(), use_fused_ops=True)
         query = torch.ones(1, 1, 2, 512)
-        with patch.object(attention, "reference_sparse_attention") as reference:
+        with patch.object(attention_impl, "reference_sparse_attention") as reference:
             with self.assertRaisesRegex(RuntimeError, "fused attention is required.*layer=0"):
                 module._run_sparse_attention(query, query, None, None, 0, 2, None, ((0, 2, 0, 2, 0),))
             reference.assert_not_called()
 
     def test_cpu_baseline_never_loads_optional_operators(self):
         """The eager baseline produces gradients without querying optional packages."""
-        module = attention.SharedCompressedDSAAttention(_source(), use_fused_ops=False)
+        module = CompressedSparseAttention2(module=_source(), use_fused_ops=False)
         query = torch.ones(1, 1, 2, 512, requires_grad=True)
         with patch.object(
                 attention_ops, "_load_attention_ops", side_effect=AssertionError("native package queried"),
@@ -114,10 +130,10 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
 
     def test_native_failure_is_not_converted_to_reference_execution(self):
         """A native exception is propagated after successful dispatch checks."""
-        module = attention.SharedCompressedDSAAttention(_source(), use_fused_ops=True)
+        module = CompressedSparseAttention2(module=_source(), use_fused_ops=True)
         query = torch.ones(1, 1, 2, 512)
-        with patch.object(attention, "supports_fused_attention_inputs", return_value=True):
-            with patch.object(attention, "sparse_flash_mla", side_effect=RuntimeError("native failure")):
+        with patch.object(attention_impl, "supports_fused_attention_inputs", return_value=True):
+            with patch.object(attention_impl, "sparse_flash_mla", side_effect=RuntimeError("native failure")):
                 with self.assertRaisesRegex(RuntimeError, "^native failure$"):
                     module._run_sparse_attention(query, query, None, None, 0, 2, None, ((0, 2, 0, 2, 0),))
 
@@ -159,9 +175,11 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                     match="model.layers.*.self_attn",
                     replace=ReplaceAction(
                         kind="module", source_type="torch.nn.Module",
-                        implementation=Target(attention.SharedCompressedDSAAttention,
-                                              target_path=f"{attention.__name__}.SharedCompressedDSAAttention",
-                                              use_fused_ops=use_fused_ops),
+                        implementation=Target(
+                            CompressedSparseAttention2,
+                            target_path="hyper_parallel.components.modules.CompressedSparseAttention2",
+                            use_fused_ops=use_fused_ops,
+                        ),
                     ),
                 )
                 factory = entries_to_module_replacements([entry])[0].factory
@@ -171,12 +189,12 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 self.assertEqual(module.use_fused_ops, use_fused_ops)
                 self.assertEqual(module.indexer.use_fused, use_fused_ops)
                 self.assertEqual({name: id(value) for name, value in module.named_parameters()}, parameters)
-        default = attention.SharedCompressedDSAAttention(_source(True))
+        default = CompressedSparseAttention2(module=_source(True))
         self.assertFalse(default.use_fused_ops)
         self.assertFalse(default.indexer.use_fused)
         for value in ("false", "true", "auto", None, 0, 1):
-            with self.subTest(invalid=value), self.assertRaisesRegex(ValueError, "use_fused_ops must be a bool"):
-                attention.SharedCompressedDSAAttention(_source(), use_fused_ops=value)
+            with self.subTest(invalid=value), self.assertRaisesRegex(TypeError, "use_fused_ops"):
+                CompressedSparseAttention2(module=_source(), use_fused_ops=value)
 
     def test_candidate_execution_is_rejected_without_reference_fallback(self):
         """A candidate producer or consumer cannot enter its reference branch."""
@@ -185,14 +203,14 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 source = _source(True)
                 source.indexer.is_candidate_source = produces
                 source.indexer.uses_candidates = consumes
-                module = attention.SharedCompressedDSAAttention(source, use_fused_ops=True)
+                module = CompressedSparseAttention2(module=source, use_fused_ops=True)
                 with self.assertRaisesRegex(NotImplementedError, "candidate-pool"):
                     module.indexer._select_indices(self.query, self.key, self.weights, None, 0, None, None, None)
 
     def test_zero_loss_does_not_require_an_unused_kernel(self):
         """A zero objective is not an attempted fused calculation."""
         query = self.query.clone().requires_grad_()
-        loss = attention.shared_compressed_indexer_kl_loss(
+        loss = loss_impl.shared_compressed_indexer_kl_loss(
             query, self.key, self.weights, torch.ones(1, 1, 2, 128), self.key,
             self.indices, torch.zeros(1), attention_scale=1., loss_coeff=0.,
             use_fused=True,
@@ -250,8 +268,9 @@ class TestNaturalDocumentCompression(unittest.TestCase):
         """A length-three document and a length-five document produce one and two keys."""
         key = torch.arange(16, dtype=torch.float32).reshape(1, 8, 2).requires_grad_()
         gate = torch.zeros_like(key, requires_grad=True)
-        plan = document_compression_plan((0, 3, 8), 2, 8, 1, 0)
-        actual = plan.pool(key, gate, None)
+        packed = SharedCompressedPackedSequence(torch.tensor([0, 3, 8]), 0, 8, 8)
+        plan = packed.block_plan(2)
+        actual = attention_impl.CSA2Compressor.pool(torch.cat((key, gate), dim=-1), plan)
         expected = torch.stack((key[:, :2].mean(1), key[:, 3:5].mean(1), key[:, 5:7].mean(1)), dim=1)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         actual.sum().backward()
@@ -259,13 +278,13 @@ class TestNaturalDocumentCompression(unittest.TestCase):
         expected_grad[:, [2, 7]] = 0
         torch.testing.assert_close(key.grad, expected_grad, rtol=0, atol=0)
         positions = torch.arange(8).reshape(1, 8, 1).float()
-        cos, sin = plan.positions(positions, -positions, None)
+        cos, sin = packed.compressed_positions(plan, (positions, -positions))
         torch.testing.assert_close(cos.flatten(), torch.tensor([0., 3., 5.]), rtol=0, atol=0)
         torch.testing.assert_close(sin, -cos, rtol=0, atol=0)
 
     def test_causal_topk_excludes_other_documents_and_incomplete_blocks(self):
         """Compressed coordinates use cumulative complete blocks, not global token division."""
-        packed = attention.SharedCompressedPackedSequence(torch.tensor([0, 3, 8]), 0, 8, 8)
+        packed = SharedCompressedPackedSequence(torch.tensor([0, 3, 8]), 0, 8, 8)
         packed = packed.prepare(torch.device("cpu"), (1, 2))
         selected = attention.compressed_causal_topk(
             torch.ones(1, 8, 1, 2), torch.ones(1, 3, 2), torch.ones(1, 8, 1),
@@ -294,12 +313,12 @@ class TestNaturalDocumentCompression(unittest.TestCase):
         self.assertTrue(attention_ops.supports_fused_attention_inputs(contract, 2, 128, 0))
         source = _source(True)
         source.compress_ratio = 2
-        module = attention.SharedCompressedDSAAttention(source, use_fused_ops=True)
+        module = CompressedSparseAttention2(module=source, use_fused_ops=True)
         query = torch.ones(1, 1, 1, 512, requires_grad=True)
         key = torch.empty(1, 0, 512, requires_grad=True)
         indices = torch.empty(1, 1, 0, dtype=torch.int32)
-        with patch.object(attention, "supports_fused_attention_inputs", return_value=True):
-            with patch.object(attention, "sparse_flash_mla", return_value=query.transpose(1, 2)):
+        with patch.object(attention_impl, "supports_fused_attention_inputs", return_value=True):
+            with patch.object(attention_impl, "sparse_flash_mla", return_value=query.transpose(1, 2)):
                 output = module._run_sparse_attention(  # pylint: disable=protected-access
                     query, query, key, indices, 0, 1, None, ((0, 1, 0, 0, 1),),
                 )
@@ -348,12 +367,12 @@ class TestNaturalDocumentCompression(unittest.TestCase):
         """Logical K is three for documents 3/3/2, even when this rank stores only two keys."""
         source = _source(True)
         source.compress_ratio = 2
-        module = attention.SharedCompressedDSAAttention(source, use_fused_ops=True)
+        module = CompressedSparseAttention2(module=source, use_fused_ops=True)
         query = torch.ones(1, 1, 4, 512)
         bank = torch.ones(1, 2, 512)
         indices = torch.full((1, 4, 3), -1, dtype=torch.int32)
-        with patch.object(attention, "supports_fused_attention_inputs", return_value=True):
-            with patch.object(attention, "sparse_flash_mla", return_value=query.transpose(1, 2)) as native:
+        with patch.object(attention_impl, "supports_fused_attention_inputs", return_value=True):
+            with patch.object(attention_impl, "sparse_flash_mla", return_value=query.transpose(1, 2)) as native:
                 output = module._run_sparse_attention(  # pylint: disable=protected-access
                     query, query, bank, indices, 4, 8, None, ((0, 2, 1, 2, 1), (2, 4, 2, 3, 0)),
                     raw_key_offset=3, main_key_offset=1, raw_document_starts=((0, 3), (2, 6)), global_key_length=3,
@@ -367,8 +386,8 @@ class TestSharedCompressedCPPlans(unittest.TestCase):
 
     def test_balance_options(self):
         """Greedy defaults to 2048; irrelevant or invalid options are rejected."""
-        self.assertEqual(attention.SharedCompressedDSAAttention(
-            _source(), indexer_load_balance="greedy").indexer_balance_block_size, 2048)
+        self.assertEqual(CompressedSparseAttention2(module=
+            _source(), context={"cp_size": 2}, indexer_load_balance="greedy").indexer_balance_block_size, 2048)
         cases = (
             ({"indexer_balance_block_size": 2048}, "requires indexer_load_balance"),
             ({"indexer_load_balance": "zigzag", "indexer_balance_block_size": 2048}, "requires indexer"),
@@ -377,7 +396,7 @@ class TestSharedCompressedCPPlans(unittest.TestCase):
         )
         for options, message in cases:
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
-                attention.SharedCompressedDSAAttention(_source(), **options)
+                CompressedSparseAttention2(module=_source(), **options)
 
     def test_task_coverage_and_row_budget(self):
         """All real rows appear once, including leading zigzag remainders."""
@@ -417,3 +436,70 @@ class TestSharedCompressedCPPlans(unittest.TestCase):
                     self.assertEqual(route.input_splits[peer], routes[peer].output_splits[rank])
         natural = document_prefix_route((0, 11, 256), local, size, 0, 2)
         self.assertEqual((natural.global_start, natural.global_end), (0, 15))
+
+
+class TestCSA2Family(unittest.TestCase):
+    """Check selection, identity, layouts and single communication ownership on CPU."""
+
+    def test_source_identity_and_four_members(self):
+        """Source parameters/buffers and frozen state survive every allowlisted selection."""
+        for size in (1, 2):
+            for fused in (False, True):
+                with self.subTest(cp=size, fused=fused):
+                    source = CompressedSparseAttention2(module=_source(True))
+                    source.register_buffer("calibration", torch.ones(1), persistent=False)
+                    source.sinks.requires_grad_(False)
+                    source.eval()
+                    source.indexer.q_b_proj.train()
+                    selected = CompressedSparseAttention2(
+                        module=source, context={"cp_size": size}, use_fused_ops=fused,
+                    )
+                    expected = ("cp_" if size > 1 else "") + ("fused" if fused else "reference")
+                    self.assertEqual(get_family_build_info(selected).resolved.variant, expected)
+                    self.assertEqual(source.state_dict().keys(), selected.state_dict().keys())
+                    for name, parameter in source.named_parameters():
+                        self.assertIs(selected.get_parameter(name), parameter)
+                    self.assertIs(selected.calibration, source.calibration)
+                    self.assertFalse(selected.training)
+                    self.assertTrue(selected.indexer.q_b_proj.training)
+                    self.assertFalse(selected.sinks.requires_grad)
+                    self.assertNotIn("calibration", selected.state_dict())
+                    checkpoint_keys = tuple(selected.state_dict())
+                    selected.indexer.enable_selection_exclude()
+                    self.assertEqual(tuple(selected.state_dict()), checkpoint_keys)
+
+    def test_complete_layout_and_invalid_override(self):
+        """Every parameter is owned; invalid TP/CP placement overrides are rejected."""
+        module = CompressedSparseAttention2(module=_source(True))
+        context = FamilyShardingContext(("tp", "cp"), {"tp": 1, "cp": 2}, {})
+        layout = family._sharding(module=module, module_fqn="", member=None, context=context)
+        self.assertEqual(set(layout.params), set(dict(module.named_parameters())))
+        validate_parallel_module(module, family._parallel_spec(module=module, member=None), layout, context)
+        layout.params["sinks"] = {"cp": Shard(0)}
+        with self.assertRaisesRegex(ValueError, "CSA2"):
+            validate_parallel_module(module, family._parallel_spec(module=module, member=None), layout, context)
+
+    def test_binding_keeps_class_forward_and_rejects_duplicate_owner(self):
+        """Binding must not monkeypatch forward or permit a second communication owner."""
+        module = CompressedSparseAttention2(module=_source(), context={"cp_size": 2})
+        binding = ParallelBinding(MeshBinding(SimpleNamespace(tp_size=1)),
+                                  cp_context=SimpleNamespace(size=2, rank=1))
+        before = module.forward.__func__
+        module.bind_parallel(binding)
+        self.assertIs(module.forward.__func__, before)
+        self.assertNotIn("forward", module.__dict__)
+        # Document-local RoPE positions do not change the physical CP row offset.
+        self.assertEqual(module.query_partition(2, torch.tensor([[0, 1]])), (2, 4))
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            module.bind_parallel(binding)
+
+    def test_unsupported_selectors_and_unbound_cp_fail(self):
+        """Reject unsupported topology/kernel combinations before any collective runs."""
+        source = CompressedSparseAttention2(module=_source())
+        with self.assertRaises((ValueError, TypeError)):
+            CompressedSparseAttention2(module=source, use_fused_ops="true")
+        with self.assertRaisesRegex(NotImplementedError, "TP=1"):
+            CompressedSparseAttention2(module=source, context={"tp_size": 2}, use_fused_ops=True)
+        cp = CompressedSparseAttention2(module=source, context={"cp_size": 2})
+        with self.assertRaisesRegex(RuntimeError, "must be bound"):
+            cp.query_partition(2, torch.arange(2).unsqueeze(0))

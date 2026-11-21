@@ -33,9 +33,14 @@ the identical byte string.
 from __future__ import annotations
 
 import ast
+from functools import wraps
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+
+from hyper_parallel.distributed.recipe_spec import inner_wrapper
+from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 
 from hyper_parallel.codegen.emit.modeling import _verify_recorded_patch_materialization
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
@@ -81,6 +86,26 @@ class Beta(nn.Module):
     def forward(self, x):
         return x + 1
 '''
+
+
+@inner_wrapper
+def _closure_cp_wrapper(target_module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
+                        ep_mesh: Any) -> _ForwardRewriteRequest:
+    """Provide a model-independent closure fixture for source lowering."""
+    del mesh, tp_mesh, ep_mesh
+    context = {"enabled": cp_mesh is not None}
+    original_forward = target_module.forward
+
+    @wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Forward the captured state through an explicit keyword."""
+        call_kwargs = dict(kwargs)
+        call_kwargs["cp_context"] = context
+        return original_forward(*args, **call_kwargs)
+
+    return _ForwardRewriteRequest(
+        target_module, cp_forward, companion_attrs={"_test_cp_context": context},
+    )
 
 
 def test_inline_meta_normalization_does_not_mutate_native_observation():
@@ -146,11 +171,7 @@ def test_framework_inner_wrapper_resolves_without_model_adapter_path():
 
 def test_closure_cp_wrapper_exposes_source_visible_forward():
     """Closure state published by a rewrite request lowers into its host."""
-    factory = (
-        "hyper_parallel.models.deepseek_v41.adapter.distributed."
-        "shared_attention_context_parallel."
-        "deepseek_v41_shared_attention_parallel_wrapper"
-    )
+    factory = f"{__name__}._closure_cp_wrapper"
 
     target = inner_wrapper_target(factory)
 
@@ -158,37 +179,32 @@ def test_closure_cp_wrapper_exposes_source_visible_forward():
     assert target.helper_name is None
     assert target.inline_body is not None
     assert "if self.cp_enable:" in target.inline_body
-    assert "self._hyper_v41_shared_attention_cp_context" in target.inline_body
-    assert "self._hyper_v41_shared_attention_tp_context" in target.inline_body
+    assert "self._test_cp_context" in target.inline_body
     assert "super().forward(*args, **call_kwargs)" in target.inline_body
 
 
 def test_closure_cp_wrapper_materializes_imported_replacement_host(monkeypatch):
     """A closure wrapper and an imported replacement compose end to end."""
-    wrapper = (
-        "hyper_parallel.models.deepseek_v41.adapter.distributed."
-        "shared_attention_context_parallel."
-        "deepseek_v41_shared_attention_parallel_wrapper"
-    )
+    wrapper = f"{__name__}._closure_cp_wrapper"
     monkeypatch.setattr(
         "hyper_parallel.codegen.inline.strategy_pass.strategy_spec",
         lambda *_args, **_kwargs: _cp_strategy_spec(wrapper),
     )
     patches = build_strategy_patches(
         (SourceObservation(match=("model.layers.0.self_attn",), inner_wrapper_target=wrapper),),
-        boundary_classes={"model.layers.0.self_attn": "SharedCompressedDSAAttention"},
+        boundary_classes={"model.layers.0.self_attn": "DemoAttention"},
     )
     patches.imports.append(
-        ImportPatch("demo.components", ("SharedCompressedDSAAttention",))
+        ImportPatch("demo.components", ("DemoAttention",))
     )
 
     _materialize_imported_forward_hosts(SOURCE_TEXT, patches)
     rendered = apply_patch_set(SOURCE_TEXT, patches)
 
     ast.parse(rendered)
-    assert "class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):" in rendered
+    assert "class DemoAttention(_DemoAttentionBase):" in rendered
     assert "if self.cp_enable:" in rendered
-    assert "self._hyper_v41_shared_attention_cp_context" in rendered
+    assert "self._test_cp_context" in rendered
     assert "return super().forward(*args, **call_kwargs)" in rendered
 
 VARIADIC_SOURCE_TEXT = '''\

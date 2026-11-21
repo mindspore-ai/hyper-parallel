@@ -15,24 +15,25 @@
 """Native functional Indexer score reductions support eager and graph capture."""
 
 from collections.abc import Callable
-from types import SimpleNamespace
+from functools import partial
 import unittest
 from unittest.mock import patch
 
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from hyper_parallel.models.deepseek_v41.adapter.distributed import shared_attention_context_parallel as adapter
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
+    cp_compressed_sparse_attention2 as adapter,
+)
 
 
 class TestTPScoreGraph(unittest.TestCase):
-    """Regression contracts for the model-owned functional Indexer score reducer."""
+    """Regression contracts for the CSA2 functional Indexer score reducer."""
 
     @staticmethod
     def _callback() -> Callable[[torch.Tensor], torch.Tensor]:
         """Build a reducer using a fake two-rank TP group."""
-        mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 0, get_group=lambda: "mock-group")
-        return adapter._build_shared_attention_tp_context(mesh).reduce_sum
+        return partial(adapter._reduce_scores, group="mock-group")
 
     def test_eager_preserves_native_functional_autograd(self) -> None:
         """Feature: Functional Indexer score SUM in ordinary eager execution.

@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-本功能在 `SharedCompressedDSAAttention` 中重新分配普通因果 Indexer 的 TopK **选择任务**。
+本功能在 `CompressedSparseAttention2` 中重新分配普通因果 Indexer 的 TopK **选择任务**。
 主 attention、teacher、KL 和输出保持原 Q owner；Indexer 参数仍通过 owner 上的 KL 更新。
 支持压缩率 1/2、Full/Reindex/Reuse，以及单文档和自然长度的 packed 文档。
 
@@ -21,7 +21,7 @@ plan_overrides:
   - match: "model.layers.*.self_attn"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
     replace_module:
-      _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+      _target_: hyper_parallel.components.modules.CompressedSparseAttention2
       use_fused_ops: true
       main_kv_comm: all_to_all_v
       indexer_load_balance: greedy

@@ -14,38 +14,21 @@
 # ============================================================================
 """Distributed CPU parity worker for the shared compressed DSA indexer."""
 
-from typing import Any
+from functools import partial
 
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
     compressed_candidate_topk,
     compressed_causal_topk_and_candidates,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.cp_compressed_sparse_attention2 import (
+    _reduce_scores,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer_kl_loss import (
     shared_compressed_indexer_kl_loss,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel import (
-    _build_shared_attention_tp_context,
-)
-
-
-class _TPMesh:
-    """Minimal TP mesh interface backed by the initialized world group."""
-
-    @staticmethod
-    def size() -> int:
-        """Return the TP world size."""
-        return dist.get_world_size()
-
-    @staticmethod
-    def get_local_rank() -> int:
-        """Return this process's TP rank."""
-        return dist.get_rank()
-
-    @staticmethod
-    def get_group() -> Any:
-        """Return the raw process group expected by the collective API."""
-        return dist.group.WORLD
 
 
 def test_deepseek_v41_indexer_tp_gloo():
@@ -60,7 +43,7 @@ def test_deepseek_v41_indexer_tp_gloo():
         index_key = torch.randn(1, 4, 3)
         merge_weight = torch.randn(1, 8, 4)
         local_head_slice = slice(rank * 2, (rank + 1) * 2)
-        tp_context = _build_shared_attention_tp_context(_TPMesh())
+        reduce_sum = partial(_reduce_scores, group=dist.group.WORLD)
 
         expected_topk, expected_candidates = compressed_causal_topk_and_candidates(
             index_query,
@@ -81,7 +64,7 @@ def test_deepseek_v41_indexer_tp_gloo():
             topk_blocks=1,
             block_size=2,
             query_chunk_size=2,
-            reduce_sum=tp_context.reduce_sum,
+            reduce_sum=reduce_sum,
         )
         torch.testing.assert_close(actual_topk, expected_topk)
         torch.testing.assert_close(actual_candidates, expected_candidates)
@@ -94,7 +77,7 @@ def test_deepseek_v41_indexer_tp_gloo():
             sparse_count=2,
             block_size=2,
             query_chunk_size=2,
-            reduce_sum=tp_context.reduce_sum,
+            reduce_sum=reduce_sum,
         )
         expected_reindex = compressed_candidate_topk(
             index_query,
@@ -140,7 +123,7 @@ def test_deepseek_v41_indexer_tp_gloo():
             attention_scale=5**-0.5,
             loss_coeff=0.1,
             query_chunk_size=2,
-            tp_context=tp_context,
+            reduce_sum=reduce_sum,
         )
         expected_loss.backward()
         actual_loss.backward()

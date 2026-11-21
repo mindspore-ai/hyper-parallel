@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
+    "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
     "Gate": "gate",
     "GateModule": "gate",
     "MegaMhc": "mhc.mhc",
@@ -96,12 +97,9 @@ _EXPORT_TO_MODULE = {
     "MultiLatentAttentionModule": "attention.multi_latent_attention",
     "GatedMultiLatentAttention": "attention.gated_multi_latent_attention",
     "GatedMultiLatentAttentionModule": "attention.gated_multi_latent_attention",
-    "SharedCompressedAttentionCPContext": "shared_compressed_dsa_attention",
-    "SharedCompressedAttentionState": "shared_compressed_dsa_attention",
-    "SharedCompressedPackedSequence": "shared_compressed_dsa_attention",
-    "SharedCompressedAttentionTPContext": "shared_compressed_dsa_attention",
-    "SharedCompressedDSAAttention": "shared_compressed_dsa_attention",
-    "SharedCompressedDSAIndexer": "shared_compressed_dsa_attention",
+    "SharedCompressedAttentionState": "attention.compressed_sparse_attention2.compressed_sparse_attention2",
+    "SharedCompressedPackedSequence": "attention.compressed_sparse_attention2.document_layout",
+    "CSA2Indexer": "attention.compressed_sparse_attention2.indexer",
 }
 _EXPORT_TO_MODULE.update({name: "module_family" for name in (
     "ModuleFamily", "SelectorSpec", "VariantRule", "FamilyRequest", "ResolvedFamily",

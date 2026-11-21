@@ -17,7 +17,7 @@
 Three mechanisms make a recomputed attention legal, and this module exercises
 them on CPU against the real classes:
 
-* ``is_recomputing()`` phase guards keep ``publish_*`` from running twice.
+* State-owned phase guards keep ``publish_*`` from writing twice.
   Those calls contain no differentiable op, so skipping them cannot change the
   checkpoint's saved-tensor count.
 * the indexer's discrete selection is an exclusion region, because a recompute
@@ -36,13 +36,27 @@ from unittest import mock
 import torch
 from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType
+from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
-    SharedCompressedAttentionCPContext,
+from hyper_parallel.components.modules import CompressedSparseAttention2
+from hyper_parallel.components.modules.module_family import get_family_build_info
+from hyper_parallel.models.module_build import prepare_model_components
+from hyper_parallel.models.replacement import ModuleReplacementRequest
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention
+
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
     SharedCompressedAttentionState,
-    SharedCompressedDSAAttentionBase,
-    SharedCompressedDSAIndexer,
 )
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    CompressedSparseAttention2Module, _apply_v41_rope,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
+    CSA2Indexer,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.cp_compressed_sparse_attention2 import (
+    CPCompressedSparseAttention2,
+)
+from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
 from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
 from hyper_parallel.models.deepseek_v41.adapter.policies import (
     activation_checkpointing as attention_policy,
@@ -66,20 +80,23 @@ class _CountingState(SharedCompressedAttentionState):
         self.topk_count = 0
         self.index_key_count = 0
 
-    def publish_compressed_kv(self, source_layer: int, value: torch.Tensor, key_offset: int = 0) -> None:
+    def publish_compressed_kv(self, source_layer: int, value: torch.Tensor, key_offset: int = 0) -> bool:
         """Count one compressed K=V publication."""
-        self.publish_count += 1
-        super().publish_compressed_kv(source_layer, value, key_offset)
+        published = super().publish_compressed_kv(source_layer, value, key_offset)
+        self.publish_count += int(published)
+        return published
 
-    def publish_topk_indices(self, source_layer: int, value: torch.Tensor) -> None:
+    def publish_topk_indices(self, source_layer: int, value: torch.Tensor) -> bool:
         """Count one Top-K publication."""
-        self.topk_count += 1
-        super().publish_topk_indices(source_layer, value)
+        published = super().publish_topk_indices(source_layer, value)
+        self.topk_count += int(published)
+        return published
 
-    def publish_index_key(self, source_layer: int, value: torch.Tensor) -> None:
+    def publish_index_key(self, source_layer: int, value: torch.Tensor) -> bool:
         """Count one indexer-K publication."""
-        self.index_key_count += 1
-        super().publish_index_key(source_layer, value)
+        published = super().publish_index_key(source_layer, value)
+        self.index_key_count += int(published)
+        return published
 
 
 class _Compressor(nn.Module):
@@ -196,17 +213,29 @@ class _GatherCounter:
         return SimpleNamespace(wait=lambda: gathered)
 
 
+class _GatherCSA2(CPCompressedSparseAttention2):
+    """Use the counting gather for raw KV without creating a process group in UT."""
+
+    def exchange_raw(self, tensor, sequence_dim, route):
+        del route
+        return self.launch_bank(tensor, sequence_dim)
+
+
+def _bind_gather(layer):
+    """Bind the same explicit CP stages used by the family runtime."""
+    counter = _GatherCounter()
+    context = SimpleNamespace(size=CP_SIZE, rank=0,
+                              launch_gather_sequence=lambda tensor, dim: SimpleNamespace(
+                                  collective=counter.launch(tensor, dim)))
+    layer.bind_parallel(ParallelBinding(MeshBinding(SimpleNamespace(tp_size=1)), cp_context=context))
+    return counter
+
+
 def _run(layer: nn.Module, state: SharedCompressedAttentionState, gather_counter, inputs):
     """Run one forward/backward and return the loss and the input gradient."""
     hidden, rope = inputs
     kwargs = {"shared_attention_state": state}
-    if gather_counter is not None:
-        kwargs["shared_attention_cp_context"] = SharedCompressedAttentionCPContext(
-            size=CP_SIZE,
-            rank=0,
-            gather_sequence=gather_counter.gather,
-            launch_sequence=gather_counter.launch,
-        )
+    del gather_counter
     output, _ = layer(
         hidden,
         {"compress": (rope, rope), "main": (rope, rope)},
@@ -222,25 +251,29 @@ def _run(layer: nn.Module, state: SharedCompressedAttentionState, gather_counter
 def _kv_source_layer(use_cp, state):
     """Build a KV-source attention layer and the inputs for one run."""
     torch.manual_seed(11)
-    layer = SharedCompressedDSAAttentionBase(
+    implementation = _GatherCSA2 if use_cp else CompressedSparseAttention2Module
+    layer = implementation(
         _Source(), replace_indexer=False, use_fused_ops=False
     )
     layer.compressor = _Compressor()
     state.publish_topk_indices(LAYER, torch.zeros(BATCH, SEQUENCE, 2, dtype=torch.int32))
-    return layer, _inputs(), _GatherCounter() if use_cp else None
+    counter = _bind_gather(layer) if use_cp else None
+    return layer, _inputs(), counter
 
 
 def _index_source_layer(use_cp, state):
     """Build a Reindex-style layer that republishes the shared Top-K."""
     torch.manual_seed(11)
     source = _IndexSource()
-    source.indexer = SharedCompressedDSAIndexer(_IndexerSource())
-    layer = SharedCompressedDSAAttentionBase(
+    source.indexer = CSA2Indexer(_IndexerSource(), apply_rope=_apply_v41_rope)
+    implementation = _GatherCSA2 if use_cp else CompressedSparseAttention2Module
+    layer = implementation(
         source, replace_indexer=False, use_fused_ops=False
     )
     state.publish_compressed_kv(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
     state.publish_index_key(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
-    return layer, _inputs(), _GatherCounter() if use_cp else None
+    counter = _bind_gather(layer) if use_cp else None
+    return layer, _inputs(), counter
 
 
 def _inputs():
@@ -392,3 +425,40 @@ def test_recompute_tiers_exclude_and_pin_one_role_set():
                 assert attention_role(attention) == role
                 assert _keeps_out_of_recompute(policy, attention) == (role in resident)
                 assert bool(getattr(attention.indexer, "selection_pinned", False)) == (role in pinned)
+
+
+def test_attention_source_replacement_retains_norm_parameters() -> None:
+    """Feature: A complete CSA2 source remains eligible for family conversion.
+    Description: Replace a compressed source containing Compressor and Indexer norms.
+    Expectation: No nested direct-family conflict; every Parameter retains its identity.
+    """
+    config = DeepseekV4Config.from_dict({
+        "vocab_size": 32, "hidden_size": 16, "num_hidden_layers": 1,
+        "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 8,
+        "q_lora_rank": 8, "o_groups": 2, "o_lora_rank": 4,
+        "index_n_heads": 2, "index_head_dim": 4, "index_topk": 2,
+        "sliding_window": 4, "partial_rotary_factor": 0.5,
+        "layer_types": ["sliding_attention"], "mlp_layer_types": ["moe"],
+        "v41_compress_ratios": [2], "v41_kv_source_layer_ids": [0],
+        "v41_index_source_layer_ids": [0], "v41_candidate_source_layer_id": -1,
+    })
+    with torch.random.fork_rng(devices=[]):
+        model = nn.Sequential(DeepseekV41Attention(config, 0))
+    original = dict(model.named_parameters())
+    context = {
+        "cp_size": 1, "tp_size": 1,
+        "module_replacement_requests": (ModuleReplacementRequest(
+            match=("0",), target=CompressedSparseAttention2,
+            kwargs={"use_fused_ops": False},
+        ),),
+    }
+    converted, _ = prepare_model_components(model, context)
+    info = get_family_build_info(converted[0])
+    assert info is not None, f"family provenance={info}, expected a converted CSA2 member"
+    assert info.request.target is CompressedSparseAttention2, (
+        f"actual={info.request.target}, expected={CompressedSparseAttention2}"
+    )
+    actual = dict(converted.named_parameters())
+    assert actual.keys() == original.keys(), f"actual={actual.keys()}, expected={original.keys()}"
+    for name, parameter in original.items():
+        assert actual[name] is parameter, f"{name}: actual={id(actual[name])}, expected={id(parameter)}"

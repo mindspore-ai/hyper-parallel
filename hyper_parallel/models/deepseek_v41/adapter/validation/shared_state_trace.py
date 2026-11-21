@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
     SharedCompressedAttentionState,
 )
 
@@ -121,8 +121,9 @@ def _traced_method(
     """Wrap one state method only for the active validation step."""
     @functools.wraps(original)
     def wrapper(state: SharedCompressedAttentionState, *args: Any, **kwargs: Any) -> Any:
+        result = original(state, *args, **kwargs)
         trace = _ACTIVE_TRACE.get()
-        if trace is not None:
+        if trace is not None and (action != "publish" or result):
             source_layer = _argument(args, kwargs, 0, "source_layer")
             consumer_layer = (
                 None
@@ -137,7 +138,7 @@ def _traced_method(
                 source_layer,
                 consumer_layer,
             )
-        return original(state, *args, **kwargs)
+        return result
 
     return wrapper
 

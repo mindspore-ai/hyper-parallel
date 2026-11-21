@@ -1154,7 +1154,7 @@ class TestV41SparseAttentionContract(unittest.TestCase):
         )
         try:
             module = importlib.import_module(
-                "hyper_parallel.components.modules.shared_compressed_dsa_attention")
+                "hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2")
         except ImportError:
             module = None
         names = ("npu_sparse_attention_with_scalar_sink", "_reference_sparse_attention")
@@ -1192,7 +1192,7 @@ class TestV41SparseAttentionContract(unittest.TestCase):
         )
         try:
             module = importlib.import_module(
-                "hyper_parallel.components.modules.shared_compressed_dsa_attention")
+                "hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer")
         except ImportError:
             module = None
         before = ({name: getattr(module, name) for name in _V41_SELECTION}
