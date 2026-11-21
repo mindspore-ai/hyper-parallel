@@ -79,7 +79,24 @@ if _has_scoped_weight_transforms() and _hf_revert_weight_conversion is not None:
     Transpose = _HFTranspose
     WeightConverter = _HFWeightConverter
     WeightRenaming = _HFWeightRenaming
-    from transformers.core_model_loading import dot_natural_key, rename_source_key
+    from transformers.core_model_loading import dot_natural_key
+    from transformers.core_model_loading import rename_source_key as _upstream_rename_source_key
+
+    def rename_source_key(
+        source_key: str,
+        weight_renamings: list[WeightRenaming],
+        weight_converters: list[WeightConverter],
+        base_model_prefix: str | None = None,
+        meta_state_dict: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None]:
+        """Rename a checkpoint key through the upstream transforms, under this module's kwarg name."""
+        # Upstream renamed the base-model-prefix kwarg across releases (transformers 5.9 calls it
+        # ``prefix``); this module's callers and its fallback below say ``base_model_prefix``,
+        # so the prefix is forwarded positionally and works under either upstream name.
+        return _upstream_rename_source_key(
+            source_key, weight_renamings, weight_converters, base_model_prefix,
+            meta_state_dict=meta_state_dict,
+        )
 
     get_model_conversion_mapping = _hf_get_model_conversion_mapping
     revert_weight_conversion = _hf_revert_weight_conversion
