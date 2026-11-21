@@ -99,9 +99,12 @@ def _with_history(
     info: PackedSequenceInfo | None,
     width: int,
 ) -> tuple[torch.Tensor, tuple[int, ...] | None, int]:
-    """Prepend only the first fragment's true history without inventing a reset."""
+    """Prepend valid history while preserving dense samples and packed resets."""
     if info is None:
-        return inputs, None, 0
+        if halo is None:
+            return inputs, None, 0
+        # Dense batch samples are independent; a CP cut is not a document reset.
+        return torch.cat((halo, inputs), dim=1), None, halo.shape[1]
     if halo is None:
         return inputs, info.local_offsets, 0
     prefix = min(width - 1, info.preceding_sample_tokens)
@@ -160,19 +163,16 @@ def _validate_fused_inputs(
     if info is not None and inputs.shape[:2] != (1, info.length):
         raise ValueError("Packed convolution expects [1,T,C] matching its token interval.")
     if halo is not None:
-        _validate_fused_history(inputs, halo, info, weight.shape[-1])
+        _validate_fused_history(inputs, halo, weight.shape[-1])
 
 
 def _validate_fused_history(
     inputs: torch.Tensor,
     halo: torch.Tensor,
-    info: PackedSequenceInfo | None,
     width: int,
 ) -> None:
-    """Reject history that cannot represent the same document and activation layout."""
-    if info is None:
-        raise ValueError("Fused convolution halo requires explicit packed sequence metadata.")
-    if halo.shape != (1, width - 1, inputs.shape[-1]):
+    """Check the received history layout for dense and packed inputs."""
+    if halo.shape != (inputs.shape[0], width - 1, inputs.shape[-1]):
         raise ValueError("Fused convolution halo has an incompatible shape.")
     if halo.dtype != inputs.dtype or halo.device != inputs.device:
         raise ValueError("Fused convolution halo must match the input dtype and device.")
@@ -195,7 +195,9 @@ def fused_causal_conv1d(
         weight: The original parameter's local view with shape ``[C,1,W]``.
         bias: Optional local bias with shape ``[C]``.
         info: Packed document boundaries, or None for independent dense batch samples.
-        halo: Already exchanged packed history; this helper adds no communication.
+        halo: Already exchanged ``[B,W-1,C]`` history for dense batches, or
+            ``[1,W-1,C]`` history whose valid prefix is selected by packed metadata.
+            This helper adds no communication.
         backend: Explicit ``triton`` or ``ascendc`` selection, with no fallback.
         dilation: Source convolution dilation; fused kernels require one.
 

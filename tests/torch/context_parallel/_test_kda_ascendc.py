@@ -115,6 +115,20 @@ def test_kda_ascendc_ulysses() -> None:
         dist.destroy_process_group()
 
 
+def _check_dense_halo_layer(mesh):
+    """A CP cut must preserve dense ShortConv history and its backward gradients."""
+    torch.manual_seed(83)
+    model = KimiDeltaAttention(hidden_size=32, num_heads=4, conv_kernel_size=4).float().npu()
+    local = (torch.randn(1, 4096, 32) * .05).bfloat16().npu()
+    do = torch.randn_like(local) * .01
+    offsets = (0, 4096 * mesh.size())
+    for method in ("p2p", "allgather"):
+        wrapper = KimiDeltaAttentionLayerCP(model, mesh, backend="ascendc", state_cp_method=method)
+        expected = _execute(model, wrapper, [local], [do], [offsets])
+        actual = _execute(model, wrapper, [local], [do], [None])
+        _assert_same(actual, expected, exact=False)
+
+
 def test_kda_ascendc_state() -> None:
     """Compare native state protocols and Ulysses hybrids on the same packed input."""
     torch.set_num_threads(1)
@@ -165,5 +179,6 @@ def test_kda_ascendc_state() -> None:
                         _assert_protocol_compatible(actual, reference)
                     else:
                         _assert_same(actual, reference, exact=False)
+        _check_dense_halo_layer(mesh)
     finally:
         dist.destroy_process_group()
