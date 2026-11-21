@@ -16,19 +16,17 @@
 
 from pathlib import Path
 
+from pytest import MonkeyPatch
+
+from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
 
-SWAP_OPTIMIZER_CHECKOUT = str(Path(__file__).with_name("swap_optimizer_checkpoint.py"))
+_WORKER = str(Path(__file__).resolve().with_name("swap_optimizer_checkpoint.py"))
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_swap_optimizer_checkpoint_resharding_gloo() -> None:
-    """Run the two-rank native DTensor optimizer checkpoint regression."""
-    parallel_run([
-        TorchCase(
-            SWAP_OPTIMIZER_CHECKOUT,
-            "test_swap_optimizer_checkpoint_reshards_native_dtensor",
-            num_proc=2,
-        ),
-    ])
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_swap_optimizer_checkpoint_resharding_gloo(monkeypatch: MonkeyPatch) -> None:
+    """Run the native DTensor checkpoint regression on two CPU/Gloo ranks."""
+    monkeypatch.setenv("HYPER_PARALLEL_TEST_DEVICE_TYPE", "cpu")
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    torchrun_case(_WORKER, "test_swap_optimizer_checkpoint_reshards_native_dtensor", num_proc=2)

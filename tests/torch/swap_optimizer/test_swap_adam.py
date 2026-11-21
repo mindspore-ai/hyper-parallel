@@ -17,7 +17,7 @@ from pathlib import Path
 
 from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
+from tests.common.parallel_case import TorchCase, parallel_run, parallel_run_ascend_batches
 
 SWAP_OPTIMIZER = "swap_adam.py"
 
@@ -38,18 +38,13 @@ def test_fp32_main_gradient_cast_with_swap_optimizer() -> None:
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_swap_optimizer_1():
-    """
-    Feature: parallel run case in swap_adam
-    Description:
-        1. test_fully_shard_adamw_mixed_precision_swap_optimizer_parameter_align
-        2. test_fully_shard_optimizer_swap_adamw_4card_parameter_align
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(SWAP_OPTIMIZER, "test_fully_shard_adamw_mixed_precision_swap_optimizer_parameter_align", 12504, 4),
-        TorchCase(SWAP_OPTIMIZER, "test_fully_shard_optimizer_swap_adamw_4card_parameter_align", 12511, 4),
+def test_swap_optimizer_1() -> None:
+    """Check flat mixed precision and packed and unpacked HSDP on separate four-card groups."""
+    parallel_run_ascend_batches([
+        TorchCase(SWAP_OPTIMIZER, "test_fully_shard_adamw_mixed_precision_swap_optimizer_parameter_align", num_proc=4),
+        TorchCase(SWAP_OPTIMIZER, "test_fully_shard_optimizer_swap_adamw_4card_parameter_align", num_proc=4),
     ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_swap_optimizer_2():

@@ -66,6 +66,8 @@ def _build_host_resident_swap_state(mesh: object, expected: torch.Tensor):
         optimizer,
         SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=False),
     )
+    # The host-resident test slots have no device work to synchronize.
+    wrapped.runtime.current_stream = lambda: None
     for slot in wrapped.adapter.all_slots():
         slot.swappable = True
         slot.cpu_tensor = slot.tensor.to_local().detach().cpu().clone()

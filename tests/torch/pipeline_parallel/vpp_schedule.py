@@ -30,6 +30,7 @@ from hyper_parallel import (
 from hyper_parallel.core.pipeline_parallel import CommComputeOverlap
 from hyper_parallel.core.activation_memory import swap_wrapper
 from hyper_parallel.core.activation_memory.swap import SwapManager
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.dtensor.random import is_rng_supported_mesh
 from tests.torch.utils import _DEVICE_TYPE, to_device
@@ -359,8 +360,12 @@ def _test_vpp_dynamic_batched_p2p_cold_start(p2p_transport: str) -> None:
         mesh_shape=(pp_size, dp_size),
         mesh_dim_names=("pp", "dp"),
     )
-    pp_mesh = mesh["pp"]
-    stage_index = pp_mesh.get_local_rank()
+    ranks = list(mesh["pp"].rank_list)
+    stage_index = ranks.index(dist.get_rank())
+    # DeviceMesh caches its groups by rank list. Give each transport its own cold
+    # metadata group so the second worker cannot pass using the first one's communicator.
+    group = dist.new_group(ranks, use_local_synchronization=True)
+    pp_mesh = DeviceMesh.from_group(group, _DEVICE_TYPE, mesh_dim_names=("pp",))
 
     chunks = [SimpleMLP(8, 16, 16), SimpleMLP(8, 16, 16)]
     for chunk_index, chunk in enumerate(chunks):
@@ -375,7 +380,7 @@ def _test_vpp_dynamic_batched_p2p_cold_start(p2p_transport: str) -> None:
             stage_index + chunk_index * pp_size,
             pp_size * len(chunks),
             torch.device(_DEVICE_TYPE),
-            group=pp_mesh.get_group(),
+            group=group,
             mesh=pp_mesh,
             dyn_shape=True,
         )
