@@ -2,6 +2,9 @@
 
 **English** | [简体中文](omni_online_data_guide.zh.md)
 
+For YAML settings and worked examples of sample length, packing, and padding, see
+[Dataset usage](../../../hyper_parallel/data/README.md#10-configuration-examples).
+
 Using the repository's Qwen2-VL example, this guide explains how to feed image-dialogue samples into `VLMTrainer`. The generic Omni path handles reading, filtering,
 encoding, packing, and TP/CP batch transport. Transforms or runtime adapters handle model-specific processors, supervision labels,
 and additional forward fields. For DeepSeek-V4.1-specific processing, see the
@@ -10,7 +13,7 @@ and additional forward fields. For DeepSeek-V4.1-specific processing, see the
 ## 1. Minimal Sample
 
 `AutoProcessorTransform` accepts nonempty `messages` and requires the last message to be from the assistant. The Qwen2-VL example uses this
-processor-compatible format; start with absolute image paths:
+processor-compatible format; use absolute image paths or paths relative to the local source file:
 
 ```json
 {
@@ -33,24 +36,34 @@ processor-compatible format; start with absolute image paths:
 Place multiple objects in a JSON array (`.json`) or write one object per line in `.jsonl`. The example script reads
 `synthetic.json` by default; set `DATA_PATH` to use your own file. During source indexing,
 `is_valid_sample()` drops `messages=[]`; missing `messages` or a non-list value raises an error. See the DeepSeek-V4.1 guide above for native JSONL indexing, relative media paths,
-splits, and routing for other formats. Do not assume every JSON image path is resolved relative to its data file.
+splits, and routing for other formats. Local JSONL/JSON/Parquet/Arrow Mapping records retain their source file's
+absolute path, which determines the base directory for relative media paths, including multi-file sources.
+Supply absolute media paths when invoking transforms directly or using records without source provenance.
 
 ## 2. YAML Integration Points
+
+Minimal templates list required settings only. See the separate
+[Dataset defaults table](../../../hyper_parallel/data/README.md#defaults-omitted-from-minimal-templates),
+Trainer-injected arguments, and unsupported settings. Add optional overrides only when changing behavior.
 
 Configure these two sections following [`examples/training_demo/train_vlm.yaml`](../../../examples/training_demo/train_vlm.yaml):
 
 ```yaml
+training:
+  epochs: 1
+  max_steps: 100
+
 dataset:
+  training_mode: sft
   model_assets:
     _target_: hyper_parallel.data.omni.build_auto_processor
     pretrained_model_name_or_path: /path/to/Qwen2-VL-model
-    local_files_only: true
   data_transform:
     _target_: hyper_parallel.data.omni.AutoProcessorTransform
-    max_seq_len: 512
   _target_: hyper_parallel.data.omni.build_online_omni_mapping_dataset
   data_path: /path/to/train.json
-  data_config: {}
+  data_config:
+    max_seq_len: 512
 
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
@@ -58,16 +71,15 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
-    encoder_dp: false
-  sampler_type: single
-  token_budget: 128
-  min_buffered_samples: 1
-  num_workers: 0
 ```
 
 `model_assets` creates the processor, which the configuration resolver injects into `data_transform.processor`. The Dataset builder receives the
 transform. `OmniPackingLoader` selects and packs candidate samples, `build_omni_collate_fn` assembles batches,
 and `OmniParallelBatch` prepares distributed model inputs. The example uses this class directly without additional hooks.
+
+VLMTrainer requires explicit `dataset.training_mode`; the generic AutoProcessor path uses `sft`.
+Online `max_steps` counts optimizer steps per training epoch; this example runs 100 steps in total.
+Source EOF repeats by default, independently of training epoch boundaries. `train_iters/train_samples` apply to Offline.
 
 You can also inspect the Dataset interface independently of the Trainer:
 
@@ -99,39 +111,38 @@ With ratio splits or presplit paths configured, the Dataset builder returns `(tr
 `None` for absent splits. `transform.is_valid_sample` is automatically passed to the source builder as the raw-record filter; do not pass it again manually.
 
 `AutoProcessorTransform` rejects samples exceeding `max_seq_len`; it **does not truncate or pad media sequences**.
-`token_budget` controls the target number of tokens selected for one packing operation, not a per-sample truncation limit.
+`max_seq_len` also limits each packed sequence; B packed sequences form one micro-batch.
 For long samples, explicitly implement truncation and synchronized image patch/grid handling in the model-specific transform, or clean the data beforehand.
 
 ### Fix the Input Length After Packing
 
-Set `pad_to_length` on the collator target to pad global token sequences across different DP branches and micro-batches
-to the same length:
+Set `dataset.data_config.max_seq_len` once as the per-sequence packing limit S.
+The loader independently packs B=`micro_batch_size` sequences, then the collator pads them:
 
 ```yaml
+dataset:
+  data_config:
+    max_seq_len: 1024
+  data_transform:
+
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
   collate_fn:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
-    pad_to_length: 1024
-  token_budget: 1024
-  min_buffered_samples: 1
 ```
 
-- `pad_to_length` defaults to `null`, aligning only to TP × CP. A positive integer specifies an exact global target length; booleans are rejected.
-  The target must be divisible by runtime TP × CP, or collator construction raises `ValueError`.
-- `token_budget` still controls only sample selection, independently of fixed padding. `pad_to_length` is neither inferred from `max_seq_len`,
-  `micro_batch_size`, or `token_budget`, nor used to overwrite them.
-- Padding occurs after packing, before CP slicing and TP broadcasting. For a target of 1024 and CP=2, the global input is
-  `[1, 1024]`, and each CP rank receives `[1, 512]`. DP ranks need no communication to determine the target length.
-- If the packed length exceeds the target, `ValueError` is raised without truncation or automatic target growth. A single sample exceeding
-  `token_budget` may still be selected; ensure both valid sample lengths and the batching budget stay within the fixed target.
-- Labels are padded with `-100` and masks with 0. Real sample boundaries are preserved, with a new padding segment appended. For example,
-  padding `cu_seq_lens=[0, 300, 700]` to 1024 produces `[0, 300, 700, 1024]`.
-  No empty segment is added if the target is already met. Fixed padding does not affect image patches, grids, or starting positions.
+- `pad_to_length: true` (the default) produces `[B,S]`; false pads to the longest
+  actual packed sequence rounded up to TP×CP alignment, producing `[B,T]` with T≤S.
+  S must be divisible by runtime TP×CP.
+- Samples longer than S are skipped. A sample that does not fit the current packed sequence
+  remains buffered for a later sequence. Repeating the source retains the buffer.
+- Padding runs before CP slicing and TP broadcasting. B=2, S=1024, CP=2 gives `[2,1024]`
+  globally and `[2,512]` on each CP rank. No DP communication is needed to determine S.
+- Token padding is 0, labels are -100, and masks are 0. Each packed sequence's padding
+  becomes a separate `cu_seq_lens` segment; image patches, grids, and local starts are retained.
+- `pad_to_length` accepts only a boolean; packing and fixed padding share S.
 
-Text Online's `build_online_text_collate_fn` supports the same `pad_to_length` parameter. Use
-`--dataloader.collate_fn.pad_to_length=1024` on the command line, or `=null` to restore alignment-only mode. Fixed lengths increase computation and memory
-for short sequences, and do not equalize image-patch counts or expert-routing loads across DP ranks.
+Text Online's `build_online_text_collate_fn` uses the same settings.
 
 ## 3. From Raw Samples to Model Inputs
 
@@ -140,7 +151,7 @@ JSON/JSONL record
   -> build_online_omni_mapping_dataset: filter empty messages and construct the Mapping source
   -> OmniDataTransform.prepare_messages: copy messages and process recognized media paths
   -> AutoProcessorTransform.encode_sample: encode with the processor and generate labels
-  -> OmniPackingLoader: select samples by token_budget; SamplePacker concatenates matching fields
+  -> OmniPackingLoader: pack B sequences up to max_seq_len; SamplePacker concatenates matching fields
   -> OmniCollator: merge token and variable-length image fields
   -> OmniParallelBatch: CP-shard token fields, broadcast over TP, and generate loss_mask
   -> VLMTrainer -> model forward/loss/backward
@@ -167,9 +178,10 @@ modality fields such as `pixel_values` and `image_grid_thw`. `OmniParallelBatch`
 `loss_mask` from `labels >= 0` when absent. Do not leave every token as a valid label, or user prompts and image placeholders
 will also be supervised. Samples with no remaining supervised tokens raise an error.
 
-In the default path without encoder DP, `OmniParallelBatch` CP-shards only token fields. Image and other modality fields are not CP-sharded;
+`OmniParallelBatch` CP-shards only token fields. Image and other modality fields are not CP-sharded;
 they remain complete at each TP×CP coordinate for each rank's vision branch. The image bucket
-and all-to-all path for `encoder_dp: true` is not implemented; PP/`pp_shared_data` is also unsupported. Models requiring special image-token
+and all-to-all encoder-DP path is not implemented; the current YAML rejects `encoder_dp`.
+PP/`pp_shared_data` is also unsupported. Models requiring special image-token
 mappings or extra forward arguments should provide their own `OmniDataTransform` and, when needed,
 `runtime_input_adapter`. Keep model-specific field rules out of the generic collator.
 
@@ -201,7 +213,7 @@ cd /path/to/hyper-parallel
 MODEL_PATH=/path/to/Qwen2-VL-model \
 DATA_PATH=/path/to/train.json \
 RUN_NAME=vlm_smoke \
-bash examples/training_demo/run_vlm.sh --training.train_iters=1
+bash examples/training_demo/run_vlm.sh --training.epochs=1 --training.max_steps=1
 ```
 
 Logs are written to `output/training_demo/vlm/run_vlm_smoke.log`. First check that the data stage no longer reports

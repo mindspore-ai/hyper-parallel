@@ -2,6 +2,13 @@
 
 **English** | [简体中文](yaml_config.zh.md)
 
+For Online/Offline Dataset options, required settings, and data configuration fragments, see
+[Dataset usage](../../../hyper_parallel/data/README.md#10-configuration-examples).
+It explains sample length, `max_seq_len`, `micro_batch_size`, packing, fixed/dynamic padding, and CP/TP alignment.
+Online training uses `epochs/max_steps`; Offline uses `train_iters/train_samples`. These plans are mutually exclusive.
+Dataset minimal templates list required settings only; defaults, optional overrides, and Trainer-injected arguments are documented separately.
+See the [Offline preparation guide](../data/offline_preparation_guide.md) for commands that produce `.bin/.idx` files.
+
 HyperParallel model training parses YAML according to the fields of [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105). Field names determine the accepted configuration keys; field types determine how values are parsed. Parsing produces a `TrainerConfig` object, then CLI dotted overrides update its fields.
 
 ```python
@@ -161,6 +168,9 @@ CLI overrides run after YAML has been parsed into `TrainerConfig`, using `--fiel
 --optimizer.adamw_config.adamw_lr=2.0e-5
 --profiler.enable=true
 ```
+
+The `train_iters` override above applies to Offline. For Online, use
+`--training.epochs=2 --training.max_steps=100` for two epochs of 100 optimizer steps each, with an Online base YAML.
 
 Values are first parsed with `yaml.safe_load()`, then converted according to the target node's type:
 

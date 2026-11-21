@@ -19,7 +19,7 @@ class names, fields and defaults are unchanged.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, Union
+from typing import Any, ClassVar, Literal, Optional, Union
 
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 
@@ -69,6 +69,10 @@ class DataLoaderConfig:
     empty one, enables distributed balancing with those configuration options.
     """
 
+    internal_options: ClassVar[frozenset[str]] = frozenset({
+        "num_workers", "pin_memory", "prefetch_factor", "drop_last", "save_by_idx",
+    })
+
     target: Target[Any]
     collate_fn: Optional[Target[Any]] = None
     get_batch: Optional[Target[Any]] = None
@@ -90,7 +94,8 @@ class DataLoaderConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize components in their compact nested YAML shape."""
-        config = self.target.to_dict()
+        # Constructor defaults must not become user options after a config round trip.
+        config = {name: value for name, value in self.target.to_dict().items() if name not in self.internal_options}
         config["collate_fn"] = _serialize_config_value(self.collate_fn)
         config["get_batch"] = _serialize_config_value(self.get_batch)
         config["cost_model"] = _serialize_config_value(self.cost_model)

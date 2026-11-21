@@ -11,7 +11,8 @@ model:
   validate_placement: false
 
 training:
-  train_iters: 10
+  epochs: 1
+  max_steps: 10
   train_samples: null
   eval_iters: 0
   global_batch_size: 8
@@ -85,11 +86,11 @@ dataset:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 128
 
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: ./output/training_demo/data/parallel_online.jsonl
   data_config:
+    max_seq_len: 128
     # Packed documents require the external global block mask accepted by the CP mask wrapper.
     create_attention_mask_in_dataloader: true
     # The online text transform already pairs input_ids[:-1] with labels[1:].
@@ -106,13 +107,6 @@ dataloader:
     attention_mode: dense
   # Online Mapping owns its deterministic sample and blend indices.
   sampler_type: single
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 
 optimizer:
   _target_: hyper_parallel.components.optim.Muon

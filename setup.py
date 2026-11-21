@@ -185,8 +185,8 @@ class BuildPy(build_py):
                 )
             else:
                 shutil.copytree(
-                    os.path.join(native_payload, "data", "indexed"),
-                    os.path.join(target_lib_dir, "data", "indexed"),
+                    os.path.join(native_payload, "data", "offline"),
+                    os.path.join(target_lib_dir, "data", "offline"),
                     dirs_exist_ok=True,
                 )
                 logger.info("Copied optional native payload from %s", native_payload)

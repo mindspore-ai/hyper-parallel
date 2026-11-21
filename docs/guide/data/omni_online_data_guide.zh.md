@@ -2,6 +2,9 @@
 
 [English](omni_online_data_guide.md) | **简体中文**
 
+通用 YAML 参数、单条长度、packing 和 padding 的逐步示例见
+[Dataset 使用方法](../../../hyper_parallel/data/README.zh.md#10-配置示例)。
+
 本文以仓库中的 Qwen2-VL 示例说明如何把图片对话样本接入 `VLMTrainer`。通用 Omni 链路负责读取、过滤、
 编码、packing 和 TP/CP batch 传输；模型特有的 processor、监督标签和额外 forward 字段由 transform 或
 runtime adapter 负责。DeepSeek-V4.1 的模型专用处理见
@@ -10,7 +13,7 @@ runtime adapter 负责。DeepSeek-V4.1 的模型专用处理见
 ## 1. 最小可用样本
 
 `AutoProcessorTransform` 接收非空 `messages`，并要求最后一条是 assistant。Qwen2-VL 示例使用如下
-processor 兼容格式；图片路径请先使用绝对路径：
+processor 兼容格式；图片可使用绝对路径，或相对于本地数据文件目录的路径：
 
 ```json
 {
@@ -33,24 +36,33 @@ processor 兼容格式；图片路径请先使用绝对路径：
 可以将多个这样的对象放进 JSON 数组（`.json`），也可以每行一个对象写成 `.jsonl`。示例脚本默认读取
 `synthetic.json`；要使用自己的文件，可通过 `DATA_PATH` 指定。`messages=[]` 会在 source 建索引时被
 `is_valid_sample()` 丢弃；缺失 `messages` 或其类型不是 list 则会报错。JSONL 的原生索引、相对媒体路径、
-split 与其他文件格式的路由细节见上面的 DeepSeek-V4.1 指南；不要假定任意 JSON 图片路径都按文件目录解析。
+split 与其他文件格式的路由细节见上面的 DeepSeek-V4.1 指南。本地 JSONL/JSON/Parquet/Arrow Mapping
+均保留来源文件的绝对路径，相对媒体路径据此解析；组合多个文件时各自使用原文件目录。
+直接调用 transform 或使用没有来源文件元数据的记录时，请提供绝对媒体路径。
 
 ## 2. YAML 接入点
+
+最小模板只列必选项；默认值独立列在 [Dataset 默认值表](../../../hyper_parallel/data/README.zh.md#默认值不写入最小模板)，
+Trainer 注入项和不支持的配置也分别列明。改变 padding 或候选池时再显式覆盖对应可选项。
 
 参照 [`examples/training_demo/train_vlm.yaml`](../../../examples/training_demo/train_vlm.yaml) 配置以下两段：
 
 ```yaml
+training:
+  epochs: 1
+  max_steps: 100
+
 dataset:
+  training_mode: sft
   model_assets:
     _target_: hyper_parallel.data.omni.build_auto_processor
     pretrained_model_name_or_path: /path/to/Qwen2-VL-model
-    local_files_only: true
   data_transform:
     _target_: hyper_parallel.data.omni.AutoProcessorTransform
-    max_seq_len: 512
   _target_: hyper_parallel.data.omni.build_online_omni_mapping_dataset
   data_path: /path/to/train.json
-  data_config: {}
+  data_config:
+    max_seq_len: 512
 
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
@@ -58,16 +70,15 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
-    encoder_dp: false
-  sampler_type: single
-  token_budget: 128
-  min_buffered_samples: 1
-  num_workers: 0
 ```
 
 `model_assets` 创建 processor，配置解析器将其注入 `data_transform.processor`；Dataset builder 接收
 transform。`OmniPackingLoader` 完成候选样本选择和 packing，`build_omni_collate_fn` 组装 batch，
 `OmniParallelBatch` 为模型 forward 准备分布式输入。示例直接使用该类，无需额外 hook。
+
+`dataset.training_mode` 在 VLMTrainer 中必须显式配置；通用 AutoProcessor 路径使用 `sft`。
+Online 的 `max_steps` 是每轮 optimizer step 数；此例总计 100 步。源耗尽后默认继续读取，
+训练轮次与遍历源文件的轮次分开；`train_iters/train_samples` 用于 Offline。
 
 不经过 Trainer 时，也可以单独检查 Dataset 接口：
 
@@ -99,39 +110,37 @@ print(encoded_sample["input_ids"].shape, encoded_sample["labels"].shape)
 `None`。`transform.is_valid_sample` 会自动作为原始记录过滤器传入 source builder；无需再手动传一次。
 
 `AutoProcessorTransform` 会拒绝超过 `max_seq_len` 的样本，**不会截断或填充媒体序列**；
-`token_budget` 决定一次 packing 尽量选择多少 token，不是单样本截断上限。
+`max_seq_len` 同时限制每条 packed 序列长度，B 条 packed 序列组成一个 micro-batch。
 接入较长样本时，应在模型专用 transform 中明确实现截断及图像 patch/grid 同步处理，或提前清洗数据。
 
 ### 固定 packing 后的输入长度
 
-在 collator target 上配置 `pad_to_length`，可以让不同 DP 分支、不同 micro-batch 的全局 token
-序列补到相同长度：
+只需用 `dataset.data_config.max_seq_len` 设置每条 packing 上限 S。
+loader 分别 packing B=`micro_batch_size` 条序列，再由 collator 统一 padding：
 
 ```yaml
+dataset:
+  data_config:
+    max_seq_len: 1024
+  data_transform:
+
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
   collate_fn:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
-    pad_to_length: 1024
-  token_budget: 1024
-  min_buffered_samples: 1
 ```
 
-- `pad_to_length` 默认 `null`，仅按 TP × CP 对齐；正整数表示精确的全局目标长度，不接受布尔值。
-  目标必须能被运行时的 TP × CP 整除，否则创建 collator 时抛出 `ValueError`。
-- `token_budget` 仍只控制样本选择，和固定 padding 独立；`pad_to_length` 不会从 `max_seq_len`、
-  `micro_batch_size` 或 `token_budget` 自动推导，也不会改写这些参数。
-- padding 在 packing 后、CP 切片和 TP 广播前执行。例如目标为 1024、CP=2 时，全局输入为
-  `[1, 1024]`，各 CP rank 的输入为 `[1, 512]`。各 DP 无需通信来确定目标长度。
-- packed 长度超过目标时抛出 `ValueError`，不截断，也不自动增大目标。单样本即使超过
-  `token_budget` 仍可能被选择，应保证有效样本长度和组批预算都不超过固定目标。
-- labels 尾部补 `-100`，mask 尾部补 0；真实样本边界保留，新增一个 padding 段。例如
-  `cu_seq_lens=[0, 300, 700]` 补到 1024 后为 `[0, 300, 700, 1024]`。
-  已经达到目标时不新增空段。图片 patch、grid 和图片起点不受固定 padding 影响。
+- `pad_to_length: true`（默认）得到 `[B,S]`；false 补到当前最长 packed 序列并向上按
+  TP×CP 对齐，得到 `[B,T]`，T≤S。S 必须能被运行时 TP×CP 整除。
+- 单条样本超过 S 时跳过；只因当前 packed 序列放不下的样本留在 buffer，参与后续序列。
+  重复读取源数据时保留 buffer。
+- padding 在 CP 切分和 TP 广播前执行。B=2、S=1024、CP=2 时，全局 `[2,1024]`，每个 CP rank
+  得到 `[2,512]`；确定 S 不需要 DP 通信。
+- token padding 为 0，labels 为 -100，mask 为 0。每条 packed 序列的 PAD 都作为独立段记录在
+  `cu_seq_lens` 中；图片 patch、grid 和局部起点保留。
+- `pad_to_length` 只接受 bool，packing 与固定 padding 共用 S。
 
-文本 Online 的 `build_online_text_collate_fn` 支持相同的 `pad_to_length` 参数。命令行可以使用
-`--dataloader.collate_fn.pad_to_length=1024`，或用 `=null` 恢复仅对齐模式。固定长度会增加短序列的
-计算和内存占用，且不会统一各 DP 的图片 patch 数或专家路由负载。
+文本 Online 的 `build_online_text_collate_fn` 使用相同设置。
 
 ## 3. 从原始样本到模型输入
 
@@ -140,7 +149,7 @@ JSON/JSONL record
   -> build_online_omni_mapping_dataset: 过滤空 messages，建立 Mapping source
   -> OmniDataTransform.prepare_messages: 复制消息，处理可识别的媒体路径
   -> AutoProcessorTransform.encode_sample: processor 编码并生成 labels
-  -> OmniPackingLoader: 按 token_budget 选择样本，SamplePacker 拼接同名字段
+  -> OmniPackingLoader: 按 max_seq_len 分别 packing B 条序列，SamplePacker 拼接同名字段
   -> OmniCollator: 合并 token 与变长图像字段
   -> OmniParallelBatch: CP 切 token 字段、TP 广播、生成 loss_mask
   -> VLMTrainer -> 模型 forward/loss/backward
@@ -167,9 +176,9 @@ Qwen2-VL Causal LM 在计算 loss 时处理位移。transform 返回单条样本
 `loss_mask` 时由 `labels >= 0` 推导。不要让所有 token 都保留为有效标签，否则用户提示和图像占位符
 也会参与监督。没有剩余监督 token 的样本会报错。
 
-默认非 encoder-DP 路径中，`OmniParallelBatch` 只对 token 字段做 CP 分片；图像等模态字段不按 CP
-切分，而是在 TP×CP 坐标上保持完整，供各 rank 的视觉分支使用。`encoder_dp: true` 的图像 bucket
-与 all-to-all 路径尚未实现；PP/`pp_shared_data` 当前也不支持。模型如果还需要特殊的 image-token
+`OmniParallelBatch` 只对 token 字段做 CP 分片；图像等模态字段不按 CP
+切分，而是在 TP×CP 坐标上保持完整，供各 rank 的视觉分支使用。encoder-DP 图像 bucket
+与 all-to-all 路径尚未实现，当前 YAML 不接受 `encoder_dp`；PP/`pp_shared_data` 当前也不支持。模型如果还需要特殊的 image-token
 映射或额外 forward 参数，应提供模型自己的 `OmniDataTransform`，并按需配置
 `runtime_input_adapter`，不要把模型专用字段规则写进通用 collator。
 
@@ -201,7 +210,7 @@ cd /path/to/hyper-parallel
 MODEL_PATH=/path/to/Qwen2-VL-model \
 DATA_PATH=/path/to/train.json \
 RUN_NAME=vlm_smoke \
-bash examples/training_demo/run_vlm.sh --training.train_iters=1
+bash examples/training_demo/run_vlm.sh --training.epochs=1 --training.max_steps=1
 ```
 
 日志写入 `output/training_demo/vlm/run_vlm_smoke.log`。先检查数据阶段不再出现

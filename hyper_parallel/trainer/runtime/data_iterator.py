@@ -21,6 +21,8 @@
 checkpointing semantics are retained.
 """
 
+from __future__ import annotations
+
 __all__ = [
     "BackgroundPrefetcher",
     "HyperIter",
@@ -89,6 +91,7 @@ class BackgroundPrefetcher:
             try:
                 self.queue.put(result, timeout=0.1)
                 return True
+
             except queue.Full:
                 continue
         return False
@@ -117,26 +120,36 @@ class BackgroundPrefetcher:
     def __next__(self) -> Any:
         """Return the next prefetched item, re-raising worker failures."""
         res = self.queue.get()
+
         if isinstance(res, tuple) and len(res) == 2:
             item, state = res
+
             if item is StopIteration:
                 raise StopIteration
+
             if isinstance(item, Exception):
                 raise item
+
             self.current_state = state
             return item
+
         if res is StopIteration:
             raise StopIteration
+
         if isinstance(res, Exception):
             raise res
+
         return res
 
     def state_dict(self) -> Dict[str, Any]:
         """Return the dataloader state captured alongside the current item."""
+
         if self.current_state is not None:
             return self.current_state
+
         if self.original_state_dict:
             return self.original_state_dict()
+
         return {}
 
     def stop(self, timeout: Optional[float] = 5.0) -> bool:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Standard deterministic weighted Dataset blending."""
+"""Deterministic weighted and index-free Dataset blending."""
 
 from __future__ import annotations
 
@@ -21,13 +21,15 @@ import json
 import os
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
-from hyper_parallel.data.indexed.indexed_helpers import build_blending_indices
+from hyper_parallel.data.offline.data_config import GPTDatasetConfig
+from hyper_parallel.data.offline.helpers import build_blending_indices
+
+SimpleBlendMode = Literal["inter", "intra"]
 
 logger = get_dataset_logger(__name__)
 
@@ -145,3 +147,60 @@ def _normalize_weights(weights: Sequence[float]) -> list[float]:
     weight_array = np.asarray(weights, dtype=np.float64)
     normalized_weights = (weight_array / np.sum(weight_array)).tolist()
     return normalized_weights
+
+
+class SimpleBlendedDataset:
+    """Blend equally weighted MR Datasets in interleaved or contiguous order."""
+
+    def __init__(
+            self,
+            datasets: Sequence[Any],
+            size: int,
+            mode: SimpleBlendMode,
+    ) -> None:
+        """Validate the inputs and create the configured simple ordering."""
+        if not datasets:
+            raise ValueError("simple blend requires at least one Dataset")
+        self.datasets = list(datasets)
+        self.size = size
+        self.mode = mode
+        self._locations = self._build_locations()
+        if self.size > len(self._locations):
+            raise ValueError(
+                f"Requested {self.size} samples from a simple blend containing "
+                f"{len(self._locations)} samples"
+            )
+
+    def __len__(self) -> int:
+        """Return the requested blended sample count."""
+        return self.size
+
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
+        """Read one MR sample in interleaved or Dataset-contiguous order."""
+        dataset_id, sample_id = self._locations[index]
+        sample = {"dataset_id": dataset_id, **self.datasets[dataset_id][sample_id]}
+        return sample
+
+    def _build_locations(self) -> list[tuple[int, int]]:
+        """Map blend positions to Dataset and sample indices."""
+        if self.mode == "intra":
+            locations = [
+                (dataset_id, sample_id)
+                for dataset_id, dataset in enumerate(self.datasets)
+                for sample_id in range(len(dataset))
+            ]
+            return locations
+
+        # mode = inter
+        locations = self._build_interleaved_locations()
+        return locations
+
+    def _build_interleaved_locations(self) -> list[tuple[int, int]]:
+        """Alternate over non-empty Datasets until every sample is exposed."""
+        max_size = max(len(dataset) for dataset in self.datasets)
+        locations = []
+        for sample_id in range(max_size):
+            for dataset_id, dataset in enumerate(self.datasets):
+                if sample_id < len(dataset):
+                    locations.append((dataset_id, sample_id))
+        return locations

@@ -31,8 +31,8 @@ PYTHON_BIN=$(command -v python) || die "Python is unavailable in the active PATH
 cd "${PROJECT_ROOT}"
 mkdir -p "${PAYLOAD_STAGING_ROOT}" "${NATIVE_ROOT}/logs"
 trap 'rm -rf "${PAYLOAD_STAGING_ROOT}"' EXIT
-bash hyper_parallel/data/indexed/build.sh --stage-only 2>&1 | tee "${NATIVE_ROOT}/logs/indexed.log"
-cp -a "${NATIVE_ROOT}/components/indexed/hyper_parallel/." "${PAYLOAD_STAGING_ROOT}/"
+bash hyper_parallel/data/offline/build.sh --stage-only 2>&1 | tee "${NATIVE_ROOT}/logs/offline.log"
+cp -a "${NATIVE_ROOT}/components/offline/hyper_parallel/." "${PAYLOAD_STAGING_ROOT}/"
 
 rm -rf "${PAYLOAD_ROOT}"
 mkdir -p "$(dirname "${PAYLOAD_ROOT}")"

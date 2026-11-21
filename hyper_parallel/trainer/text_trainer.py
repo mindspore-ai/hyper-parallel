@@ -80,10 +80,13 @@ class TextTrainer:
     def _build_model_assets(self) -> None:
         """Build tokenizer-backed assets for text training."""
         config: TrainerConfig = self.base.config
+
         if config.dataset is None:
             raise ValueError("dataset must define a build target")
+
         assets_config = config.dataset.model_assets
         tokenizer_target = assets_config.tokenizer
+
         if tokenizer_target is None:
             self.base.tokenizer = None
         elif getattr(tokenizer_target, "pretrained_model_name_or_path", None):
@@ -94,9 +97,11 @@ class TextTrainer:
             )
 
         self.base.chat_template = None
+
         if assets_config.chat_template is not None:
             if self.base.tokenizer is None:
                 raise ValueError("dataset.model_assets.tokenizer is required for conversation data")
+
             if isinstance(assets_config.chat_template, str):
                 self.base.chat_template = build_chat_template(
                     assets_config.chat_template,
@@ -109,49 +114,63 @@ class TextTrainer:
                     raise ValueError(
                         "dataset.model_assets chat-template options require chat_template='tokenizer'"
                     )
+
                 self.base.chat_template = assets_config.chat_template.build(
                     tokenizer=self.base.tokenizer,
                 )
 
         self.base.model_assets = [self.base.model_config]
+
         if self.base.tokenizer is not None:
             self.base.model_assets.append(self.base.tokenizer)
+
         if self.base.chat_template is not None:
             self.base.model_assets.append(self.base.chat_template)
 
     def _build_data_transform(self) -> None:
         """Build the configured text sample transform."""
         dataset_config = self.base.config.dataset
+
         if dataset_config is None:
             raise ValueError("dataset must define a build target")
+
         if dataset_config.data_transform is None:
             self.base.data_transform = None
             return
+
         self.base.data_transform = dataset_config.data_transform.build(
             tokenizer=self.base.tokenizer,
             chat_template=self.base.chat_template,
+            max_seq_len=dataset_config.data_config["max_seq_len"],
         )
 
     def _build_collate_fn(self) -> None:
         """Build the text collator and gradient-accumulation batch count."""
         dataloader_config = self.base.config.dataloader
+
         if dataloader_config is None or dataloader_config.collate_fn is None:
             raise ValueError("dataloader.collate_fn must define a build target")
+
         training_config = self.base.config.training
         self.base.num_micro_batches = calculate_num_micro_batches(
             global_batch_size=training_config.global_batch_size,
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
+        max_seq_len = self.base.config.dataset.data_config["max_seq_len"]
+
         self.base.collate_fn = dataloader_config.collate_fn.build(
             mesh_context=self.base.mesh,
+            max_seq_len=max_seq_len,
         )
 
     def _build_get_batch(self) -> None:
         """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
+
         if config.dataloader.get_batch is None:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
+
         get_batch = config.dataloader.get_batch.build(
             mesh_context=self.base.mesh,
             dataloader_context=self.base.dataloader_context,
@@ -320,9 +339,11 @@ class TextTrainer:
         data_iterator = iter(train_dataloader) if train_dataloader is not None else None
         start_step = self.base.state.global_step - epoch * self.base.train_steps
         train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+
         if balanced_loader:
             start_step = 0
             train_steps = self.base.train_iters - self.base.state.global_step
+
         for _ in range(start_step, train_steps):
             try:
                 self.train_step(data_iterator)
@@ -331,10 +352,12 @@ class TextTrainer:
                     optimizers = self.base.optimizer
                     for optimizer in optimizers if isinstance(optimizers, list) else [optimizers]:
                         optimizer.zero_grad()
+
                 logger.info(
                     "epoch:%s Dataloader finished with drop_last %s", epoch, self.base.config.dataloader.drop_last
                 )
                 return True
+
         return False
 
     def train(self) -> None:
@@ -357,8 +380,9 @@ class TextTrainer:
             for epoch in epochs:
                 if self.base.state.global_step >= self.base.train_iters:
                     break
+
                 # The first collective iterator may hold a restored checkpoint cursor.
-                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                if train_dataloader is not None and (not balanced_loader or epoch != start_epoch):
                     train_dataloader.set_epoch(epoch)
 
                 self.base.state.epoch = epoch
@@ -367,11 +391,12 @@ class TextTrainer:
                 epoch_exhausted = self._train_epoch(epoch, balanced_loader)
 
                 if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
-                    raise ValueError("Indexed source epoch cannot provide one complete optimizer step")
+                    raise ValueError("Offline source epoch cannot provide one complete optimizer step")
 
                 self.on_epoch_end()
                 self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
                 print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
                 if self.base.state.global_step >= self.base.train_iters:
                     break
 

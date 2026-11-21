@@ -251,13 +251,18 @@ class CPBatchSharder:
     @staticmethod
     def _extend_cu_seq_lens(cp_batch: dict[str, Any], sequence_length: int, pad_length: int) -> None:
         """Keep packed sequence boundaries aligned with token padding."""
+
         if "cu_seq_lens" not in cp_batch:
             return
+
         boundaries = cp_batch["cu_seq_lens"].reshape(-1)
+
         if int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
             raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+
         if pad_length:
             boundaries = torch.cat((boundaries, boundaries[-1:] + pad_length))
+
         cp_batch["cu_seq_lens"] = boundaries
 
     def _shard_configured_fields(self, canonical_batch: Mapping[str, Any]) -> dict[str, Any]:
@@ -270,14 +275,17 @@ class CPBatchSharder:
         cp_batch = dict(canonical_batch)
         cp_size = self.parallel_context.cp_world_size
         alignment = cp_size * self.parallel_context.tp_world_size
+
         if cp_size == 1 and alignment == 1:
             return cp_batch
 
         input_ids = cp_batch["input_ids"]
-        if not torch.is_tensor(input_ids) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise ValueError("Configured CP sharding requires input_ids with shape [1, sequence]")
+
+        if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+            raise ValueError("Configured CP sharding requires input_ids with shape [batch, sequence]")
 
         sequence_length = input_ids.shape[1]
+
         if sequence_length % alignment:
             raise ValueError(
                 f"sequence_length ({sequence_length}) must be divisible by tp_size * cp_size ({alignment}); "
@@ -286,19 +294,23 @@ class CPBatchSharder:
 
         if "cu_seq_lens" in cp_batch:
             boundaries = cp_batch["cu_seq_lens"].reshape(-1)
-            if boundaries.numel() < 2 or int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
-                raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+
+            if boundaries.numel() < 2 or int(boundaries[0]) != 0 or int(boundaries[-1]) != input_ids.numel():
+                raise ValueError("cu_seq_lens must cover the complete CP input batch")
 
             cp_batch["cu_seq_lens"] = boundaries
 
         chunk_length = sequence_length // cp_size
         local_start = self.parallel_context.cp_rank * chunk_length
         local_end = local_start + chunk_length
+
+        # Slice each row's sequence axis; boundary and media metadata stay global.
         for field in self.token_fields:
             if field not in cp_batch:
                 continue
 
             value = cp_batch[field]
+
             if not torch.is_tensor(value) or value.ndim != 2 or value.shape != input_ids.shape:
                 raise ValueError(f"CP token field {field!r} must match input_ids shape")
 

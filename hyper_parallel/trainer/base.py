@@ -58,7 +58,9 @@ from hyper_parallel.trainer.config import (
     save_configs,
 )
 from hyper_parallel.data.dataset_logging import enable_dataset_logging
-from hyper_parallel.data.batching import build_dataloader
+from hyper_parallel.data.batching import (
+    OmniPackingLoader, OmniParallelBatch, RepeatingDataLoader, TokenBatchLoader, build_dataloader,
+)
 from hyper_parallel.data.parallel import DataLoaderParallelContext, create_dataloader_parallel_context
 from hyper_parallel.trainer.runtime.distributed import (
     all_reduce,
@@ -432,12 +434,15 @@ class BaseTrainer(Stateful, ABC):
             if self.config.loss_fn is not None
             else ModelOutputLoss()
         )
+
         if not isinstance(loss_fn, torch.nn.Module):
             raise ValueError("config.loss_fn must build a torch.nn.Module")
+
         self.loss_fn = loss_fn
         # Model-integrated objectives may need to intercept the model before its
         # ordinary forward materializes an otherwise avoidable output tensor.
         loss_model_binding_hook = getattr(self.loss_fn, "bind_model", None)
+
         if callable(loss_model_binding_hook):
             loss_model_binding_hook(self.model, self.distributed_setup)
 
@@ -487,24 +492,44 @@ class BaseTrainer(Stateful, ABC):
     ) -> None:
         """Build and assign train, validation, and test dataloaders."""
         split_names = ("train", "valid", "test")
-        datasets = tuple(getattr(self, f"{split_name}_dataset", None) for split_name in split_names)
+        datasets = (self.train_dataset, self.valid_dataset, self.test_dataset)
+        data_config = getattr(self.config.dataset, "data_config", {})
+        online_data = self._get_data_source_type() == "online"
+        max_seq_len = data_config["max_seq_len"]
+
+        if online_data and getattr(self.config.dataloader, "repeat", None) is False:
+            raise ValueError(
+                "Online epochs/max_steps requires dataloader.repeat=true; omit it to use the Online default"
+            )
+
         dataloaders, batch_samplers = build_dataloader(
             self.config.dataloader,
             datasets=datasets,
             collate_fn=self.collate_fn,
             mesh_context=self.mesh,
             training_config=self.config.training,
-            data_config=getattr(self.config.dataset, "data_config", {}),
-            max_seq_len=getattr(self.data_transform, "max_seq_len", None),
+            data_config=data_config,
+            max_seq_len=max_seq_len,
             default_seed=self.default_seed,
             metadata_fn=metadata_fn,
             model_config=self.model_config,
             cost_model=cost_model,
             balancing_algorithm=balancing_algorithm,
         )
+
         for split_name, dataloader, batch_sampler in zip(split_names, dataloaders, batch_samplers):
             setattr(self, f"{split_name}_dataloader", dataloader)
             setattr(self, f"{split_name}_batch_sampler", batch_sampler)
+
+        if online_data and data_config.get("repeat", True):
+            if self.train_dataloader is not None:
+                if isinstance(self.train_dataloader, (TokenBatchLoader, OmniPackingLoader)):
+                    self.train_dataloader.repeat = True
+                else:
+                    self.train_dataloader = RepeatingDataLoader(self.train_dataloader)
+
+            # The loader checkpoints the source pass and its native sampler together.
+            self.train_batch_sampler = None
 
     def attach_model_integration_data_pipeline(self) -> None:
         """Attach the final data pipeline through one shared Trainer path."""
@@ -515,17 +540,90 @@ class BaseTrainer(Stateful, ABC):
         )
 
     def _compute_train_iters(self) -> None:
-        """Resolve the run limit and the optimizer steps available per Dataset epoch."""
-        training_config = self.config.training
-        if training_config.train_iters is not None and training_config.train_samples is not None:
+        """Normalize configured limits into total steps, steps per epoch, and epoch count."""
+        source_type = self._get_data_source_type()
+
+        if source_type == "online":
+            train_iters, train_steps = self._compute_online_train_iters()
+        else:
+            train_iters, train_steps = self._compute_offline_train_iters()
+
+        self.train_iters = train_iters
+        self.train_steps = train_steps
+        self.train_epochs = (self.train_iters + self.train_steps - 1) // self.train_steps
+        logger.info("Training plan: total_steps=%s, steps_per_epoch=%s, epochs=%s",
+                    self.train_iters, self.train_steps, self.train_epochs)
+
+    def _get_data_source_type(self) -> str:
+        """Resolve the required text source type or the intrinsically Online Omni runtime."""
+        batch_target = self.config.dataloader.get_batch
+
+        if batch_target is None:
+            raise ValueError("dataloader.get_batch must define a batching runtime target")
+
+        batch_factory = batch_target.callable
+
+        if isinstance(batch_factory, type) and issubclass(batch_factory, OmniParallelBatch):
+            source_type = "online"
+        else:
+            source_type = batch_target.source_type
+
+        return source_type
+
+    def _compute_online_train_iters(self) -> tuple[int, int]:
+        """Convert Online epochs/max_steps into optimizer-step limits.
+
+        Example:
+            ``training: {epochs: 2, max_steps: 100}`` and
+            ``dataset: {data_config: {repeat: true}}`` produce 200 total steps,
+            100 steps per epoch, and therefore two epochs. Repeat defaults to true.
+
+        Returns:
+            Total optimizer steps and optimizer steps per epoch.
+        """
+        training = self.config.training
+
+        if training.epochs is None or training.max_steps is None:
+            raise ValueError("Online requires training.epochs and training.max_steps")
+
+        if self.config.dataloader.load_balance is not None:
+            raise ValueError("epochs/max_steps requires a native DataLoader; load_balance retains the legacy plan")
+
+        if self.config.dataset.data_config.get("repeat", True) is not True:
+            raise ValueError("Online epochs/max_steps requires dataset.data_config.repeat=true")
+
+        train_iters = training.epochs * training.max_steps
+        train_steps = training.max_steps
+        return train_iters, train_steps
+
+    def _compute_offline_train_iters(self) -> tuple[int, int]:
+        """Convert Offline train_iters/train_samples into optimizer-step limits.
+
+        Example:
+            ``training: {train_iters: 100, global_batch_size: 16}`` or
+            ``training: {train_samples: 1600, global_batch_size: 16}`` produces
+            100 total steps. With 40 loader batches and four micro-batches per
+            update, each epoch provides ten steps, yielding ten epochs.
+
+        Returns:
+            Total optimizer steps and optimizer steps per epoch. Non-Online
+            training entries retain their existing total-run calculation.
+        """
+        training = self.config.training
+
+        if training.epochs is not None:
+            raise ValueError("epochs/max_steps is only supported for online; offline uses train_iters/train_samples")
+
+        if training.train_iters is not None and training.train_samples is not None:
             raise ValueError("configure only one of training.train_iters and training.train_samples")
 
-        if training_config.train_iters is None and training_config.train_samples is None:
+        if training.train_iters is None and training.train_samples is None:
             raise ValueError("configure one of training.train_iters or training.train_samples")
 
-        train_iters = training_config.train_iters
-        if training_config.train_samples is not None:
-            train_iters = training_config.train_samples // training_config.global_batch_size
+        train_iters = training.train_iters
+
+        if training.train_samples is not None:
+            train_iters = training.train_samples // training.global_batch_size
 
         if train_iters <= 0:
             raise ValueError("training configuration must produce at least one train iteration")
@@ -537,21 +635,21 @@ class BaseTrainer(Stateful, ABC):
 
         if micro_batches_per_epoch:
             train_steps = micro_batches_per_epoch // self.num_micro_batches
+
             if train_steps <= 0:
                 raise ValueError("train DataLoader must provide one complete optimizer step per epoch")
+
         else:
-            # Streaming and dynamic DataLoaders define an epoch only when their
-            # source iterator is exhausted.
+            # Preserve the legacy plan for loaders whose length is not known.
             train_steps = train_iters
 
-        self.train_iters = train_iters
-        self.train_steps = train_steps
-        self.train_epochs = (self.train_iters + self.train_steps - 1) // self.train_steps
+        return train_iters, train_steps
 
     def _build_optimizer(self) -> None:
         """Build the configured optimizer with the runtime model context."""
         config: TrainerConfig = self.config
         external = get_model_external_state(self.model)
+
         if external is not None:
             def wrap_dense(dense_raw: Any) -> Any:
                 """Wrap dense parameters in FP32 main and optional state swap.
@@ -563,29 +661,36 @@ class BaseTrainer(Stateful, ABC):
                     Float16OptimizerWithFloat16Params(dense_raw, self.model)
                     if config.optimizer.fp32_main_params else dense_raw
                 )
+
                 if config.optimizer.swap.enabled:
                     dense = _attach_optimizer_swap(dense, config.optimizer.swap)
+
                 return dense
 
             self.optimizer = external.build_optimizer(config.optimizer, wrap_dense=wrap_dense)
             return
+
         optimizer = config.optimizer.target.build(model=self.model).get_optimizer()
         self.optimizer = (
             Float16OptimizerWithFloat16Params(optimizer, self.model)
             if config.optimizer.fp32_main_params
             else optimizer
         )
+
         # Swap is attached after the fp32 main-parameter wrap so leaf optimizers
         # already reference their final parameters, and the lr scheduler built
         # right after reads the wrapped ``self.optimizer.param_groups``.
         if config.optimizer.swap.enabled:
             self.optimizer = _attach_optimizer_swap(self.optimizer, config.optimizer.swap)
 
-    def _build_lr_scheduler(self):
+    def _build_lr_scheduler(self) -> None:
+        """Build the learning rate scheduler with the configured iteration budget."""
         config: TrainerConfig = self.config
         scheduler_iters = config.training.lr_scheduler_iters or self.train_iters
+
         if scheduler_iters <= 0:
             raise ValueError("training.lr_scheduler_iters must be positive when configured")
+
         lr_scheduler = config.lr_scheduler.build(
             optimizer=self.optimizer,
             train_iters=scheduler_iters,
@@ -604,8 +709,10 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_graph_compiler(self) -> None:
         """Build the optional joint-graph compiler for this trainer runtime."""
+
         if not self.config.compile.selects_graph_compiler():
             return
+
         self.graph_compiler = GraphCompiler(
             model=self.model,
             train_fn=self._graph_train_fn,
@@ -759,8 +866,10 @@ class BaseTrainer(Stateful, ABC):
         def _to_device(v: Any) -> Any:
             if isinstance(v, torch.Tensor):
                 return v.to(self.device, non_blocking=True)
+
             if isinstance(v, dict):
                 return {k: _to_device(vv) for k, vv in v.items()}
+
             return v
 
         # chunk_mbs_config = getattr(self.config.training, "chunk_mbs_config", None)
@@ -1032,16 +1141,20 @@ class BaseTrainer(Stateful, ABC):
         self.validate_fsdp_runtime_before_optimizer()
         max_grad_norm = self.config.training.max_grad_norm
         external = get_model_external_state(self.model)
+
         if external is not None:
             preparation = external.prepare_optimizer_step(max_norm=max_grad_norm, gradient_divisor=gradient_divisor)
             self.model_integration.after_clip(preparation.post_clip_norm)
             return preparation.global_norm
+
         grad_norm: Any = 0.0
         post_clip_norm = None
         compiler = getattr(self, "graph_compiler", None)
         clip_kwargs = {"parameter_layouts": compiler.parameter_layouts} if compiler is not None else {}
+
         if max_grad_norm > 0:
             grad_norm = clip_grad_norm_(self.model, max_grad_norm, **clip_kwargs)
+
             if self.model_integration.runtime_enabled:
                 grad_norm_value = (
                     float(grad_norm.item())
@@ -1056,6 +1169,7 @@ class BaseTrainer(Stateful, ABC):
         elif self.model_integration.runtime_enabled:
             grad_norm = clip_grad_norm_(self.model, float("inf"), **clip_kwargs)
             post_clip_norm = grad_norm
+
         self.model_integration.after_clip(post_clip_norm)
         return grad_norm
 
@@ -1082,8 +1196,10 @@ class BaseTrainer(Stateful, ABC):
 
     def _end_model_integration_step(self, metrics: Dict[str, Any]) -> None:
         """Persist structured step metrics and global input identity."""
+
         if not self.model_integration.runtime_enabled:
             return
+
         resolved_metrics = dict(metrics)
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         learning_rates = []
@@ -1096,14 +1212,18 @@ class BaseTrainer(Stateful, ABC):
                     for group in getattr(leaf, "param_groups", ())
                     if group.get("lr") is not None
                 )
+
         if learning_rates:
             resolved_metrics["lr"] = float(learning_rates[0])
+
         token_counts = getattr(self, "step_token_counts", {})
         token_values = []
         for value in token_counts.values():
             token_values.append(float(value.item() if torch.is_tensor(value) else value))
+
         if token_values:
             resolved_metrics["tokens"] = sum(token_values)
+
         resolved_metrics["samples"] = self.config.training.global_batch_size
         self.model_integration.end_step(resolved_metrics)
 

@@ -18,9 +18,6 @@ data:
   max_prompt_length: 512
   max_train_samples: 4
   shuffle: true
-  num_workers: 0
-  prefetch_factor: null
-  pin_memory: true
 
 rollout:
   engine: vllm

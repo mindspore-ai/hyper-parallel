@@ -279,9 +279,6 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
     def __init__(self, *, data_sharding: bool, seed: int, **sampler_options: Any) -> None:
         """Store the cyclic data-sharding policy."""
         super().__init__(**sampler_options)
-        if not self.drop_last:
-            raise ValueError("cyclic sampling requires drop_last=True")
-
         self.data_sharding = data_sharding
         self.seed = seed
 
@@ -296,11 +293,14 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         """Return the number of local micro-batches remaining in this epoch."""
         active_samples = self._active_samples()
         remaining_samples = active_samples - self.consumed_samples
-        return remaining_samples // self.global_micro_batch_size
+        local_samples = (remaining_samples + self.dp_world_size - 1 - self.dp_rank) // self.dp_world_size
+        return (local_samples + self.micro_batch_size - 1) // self.micro_batch_size
 
     def __iter__(self) -> Iterator[list[int]]:
         """Build the current epoch permutation and DP slices."""
         active_samples = self._active_samples()
+        if self.consumed_samples == active_samples:
+            return
         if (self.consumed_samples - self._optimizer_step_offset) % self.global_micro_batch_size != 0:
             raise ValueError("cyclic consumed_samples must align to a distributed micro-batch")
 
@@ -312,9 +312,10 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
 
         if self.data_sharding:
             # Shuffle one contiguous bucket per DP rank.
-            bucket_size = active_samples // self.dp_world_size
+            bucket_size, extra_samples = divmod(active_samples, self.dp_world_size)
             bucket_offset = self.consumed_samples // self.dp_world_size
-            bucket_start = self.dp_rank * bucket_size
+            bucket_start = self.dp_rank * bucket_size + min(self.dp_rank, extra_samples)
+            bucket_size += int(self.dp_rank < extra_samples)
             random_offsets = list(range(bucket_size))
             random.Random(self.seed + self.epoch).shuffle(random_offsets)
             rank_indices = [bucket_start + offset for offset in random_offsets[bucket_offset:]]
@@ -331,12 +332,18 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         for index in rank_indices:
             local_batch.append(index)
             if len(local_batch) == self.micro_batch_size:
-                self.consumed_samples += self.global_micro_batch_size
+                self.consumed_samples = min(self.consumed_samples + self.global_micro_batch_size, active_samples)
                 yield local_batch
                 local_batch = []
+        self.consumed_samples = active_samples
+        if local_batch and not self.drop_last:
+            yield local_batch
 
     def _active_samples(self) -> int:
-        """Return the number of samples fitting complete global micro-batches."""
+        """Keep raw tails for packing, or truncate fixed-sample batches when requested."""
+        if not self.drop_last:
+            return self.total_samples
+
         remaining = self.total_samples - self.consumed_samples
         active_samples = self.total_samples - remaining % self.global_micro_batch_size
         if active_samples <= 0:

@@ -57,7 +57,7 @@ torchrun \
     --dataset.model_assets.tokenizer.pretrained_model_name_or_path="${MODEL_PATH}" \
     --dataset.model_assets.tokenizer.local_files_only=true \
     --dataset.data_path="${DATA_ROOT}/parallel_online.jsonl" \
-    --dataset.data_transform.max_seq_len=128 \
+    --dataset.data_config.max_seq_len=128 \
     --dataloader.min_buffered_samples=8 \
     "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_parallel_full_online.log"

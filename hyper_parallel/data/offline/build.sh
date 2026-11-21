@@ -14,11 +14,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --stage-only) STAGE_ONLY=on; shift ;;
         --clean) shift ;; # This small component is rebuilt on every invocation.
-        -h|--help) echo "Usage: bash hyper_parallel/data/indexed/build.sh [--clean]"; exit 0 ;;
+        -h|--help) echo "Usage: bash hyper_parallel/data/offline/build.sh [--clean]"; exit 0 ;;
         *) echo "ERROR: unknown option: $1" >&2; exit 2 ;;
     esac
 done
-OUTPUT_ROOT="${PROJECT_ROOT}/build/native/components/indexed/hyper_parallel/data/indexed"
+OUTPUT_ROOT="${PROJECT_ROOT}/build/native/components/offline/hyper_parallel/data/offline"
 rm -rf "${OUTPUT_ROOT}"
 mkdir -p "${OUTPUT_ROOT}"
 SUFFIX=$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
@@ -26,7 +26,7 @@ make -B -C "${SCRIPT_DIR}/csrc" "PYTHON=$(command -v python)" \
     "OUTPUT=${OUTPUT_ROOT}/_indexed_helpers_cpp${SUFFIX}.tmp"
 mv "${OUTPUT_ROOT}/_indexed_helpers_cpp${SUFFIX}.tmp" "${OUTPUT_ROOT}/_indexed_helpers_cpp${SUFFIX}"
 if [[ "${STAGE_ONLY}" == "off" ]]; then
-    PAYLOAD_COMPONENT="${PROJECT_ROOT}/build/native/payload/hyper_parallel/data/indexed"
+    PAYLOAD_COMPONENT="${PROJECT_ROOT}/build/native/payload/hyper_parallel/data/offline"
     rm -rf "${PAYLOAD_COMPONENT}"
     mkdir -p "${PAYLOAD_COMPONENT}"
     cp -a "${OUTPUT_ROOT}/." "${PAYLOAD_COMPONENT}/"

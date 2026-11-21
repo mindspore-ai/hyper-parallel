@@ -49,13 +49,13 @@ MODES = ("off", "selective", "full")
 # Request field -> where the trainer yaml states it.
 FIELDS = {
     "layers": ("model", "num_hidden_layers"),
-    "seq": ("dataset", "data_config", "seq_length"),
+    "seq": ("dataset", "data_config", "max_seq_len"),
     "global_batch": ("training", "global_batch_size"),
     "micro_batch": ("training", "micro_batch_size"),
     "dies": ("context", "device_num"),
 }
 # Where a trainer yaml states the tokens a sequence, in the order ND reads them.
-SEQ_PLACES = (("dataset", "data_transform", "max_seq_len"), ("dataset", "data_config", "seq_length"))
+SEQ_PLACES = (("dataset", "data_config", "max_seq_len"),)
 # <family>_description.yaml: the family's model described by hand, for a checkout that cannot build the template's.
 DESCRIBED = "_description"
 # ND log lines the answer must pass on: a part it did not price, a field it priced as 0, what it refused.

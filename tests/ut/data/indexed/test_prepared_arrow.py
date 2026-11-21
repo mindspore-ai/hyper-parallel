@@ -37,12 +37,13 @@ from hyper_parallel.data.batching import (
 )
 from hyper_parallel.data.batching.build_dataloader import build_dataloader
 from hyper_parallel.data.batching.runtime_input import IndexedBoundaryResolver, RuntimeInputAdapter
-from hyper_parallel.data.indexed.indexed_data_reader import ArrowDataReader
-from hyper_parallel.data.indexed.indexed_data_config import (
-    GPTDatasetConfig, build_gpt_dataset_config, resolve_data_paths,
+from hyper_parallel.data.offline.build_dataset import resolve_data_paths
+from hyper_parallel.data.offline.data_reader import ArrowDataReader
+from hyper_parallel.data.offline.data_config import (
+    GPTDatasetConfig, build_gpt_dataset_config,
 )
-from hyper_parallel.data.indexed.indexed_data_reader import _IndexReader
-from hyper_parallel.data.indexed.indexed_pretrain_dataset import GPTDataset, GPTFromMRDataset, MockGPTDataset
+from hyper_parallel.data.offline.data_reader import _IndexReader
+from hyper_parallel.data.offline.dataset import GPTDataset, GPTFromMRDataset, MockGPTDataset
 from hyper_parallel.data.parallel import DataLoaderParallelContext
 from hyper_parallel.data.text.build_dataset import build_indexed_text_dataset
 from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
@@ -91,7 +92,7 @@ class TestPreparedArrow(unittest.TestCase):
         self.options = {
             "random_seed": 42, "seq_length": 5, "simple_blend": "intra",
             "tokenizer": self.tokenizer, "labels_are_shifted": True,
-            "low_level_dataset": {"_target_": "hyper_parallel.data.indexed.SFTFromMRDataset"},
+            "low_level_dataset": {"_target_": "hyper_parallel.data.offline.SFTFromMRDataset"},
         }
 
     def _write(self, name, rows):
@@ -273,9 +274,9 @@ class TestPreparedArrow(unittest.TestCase):
                 output[:] = [deepcopy(layout), None] if len(seen) == 1 else [[left], [right]]
 
             with (self.subTest(rank=rank),
-                  patch("hyper_parallel.data.indexed.indexed_data_config.dist.get_rank", return_value=rank),
-                  patch("hyper_parallel.data.indexed.indexed_data_config.dist.get_world_size", return_value=2),
-                  patch("hyper_parallel.data.indexed.indexed_data_config.dist.all_gather_object", side_effect=gather)):
+                  patch("hyper_parallel.data.offline.build_dataset.dist.get_rank", return_value=rank),
+                  patch("hyper_parallel.data.offline.build_dataset.dist.get_world_size", return_value=2),
+                  patch("hyper_parallel.data.offline.build_dataset.dist.all_gather_object", side_effect=gather)):
                 paths = resolve_data_paths(str(self.root / "walk"), file_suffix=".arrow")
             self.assertEqual(paths, ["1", top, "1", left, "1", right])
             self.assertEqual(seen[1], [left] if rank == 0 else [right])
@@ -306,7 +307,7 @@ dataset:
   data_config:
     seq_length: 5
     low_level_dataset:
-      _target_: hyper_parallel.data.indexed.SFTFromMRDataset
+      _target_: hyper_parallel.data.offline.SFTFromMRDataset
     simple_blend: intra
     data_lazy_load: true
     labels_are_shifted: true

@@ -53,11 +53,12 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
             self,
             processor: DeepseekV41Processor,
             *,
-            max_seq_len: int = 4096,
+            max_seq_len: int,
             training_mode: str = "sft",
             sample_alignment_size: int = 1,
     ) -> None:
         """Bind the native processor to the generic Omni lifecycle."""
+
         if not isinstance(processor, DeepseekV41Processor):
             raise TypeError("DeepSeek-V4.1 transforms require DeepseekV41Processor")
 
@@ -103,6 +104,7 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
             batch: Packed token fields and optional image metadata.
         """
         encoded_batch = dict(batch)
+
         if "pixel_values" not in encoded_batch:
             return encoded_batch
 
@@ -116,6 +118,7 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
         for field in required_fields:
             if field not in encoded_batch:
                 missing_fields.append(field)
+
         if missing_fields:
             raise ValueError(
                 "DeepSeek-V4.1 image batch is missing fields: "
@@ -123,9 +126,13 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
             )
 
         patch_lengths = encoded_batch.pop("image_patch_lengths")
+
         # [images] belongs to one packed row; [batch, images] retains its row ownership.
         if patch_lengths.ndim == 1:
-            image_batch_indices = patch_lengths.new_zeros(patch_lengths.numel())
+            image_batch_indices = encoded_batch.get("image_batch_indices")
+
+            if image_batch_indices is None:
+                image_batch_indices = patch_lengths.new_zeros(patch_lengths.numel())
         elif patch_lengths.ndim == 2:
             batch_size, images_per_batch = patch_lengths.shape
             image_batch_indices = torch.arange(
@@ -143,6 +150,7 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
         encoded_batch["image_vit_grid_hw"] = encoded_batch["image_vit_grid_hw"].reshape(-1, 2)
         encoded_batch["image_llm_grid_hw"] = encoded_batch["image_llm_grid_hw"].reshape(-1, 2)
         encoded_batch["image_token_starts"] = encoded_batch["image_token_starts"].reshape(-1)
+
         if logger.isEnabledFor(logging.DEBUG) and encoded_batch["input_ids"].device.type == "cpu":
             starts = encoded_batch["image_token_starts"].tolist()
             grids = encoded_batch["image_llm_grid_hw"].tolist()
@@ -162,8 +170,10 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
                 rows, starts, ends, grids, offsets, tuple(encoded_batch["pixel_values"].shape),
                 valid_spans, valid_patches, enabled=True,
             )
+
             if not valid_spans or not valid_patches:
                 logger.warning("DeepSeek image batch has inconsistent token spans or patch metadata")
+
         return encoded_batch
 
     @staticmethod
@@ -213,7 +223,7 @@ class DeepseekV41SFTTransform(_DeepseekV41OmniTransformBase):
             self,
             processor: DeepseekV41Processor,
             *,
-            max_seq_len: int = 4096,
+            max_seq_len: int,
             thinking_mode: str = "chat",
             drop_thinking: bool = True,
             sample_format: str = "messages",
@@ -223,6 +233,7 @@ class DeepseekV41SFTTransform(_DeepseekV41OmniTransformBase):
         super().__init__(processor, max_seq_len=max_seq_len, sample_alignment_size=sample_alignment_size)
         self.thinking_mode = thinking_mode
         self.drop_thinking = drop_thinking
+
         if sample_format not in ("messages", "openai", "hf", "sharegpt"):
             raise ValueError(f"Unsupported DeepSeek-V4.1 SFT sample format: {sample_format!r}")
 
@@ -315,7 +326,7 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
     """Encode image-caption pairs or ordered interleaved text/images with native image spans."""
 
     def __init__(
-            self, processor: DeepseekV41Processor, *, max_seq_len: int = 4096,
+            self, processor: DeepseekV41Processor, *, max_seq_len: int,
             sample_format: str = "image_caption",
             sample_alignment_size: int = 1,
     ) -> None:
@@ -323,6 +334,7 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
         super().__init__(
             processor, max_seq_len=max_seq_len, training_mode="pretrain", sample_alignment_size=sample_alignment_size,
         )
+
         if sample_format not in ("image_caption", "interleaved"):
             raise ValueError(f"Unsupported DeepSeek-V4.1 pretrain sample format: {sample_format!r}")
 
@@ -435,7 +447,7 @@ def build_deepseek_v41_omni_transform(
         *,
         processor: DeepseekV41Processor,
         training_mode: str,
-        max_seq_len: int = 4096,
+        max_seq_len: int,
         thinking_mode: str = "chat",
         drop_thinking: bool = True,
         sample_format: str | None = None,
@@ -446,7 +458,7 @@ def build_deepseek_v41_omni_transform(
     Args:
         processor: Model-owned tokenizer and native image processor settings.
         training_mode: Required ``sft`` for conversations or ``pretrain`` for raw text/images.
-        max_seq_len: Maximum expanded sample length. Longer samples emit a warning
+        max_seq_len: Required maximum expanded sample length. Longer samples emit a warning
             and are skipped without truncating image spans.
         thinking_mode: SFT chat-template reasoning mode.
         drop_thinking: Whether the SFT template drops reasoning content.
@@ -464,6 +476,7 @@ def build_deepseek_v41_omni_transform(
     Raises:
         ValueError: If training_mode is neither ``sft`` nor ``pretrain``.
     """
+
     if training_mode == "pretrain":
         data_transform = DeepseekV41PretrainTransform(
             processor,

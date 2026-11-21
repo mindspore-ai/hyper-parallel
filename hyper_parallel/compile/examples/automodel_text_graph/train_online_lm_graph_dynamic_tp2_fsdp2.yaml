@@ -20,7 +20,8 @@ lr_scheduler:
     lr: 0.0001
     lr_warmup_steps: 0
 training:
-  train_iters: 6
+  epochs: 1
+  max_steps: 6
   global_batch_size: 4
   micro_batch_size: 1
   backend: hccl
@@ -54,18 +55,13 @@ dataset:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 128
   data_config:
+    max_seq_len: 128
     labels_are_shifted: true
     create_attention_mask_in_dataloader: true
 dataloader:
   _target_: hyper_parallel.data.batching.TokenBatchLoader
   min_buffered_samples: 8
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:

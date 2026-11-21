@@ -33,7 +33,8 @@ model:
 model_init_dtype: float32
 
 training:
-  train_iters: 100
+  epochs: 1
+  max_steps: 100
   train_samples: null
   eval_iters: 0
   # DP = 16 / (TP1 * CP4 * PP1) = 4; GBS8/micro1 accumulates two microbatches.
@@ -195,13 +196,13 @@ dataset:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 4096
     # A short trailing window breaks both the CSA compression-ratio alignment
     # and the context-parallel shard size once it lands in a batch.
     drop_ragged_tail: true
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: ./output/training_demo/deepseek_v41/online_4k.jsonl
   data_config:
+    max_seq_len: 4096
     # Emit compact sample boundaries through the V4.1 runtime adapter. A dense
     # [S,S] mask would be infeasible at the report's 64K/1M training lengths.
     create_attention_mask_in_dataloader: true
@@ -212,7 +213,6 @@ dataloader:
   min_buffered_samples: 1
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
-    pad_to_length: 4096
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
@@ -225,13 +225,6 @@ dataloader:
       include_image_sequence_start: false
   # Online Mapping owns its deterministic sample and blend indices.
   sampler_type: single
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 
 optimizer:
   _target_: hyper_parallel.components.optim.Sinkhorn
