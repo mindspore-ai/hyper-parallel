@@ -23,6 +23,8 @@ __all__ = [
     "kda_split_state_summary_kernel",
     "kda_state_transition_kernel",
     "kda_state_grad_ext_kernel",
+    "kda_bounded_state_summary_kernel",
+    "kda_bounded_state_gradient_kernel",
 ]
 
 import triton
@@ -35,8 +37,10 @@ def _exp2(value):
     return tl.math.exp2(value.to(tl.float32))
 
 
-@triton.jit(do_not_specialize=["T"])
-def kda_split_state_summary_kernel(
+@triton.jit
+def _state_summary_head(
+    i_col: tl.tensor,
+    i_bh: tl.tensor,
     key: tl.tensor,
     w: tl.tensor,
     u: tl.tensor,
@@ -74,8 +78,6 @@ def kda_split_state_summary_kernel(
         OUTPUT_MODE: Select combined, state-only, or transfer-only output.
         W_HEAD_FIRST: Whether feedback weights use head-first storage.
     """
-    i_col = tl.program_id(0)
-    i_bh = tl.program_id(1)
     i_b = i_bh // H
     i_h = i_bh % H + HEAD_OFFSET
 
@@ -156,6 +158,66 @@ def kda_split_state_summary_kernel(
 
 
 @triton.jit(do_not_specialize=["T"])
+def kda_split_state_summary_kernel(
+    key: tl.tensor,
+    w: tl.tensor,
+    u: tl.tensor,
+    gate: tl.tensor,
+    state_ext: tl.tensor,
+    transition: tl.tensor,
+    T: tl.tensor,
+    H: tl.constexpr,
+    H_TOTAL: tl.constexpr,
+    HEAD_OFFSET: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    OUTPUT_MODE: tl.constexpr = 0,
+    W_HEAD_FIRST: tl.constexpr = False,
+) -> None:
+    """Dispatch one independent head/column task per Triton program."""
+    _state_summary_head(
+        tl.program_id(0), tl.program_id(1),
+        key, w, u, gate, state_ext, transition, T,
+        H, H_TOTAL, HEAD_OFFSET, K, V, BT, BV,
+        OUTPUT_MODE, W_HEAD_FIRST,
+    )
+
+
+@triton.jit(do_not_specialize=["T"])
+def kda_bounded_state_summary_kernel(
+    key: tl.tensor,
+    w: tl.tensor,
+    u: tl.tensor,
+    gate: tl.tensor,
+    state_ext: tl.tensor,
+    transition: tl.tensor,
+    T: tl.tensor,
+    H: tl.constexpr,
+    H_TOTAL: tl.constexpr,
+    HEAD_OFFSET: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    OUTPUT_MODE: tl.constexpr = 0,
+    W_HEAD_FIRST: tl.constexpr = False,
+    NUM_WORKERS: tl.constexpr = 16,
+) -> None:
+    """Bound active programs while executing the identical per-head arithmetic."""
+    tl.static_assert(OUTPUT_MODE == 1)
+    columns = tl.cdiv(V, BV)
+    for task in range(tl.program_id(0), H * columns, NUM_WORKERS):
+        _state_summary_head(
+            task % columns, task // columns,
+            key, w, u, gate, state_ext, transition, T,
+            H, H_TOTAL, HEAD_OFFSET, K, V, BT, BV,
+            OUTPUT_MODE, W_HEAD_FIRST,
+        )
+
+
+@triton.jit(do_not_specialize=["T"])
 def kda_state_transition_kernel(
     key: tl.tensor,
     w: tl.tensor,
@@ -166,6 +228,8 @@ def kda_state_transition_kernel(
     K: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
+    H_TOTAL: tl.constexpr = 0,
+    HEAD_OFFSET: tl.constexpr = 0,
 ) -> None:
     """Compose explicit chunk transfers with FP32 feedback, as in FLA CP.
 
@@ -183,7 +247,8 @@ def kda_state_transition_kernel(
     column = tl.program_id(0)
     head = tl.program_id(1)
     batch = head // H
-    local_head = head % H
+    total_heads: tl.constexpr = H_TOTAL if H_TOTAL > 0 else H
+    local_head = head % H + HEAD_OFFSET
     rows = tl.arange(0, K)
     columns = column * BV + tl.arange(0, BV)
     tokens = tl.arange(0, BT)
@@ -194,10 +259,10 @@ def kda_state_transition_kernel(
     # neither an inter-program barrier nor a per-chunk matrix workspace.
     tl.store(transition + output_offsets, matrix)
     for chunk in range(tl.cdiv(T, BT)):
-        offsets = ((batch * T + chunk * BT + tokens[:, None]) * H + local_head) * K + rows[None, :]
+        offsets = ((batch * T + chunk * BT + tokens[:, None]) * total_heads + local_head) * K + rows[None, :]
         key_tile = tl.load(key + offsets, mask=chunk * BT + tokens[:, None] < T, other=0.0)
         weight_tile = tl.load(w + offsets, mask=chunk * BT + tokens[:, None] < T, other=0.0)
-        last = ((batch * T + tl.minimum((chunk + 1) * BT, T) - 1) * H + local_head) * K + rows
+        last = ((batch * T + tl.minimum((chunk + 1) * BT, T) - 1) * total_heads + local_head) * K + rows
         decay = tl.exp2(tl.load(gate + last).to(tl.float32))
         diagonal = tl.where(rows[:, None] == rows[None, :], decay[:, None], 0.0)
         interaction = tl.dot(tl.trans(key_tile), weight_tile)
@@ -207,8 +272,10 @@ def kda_state_transition_kernel(
         tl.store(transition + output_offsets, updated)
 
 
-@triton.jit(do_not_specialize=["T"])
-def kda_state_grad_ext_kernel(
+@triton.jit
+def _state_gradient_head(
+    i_col: tl.tensor,
+    i_bh: tl.tensor,
     query: tl.tensor,
     key: tl.tensor,
     w: tl.tensor,
@@ -246,8 +313,6 @@ def kda_state_grad_ext_kernel(
         BT: Tokens per chunk, currently 64.
         BV: Value-column tile width.
     """
-    i_col = tl.program_id(0)
-    i_bh = tl.program_id(1)
     i_b = i_bh // H
     i_h = i_bh % H + HEAD_OFFSET
 
@@ -322,3 +387,62 @@ def kda_state_grad_ext_kernel(
     output2_ptr = tl.make_block_ptr(grad_state_ext, (K, V), (V, 1), (64, i_col * BV), (64, BV), (1, 0))
     tl.store(output1_ptr, state1.to(output1_ptr.dtype.element_ty), boundary_check=(0, 1))
     tl.store(output2_ptr, state2.to(output2_ptr.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit(do_not_specialize=["T"])
+def kda_state_grad_ext_kernel(
+    query: tl.tensor,
+    key: tl.tensor,
+    w: tl.tensor,
+    gate: tl.tensor,
+    grad_output: tl.tensor,
+    grad_value: tl.tensor,
+    grad_state_ext: tl.tensor,
+    scale: tl.tensor,
+    T: tl.tensor,
+    H: tl.constexpr,
+    H_TOTAL: tl.constexpr,
+    HEAD_OFFSET: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+) -> None:
+    """Dispatch one independent head/column task per Triton program."""
+    _state_gradient_head(
+        tl.program_id(0), tl.program_id(1),
+        query, key, w, gate, grad_output, grad_value, grad_state_ext,
+        scale, T, H, H_TOTAL, HEAD_OFFSET, K, V,
+        BT, BV,
+    )
+
+
+@triton.jit(do_not_specialize=["T"])
+def kda_bounded_state_gradient_kernel(
+    query: tl.tensor,
+    key: tl.tensor,
+    w: tl.tensor,
+    gate: tl.tensor,
+    grad_output: tl.tensor,
+    grad_value: tl.tensor,
+    grad_state_ext: tl.tensor,
+    scale: tl.tensor,
+    T: tl.tensor,
+    H: tl.constexpr,
+    H_TOTAL: tl.constexpr,
+    HEAD_OFFSET: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    NUM_WORKERS: tl.constexpr = 16,
+) -> None:
+    """Bound active programs while executing the identical per-head arithmetic."""
+    columns = tl.cdiv(V, BV)
+    for task in range(tl.program_id(0), H * columns, NUM_WORKERS):
+        _state_gradient_head(
+            task % columns, task // columns,
+            query, key, w, gate, grad_output, grad_value, grad_state_ext,
+            scale, T, H, H_TOTAL, HEAD_OFFSET, K, V,
+            BT, BV,
+        )
