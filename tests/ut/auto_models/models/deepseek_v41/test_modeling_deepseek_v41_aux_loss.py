@@ -51,6 +51,7 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
 )
 from hyper_parallel.trainer.config import PlanOverride, entries_to_plan_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
+from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
@@ -91,6 +92,7 @@ def tiny_config(coefficient: float = 0.1) -> DeepseekV4Config:
 class TestV41RouterAuxLoss(unittest.TestCase):
     """Verify the learned text/image router against an independent objective."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_router_gradient_matches_explicit_full_score_loss(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -146,6 +148,7 @@ class TestV41RouterAuxLoss(unittest.TestCase):
                 self.assertIsNone(actual.bias_vl.grad)
                 self.assertFalse(actual.last_aux_loss.requires_grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_aux_loss_uses_unbiased_topk_while_routing_uses_bias(self) -> None:
         """
         Feature: Sequence auxiliary loss and modality correction bias.
@@ -183,6 +186,7 @@ class TestV41RouterAuxLoss(unittest.TestCase):
                 self.assertIsNone(router.bias.grad)
                 self.assertIsNone(router.bias_vl.grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_disable_eval_and_invalid_coefficient(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -206,6 +210,7 @@ class TestV41RouterAuxLoss(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "router_aux_loss_coef"):
                 DeepseekV41TopKRouter(tiny_config(coefficient))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_compute_factory_reduces_only_token_partition_axes(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -254,6 +259,7 @@ class TestV41RouterAuxLoss(unittest.TestCase):
 class TestV41NativeAuxLoss(unittest.TestCase):
     """Exercise the real causal-LM and EP adapter paths on CPU."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cropped_config_preserves_aux_coefficient_and_upstream_structure(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -285,16 +291,21 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             (root / "config.json").write_text(json.dumps(source), encoding="utf-8")
             assets_path = root / "engram.json"
             assets_path.write_text(json.dumps(assets), encoding="utf-8")
-            for options in ({}, {"router_aux_loss_coeff": 0.125},
-                            {"router_aux_loss_coeff": 0.0, "router_bias_update_rate": 0.0}):
+            for options in ({}, {"moe_aux_loss_coeff": 0.125},
+                            {"moe_router_force_load_balancing": True},
+                            {"moe_aux_loss_coeff": 0.0, "moe_router_bias_update_rate": 0.0}):
                 with self.subTest(options=options):
                     config = build_deepseek_v41_validation_config(
                         str(root), str(assets_path), text_parameter_divisor=2,
                         vision_parameter_divisor=2, enable_vision=True, num_routed_experts=4, **options,
                     )
                     router = DeepseekV41TopKRouter(config)
-                    self.assertEqual(router.aux_loss_coeff, options.get("router_aux_loss_coeff", 1.0e-4))
-                    self.assertEqual(router.expert_bias_update_rate, options.get("router_bias_update_rate", 0.001))
+                    self.assertEqual(router.aux_loss_coeff, options.get("moe_aux_loss_coeff", 0.0))
+                    self.assertEqual(router.expert_bias_update_rate, options.get("moe_router_bias_update_rate", 0.0))
+                    self.assertEqual(config.moe_aux_loss_coeff, router.aux_loss_coeff)
+                    self.assertEqual(config.moe_router_bias_update_rate, router.expert_bias_update_rate)
+                    self.assertEqual(config.moe_router_force_load_balancing,
+                                     options.get("moe_router_force_load_balancing", False))
                     self.assertEqual(router.enable_expert_bias, router.expert_bias_update_rate > 0)
                     self.assertEqual(config.hidden_size, 8)
                     self.assertEqual(config.o_groups, 2)
@@ -303,6 +314,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
                     self.assertEqual(config.v41_vision_num_hidden_layers, 5)
                     self.assertEqual(config.v41_vision_hidden_size, 8)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_forward_backward_preserves_logits_and_checkpoint_keys(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -334,6 +346,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             self.assertEqual(set(model.state_dict()), set(reference.state_dict()))
             self.assertTrue(torch.isfinite(gate.weight.grad).all())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_ep_adapter_retains_router_auxiliary_gradient(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -365,6 +378,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
         self.assertIsNotNone(router.last_aux_loss)
         self.assertGreater(router.weight.grad.abs().sum().item(), 0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_packed_samples_reach_router_as_distinct_sequences(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -389,6 +403,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             self.assertEqual(forward.call_args.kwargs["num_sequences"], 2)
             self.assertEqual(gate.tokens_per_expert.sum().item(), 4 * config.num_experts_per_tok)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_recipe_compute_installs_in_production_and_validate(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -448,6 +463,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
 class TestV41MegaMoeAuxLoss(unittest.TestCase):
     """Run real router training state around a CPU replacement for native experts."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_megamoe_preserves_router_loss_gradients_and_loads(self) -> None:
         """Keep packed IDs, masks and independent aux switches through MegaMoe.
 
@@ -511,6 +527,7 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
                         self.assertEqual(router.tokens_per_expert.sum().item(), 6 if rate else 0)
                         experts.configure.assert_called_once_with(None, 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_megamoe_aligns_tp_metadata_and_statistics_groups(self) -> None:
         """Align all metadata and preserve separate sequence and bias domains.
 

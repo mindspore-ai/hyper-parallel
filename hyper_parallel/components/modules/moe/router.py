@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Gate and token-choice routing protocols with shared family registration."""
+"""One Gate family owning routing and optional training state."""
 
 from __future__ import annotations
 from collections.abc import Mapping
@@ -24,11 +24,28 @@ from torch import nn
 from torch.nn import functional as F
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
+from hyper_parallel.components.modules.moe.moe_utils import router_sharding, validate_router_layout
 from hyper_parallel.models.replacement import module_replacement
+from hyper_parallel.distributed.module_binding import ParallelBinding, ParallelModuleSpec
+
+
+def _setting(sources: tuple, names: tuple[str, ...], default: Any) -> Any:
+    for source in sources:
+        for name in names:
+            value = source.get(name) if isinstance(source, Mapping) else getattr(source, name, None)
+            if value is not None:
+                return value
+    return default
+
 
 
 def routing_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
-    """Apply nonnegative expert scoring without mixing in correction bias or model statistics."""
+    """Apply nonnegative expert scoring without correction bias.
+
+    Args:
+        logits: Projection outputs ending in the expert dimension.
+        scoring_func: sqrtsoftplus, softmax or sigmoid.
+    """
     if scoring_func == "sqrtsoftplus":
         return F.softplus(logits).sqrt()  # pylint: disable=not-callable
     if scoring_func == "softmax":
@@ -44,6 +61,14 @@ def select_topk_scores(scores: torch.Tensor, *, top_k: int, correction_bias: tor
                        sorted_indices: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Select with correction bias, then gather unbiased weights and optionally normalize.
 
+
+    Args:
+        scores: Floating unbiased expert scores [tokens, experts].
+        top_k: Selected experts per token.
+        correction_bias: Optional selection-only [experts] or [tokens, experts] bias.
+        routed_scaling_factor: Multiplier applied to selected weights.
+        normalize_topk: Normalize selected weights to sum to one before scaling.
+        sorted_indices: Sort selected experts by selection score.
     """
     if scores.ndim != 2 or not scores.is_floating_point():
         raise ValueError("scores must be a floating [tokens, experts] tensor")
@@ -52,7 +77,7 @@ def select_topk_scores(scores: torch.Tensor, *, top_k: int, correction_bias: tor
     if (isinstance(routed_scaling_factor, bool) or not isinstance(routed_scaling_factor, (int, float))
             or not isfinite(routed_scaling_factor)):
         raise ValueError("routed_scaling_factor must be finite")
-    if not isinstance(normalize_topk, bool) or not isinstance(sorted_indices, bool):
+    if not all((isinstance(normalize_topk, bool), isinstance(sorted_indices, bool))):
         raise TypeError("normalize_topk and sorted_indices must be bool")
     selection = scores
     if correction_bias is not None:
@@ -69,15 +94,43 @@ def select_topk_scores(scores: torch.Tensor, *, top_k: int, correction_bias: tor
 
 
 
+def balanced_expert_indices(indices: torch.Tensor, num_experts: int, ep_size: int = 1) -> torch.Tensor:
+    """Replace destinations with the existing deterministic owner-major routing pattern.
+
+    Args:
+        indices: Learned integer expert IDs [tokens, top_k]; only shape/device/dtype are used.
+        num_experts: Global expert count, divisible by the physical EP owner count.
+        ep_size: Physical expert owners, including the TP extension of EP.
+
+    Returns:
+        Balanced global expert IDs with the same shape, dtype and device.
+        Learned routing weights are deliberately left unchanged by callers.
+    """
+    if indices.ndim != 2 or indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("indices must be integer [tokens, top_k]")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+           for value in (num_experts, ep_size)) or num_experts % ep_size:
+        raise ValueError("num_experts must be positive and divisible by the positive EP owner count")
+    if not 1 <= indices.shape[1] <= num_experts:
+        raise ValueError("top_k must be in [1, num_experts]")
+    slots = torch.arange(indices.numel(), device=indices.device)
+    local_experts = num_experts // ep_size
+    fixed = (slots % ep_size) * local_experts + (slots // ep_size) % local_experts
+    return fixed.reshape_as(indices).to(indices.dtype)
+
+
+
 class GateModule(nn.Module):
     """Own common gate configuration, projection state, initialization and routing math.
 
     Projection still follows the enclosing Torch autocast policy, as the model
-    source does. Correction state and fused execution belong to derived gates.
+    source does. Optional training state is shared with the token-choice Router;
+    fused execution belongs to the MegaGate variant.
     """
 
-    def __init__(self, *, config: Any = None, module: nn.Module | None = None) -> None:
-        """Construct routing math or retain a public member; model state is not a replacement boundary."""
+    def __init__(self, *, config: Any = None, module: nn.Module | None = None,
+                 context: Mapping[str, Any] | None = None) -> None:
+        """Construct a gate or retain a public member and its optional training state."""
         super().__init__()
         if (config is None) == (module is None):
             raise ValueError("provide exactly one of config or module")
@@ -96,6 +149,7 @@ class GateModule(nn.Module):
                 raise ValueError("source weight must be a floating Parameter [num_experts, hidden_size]")
             self.weight = weight
             self.train(module.training)
+        self._init_router_training(source, context, self.weight, module)
 
     def _set_routing_settings(self, source: Any) -> None:
         """Validate dimensions, scoring, TopK normalization and initialization policy."""
@@ -116,7 +170,7 @@ class GateModule(nn.Module):
             raise ValueError("routed_scaling_factor must be finite")
         self.normalize_topk = getattr(source, "normalize_topk", self.top_k > 1)
         self.sorted_indices = getattr(source, "sorted_indices", False)
-        if not isinstance(self.normalize_topk, bool) or not isinstance(self.sorted_indices, bool):
+        if not all((isinstance(self.normalize_topk, bool), isinstance(self.sorted_indices, bool))):
             raise TypeError("normalize_topk and sorted_indices must be bool")
         self.initializer_range = source.initializer_range
         if (isinstance(self.initializer_range, bool) or not isinstance(self.initializer_range, (int, float))
@@ -152,7 +206,63 @@ class GateModule(nn.Module):
             routing_scores(logits, self.scoring_func), top_k=self.top_k, correction_bias=correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             normalize_topk=self.normalize_topk, sorted_indices=self.sorted_indices)
+        weights, indices = self._finish_routing(weights, indices)
         return logits, weights, indices
+
+    def _finish_routing(self, weights: torch.Tensor,
+                        indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.fix_router:
+            indices = balanced_expert_indices(indices, self.num_experts, self.router_ep_size)
+        return weights, indices
+
+
+    def _init_router_training(self, source: Any, context: Mapping[str, Any] | None,
+                              weight: nn.Parameter, module: nn.Module | None = None) -> None:
+        """Resolve router options and initialize parallel routing state."""
+        sources = (*tuple((context or {}).get("module_configs", ())), source)
+        self.fix_router = _setting(
+            sources, ("moe_router_force_load_balancing", "fix_router", "router_fix_router"), False,
+        )
+        if not isinstance(self.fix_router, bool):
+            raise ValueError("moe_router_force_load_balancing must be bool")
+        self.router_ep_size = 1
+        self.router_tp_mesh = None
+        self.sequence_partition_groups = ()
+        self.expert_bias_update_groups = None
+
+
+    def parallel_module_spec(self) -> ParallelModuleSpec:
+        """Declare a replicated router that borrows existing statistics meshes."""
+        return ParallelModuleSpec(
+            protocol="moe.router.statistics", binding_kind="mesh",
+            stages={"forward": ("hidden_states",)}, validate=validate_router_layout,
+        )
+
+
+    def bind_parallel(self, binding: ParallelBinding) -> None:
+        """Bind source-token statistics independently of expert transport.
+
+        Args:
+            binding: Job-owned mesh resources; no new process groups are created.
+        """
+        mesh = binding.mesh_binding.mesh_context
+        device_mesh = mesh.device_mesh
+        names = tuple(device_mesh.mesh_dim_names or ()) if device_mesh is not None else ()
+        tp_partitioned = mesh.sequence_parallel or mesh.ep_size > 1
+        tp_mesh = device_mesh["tp"] if "tp" in names and tp_partitioned else None
+        sequence_axes = [device_mesh["cp"]] if "cp" in names else []
+        if tp_mesh is not None:
+            sequence_axes.append(tp_mesh)
+        sequence_groups = tuple(axis.get_group() for axis in sequence_axes if axis.size() > 1)
+        dp_groups = tuple(device_mesh[name].get_group() for name in names
+                          if name in ("dp", "dp_replicate", "dp_shard") and device_mesh[name].size() > 1)
+        owners = binding.mesh_binding.axis_mesh("ep").size() if mesh.ep_size > 1 else 1
+        if self.num_experts % owners:
+            raise ValueError("router expert count must be divisible by the physical EP owner count")
+        self.router_ep_size = owners
+        self.router_tp_mesh = tp_mesh
+        self.sequence_partition_groups = sequence_groups
+        self.expert_bias_update_groups = dp_groups + sequence_groups
 
 
 
@@ -172,10 +282,11 @@ class MegaGateModule(GateModule):
     supplies the native function and plan, without owning this module's state.
     """
 
+
     def __init__(self, *, config: Any = None, module: nn.Module | None = None,
                  module_fqn: str = "", context: Mapping[str, Any] | None = None) -> None:
         """Construct or adopt the public MegaGate without accepting model-specific subclasses."""
-        del module_fqn, context
+        del module_fqn
         if (config is None) == (module is None):
             raise ValueError("provide exactly one of config or module")
         if module is not None:
@@ -188,7 +299,7 @@ class MegaGateModule(GateModule):
                           if config is not None else getattr(source, "bias_vl", None) is not None)
         if not isinstance(vision_enabled, bool):
             raise TypeError("vision_enabled must be bool")
-        super().__init__(config=config, module=module)
+        super().__init__(config=config, module=module, context=context)
         for name in ("bias", "bias_vl"):
             if name == "bias_vl" and not vision_enabled:
                 self.register_parameter(name, None)
@@ -202,17 +313,6 @@ class MegaGateModule(GateModule):
                     raise ValueError(f"source {name} must be an FP32 Parameter [num_experts] on the weight device")
             setattr(self, name, parameter)
 
-    @classmethod
-    def _validate_source(cls, module: nn.Module) -> None:
-        if module.__class__ is cls:
-            return
-        if not module.__class__.__module__.startswith("hyper_multicore.modules.mega_gate"):
-            raise TypeError("MegaGate family accepts only the public MegaGate; use a model adapter for other routers")
-        # Existing HyperMulticore modules remain valid sources; this is not a base class.
-        from hyper_multicore.modules.mega_gate import MegaGate as SourceMegaGate  # pylint: disable=import-outside-toplevel
-
-        if module.__class__ is not SourceMegaGate:
-            raise TypeError("MegaGate family accepts only the public MegaGate; use a model adapter for other routers")
 
     def reset_parameters(self) -> None:
         """Reset the common projection and MegaGate-specific correction state."""
@@ -220,6 +320,20 @@ class MegaGateModule(GateModule):
         nn.init.zeros_(self.bias)
         if self.bias_vl is not None:
             nn.init.zeros_(self.bias_vl)
+
+    @classmethod
+    def _validate_source(cls, module: nn.Module) -> None:
+        if module.__class__ is cls:
+            return
+        if not module.__class__.__module__.startswith("hyper_multicore.modules.mega_gate"):
+            raise TypeError("MegaGate family accepts only the public MegaGate; use a model adapter for other routers")
+        # Existing HyperMulticore modules remain valid sources; this is not a base class.
+        from hyper_multicore.modules.mega_gate import (  # pylint: disable=import-outside-toplevel
+            MegaGate as SourceMegaGate,
+        )
+
+        if module.__class__ is not SourceMegaGate:
+            raise TypeError("MegaGate family accepts only the public MegaGate; use a model adapter for other routers")
 
     def make_transforms(self) -> list:
         """Declare that this member keeps parameter names and layouts unchanged.
@@ -229,6 +343,7 @@ class MegaGateModule(GateModule):
             fully owned by ``reset_parameters``.
         """
         return []
+
 
     def _apply(self, fn: Any, recurse: bool = True) -> MegaGateModule:
         """Preserve declared FP32 parameters and gradients during conversion."""
@@ -244,6 +359,7 @@ class MegaGateModule(GateModule):
             return converted.float() if tensor.is_meta else tensor.to(device=converted.device, dtype=torch.float32)
 
         return super()._apply(apply, recurse=recurse)
+
 
     def _torch_forward(self, hidden_states: torch.Tensor,
                        image_mask: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
@@ -279,11 +395,18 @@ class MegaGateModule(GateModule):
             return self._torch_forward(hidden_states, image_mask)
         if image_mask is not None and not image_mask.is_contiguous():
             raise ValueError("image_mask must be contiguous for native MegaGate")
-        return self._native_forward(hidden_states, image_mask)
+        logits, weights, indices = self._native_forward(hidden_states, image_mask)
+        weights, indices = self._finish_routing(weights, indices)
+        return logits, weights, indices
 
     @classmethod
     def from_module(cls, module: nn.Module, **configuration: Any) -> MegaGateModule:
-        """Retain the source's declared settings; overrides require a separate explicit construction."""
+        """Retain declared settings without configuration overrides.
+
+        Args:
+            module: Existing public MegaGate source.
+            **configuration: Overrides are rejected; construct a new configured gate instead.
+        """
         if configuration:
             raise ValueError("family source construction preserves source settings; overrides are unsupported")
         return cls(module=module)
@@ -304,12 +427,14 @@ register_module_family(ModuleFamily(
     name="gate", baseline=Gate,
     variants={"local": "hyper_parallel.components.modules.moe.router.GateModule",
               "mega": "hyper_parallel.components.modules.moe.router.MegaGateModule"},
-    default_variant="local", selector_specs={"implementation": SelectorSpec(str, "local")},
+    default_variant="local", sharding=router_sharding,
+    selector_specs={"implementation": SelectorSpec(str, "local")},
     variant_rules=(VariantRule({"implementation": "mega", "parallel": False}, "mega"),),
 ))
 
 
+
 __all__ = [
     "Gate", "GateModule", "MegaGateModule",
-    "routing_scores", "select_topk_scores",
+    "balanced_expert_indices", "routing_scores", "select_topk_scores",
 ]

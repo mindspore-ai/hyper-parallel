@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MoE utilities for distributed training."""
+"""Model-independent router load accounting, bias updates and statistics resources."""
+
+from __future__ import annotations
 
 from typing import Any, Optional
 
@@ -20,6 +22,39 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from hyper_parallel.core.dtensor.placement_types import Replicate
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
+
+
+def router_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
+    """Declare complete replicated router state without another token boundary.
+
+    Args:
+        module: Actual router member.
+        module_fqn: Diagnostic path supplied by the family builder.
+        member: Resolved family member.
+        context: Existing logical topology.
+    """
+    del module_fqn, member, context
+    return ModuleShardingSpec(params={name: {} for name, _ in module.named_parameters()},
+                              in_src={}, in_dst={}, is_boundary=False)
+
+
+def validate_router_layout(*, module: nn.Module, sharding: ModuleShardingSpec, context: Any) -> None:
+    """Reject parameter sharding or token redistribution inside a replicated router.
+
+    Args:
+        module: Router owning projection and optional correction state.
+        sharding: Final family layout after user overrides.
+        context: Existing logical topology.
+    """
+    del context
+    if set(sharding.params) != {name for name, _ in module.named_parameters()}:
+        raise ValueError("router requires complete parameter ownership")
+    if any(value != Replicate() for axes in sharding.params.values() for value in axes.values()):
+        raise ValueError("router parameters must be replicated across computation axes")
+    if sharding.is_boundary or sharding.in_src or sharding.in_dst or sharding.out_src or sharding.out_dst:
+        raise ValueError("router token redistribution belongs to the containing MoE")
 
 
 def sync_and_update_expert_bias(

@@ -2,6 +2,7 @@
 
 本目录提供 `routed_grouped_experts` 模块族：默认成员拥有专家参数和 routed 算法，EP 成员复用相同数学，只替换 slot 的运输阶段。
 模型 / MoE 负责 router、最终路由权重、aux-loss、共享专家及其 gate/mask，以及最终输出组装。
+新 Gate 的 fix-router、aux-loss、aux-loss-free、共享专家掩盖与独立训练循环见 [MoE 模块说明](../README.md)。
 
 目录按算法与并行成员组织：
 
