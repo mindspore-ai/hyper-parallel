@@ -10,6 +10,15 @@ Follow semantic versioning (SemVer): `vMAJOR.MINOR.PATCH`.
 - **MINOR**: Backward-compatible new features.
 - **PATCH**: Backward-compatible bug fixes.
 
+## Maintenance and PyTorch compatibility
+
+The maintainers commit to supporting and maintaining HyperParallel for at least 12 months from the date of its
+PyTorch Ecosystem application. As new stable PyTorch versions are released, the maintainers will update HyperParallel
+to support the two most recent stable releases.
+
+In each HyperParallel release's notes, list the exact PyTorch versions and hardware tested and link to the passing
+CI runs. Mark combinations that still need testing as pending validation and link to their tracking issues.
+
 ## Release Workflow
 
 ### 1. Prepare the Version
