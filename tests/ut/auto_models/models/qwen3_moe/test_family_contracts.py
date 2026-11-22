@@ -1,0 +1,535 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Qwen adapter contracts and class-owned GQA family integration on CPU."""
+# Transformers @strict supplies the supported keyword constructor at runtime.
+# pylint: disable=unexpected-keyword-arg
+# These per-case imports keep optional model implementations behind the CPU fixtures.
+# pylint: disable=wrong-import-position,import-outside-toplevel
+
+from functools import partial
+import importlib.util
+import inspect
+import sys
+import types
+import unittest
+import unittest.mock
+from types import SimpleNamespace
+from typing import Any
+
+import torch
+from torch import nn
+
+from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
+from hyper_parallel.distributed.recipe_spec import (
+    LOCAL_COMPUTE,
+)
+from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
+
+_MESH_FAMILY = frozenset({"mesh", "tp_mesh", "cp_mesh", "ep_mesh"})
+
+
+class TestGQAFamilyContracts(unittest.TestCase):
+    """Minimal family promotion, layout and packed-partition regressions."""
+
+    @staticmethod
+
+    def _source(gated: bool = False) -> nn.Module:
+        """Build a minimal ordinary or gated GQA source for family contract tests."""
+        source = nn.Module()
+        source.config = SimpleNamespace(hidden_size=16, num_attention_heads=4,
+                                        num_key_value_heads=2, head_dim=4)
+        source.q_proj = nn.Linear(16, 32 if gated else 16)
+        source.k_proj = nn.Linear(16, 8)
+        source.v_proj = nn.Linear(16, 8)
+        source.o_proj = nn.Linear(16, 16)
+        source.q_norm = nn.LayerNorm(4)
+        source.k_norm = nn.LayerNorm(4)
+        return source
+
+
+    def test_promotion_preserves_parameters_and_fixed_representation(self):
+        """Feature: Class-owned CP with stable parameter/FSDP boundaries.
+        Description: Promote ordinary, split and gated local members to CP2/TP2.
+        Expectation: Weights keep identity and overlap never changes their names.
+        """
+        from hyper_parallel.components.modules import (
+            GroupedQueryAttention, GatedGroupedQueryAttention,
+        )
+        from hyper_parallel.components.modules.module_family import get_family_build_info
+        from hyper_parallel.models.module_build import prepare_model_components
+        for factory, arguments in ((GroupedQueryAttention, {"fuse_qkv": True}),
+                                   (GroupedQueryAttention, {"fuse_qkv": False}),
+                                   (GatedGroupedQueryAttention, {})):
+            local = factory(module=self._source(factory is GatedGroupedQueryAttention), overlap=True, **arguments)
+            self.assertNotIn("overlap", inspect.signature(type(local)).parameters)
+            self.assertNotIn("ulysses_degree", vars(local))
+            self.assertNotIn("attn_groupnorm", vars(local))
+            self.assertNotIn("attn_elementwise_gate", vars(local))
+            self.assertTrue(get_family_build_info(local).request.kwargs["overlap"])
+            for attribute in ("tp_degree", "tensor_parallel", "bind_parallel", "parallel_module_spec"):
+                self.assertFalse(hasattr(local, attribute), attribute)
+            model = nn.Module()
+            model.self_attn = local
+            model, _ = prepare_model_components(model, {"tp_size": 2, "cp_size": 1})
+            tp_member = model.self_attn
+            self.assertIs(tp_member, local)
+            self.assertFalse(hasattr(tp_member, "bind_parallel"))
+            self.assertNotIn("forward", vars(tp_member))
+            for name, parameter in tp_member.named_parameters():
+                self.assertIs(parameter, local.get_parameter(name))
+            parallel = factory(module=tp_member, context={"cp_size": 2, "tp_size": 2},
+                               overlap=True, ulysses_degree=1, **arguments)
+            self.assertEqual(get_family_build_info(parallel).resolved.variant, "cp")
+            self.assertEqual(set(dict(local.named_parameters())), set(dict(parallel.named_parameters())))
+            for name, parameter in parallel.named_parameters():
+                self.assertIs(parameter, local.get_parameter(name))
+            self.assertNotIn("forward", vars(parallel))
+            if arguments.get("fuse_qkv", True):
+                source = self._source(factory is GatedGroupedQueryAttention)
+                parallel.num_key_value_heads = 1  # TP binding localizes runtime heads, not checkpoint layout.
+                transform = parallel.make_transforms()[0]
+                converted = transform.operations[0].convert(
+                    dict(source.named_parameters()), transform.source_patterns, transform.target_patterns)
+                self.assertEqual(converted["linear_qkv.weight"].shape, local.linear_qkv.weight.shape)
+        with self.assertRaisesRegex(ValueError, "divisible by TP"):
+            GroupedQueryAttention(module=self._source(), context={"tp_size": 3})
+        with self.assertRaisesRegex(TypeError, "fuse_qkv must be boolean"):
+            GroupedQueryAttention(module=self._source(), fuse_qkv="false")
+        source = self._source()
+        source.k_proj.weight.requires_grad_(False)
+        source.v_proj.bias = None
+        independent = GroupedQueryAttention(module=source, fuse_qkv=False)
+        self.assertIs(independent.k_proj.weight, source.k_proj.weight)
+        self.assertIsNone(independent.v_proj.bias)
+        self.assertFalse(independent.k_proj.weight.requires_grad)
+        with self.assertRaisesRegex(ValueError, "one fused projection"):
+            GroupedQueryAttention(module=source)
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            GroupedQueryAttention(module=independent, fuse_qkv=True)
+
+    def test_native_config_matches_source_parameters_and_gradients(self):
+        """Feature: Native construction without an intermediate HF attention.
+        Description: Compare grouped/split/gated math with independently projected Q/K/V.
+        Expectation: B2 partial RoPE, biases, optional Norm and all gradients agree.
+        """
+        from hyper_parallel.components.modules import (
+            GroupedQueryAttention, GatedGroupedQueryAttention,
+        )
+        from hyper_parallel.components.modules.attention.grouped_query_attention.grouped_query_attention import (
+            rotate_half,
+        )
+        # CPU contract tests replace the NPU boundary while preserving the production fused selection.
+        norm_module = importlib.import_module("hyper_parallel.components.modules.common.rms_norm")
+
+        def norm_kernel(inputs, weight, eps, cast_order):
+            del cast_order
+            return torch.nn.functional.rms_norm(inputs, (inputs.shape[-1],), weight, eps)
+
+        def attention(module, query, key, value, mask, **kwargs):
+            del module
+            result = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, attn_mask=mask, scale=kwargs["scaling"], enable_gqa=True)
+            return result.transpose(1, 2), None
+
+        def positioned(tensor, norm, positions):
+            tensor = norm(tensor) if norm is not None else tensor
+            rotary, tail = tensor.split((2, tensor.shape[-1] - 2), dim=-1)
+            cos, sin = (part.unsqueeze(2) for part in positions)
+            return torch.cat((rotary * cos + rotate_half(rotary) * sin, tail), dim=-1)
+
+        for factory, arguments in ((GroupedQueryAttention, {"fuse_qkv": True}),
+                                   (GroupedQueryAttention, {"fuse_qkv": False}),
+                                   (GatedGroupedQueryAttention, {})):
+            for use_norm in (False, True):
+                with self.subTest(factory=factory.__name__, norm=use_norm, **arguments):
+                    torch.manual_seed(41)
+                    gated = factory is GatedGroupedQueryAttention
+                    source = self._source(gated)
+                    source.config.qk_norm = use_norm
+                    source.config.attention_bias = True
+                    source.config.o_proj_bias = False
+                    source.config.rms_norm_eps = 1e-5
+                    source.config.dtype = torch.float32
+                    source.config.scaling = 0.7
+                    source.config.v_head_dim = 4 if gated else 3
+                    source.v_proj = nn.Linear(16, 2 * source.config.v_head_dim)
+                    source.o_proj = nn.Linear(4 * source.config.v_head_dim, 16, bias=False)
+                    source.q_norm = nn.RMSNorm(4, eps=1e-5) if use_norm else None
+                    source.k_norm = nn.RMSNorm(4, eps=1e-5) if use_norm else None
+                    converters = factory(module=source, **arguments).make_transforms()
+                    candidate = factory(config=source.config, **arguments)
+                    self.assertEqual(candidate.make_transforms(), [])
+                    state = dict(source.state_dict())
+                    for transform in converters:
+                        state.update(transform.operations[0].convert(
+                            state, transform.source_patterns, transform.target_patterns))
+                    candidate.load_state_dict({name: state[name] for name in candidate.state_dict()})
+                    candidate.attention_interface = attention
+                    inputs = torch.randn(2, 7, 16, requires_grad=True)
+                    local = inputs.detach().clone().requires_grad_()
+                    phase = torch.randn(2, 7, 1).repeat(1, 1, 2)
+                    positions = phase.cos(), phase.sin()
+                    query = source.q_proj(inputs).view(2, 7, 4, -1)
+                    gate = None
+                    if gated:
+                        query, gate = query.chunk(2, dim=-1)
+                    query = positioned(query, source.q_norm, positions)
+                    key = positioned(source.k_proj(inputs).view(2, 7, 2, 4), source.k_norm, positions)
+                    value = source.v_proj(inputs).view(2, 7, 2, -1)
+                    mask = torch.ones(7, 7, dtype=torch.bool).tril()
+                    result, _ = attention(None, query.transpose(1, 2), key.transpose(1, 2),
+                                          value.transpose(1, 2), mask, scaling=0.7)
+                    expected = source.o_proj((result * gate.sigmoid() if gated else result).flatten(-2))
+                    with unittest.mock.patch.object(norm_module, "_npu_rms_norm", norm_kernel):
+                        actual = candidate(local, positions, mask)[0]
+                        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+                        gradient = torch.randn_like(expected)
+                        actual.backward(gradient)
+                    expected.backward(gradient)
+                    torch.testing.assert_close(local.grad, inputs.grad, atol=3e-6, rtol=3e-5)
+                    gradients = {name: parameter.grad for name, parameter in source.named_parameters()}
+                    for transform in converters:
+                        gradients.update(transform.operations[0].convert(
+                            gradients, transform.source_patterns, transform.target_patterns))
+                    for name, parameter in candidate.named_parameters():
+                        torch.testing.assert_close(parameter.grad, gradients[name], atol=5e-6, rtol=5e-5)
+
+    def test_native_config_meta_and_cp_promotion(self):
+        """Feature: Direct families retain native checkpoint and initialization contracts.
+        Description: Materialize meta parameters and promote a loaded/frozen local member.
+        Expectation: CP keeps Parameter identity, aliases, values and native checkpoint names.
+        """
+        from hyper_parallel.components.modules import (
+            GroupedQueryAttention, GatedGroupedQueryAttention,
+        )
+        from hyper_parallel.components.modules.module_family import get_family_build_info
+        from hyper_parallel.models.module_build import prepare_model_components
+        for factory, arguments in ((GroupedQueryAttention, {"fuse_qkv": True}),
+                                   (GroupedQueryAttention, {"fuse_qkv": False}),
+                                   (GatedGroupedQueryAttention, {})):
+            with self.subTest(factory=factory.__name__, **arguments):
+                config = SimpleNamespace(hidden_size=16, num_attention_heads=4, num_key_value_heads=2,
+                                         qk_norm=True, dtype=torch.float64)
+                with torch.device("meta"):
+                    local = factory(config=config, overlap=True, **arguments)
+                    direct_cp = factory(config=config, context={"cp_size": 2}, overlap=True, **arguments)
+                self.assertTrue(all(parameter.is_meta for parameter in direct_cp.parameters()))
+                self.assertEqual(get_family_build_info(direct_cp).resolved.variant, "cp")
+                local.to_empty(device="cpu")
+                local.reset_parameters()
+                self.assertTrue(all(torch.isfinite(parameter).all() for parameter in local.parameters()))
+                self.assertTrue(all(parameter.dtype == torch.float64 for parameter in local.parameters()))
+                torch.testing.assert_close(local.q_norm.weight, torch.ones(4, dtype=torch.float64))
+                local.k_norm.weight = local.q_norm.weight
+                local.o_proj.weight.requires_grad_(False)
+                parameters = dict(local.named_parameters(remove_duplicate=False))
+                values = {name: parameter.detach().clone() for name, parameter in parameters.items()}
+                config.hidden_size = 100  # Promotion uses the family's captured config, not this mutation.
+                promoted, _ = prepare_model_components(local, {"cp_size": 2})
+                self.assertEqual(get_family_build_info(promoted).resolved.variant, "cp")
+                self.assertEqual(promoted.make_transforms(), [])
+                self.assertFalse(promoted.o_proj.weight.requires_grad)
+                for name, parameter in promoted.named_parameters(remove_duplicate=False):
+                    self.assertIs(parameter, parameters[name])
+                    torch.testing.assert_close(parameter, values[name], atol=0, rtol=0)
+                copied = factory(module=promoted, context={"cp_size": 2}, **arguments)
+                self.assertEqual(copied.make_transforms(), [])
+                self.assertIs(copied.q_norm.weight, copied.k_norm.weight)
+                for invalid in ({"num_key_value_heads": 0}, {"head_dim": 0}, {"qk_norm": "yes"}):
+                    config = SimpleNamespace(hidden_size=16, num_attention_heads=4, num_key_value_heads=2)
+                    vars(config).update(invalid)
+                    with self.assertRaises(ValueError):
+                        factory(config=config, **arguments)
+        with self.assertRaisesRegex(ValueError, "gate width"):
+            GatedGroupedQueryAttention(config=SimpleNamespace(
+                hidden_size=16, num_attention_heads=4, num_key_value_heads=2, v_head_dim=3))
+
+    def test_family_owns_qkv_groups_norm_and_output_bias_layout(self):
+        """Feature: Complete TP/SP layout without KV replication.
+        Description: Build the final layout for a biased GQA module at TP2 CP2.
+        Expectation: QKV rows and output columns shard; per-head Norm and O bias replicate.
+        """
+        from hyper_parallel.components.modules import GroupedQueryAttention
+        from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
+        from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+        module = GroupedQueryAttention(module=self._source())
+        info = get_family_build_info(module)
+        context = FamilyShardingContext(("cp", "tp"), {"cp": 2, "tp": 2}, {}, sequence_parallel=True)
+        spec = info.resolved.sharding(module=module, module_fqn="", member=info.resolved, context=context)
+        self.assertEqual(spec.params["linear_qkv.weight"]["tp"], Shard(0))
+        self.assertEqual(spec.params["o_proj.weight"]["tp"], Shard(1))
+        self.assertEqual(spec.params["o_proj.bias"]["tp"], Replicate())
+        self.assertEqual(spec.params["q_norm.weight"]["tp"], Replicate())
+        self.assertEqual(spec.in_src["hidden_states"]["tp"], Shard(1))
+        from hyper_parallel.distributed._builder.family_layout import _module_parallel
+        from hyper_parallel.distributed.module_binding import validate_parallel_module
+        local_context = FamilyShardingContext(("cp", "tp"), {"cp": 1, "tp": 1}, {})
+        local_spec = info.resolved.sharding(module=module, module_fqn="", member=info.resolved,
+                                            context=local_context)
+        protocol = _module_parallel(module, info.resolved)
+        self.assertEqual(protocol.binding_kind, "none")
+        validate_parallel_module(module, protocol, local_spec, local_context)
+        self.assertEqual(spec.in_dst["hidden_states"]["tp"], Replicate())
+        self.assertEqual(spec.in_dst["hidden_states"]["cp"], Shard(1))
+        self.assertTrue(spec.out_src["output"]["tp"].is_partial())
+        module.extra_projection = nn.Linear(16, 16)
+        with self.assertRaisesRegex(ValueError, "no declared sharding role"):
+            info.resolved.sharding(module=module, module_fqn="", member=info.resolved, context=context)
+        del module.extra_projection
+        local_spec.params["q_norm.weight"]["tp"] = Shard(0)
+        with self.assertRaisesRegex(ValueError, "unsupported parameter layout"):
+            validate_parallel_module(module, protocol, local_spec, local_context)
+
+    def test_hybrid_gathers_start_before_waiting_for_other_branches(self):
+        """Feature: Preserve the existing hybrid CP overlap window.
+        Description: Record prepare/exchange events for fused and independent projections.
+        Expectation: Prepare launches without waiting; exchange starts KV AG before Q wait.
+        """
+        from hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention import (
+            CPGroupedQueryAttentionModule,
+        )
+        events = []
+
+        def launch(branch: str) -> SimpleNamespace:
+            """Record submission of one Ulysses branch."""
+            events.append(("launch_u", branch))
+            return SimpleNamespace(wait=lambda: wait(branch))
+
+        def wait(branch: str) -> str:
+            """Record readiness without invoking distributed collectives."""
+            events.append(("wait_u", branch))
+            return branch
+
+        def gather(branch: str) -> SimpleNamespace:
+            """Record entry into the query-partition AllGather group."""
+            events.append(("launch_ag", branch))
+            return SimpleNamespace(wait=lambda: (branch, None))
+
+        def project(branch: str) -> str:
+            """Record an independent projection or a fused projection's Norm."""
+            events.append(("project", branch))
+            return branch
+
+        def split_projection(hidden: Any) -> tuple:
+            """Represent one fused GEMM, with a separate output-gate result."""
+            del hidden
+            events.append(("project", "qkv"))
+            return "q", "k", "v", "gate"
+
+        for fused in (False, True):
+            with self.subTest(fused=fused):
+                events.clear()
+                member = SimpleNamespace(
+                    overlap=True, fuse_qkv=fused, ulysses_degree=2, all_gather_degree=2,
+                    cp_context=SimpleNamespace(size=4),
+                    ulysses_context=SimpleNamespace(launch_sequence_to_head=launch),
+                    query_context=SimpleNamespace(launch_gather_sequence=gather),
+                    project_query_state=lambda _hidden, _positions: (project("q"), None),
+                    project_key=lambda _hidden, _positions: project("k"),
+                    project_value=lambda _hidden: project("v"),
+                    split_projection=split_projection, q_norm=None, k_norm=None,
+                    normalize_position=lambda tensor, _norm, _positions: project(tensor),
+                )
+                member._transfer_input = partial(CPGroupedQueryAttentionModule._transfer_input, member)
+                member._finish_input_transfers = partial(CPGroupedQueryAttentionModule._finish_input_transfers, member)
+                member._attention_operands = lambda query, key, value, _mask, _lengths, _options, state: (
+                    query, key, value, state)
+                prepared = CPGroupedQueryAttentionModule.prepare_attention_inputs(
+                    member, torch.empty(1, 4, 1), None)
+                self.assertFalse(any(event[0].startswith("wait") for event in events))
+                self.assertFalse(any(event[0] == "launch_ag" for event in events))
+                actual = CPGroupedQueryAttentionModule.exchange_attention(member, prepared)
+                self.assertEqual(actual, ("q", "k", "v", "gate" if fused else None))
+                self.assertLess(events.index(("launch_u", "q")), events.index(("project", "k")))
+                if fused:
+                    self.assertEqual(events.count(("project", "qkv")), 1)
+                    self.assertLess(events.index(("project", "qkv")), events.index(("launch_u", "q")))
+                else:
+                    self.assertLess(events.index(("launch_u", "k")), events.index(("project", "v")))
+                self.assertLess(events.index(("launch_ag", "k")), events.index(("wait_u", "v")))
+                self.assertLess(events.index(("launch_ag", "v")), events.index(("wait_u", "q")))
+
+    def test_packed_query_fragments_preserve_document_visibility(self):
+        """Feature: Packed AG consumes local Q and correct global document prefixes.
+        Description: Include a document crossing a batch boundary with CP2.
+        Expectation: Every selected key belongs to the query's own document and causal prefix.
+        """
+        from hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention import (
+            _query_documents, _select_document_keys,
+        )
+        lengths = (3, 10, 16)
+        ranges, q_lengths, k_lengths = _query_documents(lengths, 2, 8, 4, 1, True)
+        self.assertEqual(ranges, ((3, 8), (10, 16)))
+        self.assertEqual(q_lengths, (4, 8))
+        self.assertEqual(k_lengths, (5, 11))
+        # A full adjacent span avoids a copy; partial spans retain compact
+        # storage. Reused prefixes must sum all consumer gradients.
+        for selected_ranges, expected_ids in (
+            (((0, 3), (3, 8)), list(range(8))),
+            (((1, 3), (3, 6)), [1, 2, 3, 4, 5]),
+            (((1, 3), (5, 7)), [1, 2, 5, 6]),
+            (((1, 4), (2, 5)), [1, 2, 3, 2, 3, 4]),
+        ):
+            with self.subTest(ranges=selected_ranges):
+                source = torch.arange(8, dtype=torch.float32).reshape(1, 8, 1, 1).requires_grad_()
+                selected = _select_document_keys(source, selected_ranges)
+                torch.testing.assert_close(selected.flatten(), torch.tensor(expected_ids, dtype=torch.float32))
+                shares_storage = selected.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+                self.assertEqual(shares_storage, selected_ranges == ((0, 3), (3, 8)))
+                selected.square().sum().backward()
+                expected_grad = torch.zeros(8)
+                for token in expected_ids:
+                    expected_grad[token] += 2 * token
+                torch.testing.assert_close(source.grad.flatten(), expected_grad)
+
+
+class TestEpFactoryContract(unittest.TestCase):
+    """Generic routed-only recipe compatibility without a model-owned factory."""
+
+    def test_local_compute_mark_and_signature(self):
+        """qwen3moe_ep_compute_fn declares module + mesh family, keyword-only."""
+        factory = ep_compute.topk_router_ep_compute_fn
+        meta = getattr(factory, "_injection_meta", None)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.kind, LOCAL_COMPUTE)
+        self.assertEqual(meta.context, {"module"} | _MESH_FAMILY)
+        parameters = list(inspect.signature(factory).parameters.values())
+        self.assertEqual(
+            [param.name for param in parameters],
+            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm",
+             "fix_router"],
+        )
+        for param in parameters:
+            self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
+        for param in parameters[:-2]:
+            self.assertIs(param.default, inspect.Parameter.empty)
+        # Both switches are opt-in: an existing recipe keeps the real router and the
+        # eager per-expert loop unless it asks otherwise.
+        self.assertIs(parameters[-2].default, False)
+        self.assertIs(parameters[-1].default, False)
+
+    def test_ep_factory_validates_ep_mesh(self):
+        """Calling the factory without an ep_mesh fails with the teaching error."""
+        with self.assertRaisesRegex(ValueError, "built without an ep_mesh"):
+            ep_compute.topk_router_ep_compute_fn(
+                module=nn.Module(), mesh=None, tp_mesh=None, cp_mesh=None,
+                ep_mesh=None,
+            )
+
+
+class _AttentionNpuStub(types.ModuleType):
+    """Recording ``torch_npu`` stub for the flash-attention kernel path."""
+
+    def __init__(self):
+        super().__init__("torch_npu")
+        self.calls = []
+
+    def npu_fusion_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                             head_num: int, input_layout: str, **kwargs: Any) -> tuple[torch.Tensor, None]:
+        """Record the kernel kwargs and echo the query as attention output."""
+        del key, value
+        self.calls.append(dict(kwargs, head_num=head_num, input_layout=input_layout))
+        return query, None
+
+
+class TestFlashAttentionMaskBranches(unittest.TestCase):
+    """Mask/cache branches of ``run_qwen3_moe_flash_attention`` (Ascend kernel)."""
+
+    def _run(self, query, key, value, attention_mask, module=None, **options):
+        """Run the attention helper with a recording ``torch_npu`` stub."""
+        stub = _AttentionNpuStub()
+        with unittest.mock.patch.dict(sys.modules, {"torch_npu": stub}):
+            output, weights = npu_fusion_attention_forward(
+                module if module is not None else nn.Module(),
+                query,
+                key,
+                value,
+                attention_mask,
+                **options,
+            )
+        return stub, output, weights
+
+    def test_packed_lengths_reach_tnd_kernel(self):
+        """Feature: Qwen no longer discards packed metadata.
+        Description: Supply two documents to the adapter's common FA delegate.
+        Expectation: TND and both cumulative-length arrays reach the kernel unchanged.
+        """
+        query = torch.randn(1, 2, 4, 8)
+        stub, output, weights = self._run(query, query, query, None, actual_seq_len=(1, 4))
+        call = stub.calls[0]
+        self.assertEqual(call["input_layout"], "TND")
+        self.assertEqual(list(call["actual_seq_qlen"]), [1, 4])
+        self.assertEqual(list(call["actual_seq_kvlen"]), [1, 4])
+        self.assertEqual(output.shape, (1, 4, 2, 8))
+        self.assertIsNone(weights)
+        stub, _, _ = self._run(query, query, query, None, actual_seq_len=(1, 4), sliding_window=2)
+        self.assertEqual(stub.calls[0]["sparse_mode"], 4)
+        self.assertEqual(stub.calls[0]["pre_tockens"], 1)
+
+    def test_packed_registry_bypasses_dense_masks_in_native_models(self):
+        """Feature: Native dense and MoE model entries retain compact document metadata.
+        Description: Run tiny HF backbones through the public attention/mask registry.
+        Expectation: Every attention receives no dense mask and the same document bounds.
+        """
+        from transformers import Qwen3Config, Qwen3Model, Qwen3MoeConfig, Qwen3MoeModel
+        from hyper_parallel.models._transformers.packed_attention import register_npu_packed_attention
+        for config_type, model_type in ((Qwen3Config, Qwen3Model), (Qwen3MoeConfig, Qwen3MoeModel)):
+            config = config_type(hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                                 num_attention_heads=4, num_key_value_heads=2, head_dim=8, vocab_size=16,
+                                 moe_intermediate_size=32, num_experts=4, num_experts_per_tok=2)
+            config._attn_implementation = register_npu_packed_attention()  # pylint: disable=protected-access
+            model = model_type(config)
+            query = torch.zeros(1, 8, 4, 8)
+            with unittest.mock.patch(
+                "hyper_parallel.models._transformers.packed_attention.npu_fusion_attention_forward",
+                return_value=(query, None),
+            ) as attention:
+                model(torch.arange(8)[None], use_cache=False,
+                      position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+                      cu_seq_lens_q=(0, 3, 8), cu_seq_lens_k=(0, 3, 8))
+                self.assertIsNone(attention.call_args.args[4])
+                self.assertEqual(attention.call_args.kwargs["cu_seq_lens_q"], (0, 3, 8))
+                with self.assertRaisesRegex(ValueError, "cumulative document lengths"):
+                    model(torch.arange(8)[None], use_cache=False)
+
+
+    def test_float_mask_is_cast_without_inversion(self):
+        """A float (additive-style) mask is cast to bool WITHOUT inversion."""
+        query = torch.randn(1, 2, 4, 8)
+        float_mask = torch.zeros(1, 1, 4, 4)
+        float_mask[..., -1] = float("-inf")
+        stub, _, _ = self._run(query, query, query, float_mask)
+        call = stub.calls[0]
+        self.assertEqual(call["sparse_mode"], 0)
+        self.assertTrue(torch.equal(
+            call["atten_mask"], float_mask.bool() | torch.ones(4, 4, dtype=torch.bool).triu(1)
+        ))
+
+    def test_next_tockens_requires_causal_self_attention(self):
+        """next_tockens=0 is withheld for cross-attention or is_causal=False."""
+        query = torch.randn(1, 2, 2, 8)
+        key = torch.randn(1, 2, 4, 8)
+        mask = torch.ones(1, 1, 2, 4, dtype=torch.bool)
+        stub, _, _ = self._run(query, key, key, mask)
+        self.assertEqual(stub.calls[0]["next_tockens"], 0)
+        non_causal = nn.Module()
+        non_causal.is_causal = False
+        self_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+        stub, _, _ = self._run(key, key, key, self_mask, module=non_causal)
+        self.assertEqual(stub.calls[0]["next_tockens"], 2147483647)
+
+
+if __name__ == "__main__":
+    unittest.main()

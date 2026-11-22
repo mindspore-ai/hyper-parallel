@@ -38,7 +38,7 @@ from tests.common.grouped_experts_family import TinyMoE, family_config, replace_
 
 _LOCAL_MATH = "hyper_parallel.components.modules.mxfp8_grouped_swiglu."
 _RECIPES = (
-    "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+    "hyper_parallel.distributed.expert_parallel.recipes.topk_router_ep_compute_fn",
     "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
 )
 

@@ -41,9 +41,8 @@ qwen2moe_shared_expert_gate      TopKRouter tuple        shared_expert + sigmoid
 deepseekv3_sigmoid_group_shared  sigmoid group routing   shared_experts               DeepSeek-V3 / GLM-4-MoE
 ===============================  ======================  ===========================  =========================
 
-Model-family archetypes live at their model-adapter homes (adjust doc §5.1):
-the Qwen3-MoE ``qwen3moe_topk_router`` archetype is
-``models/qwen3_moe/adapter/distributed/expert_parallel.qwen3moe_ep_compute_fn``.
+Routed-only TopKRouter blocks use ``topk_router_ep_compute_fn`` for legacy whole-block recipes.
+New model specifications select the public GroupedExperts family directly.
 
 Three hard constraints on every archetype (accuracy_fix_plan.md §3.2):
 
@@ -88,7 +87,7 @@ tensors inside the local-region skeleton.
 """
 
 import math
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 
@@ -98,9 +97,11 @@ from hyper_parallel.distributed._builder.rule_resolver import (
     fill_context_kwargs,
 )
 from hyper_parallel.distributed.expert_parallel.routing import (
+    MOE_ROUTER_ADAPTERS,
     resolve_moe_router,
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
+    SHARED_MERGE_MODES,
     bind_local_expert_forward,
     ep_routed_dispatch,
     ep_routed_experts_and_combine,
@@ -140,7 +141,7 @@ def _require_ep_group(ep_mesh: Any, factory_name: str):
     return ep_mesh.get_group("ep")
 
 
-def _require_moe_interface(module: Any, expected_attrs, archetype_key: str) -> None:
+def _require_moe_interface(module: Any, expected_attrs: Sequence[str], archetype_key: str) -> None:
     """Apply-time structural assertion for an archetype (constraint 2)."""
     require_attrs(module, *expected_attrs, owner=f"archetype '{archetype_key}'")
 
@@ -149,9 +150,9 @@ def build_ep_compute(
     module: Any,
     ep_mesh: Any,
     *,
-    router_fn: Callable,
+    router_fn: Union[Callable, str],
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
     fix_router: bool = False,
@@ -173,10 +174,9 @@ def build_ep_compute(
     ``hidden_states``) proceeds while it is in flight.  ``combine`` then
     receives that value as a fourth argument.
 
-    Public since M3 (adjust doc §5.4): model adapters (e.g.
-    ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
-    their EP archetype on top of this skeleton while the router adapters and
-    dispatch primitives stay in this generic layer.
+    Whole-block compatibility entries such as ``topk_router_ep_compute_fn``
+    compose routing and combination through this skeleton. New model specs select
+    the expert family directly while the source model retains routing ownership.
     ``fix_router`` is the archetype-independent benchmark switch: it swaps the chosen
     router for its balanced variant -- the ``<name>_fixed`` registry entry when
     ``router_fn`` names one, else
@@ -296,6 +296,24 @@ def routed_only_ep_compute_fn(
 
 
 @local_compute
+def topk_router_ep_compute_fn(
+    *, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
+    use_grouped_gemm: bool = False, fix_router: bool = False,
+) -> Callable:
+    """Execute a routed-only block whose router returns logits, scores and expert IDs.
+
+    This compatibility entry retains whole-block recipe execution. New model specs
+    select the GroupedExperts family at the expert boundary and keep routing in the model.
+    """
+    del mesh, tp_mesh, cp_mesh
+    return build_ep_compute(
+        module, ep_mesh, router_fn=resolve_moe_router("topk_router"),
+        archetype_key="topk_router", expected_attrs=["gate", "experts"], combine=SHARED_MERGE_MODES["none"],
+        use_grouped_gemm=use_grouped_gemm, fix_router=fix_router,
+    )
+
+
+@local_compute
 def mixtral_ep_compute_fn(
     *,
     module: Any,
@@ -381,6 +399,61 @@ def qwen2moe_ep_compute_fn(
         expected_attrs=["gate", "experts", "shared_expert", "shared_expert_gate"],
         combine=combine,
     )
+
+
+@local_compute
+def gated_shared_topk_router_ep_compute_fn(
+    *,
+    module: Any,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+    use_grouped_gemm: bool = False,
+) -> Callable:
+    """Build TopKRouter EP with a precomputed sigmoid-gated shared branch.
+
+    The execution order follows the Transformers implementation exactly:
+    shared expert, router and routed experts, shared-expert gate, then merge.
+    """
+    del mesh, tp_mesh, cp_mesh
+    if ep_mesh is None:
+        raise ValueError(
+            "gated_shared_topk_router_ep_compute_fn requires an active ep_mesh; "
+            "set ep_size greater than 1 before selecting this factory"
+        )
+
+    require_attrs(
+        module,
+        "gate",
+        "experts",
+        "shared_expert",
+        "shared_expert_gate",
+        owner="gated shared TopKRouter EP compute",
+    )
+    ep_group = ep_mesh.get_group("ep")
+    bind_local_expert_forward(
+        module,
+        ep_mesh["ep"].size(),
+        use_grouped_gemm=use_grouped_gemm,
+    )
+
+    def compute_fn(module: Any, hidden_states):
+        """Run the Qwen3.5-MoE block while preserving branch order."""
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flattened_states = hidden_states.reshape(-1, hidden_dim)
+        shared_output = module.shared_expert(flattened_states)
+        routed_output = ep_routed_forward(
+            module,
+            hidden_states,
+            router_fn=MOE_ROUTER_ADAPTERS["topk_router"],
+            ep_group=ep_group,
+        ).reshape(-1, hidden_dim)
+        shared_gate = module.shared_expert_gate(flattened_states).sigmoid()
+        output = routed_output + shared_gate * shared_output
+        return output.reshape(batch_size, sequence_length, hidden_dim)
+
+    return compute_fn
 
 
 @local_compute

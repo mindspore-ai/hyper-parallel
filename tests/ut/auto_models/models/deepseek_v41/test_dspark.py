@@ -28,9 +28,12 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from hyper_parallel.distributed import ShardingPlanner
+from hyper_parallel.distributed.mesh import LogicalDeviceMesh
+from hyper_parallel.models.deepseek_v41.components.dspark import DSpark
 from hyper_parallel import init_empty_weights
 from hyper_parallel.data.constants import IGNORE_INDEX
-from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
+from hyper_parallel.models.deepseek_v41.validation.cropped_model import build_layer_cropped_config
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
 
@@ -103,6 +106,21 @@ def _batch(config: SimpleNamespace, batch: int = 2, seq: int = 10):
 
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
+
+    def test_complete_family_owns_draft_state_without_overlapping_child_experts(self):
+        """Every draft parameter has one layout owner, including bare state and Markov embeddings."""
+        config = _small_config()
+        config.__dict__.update(
+            num_hidden_layers=3, intermediate_size=48, num_local_experts=4,
+            num_experts_per_tok=2, scoring_func="sigmoid", routed_scaling_factor=1.0,
+            swiglu_limit=1.5, router_aux_loss_coef=0.0, router_bias_update_rate=0.0,
+            v41_dspark_n_routed_experts=4, v41_dspark_top_k=2,
+        )
+        target = DSpark(config=config)
+        plan = ShardingPlanner().plan(target, LogicalDeviceMesh(("dp",), (1,)))
+        self.assertIsNotNone(plan)
+        self.assertIn("markov_head.embed.weight", plan.owned_parameter_names)
+        self.assertIn("noise_embedding", plan.owned_parameter_names)
 
     def test_forward_produces_finite_losses_and_metrics(self):
         """A full forward returns finite loss values and metric entries."""
@@ -182,7 +200,7 @@ class DSparkComponentTest(unittest.TestCase):
             captured.append(target.detach().clone())
             return original(logits, target, **kwargs)
 
-        with patch("hyper_parallel.models.deepseek_v41.dspark.functional.cross_entropy",
+        with patch("hyper_parallel.models.deepseek_v41.components.dspark.functional.cross_entropy",
                    side_effect=_spy):
             _, metrics = dspark(hiddens, input_ids, labels, embeds, head)
         got = torch.cat(captured).view(batch, seq, 2)
@@ -423,9 +441,10 @@ class TestDrafterMatchesReleasedLayout(unittest.TestCase):
     """
 
     @staticmethod
+
     def _drafter_leaves() -> set:
         """Build the drafter on meta and collapse index positions to "N"."""
-        from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+        from hyper_parallel.models.deepseek_v41.validation.cropped_model import (  # pylint: disable=C0415
             build_deepseek_v41_validation_config,
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -459,7 +478,7 @@ class TestDrafterMatchesReleasedLayout(unittest.TestCase):
             config_path = _write_released_config(directory)
             released = json.loads(config_path.read_text(encoding="utf-8"))["text_config"]
             assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
-            from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+            from hyper_parallel.models.deepseek_v41.validation.cropped_model import (  # pylint: disable=C0415
                 build_deepseek_v41_validation_config,
             )
             config = build_deepseek_v41_validation_config(
@@ -476,12 +495,13 @@ class TestDSparkCropSwitches(unittest.TestCase):
     """The crop entry carries the DSpark drafter switches into the config."""
 
     @staticmethod
+
     def _build(**kwargs):
         """Build a validation config from the release-shaped fixtures."""
         with tempfile.TemporaryDirectory() as directory:
             config_path = _write_released_config(directory)
             assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
-            from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+            from hyper_parallel.models.deepseek_v41.validation.cropped_model import (  # pylint: disable=C0415
                 build_deepseek_v41_validation_config,
             )
             return build_deepseek_v41_validation_config(
@@ -507,7 +527,7 @@ class TestDSparkCropSwitches(unittest.TestCase):
         A run with the drafter silently absent looks like a run with the
         drafter present but ineffective, so assert the object exists.
         """
-        from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+        from hyper_parallel.models.deepseek_v41.validation.cropped_model import (  # pylint: disable=C0415
             build_deepseek_v41_validation_config,
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -530,7 +550,6 @@ class TestDSparkCropSwitches(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 
 
 class TestHFLayerCropConfig(unittest.TestCase):

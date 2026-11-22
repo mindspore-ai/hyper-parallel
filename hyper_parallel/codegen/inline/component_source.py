@@ -27,4 +27,6 @@ def render_component_source(
     return render_attention_class(component, interface=interface)
 
 
-__all__ = ["render_component_source"]
+render_replacement_source = render_component_source
+
+__all__ = ["render_component_source", "render_replacement_source"]

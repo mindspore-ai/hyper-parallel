@@ -16,7 +16,10 @@
 
 from typing import Any
 
-__all__ = ["get_adapter_spec"]
+__all__ = ["get_adapter_spec", "KIMI_MODEL_TYPES"]
+
+# Published K2.6 assets retain the native Transformers kimi_k25 model identity.
+KIMI_MODEL_TYPES = ("kimi_k25", "kimi_k26")
 
 
 def get_adapter_spec() -> Any:

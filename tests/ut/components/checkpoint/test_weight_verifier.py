@@ -31,10 +31,10 @@ from hyper_parallel.components.checkpoint import weight_verifier as verifier
 from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import HuggingFaceCheckpointer
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter, WeightRenaming
-from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import (
     build_deepseek_v41_checkpoint_mapping,
 )
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
+from hyper_parallel.components.modules.engram.host_state import HostEngramState
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.external_state import CheckpointTensorShard
 
@@ -125,7 +125,7 @@ class TestWeightVerifier(unittest.TestCase):
         model._hp_used_replacement_weight_conversions = [WeightConverter(
             source_patterns="weight", target_patterns="weight", operations=[Transpose()],
         )]
-        before = model.weight.detach().clone()
+        before = torch.detach(model.weight).clone()
         mapping = model._weight_conversions
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -268,7 +268,7 @@ class TestWeightVerifier(unittest.TestCase):
         )
         model.embed.bind_planned_shard(ep_rank=0, ep_size=1)
         torch.utils.swap_tensors(model.embed.weight, nn.Parameter(torch.cat([source, torch.zeros((3, 2))])))
-        model._hp_external_state = DeepseekV41HostState(model, {"embed": model.embed}, None)
+        model._hp_external_state = HostEngramState(model, {"embed": model.embed}, None)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             save_file({"embed.weight": source.bfloat16()}, root / "model.safetensors")

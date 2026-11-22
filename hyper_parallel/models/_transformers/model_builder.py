@@ -232,11 +232,25 @@ def _init_model(
             **kwargs,
         )
     else:
-        model = custom_model_cls.from_config(
-            hf_config,
-            *model_args,
-            **kwargs,
-        )
+        factory = getattr(custom_model_cls, "from_config", None)
+        if callable(factory):
+            config_kwargs = dict(kwargs)
+            config_kwargs.pop("trust_remote_code", None)
+            if torch_dtype != "auto":
+                config_kwargs["dtype"] = torch_dtype
+            config_kwargs["attn_implementation"] = attn_implementation
+            model = factory(hf_config, *model_args, **config_kwargs)  # pylint: disable=not-callable
+        else:
+            factory = getattr(custom_model_cls, "_from_config", None)
+            if callable(factory):
+                config_kwargs = dict(kwargs)
+                config_kwargs.pop("trust_remote_code", None)
+                if torch_dtype != "auto":
+                    config_kwargs["dtype"] = torch_dtype
+                config_kwargs["attn_implementation"] = attn_implementation
+                model = factory(hf_config, *model_args, **config_kwargs)  # pylint: disable=not-callable
+            else:
+                model = custom_model_cls(hf_config, *model_args, **kwargs)
 
     return True, model
 
@@ -357,26 +371,33 @@ def _initialize_model_weights(model: nn.Module) -> None:
             tensor._is_hf_initialized = False  # pylint: disable=W0212
 
     initialize_weights = getattr(model, "initialize_weights", None)
-    native_initialization = callable(initialize_weights)
     if callable(initialize_weights):
         initialize_weights()
     else:
         init_weights = getattr(model, "init_weights", None)
-        native_initialization = callable(init_weights)
         if callable(init_weights):
             init_weights()
         else:
             for module in model.modules():
+                if getattr(module, "_hp_reset_after_materialization", False):
+                    continue
                 reset_parameters = getattr(module, "reset_parameters", None)
                 if callable(reset_parameters):
                     reset_parameters()
-    if native_initialization:
-        for module in model.modules():
-            if not getattr(module, "_hp_reset_after_materialization", False):
-                continue
-            reset_parameters = getattr(module, "reset_parameters", None)
-            if callable(reset_parameters):
-                reset_parameters()
+    initialized_families: set[int] = set()
+
+    def reset_family(module: nn.Module) -> None:
+        if id(module) in initialized_families:
+            return
+        initialized_families.add(id(module))
+        for child in module.children():
+            reset_family(child)
+        if getattr(module, "_hp_reset_after_materialization", False):
+            reset = getattr(module, "reset_parameters", None)
+            if callable(reset):
+                reset()
+
+    reset_family(model)
     logger.info("Initialized model state with model-native random initialization")
 
 

@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """NPU parity for V4.1 MegaGate replacement, FSDP and expert dispatch."""
+# Transformers @strict supplies the supported keyword constructor at runtime.
+# pylint: disable=unexpected-keyword-arg
 
 from copy import deepcopy
 from types import MethodType, SimpleNamespace
@@ -24,14 +26,12 @@ import torch_npu  # pylint: disable=unused-import
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4DecoderLayer
 
-from hyper_multicore.modules.mega_gate import MegaGate
-
 from hyper_parallel import SkipDTensorDispatch, fully_shard, init_device_mesh
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
-from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import (
-    DeepseekV41MegaGate,
+from hyper_parallel.models.deepseek_v41.components.modality_router import (
+    ModalityTopKRouter,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     deepseek_v41_ep_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
@@ -50,7 +50,8 @@ def _config(vision=True):
 
 
 def _replace(router):
-    return DeepseekV41MegaGate(
+    return ModalityTopKRouter(
+        use_fused_ops=True,
         module=router, module_fqn="model.layers.0.mlp.gate", context={},
     )
 
@@ -122,7 +123,7 @@ def test_router_parity():
         hidden = torch.randn(1, 257, 128, device=device, dtype=torch.bfloat16)
         mask = None if not vision else (torch.arange(257, device=device).remainder(4) == 0).view(1, 257)
         expected = _run_router(golden, hidden, mask, autocast_enabled=True)
-        with patch.object(MegaGate, "_torch_forward", side_effect=AssertionError("native required")):
+        with patch.object(DeepseekV41TopKRouter, "compute_routing", side_effect=AssertionError("native required")):
             actual = _run_router(candidate, hidden, mask, autocast_enabled=True)
         _compare_router_runs(expected, actual, golden, candidate)
 
@@ -133,7 +134,7 @@ def test_router_parity():
                 golden.bias_vl.sub_(0.5)
                 candidate.bias_vl.copy_(golden.bias_vl)
             expected = _run_router(golden, hidden, mask)
-            with patch.object(MegaGate, "_torch_forward", side_effect=AssertionError("native required")):
+            with patch.object(DeepseekV41TopKRouter, "compute_routing", side_effect=AssertionError("native required")):
                 actual = _run_router(candidate, hidden, mask)
             _compare_router_runs(expected, actual, golden, candidate)
 
@@ -157,7 +158,7 @@ def test_fsdp_bf16_parity():
     mask = (torch.arange(257, device=device).remainder(4) == rank % 4).view(1, 257)
     for _ in range(2):
         expected = _run_router(golden, hidden, mask, autocast_enabled=True)
-        with patch.object(MegaGate, "_torch_forward", side_effect=AssertionError("native required")):
+        with patch.object(DeepseekV41TopKRouter, "compute_routing", side_effect=AssertionError("native required")):
             actual = _run_router(candidate, hidden, mask, autocast_enabled=True)
         _compare_router_runs(expected, actual, golden, candidate)
         # FSDP optimizer updates act on local parameter shards, as in the trainer.
@@ -208,7 +209,7 @@ def test_moe_parity():
     hidden = torch.randn(1, 257, 128, device=device, dtype=torch.bfloat16)
     mask = (torch.arange(257, device=device).remainder(4) == 0).view(1, 257)
     expected = _run_moe(golden, hidden, mask, _v41_sparse_moe_forward)
-    with patch.object(MegaGate, "_torch_forward", side_effect=AssertionError("native required")):
+    with patch.object(DeepseekV41TopKRouter, "compute_routing", side_effect=AssertionError("native required")):
         actual = _run_moe(candidate, hidden, mask, _v41_sparse_moe_forward)
     for result, baseline in zip(actual, expected):
         _close(result, baseline, gradient=True)
@@ -239,7 +240,7 @@ def test_ep_parity():
     hidden = torch.randn(1, 257, 128, device=device, dtype=torch.bfloat16)
     mask = (torch.arange(257, device=device).remainder(4) == rank % 4).view(1, 257)
     expected = _run_moe(golden, hidden, mask, computes[0])
-    with patch.object(MegaGate, "_torch_forward", side_effect=AssertionError("native required")):
+    with patch.object(DeepseekV41TopKRouter, "compute_routing", side_effect=AssertionError("native required")):
         actual = _run_moe(candidate, hidden, mask, computes[1])
     for result, baseline in zip(actual, expected):
         _close(result, baseline, gradient=True)

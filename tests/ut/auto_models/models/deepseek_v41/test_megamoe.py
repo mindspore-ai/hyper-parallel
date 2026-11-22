@@ -30,6 +30,9 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Exper
 from hyper_multicore import MegaMoeExperts, SwiGLUParameters
 
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
+from hyper_parallel.components.modules.moe.grouped_experts import GroupedExpertsConfig
+from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_mega_grouped_experts import EPMegaGroupedExperts
+from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.models.replacement import (
     apply_module_replacements, compile_module_replacements,
 )
@@ -37,14 +40,14 @@ from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 from hyper_parallel.distributed._builder.forward_rewriter import validate_local_compute_signature
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
-    DeepseekV41MegaMoeExperts,
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import (
+    DeepseekV41MegaMoeExperts, PackedMegaExperts,
 )
 
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     deepseek_v41_megamoe_compute_fn, deepseek_v41_ep_compute_fn,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel as ep_adapter
+from hyper_parallel.models.deepseek_v41.components import modality_moe as ep_adapter
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter, _v41_sparse_moe_forward,
 )
@@ -155,6 +158,31 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
     # White-box assertions verify executor ownership and parameter lifetimes.
     # pylint: disable=protected-access
 
+    def test_direct_family_and_same_layout_adoption(self) -> None:
+        """Use canonical EOI state and the upstream Mega family without another packing implementation."""
+        config = GroupedExpertsConfig(4, 8, 16, num_layers=2, top_k=2, routing_weight_mode="output",
+                                      activation_dtype="float32", swiglu_limit=10.0)
+        source = PackedMegaExperts(config=config, megakernel=True, context={"ep_size": 2})
+        self.assertEqual(source.gate_up_proj.shape, (4, 32, 8))
+        self.assertEqual(source.down_proj.shape, (4, 8, 16))
+        self.assertEqual(get_family_build_info(source).resolved.family.name, "routed_grouped_experts")
+        rng = torch.get_rng_state().clone()
+        adopted = PackedMegaExperts(module=source, megakernel=True, context={"ep_size": 2})
+        self.assertIs(adopted.gate_up_proj, source.gate_up_proj)
+        self.assertIs(adopted.down_proj, source.down_proj)
+        torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+        self.assertNotIn("_executor", dict(adopted.named_children()))
+        restored = PackedMegaExperts(config=config, megakernel=True, context={"ep_size": 2})
+        restored.load_state_dict(source.state_dict(), strict=True)
+        for name, value in source.state_dict().items():
+            torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+        for mode in ("before_fc2", "output"):
+            supported = GroupedExpertsConfig(4, 8, 16, num_layers=2, top_k=2,
+                                              routing_weight_mode=mode, swiglu_limit=10.0)
+            member = PackedMegaExperts(config=supported, megakernel=True, context={"ep_size": 2})
+            self.assertIsInstance(member, EPMegaGroupedExperts)
+            self.assertEqual(member.config.routing_weight_mode, mode)
+
     def test_ordered_ep_subgroup_binds_without_world_size_assumption(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Expert FSDP may add ranks outside an ordered EP subgroup.
@@ -195,7 +223,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 self.assertEqual(matches, expected)
                 experts = [entry for entry in mega.plan_overrides
                            if entry.replace is not None and entry.replace.kind == "module"
-                           and entry.replace.implementation.callable is DeepseekV41MegaMoeExperts]
+                           and entry.replace.implementation.callable is PackedMegaExperts]
                 self.assertEqual(len(experts), 1)
                 self.assertEqual(experts[0].replace.implementation.dispatch_mode, 'push')
                 compute = [entry for entry in mega.plan_overrides
@@ -422,7 +450,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 self.assertNotIn('megamoe', config.to_dict())
                 entry = next(entry for entry in config.plan_overrides
                              if entry.replace is not None and entry.replace.kind == "module"
-                             and entry.replace.implementation.callable is DeepseekV41MegaMoeExperts)
+                             and entry.replace.implementation.callable is PackedMegaExperts)
                 rules = entries_to_module_replacements([entry])
                 model = nn.Module()
                 model.config = DeepseekV4Config.from_dict({
@@ -438,14 +466,15 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 original = {key: value.clone() for key, value in model.state_dict().items()}
                 conversions = []
                 apply_module_replacements(model, compile_module_replacements(model, rules),
-                                          weights_mapping=conversions)
-                self.assertIsInstance(model.model.layers[0].mlp.experts, DeepseekV41MegaMoeExperts)
+                                          weights_mapping=conversions,
+                                          context={"ep_size": 2, "num_layers": model.config.num_hidden_layers})
+                self.assertIsInstance(model.model.layers[0].mlp.experts, EPMegaGroupedExperts)
                 model._weight_conversions = conversions
                 restored = revert_weight_conversion(model, dict(model.state_dict()))
                 for name, value in original.items():
                     torch.testing.assert_close(restored[name], value, rtol=0, atol=0)
-                with self.assertRaisesRegex(RuntimeError, 'Configure every expert'):
-                    DeepseekV41MegaMoeExperts.prepare_runtime_group([model.model.layers[0].mlp.experts])
+                with self.assertRaisesRegex(RuntimeError, 'bind_parallel'):
+                    EPMegaGroupedExperts.prepare_runtime_group([model.model.layers[0].mlp.experts])
 
     def test_dispatch_transports_and_capacity_options(self) -> None:
         """Feature: DSV4.1 automatic-token integration.

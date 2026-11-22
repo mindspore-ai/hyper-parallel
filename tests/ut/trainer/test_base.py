@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
+from hyper_parallel.components.modules.engram.host_state import HostEngramState
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
@@ -160,6 +160,7 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         """Return a build_optimizer stub that captures the wrap_dense hook."""
         def build_optimizer(optimizer_config: Any, *, wrap_dense: Any) -> Any:
             """Capture wrap_dense and return the prebuilt optimizer."""
+            del optimizer_config
             captured["wrap_dense"] = wrap_dense
             return built
         return build_optimizer
@@ -232,7 +233,6 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         external.prepare_optimizer_step.assert_called_once_with(max_norm=1.0, gradient_divisor=1.0)
         trainer.model_integration.after_clip.assert_called_once_with(0.5)
 
-
     def test_main_grad_normalizes_before_clipping(self) -> None:
         """Feature: FP32 main-gradient normalization.
 
@@ -264,7 +264,6 @@ class TestBaseTrainerExternalState(unittest.TestCase):
             if ordinary_grad is not None:
                 torch.testing.assert_close(ordinary_grad, torch.tensor([[99.]], dtype=torch.bfloat16))
 
-
     def test_host_gradients_normalize_before_joint_clipping(self) -> None:
         """Feature: External gradient normalization.
 
@@ -282,7 +281,7 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         model.dense.grad = torch.tensor([12.])
         for value in (4., 12.):
             table.append_rows(torch.tensor([0]), torch.tensor([[value]]))
-        external = DeepseekV41HostState(model, {"embed": table}, None)
+        external = HostEngramState(model, {"embed": table}, None)
         external.optimizer = SimpleNamespace(state="ACCUMULATING")
         model._hp_external_state = external  # pylint: disable=protected-access
         trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)

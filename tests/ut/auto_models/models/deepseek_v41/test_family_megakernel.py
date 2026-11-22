@@ -28,7 +28,7 @@ from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts
 from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_mega_grouped_experts import EPMegaGroupedExperts
 from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsModule
 from hyper_parallel.components.modules import GroupedExperts
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     replace_deepseek_v41_grouped_experts,
 )
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements

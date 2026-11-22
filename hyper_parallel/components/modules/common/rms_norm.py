@@ -48,7 +48,8 @@ def _hf_scale_kind(source: Any) -> str | None:
     if source_type.__name__ in ("Qwen3_5RMSNorm", "Qwen3_5MoeRMSNorm"):
         return "offset"
     if source_type.__name__ in ("Qwen3RMSNorm", "Qwen3MoeRMSNorm", "Qwen2MoeRMSNorm",
-                                "Qwen3VLMoeTextRMSNorm", "DeepseekV3RMSNorm", "DeepseekV32RMSNorm",
+                                "Qwen3VLMoeTextRMSNorm", "DeepseekV2RMSNorm", "DeepseekV3RMSNorm", "DeepseekV32RMSNorm",
+                                "KimiLinearRMSNorm",
                                 "DeepseekV4RMSNorm"):
         return "direct"
     return None
@@ -57,13 +58,21 @@ def _hf_scale_kind(source: Any) -> str | None:
 class _RMSNormPolicy(torch.nn.Module):
     """Declare rounding order and optional FP32 scale ownership at construction."""
 
+    @property
+
+    def variance_epsilon(self) -> float:
+        """Expose the source normalization epsilon to fused residual computations."""
+        return self.eps
+
     def _set_policy(self, source: Any, cast_order: str | None, fp32_weight: bool | None) -> None:
         """Resolve source rounding order and FP32 scale ownership."""
         if cast_order is None:
             cast_order = getattr(source, "rms_norm_cast_order", None)
         if cast_order is None:
-            # HF direct-scale text norms cast normalized activations before multiplication.
-            cast_order = "before_weight" if _hf_scale_kind(source) == "direct" else "after_weight"
+            # V4 keeps the multiplication in FP32 and casts only its final result.
+            hf_direct = _hf_scale_kind(source) == "direct"
+            cast_order = ("before_weight" if hf_direct and type(source).__name__ != "DeepseekV4RMSNorm"
+                          else "after_weight")
         if cast_order not in ("before_weight", "after_weight"):
             raise ValueError("cast_order must be before_weight or after_weight")
         if fp32_weight is None:

@@ -35,7 +35,12 @@ from hyper_parallel.models.replacement import apply_module_replacements, compile
 from hyper_parallel.trainer.config.parallelism import (
     ReplaceAction, entries_to_module_replacements, normalize_distributed_setup_overrides,
 )
-from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_config
+from hyper_parallel.trainer.config.resolver import (
+    ConfigResolutionError,
+    replace_override_path,
+    resolve_component,
+    resolve_config,
+)
 from hyper_parallel.trainer.config.target import Target
 
 
@@ -378,3 +383,49 @@ class TestFamilyReplacement(unittest.TestCase):
         )
         model = _install(nn.Sequential(nn.Linear(4, 3)), config)
         self.assertIs(model[0].options["callback"], callback)
+
+
+class TestRetiredRecipeTargets(unittest.TestCase):
+    """Validate production registrations outside test-only registry isolation."""
+
+
+    def test_retired_qwen3_recipe_targets_resolve_to_public_families(self) -> None:
+        """Feature: Preserve recipes when deleting retired adapter modules.
+        Description: Resolve legacy YAML targets without importing the removed Python package.
+        Expectation: Public family identity, fused norm policy and roundtrip arguments remain intact.
+        """
+        aliases: dict[str, tuple[str, dict[str, object]]] = {
+            "rms_norm": ("rms_norm", {"use_fused_ops": True}),
+            "flash_attention": ("grouped_query_attention", {}),
+            "swiglu_mlp": ("swiglu_mlp", {}),
+        }
+        for suffix, (family_name, defaults) in aliases.items():
+            with self.subTest(suffix=suffix):
+                raw = _raw_config()
+                target_path = (
+                    "hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_" + suffix
+                )
+                raw["plan_overrides"][0]["replace"]["implementation"] = {"_target_": target_path}
+                resolved = resolve_config(raw).plan_overrides[0].replace.implementation
+                self.assertEqual(registry.get_module_family(resolved.requested_target).name, family_name)
+                serialized = resolved.to_dict()
+                self.assertEqual(serialized["_target_"], target_path)
+                for key, value in dict(defaults).items():
+                    self.assertEqual(serialized[key], value)
+                raw["plan_overrides"][0]["replace"]["implementation"] = serialized
+                restored = resolve_config(raw).plan_overrides[0].replace.implementation
+                self.assertIs(restored.requested_target, resolved.requested_target)
+
+
+    def test_retired_dataset_target_keeps_recipe_and_uses_owner_declaration(self) -> None:
+        """A historical data target resolves through the model spec to the root dataset adapter."""
+        path = "hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime"
+        target = resolve_component(
+            {"_target_": path, "include_position_ids": False},
+            annotation=Target[Any], path="$.runtime_input_adapter",
+        )
+        adapter = target.build()
+        self.assertEqual(type(adapter).__module__, "hyper_parallel.models.deepseek_v41.dataset_adapter")
+        self.assertEqual(type(adapter).__name__, "DeepseekV41DatasetAdapter")
+        self.assertFalse(adapter.include_position_ids)
+        self.assertEqual(target.to_dict()["_target_"], path)

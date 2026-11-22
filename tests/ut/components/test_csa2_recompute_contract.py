@@ -58,10 +58,8 @@ from hyper_parallel.components.modules.attention.compressed_sparse_attention2.cp
 )
 from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
 from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
-from hyper_parallel.models.deepseek_v41.adapter.policies import (
-    activation_checkpointing as attention_policy,
-)
-from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
+from hyper_parallel.models.deepseek_v41 import deepseek_v41_spec as attention_policy
+from hyper_parallel.models.deepseek_v41.shared_state import (
     attention_role,
 )
 

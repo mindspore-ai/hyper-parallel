@@ -15,6 +15,7 @@
 """CPU adapter contracts and real HF replacement/checkpoint coverage for MLA CP."""
 
 from copy import deepcopy
+from functools import partial
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,13 +51,16 @@ from hyper_parallel.components.modules.attention.multi_latent_attention.cp_mla_b
 from hyper_parallel.components.modules.attention.gated_multi_latent_attention.cp_gated_mla_backward_overlap import (
     GatedMLAInputState, GatedMLAOutputProjectionState,
 )
-from hyper_parallel.models.kimi_k3.adapter.mla import KimiMultiLatentAttention
+
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
 from hyper_parallel.trainer.config.resolver import resolve_config
 from hyper_parallel.trainer.config.parallelism import normalize_distributed_setup_overrides
 from tests.common.mla_cp_utils import (
     TestCPMesh, make_cp_mla, make_mla, make_deepseek_model, replace_and_load_mla,
 )
+
+
+KimiMultiLatentAttention = partial(GatedMultiLatentAttention, source_contract="tensor")
 
 
 def _reference_attention(module, query, key, value, attention_mask=None, **kwargs):
@@ -361,7 +365,6 @@ class TestMLAContextParallel(unittest.TestCase):
                 actual_grads = torch.autograd.grad(actual, (query, key, value), upstream, retain_graph=True)
                 for actual_grad, expected_grad in zip(actual_grads, expected_grads):
                     torch.testing.assert_close(actual_grad, expected_grad)
-
 
     def test_selective_kv_routes_preserve_batch_and_sum_consumers(self) -> None:
         """Feature: Selective causal KV distribution with repeated consumers.

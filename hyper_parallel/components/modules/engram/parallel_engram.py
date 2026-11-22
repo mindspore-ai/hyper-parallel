@@ -21,6 +21,8 @@ import torch
 from torch import nn
 import torch.distributed as dist
 from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all
+from hyper_parallel.distributed.expert_parallel.experts import require_attrs
+from hyper_parallel.distributed.recipe_spec import local_compute
 
 
 def local_token_mask(token_mask: torch.Tensor | None, hidden_states: torch.Tensor,
@@ -101,6 +103,7 @@ class HostRowsFn(torch.autograd.Function):
     """Fetch CPU rows and accumulate their backward values as sparse chunks."""
 
     @staticmethod
+
     def forward(ctx: Any, weight: torch.Tensor, local_ids: torch.Tensor, table: Any) -> torch.Tensor:
         """Gather touched CPU rows and retain their local IDs for backward.
 
@@ -115,6 +118,7 @@ class HostRowsFn(torch.autograd.Function):
         return weight.index_select(0, local_ids)
 
     @staticmethod
+
     def backward(ctx: Any, grad_rows: torch.Tensor) -> tuple[None, None, None]:
         """Append touched row gradients without constructing a dense weight grad.
 
@@ -293,6 +297,7 @@ class ParallelEngram:
     _fuse: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
     @staticmethod
+
     def _sparse_lookup(
         hash_ids: torch.Tensor,
         embedding: nn.Embedding,
@@ -443,3 +448,83 @@ class ParallelHostTable:
         self.ep_size = ep_size
         self.ep_group = ep_group
         self.lookup_compute_dtype = compute_dtype
+
+
+@local_compute
+def engram_ep_compute_fn(
+        *,
+        module: Any,
+        mesh: Any,
+        tp_mesh: Any,
+        cp_mesh: Any,
+        ep_mesh: Any,
+) -> Callable:
+    """Build the sparse EP-row lookup with CP/TP sequence alignment."""
+    del mesh
+    require_attrs(
+        module,
+        "hash_mapping",
+        "embed",
+        "parallel_forward",
+        owner="DeepSeek-V4.1 Engram EP",
+    )
+    ep_group = None if ep_mesh is None else ep_mesh.get_group("ep")
+    ep_size = 1 if ep_mesh is None else ep_mesh["ep"].size()
+    ep_rank = 0 if ep_mesh is None else ep_mesh.get_local_rank("ep")
+    cp_group = None if cp_mesh is None else cp_mesh.get_group()
+    cp_size = 1 if cp_mesh is None else cp_mesh.size()
+    cp_rank = 0 if cp_mesh is None else cp_mesh.get_local_rank()
+    tp_size = 1 if tp_mesh is None else tp_mesh.size()
+    tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
+
+    def compute_fn(
+            module: Any,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            segment_starts: torch.Tensor | None = None,
+            token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Route hash-row requests and run the exact V4.1 fusion.
+
+        Args:
+            module: Active Engram module.
+            hidden_states: TP-local decoder hidden rows.
+            input_ids: CP-local token IDs.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: CP-local mask selecting Engram updates.
+        """
+        from hyper_parallel.components.modules.engram.host_engram_table import (  # pylint: disable=C0415
+            HostEngramTable,
+        )
+        if isinstance(module.embed, HostEngramTable):
+            ids = module._aligned_hash_ids(  # pylint: disable=protected-access
+                hidden_states, input_ids, segment_starts, token_mask,
+                cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+                tp_rank=tp_rank, tp_size=tp_size,
+            )
+            fused = module._fuse(hidden_states, module.embed(ids))  # pylint: disable=protected-access
+            if token_mask is None:
+                return fused
+            return torch.where(
+                token_mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1),
+                fused, hidden_states,
+            )
+        if ep_size > 1:
+            return module.parallel_forward(
+                hidden_states, input_ids, segment_starts, token_mask,
+                ep_group=ep_group, ep_rank=ep_rank, ep_size=ep_size,
+                cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+                tp_rank=tp_rank, tp_size=tp_size,
+            )
+        hash_ids = module._aligned_hash_ids(  # pylint: disable=protected-access
+            hidden_states, input_ids, segment_starts, token_mask,
+            cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+            tp_rank=tp_rank, tp_size=tp_size,
+        )
+        fused = module._fuse(hidden_states, module.embed(hash_ids))  # pylint: disable=protected-access
+        mask = local_token_mask(token_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size)
+        return fused if mask is None else torch.where(
+            mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states,
+        )
+
+    return compute_fn

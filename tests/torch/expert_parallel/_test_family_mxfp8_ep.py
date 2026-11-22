@@ -37,7 +37,7 @@ from tests.common.grouped_experts_family import TinyMoE, family_config, replace_
 from tests.torch.expert_parallel._test_family_mxfp8_local import CountingMXOps, _device, _metric
 
 
-_EP_FACTORY = "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn"
+_EP_FACTORY = "hyper_parallel.distributed.expert_parallel.recipes.topk_router_ep_compute_fn"
 _STEPS = ("balanced", "empty_experts", "empty_rank")
 
 

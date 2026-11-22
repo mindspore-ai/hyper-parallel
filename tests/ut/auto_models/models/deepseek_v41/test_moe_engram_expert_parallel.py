@@ -33,7 +33,7 @@ except ImportError as exc:
 
 from hyper_parallel.components import functional as hp_functional
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     _deepseek_v41_grouped_expert_forward,
     deepseek_v41_ep_compute_fn,
 )
@@ -67,6 +67,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
     """Verify grouped GEMM retains the authoritative V4.1 clamp semantics."""
 
     @staticmethod
+
     def _cpu_grouped_matmul(
             inputs: torch.Tensor,
             weight: torch.Tensor,
@@ -285,7 +286,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         )
         ep_mesh = Mock()
         ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
-        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
         with patch(f"{prefix}.bind_local_expert_forward") as bind:
             compute = deepseek_v41_ep_compute_fn(
                 module=module, mesh=None, tp_mesh=None, cp_mesh=None,
@@ -317,7 +318,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                     module.forward = lambda hidden_states, input_ids=None, image_mask=None: hidden_states
                 ep_mesh = Mock()
                 ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
-                prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+                prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
                 with patch(f"{prefix}.bind_local_expert_forward") as bind:
                     compute = _resolve_local_compute_fn(
                         module, spec, mesh=None, mesh_dim_names=(), expert_mesh=ep_mesh,
@@ -359,7 +360,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         )
         ep_mesh = Mock()
         ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
-        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
         with patch(f"{prefix}.bind_local_expert_forward") as bind:
             deepseek_v41_ep_compute_fn(
                 module=module, mesh=None, tp_mesh=None, cp_mesh=None,

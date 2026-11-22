@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU unit tests for the declarative DeepSeek-V4.1 HyperMegaMhc adapter."""
+"""CPU contracts for public shifted mHC and historical recipe resolution."""
 
 import unittest
 
@@ -20,14 +20,13 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules.mhc import pipelined_mhc_post
-from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import (
-    DeepseekV41HyperMegaMhc,
-)
+from hyper_parallel.components.modules import PipelinedMhc
+from hyper_parallel.components.modules.mhc.pipelined_mhc import NativeShiftedPipelinedMhcModule
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41PipelinedHyperConnection,
 )
 from hyper_parallel.models.replacement import (
-    ModuleReplacementSpec,
+    ModuleReplacementRequest,
     apply_module_replacements,
     compile_module_replacements,
 )
@@ -73,6 +72,7 @@ class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
     """Validate replacement contracts and the hardware-free shifted protocol."""
 
     @staticmethod
+
     def _source() -> DeepseekV41PipelinedHyperConnection:
         """Build one canonical model-owned mHC coefficient module."""
         return DeepseekV41PipelinedHyperConnection(_SourceMhc())
@@ -82,16 +82,17 @@ class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
         model = nn.Sequential(self._source())
         original_keys = tuple(model.state_dict())
         original_parameters = {name: id(parameter) for name, parameter in model.named_parameters()}
-        rule = ModuleReplacementSpec(
+        rule = ModuleReplacementRequest(
             match=("0",),
-            factory=DeepseekV41HyperMegaMhc,
+            target=PipelinedMhc,
+            kwargs={"shifted": True, "use_fused_ops": True},
             module_type=DeepseekV41PipelinedHyperConnection,
         )
 
-        plan = compile_module_replacements(model, [rule])
-        apply_module_replacements(model, plan, context={"ep": True})
+        plan = compile_module_replacements(model, (), defaults=(rule,))
+        apply_module_replacements(model, plan, context={"ep": True, "ep_size": 2})
 
-        self.assertIsInstance(model[0], DeepseekV41HyperMegaMhc)
+        self.assertIsInstance(model[0], NativeShiftedPipelinedMhcModule)
         self.assertEqual(tuple(model.state_dict()), original_keys)
         self.assertEqual(
             {name: id(parameter) for name, parameter in model.named_parameters()},
@@ -100,7 +101,7 @@ class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
 
     def test_cpu_advance_matches_shifted_reference_boundary(self):
         """Keep the model protocol numerically testable without importing multicore."""
-        module = DeepseekV41HyperMegaMhc(module=self._source(), context={})
+        module = PipelinedMhc(module=self._source(), shifted=True)
         previous_output = torch.randn(2, 3, 8)
         residual = torch.randn(2, 3, 4, 8)
         previous_pre = torch.softmax(torch.randn(2, 3, 4), dim=-1)
@@ -164,8 +165,8 @@ class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
         plan = compile_module_replacements(model, rules)
         apply_module_replacements(model, plan)
 
-        self.assertIsInstance(model.model.layers[0].attn_hc, DeepseekV41HyperMegaMhc)
-        self.assertIsInstance(model.model.layers[0].ffn_hc, DeepseekV41HyperMegaMhc)
+        self.assertIsInstance(model.model.layers[0].attn_hc, NativeShiftedPipelinedMhcModule)
+        self.assertIsInstance(model.model.layers[0].ffn_hc, NativeShiftedPipelinedMhcModule)
 
 if __name__ == "__main__":
     unittest.main()

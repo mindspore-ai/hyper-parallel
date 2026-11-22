@@ -31,8 +31,8 @@ from hyper_multicore import MegaMoeExperts, SwiGLUParameters
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.models.module_build import build_module_context
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import DeepseekV41MegaMoeExperts
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     deepseek_v41_megamoe_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter

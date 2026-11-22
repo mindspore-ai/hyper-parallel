@@ -21,7 +21,7 @@ import torch
 
 from hyper_parallel.distributed.encoder_parallel.planning import DecoderSequenceLayout
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
-from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
+from hyper_parallel.models.deepseek_v41.dataset_adapter import DeepseekV41DatasetAdapter
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Model
 
 
@@ -122,7 +122,7 @@ class TestEncoderMerge(unittest.TestCase):
             local_input_shape=(1, 128), parallel_ranks={"cp": 1, "tp": 3},
             parallel_sizes={"cp": 2, "tp": 4}, options={"sequence_parallel": True},
         )
-        runtime = DeepseekV41Runtime()
+        runtime = DeepseekV41DatasetAdapter()
 
         result = runtime.build_runtime_inputs(batch=batch, context=context)
 

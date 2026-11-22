@@ -28,10 +28,12 @@ import functools
 import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
+
 from hyper_parallel.core.utils import communication
 from hyper_parallel.distributed.context_parallel.collectives import (
     _ULYSSES_WRAPPED_FLAG,
@@ -74,6 +76,7 @@ def _mome_cp_halo_exchange(attention_module, context):
         return
 
     @functools.wraps(original)
+
     def apply_mome_with_halo(
         hidden_states: Tensor,
         mome_mask: Tensor,
@@ -115,6 +118,7 @@ def _mla_cp_alltoall(attention_functions, context):
         return
 
     @functools.wraps(original)
+
     def mla_with_sequence_head_exchange(
             module: Any, query: Tensor, key: Tensor, value: Tensor,
             attention_mask: Any, **kwargs: Any) -> Tensor:
@@ -335,3 +339,42 @@ def _cp_offset_causal_mask(q_len: int, kv_len: int, lo: int,
     i = torch.arange(q_len, device=device).view(-1, 1)
     j = torch.arange(kv_len, device=device).view(1, -1)
     return (j <= (lo + i)).to(dtype)
+
+
+def build_cp_attention_mask(
+        attention_mask: Optional[torch.Tensor],
+        *,
+        q_len: int,
+        kv_len: int,
+        query_offset: int,
+        device: Any,
+) -> torch.Tensor:
+    """Build the ``(B, 1, q_len, kv_len)`` CP offset causal + padding mask.
+
+    ``attention_mask`` is the 2D ``[B, S]`` padding mask covering the complete
+    (unsharded) sequence; it is required — a padding-free fallback would let
+    query rows attend pad tokens that the all-gather brings in from every rank.
+    """
+    if attention_mask is None:
+        raise ValueError(
+            "Decoder CP input sharding requires a 2D attention_mask covering "
+            "the complete sequence (the K/V all-gather exposes every rank's pad "
+            "tokens, so the padding must be masked explicitly)"
+        )
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            "Decoder CP input sharding expects a 2D [batch, seq] attention "
+            f"mask, got shape {tuple(attention_mask.shape)}"
+        )
+    if attention_mask.shape[-1] != kv_len:
+        raise ValueError(
+            "Decoder CP input sharding expects the attention mask to cover "
+            f"the complete sequence: mask length={attention_mask.shape[-1]}, "
+            f"sequence length={kv_len}"
+        )
+    allowed = _cp_offset_causal_mask(q_len, kv_len, query_offset, device)
+    allowed = allowed.view(1, 1, q_len, kv_len)
+    padding = attention_mask.to(device=device, dtype=torch.bool).view(
+        attention_mask.shape[0], 1, 1, kv_len
+    )
+    return allowed & padding

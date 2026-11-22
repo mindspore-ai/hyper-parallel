@@ -44,7 +44,7 @@ from hyper_parallel.distributed.recipe_spec import (
     ModuleShardingSpec,
 )
 from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.models.qwen3_5.adapter import linear_attention_decoder as adapter_context_parallel
+from hyper_parallel.distributed.context_parallel import wrappers as adapter_context_parallel
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.components.modules import GatedGroupedQueryAttention
 from hyper_parallel.models.module_build import prepare_model_components
@@ -152,7 +152,7 @@ class TestQwen35GdnCpContracts(unittest.TestCase):
         self.assertIs(top_spec.context_parallel(), text_spec.context_parallel())
         self.assertIsNotNone(get_model_adapter("Qwen3_5ForCausalLM"))
         for name in (
-            "qwen3_5_linear_attention_decoder_wrapper",
+            "packed_linear_decoder_wrapper",
         ):
             wrapper = getattr(adapter_context_parallel, name)
             self.assertEqual(wrapper._injection_meta.kind, INNER_WRAPPER)

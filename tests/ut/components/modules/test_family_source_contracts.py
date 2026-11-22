@@ -19,20 +19,20 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3MLP
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MLP, DeepseekV3RMSNorm
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MLP, DeepseekV4RMSNorm
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32MLP, DeepseekV32RMSNorm
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm, Qwen3_5MLP
+from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP, Qwen3_5RMSNorm
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeMLP
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3RMSNorm, DeepseekV3MLP
-from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32RMSNorm, DeepseekV32MLP
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4RMSNorm, DeepseekV4MLP
 
 from examples.torch.module_family.config import RMSNormConfig, SharedExpertConfig, SwiGLUMLPConfig
-from hyper_parallel.components.modules import RMSNorm, OffsetRMSNorm, SharedExpert, SwiGLUMLP, get_family_build_info
-from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation, W1W2SwiGLUMLPModule
+from hyper_parallel.components.modules import OffsetRMSNorm, RMSNorm, SharedExpert, SwiGLUMLP, get_family_build_info
 from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
-from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower
+from hyper_parallel.components.modules.common.swiglu_mlp import W1W2SwiGLUMLPModule, swiglu_activation
 from hyper_parallel.models._transformers.model_builder import validate_model_init_dtype
+from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower
 
 
 def _mlp_config():
@@ -61,7 +61,7 @@ class TestFamilySourceContracts(unittest.TestCase):
         torch.manual_seed(20261117)
 
     def test_hf_direct_norm_cast_and_all_gradients(self):
-        """Direct text sources round before multiplication, including FP32 scale promotion."""
+        """Each audited source retains its actual scale/rounding boundary and output dtype."""
         for source_type in (Qwen3RMSNorm, DeepseekV3RMSNorm, DeepseekV32RMSNorm, DeepseekV4RMSNorm):
             for weight_dtype in (torch.float32, torch.bfloat16):
                 with self.subTest(source=source_type.__name__, dtype=weight_dtype):
@@ -69,7 +69,8 @@ class TestFamilySourceContracts(unittest.TestCase):
                     nn.init.uniform_(source.weight, 0.1, 1.9)
                     reference = deepcopy(source)
                     member = RMSNorm(module=source)
-                    self.assertEqual(member.rms_norm_cast_order, "before_weight")
+                    self.assertEqual(member.rms_norm_cast_order,
+                                     "after_weight" if source_type is DeepseekV4RMSNorm else "before_weight")
                     self.assertIs(member.weight, source.weight)
                     expected, actual = _source_gradients(reference, member, torch.randn(3, 8).bfloat16(),
                                                          atol=0, rtol=0)

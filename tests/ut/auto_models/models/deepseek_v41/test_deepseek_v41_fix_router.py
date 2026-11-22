@@ -27,8 +27,8 @@ from torch.nn import functional
 import yaml
 
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
-from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel as ep_adapter
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
+from hyper_parallel.models.deepseek_v41.components import modality_moe as ep_adapter
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
     _v41_sparse_moe_forward,
@@ -216,6 +216,7 @@ replace:
         self.assertFalse(hasattr(module.experts, "local_expert_count"))
 
     @staticmethod
+
     def _execute_mega_experts(
             inputs: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor,
             *, expert_weights: tuple[torch.Tensor, torch.Tensor],

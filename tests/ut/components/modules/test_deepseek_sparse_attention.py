@@ -88,6 +88,7 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         self.addCleanup(torch.set_rng_state, torch.get_rng_state())
         torch.manual_seed(7)
 
+
     def test_native_config_selects_local_and_cp_members(self) -> None:
         """The public factory constructs local and CP members directly from config."""
         for cp_size, expected_type in ((1, DeepseekSparseAttentionModule), (2, CPDeepseekSparseAttentionModule)):
@@ -104,7 +105,7 @@ class TestDeepseekSparseAttention(unittest.TestCase):
     def test_cp_defaults_match_factory_and_deferred_requests(self) -> None:
         """YAML requests that omit arguments receive the documented constructor defaults."""
         expected = {
-            "kv_cp_size": 1, "kv_cp_strategy": "allgather", "cp_comm_overlap": False,
+            "kv_cp_size": None, "kv_cp_strategy": "allgather", "cp_comm_overlap": False,
         }
         for deferred in (False, True):
             with self.subTest(deferred=deferred):
@@ -154,7 +155,7 @@ class TestDeepseekSparseAttention(unittest.TestCase):
 
     def test_cp_rejects_inconsistent_topology_and_unsupported_options(self) -> None:
         """KV AllGather degrees must match the job; unrelated CP options are not exposed."""
-        for cp_size, options in ((2, {}), (1, {"kv_cp_size": 2}), (4, {"kv_cp_size": 2})):
+        for cp_size, options in ((1, {"kv_cp_size": 2}), (4, {"kv_cp_size": 2})):
             for deferred in (False, True):
                 with self.subTest(cp_size=cp_size, options=options, deferred=deferred), self.assertRaises(ValueError):
                     if deferred:

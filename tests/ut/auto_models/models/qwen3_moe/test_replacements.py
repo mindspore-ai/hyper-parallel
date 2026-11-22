@@ -12,91 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Qwen3-MoE experts replacement: the Transformers version matrix (plan §6.1.1).
+"""Public family adoption of actual HF packed Qwen3 experts."""
+# Transformers @strict supplies the supported keyword constructor at runtime.
+# pylint: disable=unexpected-keyword-arg
 
-The ``*.mlp.experts`` boundary supports only the batched Transformers
-layout (``gate_up_proj``/``down_proj`` parameters); the legacy 4.57
-``ModuleList`` layout is explicitly rejected with a clear error. Both
-layouts are faked by the shared conftest fixtures so the support matrix is
-asserted explicitly instead of depending on whichever Transformers version
-happens to be installed (plan §14.5). The contract validation is pure
-Python and runs before the lazy NPU-only ``modules`` import, so the whole
-matrix is testable on CPU-only checkouts (Gate-1).
-"""
-# pylint: disable=wrong-import-position
+import copy
 
-import os
-import sys
-import types
-import unittest.mock
-
-import pytest
+import torch
 from torch import nn
+from transformers import Qwen3MoeConfig
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
 
-from hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement import (
-    _validate_batched_experts_contract,
-    replace_qwen3_moe_grouped_experts,
-)
-
-
-def test_batched_layout_is_accepted(batched_experts):
-    """The batched gate_up_proj/down_proj layout passes validation."""
-    _validate_batched_experts_contract(batched_experts, "model.layers.0.mlp.experts")
+from hyper_parallel.components.modules import GroupedExperts
 
 
-def test_legacy_module_list_layout_is_rejected(legacy_experts):
-    """The legacy 4.57 ModuleList layout fails with a clear error."""
-    with pytest.raises(TypeError, match="legacy Transformers expert layout"):
-        _validate_batched_experts_contract(legacy_experts, "model.layers.0.mlp")
-
-
-def test_bare_module_list_target_is_rejected():
-    """A bare ModuleList target (legacy ``*.mlp.experts``) is rejected."""
-    with pytest.raises(TypeError, match="legacy Transformers expert layout"):
-        _validate_batched_experts_contract(nn.ModuleList(), "model.layers.0.mlp.experts")
-
-
-def test_missing_batched_parameters_are_named():
-    """A module without the batched parameters names what is missing."""
-    with pytest.raises(TypeError, match="gate_up_proj"):
-        _validate_batched_experts_contract(nn.Module(), "model.layers.0.mlp.experts")
-
-
-def test_factory_rejects_legacy_before_npu_import(legacy_experts):
-    """The factory rejects the legacy layout on CPU-only checkouts.
-
-    The rejection must fire before the lazy ``modules`` import so the
-    version matrix holds even where the NPU-only functional backends
-    cannot be imported at all.
-    """
-    with pytest.raises(TypeError, match="legacy Transformers expert layout"):
-        replace_qwen3_moe_grouped_experts(
-            module=legacy_experts, module_fqn="model.layers.0.mlp", context={}
-        )
-
-
-def test_factory_delegates_batched_layout_to_grouped_experts(batched_experts):
-    """The accepted batched layout is handed to ``modules.GroupedExperts``."""
-    fake_modules = types.ModuleType("hyper_parallel.components.modules")
-
-    class _FakeGroupedExperts(nn.Module):
-        """Stand-in recording the delegation arguments."""
-
-        def __init__(self, *, module, module_fqn, context):
-            super().__init__()
-            self.delegation = (module, module_fqn, context)
-
-    fake_modules.GroupedExperts = _FakeGroupedExperts
-    with unittest.mock.patch.dict(
-        sys.modules, {"hyper_parallel.components.modules": fake_modules}
-    ):
-        replaced = replace_qwen3_moe_grouped_experts(
-            module=batched_experts,
-            module_fqn="model.layers.0.mlp.experts",
-            context={"tp": None},
-        )
-    assert isinstance(replaced, _FakeGroupedExperts), "case: delegation"
-    module, module_fqn, context = replaced.delegation
-    assert module is batched_experts, "case: module"
-    assert module_fqn == "model.layers.0.mlp.experts", "case: module_fqn"
-    assert context == {"tp": None}, "case: context"
+def test_actual_packed_source_retains_parameters_and_full_gradients() -> None:
+    """Preserve HF's expert boundary and independently compare its full differentiation."""
+    torch.set_num_threads(2)
+    config = Qwen3MoeConfig(hidden_size=8, moe_intermediate_size=16, num_experts=4,
+                           num_experts_per_tok=2, num_hidden_layers=2)
+    source = Qwen3MoeExperts(config)
+    # HF initializes these bare tensors only through the enclosing pretrained model.
+    for parameter in source.parameters():
+        nn.init.normal_(parameter, std=0.02)
+    reference = copy.deepcopy(source)
+    target = GroupedExperts(module=source, context={"num_layers": 2}, use_grouped_gemm=False)
+    assert target.gate_up_proj is source.gate_up_proj
+    assert target.down_proj is source.down_proj
+    hidden = torch.randn(6, 8, requires_grad=True)
+    ids = torch.tensor([[0, 2], [1, 3], [2, 1], [0, 3], [1, 2], [3, 0]])
+    scores = torch.rand(6, 2, requires_grad=True)
+    actual = target(hidden, ids, scores)
+    expected = reference(hidden, ids, scores)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    actual_gradients = torch.autograd.grad(actual.square().sum(), (hidden, scores, *target.parameters()))
+    expected_gradients = torch.autograd.grad(expected.square().sum(), (hidden, scores, *reference.parameters()))
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-5, atol=1e-7)

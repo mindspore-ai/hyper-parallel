@@ -16,7 +16,7 @@
 
 from transformers.utils import generic
 
-from hyper_parallel.models.kimi_k3.adapter.codegen import prepare_model_import
+from hyper_parallel.models.kimi_k3.source_compat import prepare_model_import
 
 
 def test_kimi_output_recorder_compat_installs_only_when_missing():

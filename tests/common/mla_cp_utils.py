@@ -34,8 +34,11 @@ from hyper_parallel.components.modules.attention.multi_latent_attention.cp_multi
 from hyper_parallel.distributed.context_parallel.cp_context import CPContext
 from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
 from hyper_parallel.distributed.mesh import LogicalDeviceMesh, MeshContext
-from hyper_parallel.models.kimi_k3.adapter.mla import (
-    KimiMultiLatentAttentionModule, CPKimiMultiLatentAttentionModule,
+from hyper_parallel.components.modules.attention.gated_multi_latent_attention.gated_multi_latent_attention import (
+    GatedMultiLatentAttentionModule,
+)
+from hyper_parallel.components.modules.attention.gated_multi_latent_attention.cp_gated_multi_latent_attention import (
+    CPGatedMultiLatentAttentionModule,
 )
 from hyper_parallel.models.replacement import (
     ModuleReplacementSpec, apply_module_replacements, compile_module_replacements,
@@ -134,8 +137,8 @@ def make_mla(
         source.use_output_gate = True
         source.g_proj = nn.Linear(hidden_dim, dims.heads * dims.value_dim, bias=bias)
     source = source.to(dtype=dtype)
-    replacement = KimiMultiLatentAttentionModule if gated else MultiLatentAttentionModule
-    result = replacement(module=source)
+    replacement = GatedMultiLatentAttentionModule if gated else MultiLatentAttentionModule
+    result = replacement(module=source, **({"source_contract": "tensor"} if gated else {}))
     with torch.no_grad():
         result.linear_qkv.weight.copy_(torch.cat((source.q_a_proj.weight, source.kv_a_proj_with_mqa.weight)))
         if bias:
@@ -153,8 +156,10 @@ def make_cp_mla(module: MultiLatentAttentionModule, mesh: TestCPMesh, strategy: 
         strategy: Expanded or latent KV communication.
         **options: Additional CP selectors and test callbacks.
     """
-    implementation = CPKimiMultiLatentAttentionModule if isinstance(module, KimiMultiLatentAttentionModule) else (
-        CPMultiLatentAttentionModule)
+    gated = isinstance(module, GatedMultiLatentAttentionModule)
+    implementation = CPGatedMultiLatentAttentionModule if gated else CPMultiLatentAttentionModule
+    if gated:
+        options = {"source_contract": module.source_contract, **options}
     result = implementation(module=module, context={"cp_size": mesh.size()}, strategy=strategy, **options)
     logical = LogicalDeviceMesh(("cp",), (mesh.size(),))
     result.bind_parallel(ParallelBinding(MeshBinding(MeshContext(device_mesh=logical)), CPContext(mesh)))
