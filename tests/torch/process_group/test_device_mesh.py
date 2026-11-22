@@ -13,25 +13,23 @@
 # limitations under the License.
 # ============================================================================
 """test device mesh"""
+from pathlib import Path
+
+from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-DEVICE_MESH = "device_mesh.py"
+DEVICE_MESH = str(Path(__file__).with_name("device_mesh.py").resolve())
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_device_mesh_group1():
-    """
-    Feature: parallel run case in process_group
-    Description:
-        1.test_device_mesh_from_1d_group_valid
-        2.test_device_mesh_from_2d_group_use_list_valid
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(DEVICE_MESH, "test_device_mesh_from_1d_group_valid", 10124, 2),
-        TorchCase(DEVICE_MESH, "test_device_mesh_from_2d_group_use_list_valid", 10127, 4),
-    ])
+def test_device_mesh_group1() -> None:
+    """Check world coordinates and rebuild one- and two-dimensional Ascend meshes."""
+    torchrun_case(DEVICE_MESH, (
+        "test_device_mesh_from_1d_group_valid",
+        "test_device_mesh_from_1d_subgroup",
+        "test_device_mesh_from_2d_group_use_list_valid",
+    ), num_proc=4, timeout=420)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")

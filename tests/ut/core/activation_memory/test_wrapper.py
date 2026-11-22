@@ -22,16 +22,16 @@ import importlib
 import unittest
 import warnings
 import weakref
-from typing import Any, Callable, cast
+from typing import Any, Callable, Optional, cast
 from unittest.mock import MagicMock, patch, sentinel
 
+import pytest
 import torch
 
 
-from hyper_parallel.core.activation_memory.api import (
-    CheckpointPolicy,
-)
+from hyper_parallel.core.activation_memory import checkpoint_wrapper, swap_wrapper as public_swap_wrapper
 from hyper_parallel.core.activation_memory import wrapper as wrapper_module
+from hyper_parallel.core.activation_memory.api import CheckpointPolicy
 from hyper_parallel.core.activation_memory.wrapper import (
     ActivationWrapper,
     AsyncSaveOnCpu,
@@ -143,7 +143,7 @@ class TestWrapperHelpers(unittest.TestCase):
         callable_obj = _CallableObject()
 
         wrapper_module._check_and_mark_callable(callable_obj)
-        with self.assertWarnsRegex(UserWarning, "already wrapped"):
+        with pytest.warns(UserWarning, match="already wrapped"):
             wrapper_module._check_and_mark_callable(callable_obj)
 
         self.assertTrue(getattr(callable_obj, "_is_wrapped", False))
@@ -153,7 +153,7 @@ class TestWrapperHelpers(unittest.TestCase):
         child = swap_wrapper(torch.nn.Linear(2, 2))
         parent = torch.nn.Sequential(child)
 
-        with self.assertWarnsRegex(UserWarning, "Submodule.*already wrapped"):
+        with pytest.warns(UserWarning, match="Submodule.*already wrapped"):
             swap_wrapper(parent)
 
     def test_shared_parameterless_child_does_not_warn(self):
@@ -176,8 +176,309 @@ class TestWrapperHelpers(unittest.TestCase):
         second.helper = callable_obj
         swap_wrapper(first)
 
-        with self.assertWarnsRegex(UserWarning, "already wrapped"):
+        with pytest.warns(UserWarning, match="already wrapped"):
             swap_wrapper(second)
+
+
+_OVERLAP_WARNING = "Wrapping overlapping module regions is not allowed"
+
+
+class _OverlapTransformerBlock(torch.nn.Module):
+    """Small transformer-style block used for wrapper overlap detection."""
+
+    def __init__(self, dim: int = 4, hidden_dim: int = 8) -> None:
+        """Build a parameterized block with the callable attributes under test."""
+        super().__init__()
+        self.norm1 = torch.nn.LayerNorm(dim)
+        self.qkv = torch.nn.Linear(dim, dim * 3)
+        self.out_proj = torch.nn.Linear(dim * 3, dim)
+        self.norm2 = torch.nn.LayerNorm(dim)
+        self.ffn1 = torch.nn.Linear(dim, hidden_dim)
+        self.ffn2 = torch.nn.Linear(hidden_dim, dim)
+
+        def local_activation(x):
+            return torch.relu(x)
+
+        self.local_activation = local_activation
+        self.framework_mul = torch.mul
+
+    def scale(self, x: torch.Tensor) -> torch.Tensor:
+        """Provide a bound method for callable exemption checks."""
+        return x * 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate the region with its callable attributes."""
+        residual = x
+        x = self.norm1(x)
+        x = self.out_proj(self.qkv(x))
+        x = residual + x
+        residual = x
+        x = self.norm2(x)
+        x = self.local_activation(self.ffn1(x))
+        x = self.framework_mul(x, torch.tensor(1.0, device=x.device, dtype=x.dtype))
+        return residual + self.ffn2(x)
+
+
+class _OverlapTransformerNet(torch.nn.Module):
+    """Three-block net used to validate nested wrapper overlap detection."""
+
+    def __init__(self, dim: int = 4, depth: int = 3) -> None:
+        """Register distinct parameterized regions and root callables."""
+        super().__init__()
+        self.embed = torch.nn.Linear(dim, dim)
+        self.blocks = torch.nn.ModuleList([_OverlapTransformerBlock(dim=dim) for _ in range(depth)])
+        self.norm = torch.nn.LayerNorm(dim)
+        self.head = torch.nn.Linear(dim, dim)
+
+        def root_activation(x):
+            return torch.relu(x)
+
+        self.root_activation = root_activation
+        self.framework_mul = torch.mul
+
+    def scale(self, x: torch.Tensor) -> torch.Tensor:
+        """Provide a bound method for callable exemption checks."""
+        return x * 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate the region with its callable attributes."""
+        x = self.embed(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.root_activation(x)
+        x = self.norm(x)
+        return self.head(x)
+
+
+def _overlap_same_module_twice() -> None:
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].ffn1)
+    checkpoint_wrapper(net.blocks[0].ffn1)
+
+
+def _overlap_checkpoint_then_swap_same_module() -> None:
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].ffn1)
+    public_swap_wrapper(net.blocks[0].ffn1)
+
+
+def _overlap_leaf_then_parent() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[0].ffn1 = checkpoint_wrapper(net.blocks[0].ffn1)
+    checkpoint_wrapper(net)
+
+
+def _overlap_parent_then_leaf() -> None:
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[0].ffn1)
+
+
+def _overlap_block_then_parent() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[1] = checkpoint_wrapper(net.blocks[1])
+    checkpoint_wrapper(net)
+
+
+def _overlap_parent_then_block() -> None:
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[1])
+
+
+def _overlap_leaf_then_block() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[1].ffn1 = checkpoint_wrapper(net.blocks[1].ffn1)
+    checkpoint_wrapper(net.blocks[1])
+
+
+def _overlap_block_then_leaf() -> None:
+    net = _OverlapTransformerNet()
+    wrapped_block = checkpoint_wrapper(net.blocks[1])
+    checkpoint_wrapper(wrapped_block.ffn1)
+
+
+def _allowed_distinct_sibling_modules() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[0].ffn1 = checkpoint_wrapper(net.blocks[0].ffn1)
+    net.blocks[0].ffn2 = public_swap_wrapper(net.blocks[0].ffn2)
+
+
+def _allowed_distinct_blocks() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[0] = checkpoint_wrapper(net.blocks[0])
+    net.blocks[1] = public_swap_wrapper(net.blocks[1])
+
+
+def _allowed_distinct_block_callables() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[0].local_activation = checkpoint_wrapper(net.blocks[0].local_activation)
+    net.blocks[1].local_activation = public_swap_wrapper(net.blocks[1].local_activation)
+
+
+def _allowed_framework_function_reuse() -> None:
+    checkpoint_wrapper(torch.mul)
+    public_swap_wrapper(torch.mul)
+
+
+def _allowed_framework_function_attr_after_parent_wrap() -> None:
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[0].framework_mul)
+    checkpoint_wrapper(wrapped.blocks[1].framework_mul)
+
+
+def _allowed_root_framework_function_attr_after_parent_wrap() -> None:
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.framework_mul)
+
+
+def _allowed_bound_method_reuse() -> None:
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].scale)
+    public_swap_wrapper(net.blocks[0].scale)
+
+
+def _allowed_root_bound_method_reuse() -> None:
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.scale)
+    public_swap_wrapper(net.scale)
+
+
+def _allowed_callable_attr_then_parent() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[2].local_activation = checkpoint_wrapper(net.blocks[2].local_activation)
+    checkpoint_wrapper(net.blocks[2])
+
+
+def _allowed_parent_then_callable_attr() -> None:
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net.blocks[2])
+    checkpoint_wrapper(wrapped.local_activation)
+
+
+def _allowed_root_callable_attr_then_parent() -> None:
+    net = _OverlapTransformerNet()
+    net.root_activation = checkpoint_wrapper(net.root_activation)
+    checkpoint_wrapper(net)
+
+
+def _allowed_parent_then_root_callable_attr() -> None:
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.root_activation)
+
+
+def _allowed_diff_callables() -> None:
+    net = _OverlapTransformerNet()
+    net.blocks[1].local_activation = checkpoint_wrapper(net.blocks[1].local_activation)
+    net.blocks[2].local_activation = checkpoint_wrapper(net.blocks[2].local_activation)
+
+
+class TestWrapperOverlap(unittest.TestCase):
+    """Verify public checkpoint and swap wrapper region rules on CPU."""
+
+    def test_overlapping_regions_warn(self) -> None:
+        """Warn about repeated and nested parameterized module wrappers."""
+        for case in (
+            _overlap_same_module_twice,
+            _overlap_checkpoint_then_swap_same_module,
+            _overlap_leaf_then_parent,
+            _overlap_parent_then_leaf,
+            _overlap_block_then_parent,
+            _overlap_parent_then_block,
+            _overlap_leaf_then_block,
+            _overlap_block_then_leaf,
+        ):
+            with self.subTest(case=case.__name__), pytest.warns(UserWarning, match=_OVERLAP_WARNING):
+                case()
+
+    def test_disjoint_and_exempt_regions_do_not_warn(self) -> None:
+        """Allow disjoint regions and exempt callable types without an overlap warning."""
+        for case in (
+            _allowed_distinct_sibling_modules,
+            _allowed_distinct_blocks,
+            _allowed_distinct_block_callables,
+            _allowed_framework_function_reuse,
+            _allowed_framework_function_attr_after_parent_wrap,
+            _allowed_root_framework_function_attr_after_parent_wrap,
+            _allowed_bound_method_reuse,
+            _allowed_root_bound_method_reuse,
+            _allowed_callable_attr_then_parent,
+            _allowed_parent_then_callable_attr,
+            _allowed_root_callable_attr_then_parent,
+            _allowed_parent_then_root_callable_attr,
+            _allowed_diff_callables,
+        ):
+            with self.subTest(case=case.__name__), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                case()
+                overlap_warnings = [
+                    str(item.message) for item in caught
+                    if issubclass(item.category, UserWarning)
+                    and _OVERLAP_WARNING in str(item.message)
+                ]
+                self.assertEqual(overlap_warnings, [])
+
+
+class _CallableActivationNet(torch.nn.Module):
+    """Two CPU layers connected through a plain activation closure."""
+
+    def __init__(self, wrapper: Optional[Callable] = None) -> None:
+        """Optionally wrap the activation without wrapping either parameterized layer."""
+        super().__init__()
+        self.fc1 = torch.nn.Linear(32, 32)
+        self.fc2 = torch.nn.Linear(32, 32)
+
+        def hidden(value: torch.Tensor) -> torch.Tensor:
+            return torch.relu(self.fc1(value))
+
+        self.hidden = hidden if wrapper is None else wrapper(hidden)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        """Apply the activation between the two linear layers."""
+        return self.fc2(self.hidden(value))
+
+
+class TestCallableActivationWrapper(unittest.TestCase):
+    """Verify that wrapping a plain callable preserves CPU training behavior."""
+
+    @staticmethod
+    def _step(
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        inputs: torch.Tensor,
+        target: torch.Tensor,
+    ) -> float:
+        """Run one training step and return the loss for comparison."""
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(inputs), target)
+        loss.backward()
+        optimizer.step()
+        return loss.item()
+
+    def test_checkpoint_callable_matches_eager_training(self) -> None:
+        """Keep the Level0 checkpoint callable's five-step loss comparison."""
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(42)
+            reference = _CallableActivationNet()
+            wrapped = _CallableActivationNet(checkpoint_wrapper)
+            wrapped.load_state_dict(reference.state_dict())
+            # Avoid probing NPU foreach support when torch_npu is installed on a CPU runner.
+            ref_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01, foreach=False)
+            wrapped_optimizer = torch.optim.SGD(wrapped.parameters(), lr=0.01, foreach=False)
+
+            torch.random.default_generator.manual_seed(42)
+            for step in range(5):
+                inputs = torch.randn(8, 32)
+                target = torch.randn(8, 32)
+                expected = self._step(reference, ref_optimizer, inputs, target)
+                actual = self._step(wrapped, wrapped_optimizer, inputs, target)
+                self.assertLess(
+                    abs(actual - expected), 1e-6,
+                    f"step {step}: expected loss={expected:.8f}, actual loss={actual:.8f}",
+                )
 
 
 class TestActivationWrapper(unittest.TestCase):
@@ -290,7 +591,7 @@ class TestSwapWrapper(unittest.TestCase):
         mod = _TinyModule()
         swap_wrapper(mod)
 
-        with self.assertWarnsRegex(UserWarning, "already wrapped"):
+        with pytest.warns(UserWarning, match="already wrapped"):
             swap_wrapper(mod)
 
     def test_forwards_attributes_and_strips_state_dict_prefix(self):
@@ -437,9 +738,9 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
 
         for options, expected_options in test_cases:
             with self.subTest(options=options):
-                with self.assertWarnsRegex(
+                with pytest.warns(
                     UserWarning,
-                    rf"ignores {expected_options} when swap=False",
+                    match=rf"ignores {expected_options} when swap=False",
                 ):
                     checkpoint_exclude_wrapper(torch.nn.Identity(), swap=False, **options)
 
@@ -592,7 +893,7 @@ class TestSwapTensorWrapper(unittest.TestCase):
         fake_manager.get_current_group_name.return_value = None
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
-            with self.assertWarnsRegex(UserWarning, "cannot be swapped"):
+            with pytest.warns(UserWarning, match="cannot be swapped"):
                 result = swap_tensor_wrapper(target, tag="hidden")
 
         self.assertIs(result, target)

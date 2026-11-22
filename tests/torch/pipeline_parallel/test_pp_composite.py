@@ -12,43 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Pytest launcher for PP + HSDP + Interleaved 1F1B composite vs single-card reference.
-
-Spawns one ``torchrun`` worker on 8 NPUs exercising ``ScheduleInterleaved1F1B`` over a
-3-D ``(pp=2, dp=2, fsdp=2)`` mesh, where the 2-D ``(dp, fsdp)`` HSDP submesh drives the
-``fully_shard`` reduce (replicate all-reduce + shard reduce-scatter).  Per-step loss and
-gradient parity are checked against a full-model serial reference inside the worker.
-"""
+"""Gate launchers for pipeline scheduling, HSDP, and tensor parallelism."""
 from pathlib import Path
 
-from tests.common.mark_utils import arg_mark
+from tests.common.ascend_level0_cases import (
+    run_pp_batch_cold_start_and_hsdp,
+    run_pp_multi_stream_cold_start_and_composites,
+)
 from tests.common.distributed_launcher import torchrun_case
+from tests.common.mark_utils import arg_mark
 
-_WORKER = str(Path(__file__).resolve().parent / "_test_pp_composite.py")
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_pp_plus_fully_shard_vpp():
-    """
-    Feature: ``PP + HSDP`` Interleaved 1F1B composite vs full-model serial reference.
-    Description:
-        Launch :func:`test_pp_hsdp_vpp_interleaved_1f1b_matches_reference` on 8 ranks with
-        mesh ``(pp=2, dp=2, fsdp=2)``.  Each step compares the HSDP-reduced global loss and
-        every owned reduced gradient against a single-card full-model serial baseline,
-        verifying the pipeline-driven HSDP gradient drain under ``ScheduleInterleaved1F1B``.
-    Expectation: Worker exits with status 0 on every rank.
-    """
-    torchrun_case(
-        _WORKER,
-        "test_pp_hsdp_vpp_interleaved_1f1b_matches_reference",
-        master_port=13830,
-        num_proc=8,
-    )
+_WORKER_DIR = Path(__file__).resolve().parent
+_WORKER = str(_WORKER_DIR / "_test_pp_composite.py")
 
 
 @arg_mark(
@@ -57,13 +32,20 @@ def test_pp_plus_fully_shard_vpp():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_pp_plus_fully_shard_vpp_dxdw_split():
-    """Run Torch PP+HSDP with split input/weight backward on eight ranks."""
-    torchrun_case(
-        _WORKER,
-        "test_pp_hsdp_vpp_dxdw_split_matches_reference",
-        num_proc=8,
-    )
+def test_pp_batch_cold_start_and_hsdp() -> None:
+    """Start batch P2P on a fresh WORLD, then verify both PP/HSDP backward schedules."""
+    run_pp_batch_cold_start_and_hsdp(_WORKER_DIR)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_pp_multi_stream_cold_start_and_composites() -> None:
+    """Start multi-stream P2P on its own fresh WORLD before PP8 and PP/FSDP/TP."""
+    run_pp_multi_stream_cold_start_and_composites(_WORKER_DIR)
 
 
 @arg_mark(

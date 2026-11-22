@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lightweight launcher for collective MoonEP family parity."""
+"""Level0 launch for four-rank MoonEP and Host Engram checks."""
 
 from pathlib import Path
 
-from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import TorchCase, parallel_run_ascend_batches
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_collective_moonep_family() -> None:
-    """Feature: Collective MoonEP family.
-    Description: Compare ordinary EP and capacity-bounded replicas across modes and checkpoint replay.
-    Expectation: Forward, hidden/router gradients and home parameter gradients agree on four NPUs.
-    """
-    worker = str(Path(__file__).with_name("_test_moonep_family.py"))
-    torchrun_case(worker, "test_collective_moonep_family", num_proc=4)
+    """Run MoonEP parity and Host Engram routing, sparse updates and restore on independent worlds."""
+    worker_dir = Path(__file__).resolve().parent
+    parallel_run_ascend_batches([
+        TorchCase(str(worker_dir / "_test_moonep_family.py"), "test_collective_moonep_family", num_proc=4),
+        TorchCase(str(worker_dir / "_test_host_engram_sparse.py"), "test_host_engram_four_rank_hccl", num_proc=4),
+    ])

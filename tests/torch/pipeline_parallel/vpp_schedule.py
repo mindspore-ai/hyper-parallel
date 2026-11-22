@@ -395,6 +395,12 @@ def _test_vpp_dynamic_batched_p2p_cold_start(p2p_transport: str) -> None:
         assert len(losses) == 1
         assert torch.isfinite(losses[0]).all()
 
+    # The two PP domains finish independently. Keep their cold groups alive until
+    # every rank has completed P2P before a faster domain builds its next mesh.
+    if _DEVICE_TYPE == "npu":
+        torch.npu.synchronize()
+    dist.barrier()
+
 
 def test_vpp_dynamic_batch_p2p_cold_start():
     """Dynamic-shape VPP should initialize and run the full PP batch group."""

@@ -278,7 +278,7 @@ def _build_hsdp_reference(base_layers, device):
 
 def _assert_pp_hsdp_vpp_matches_reference(
     case_name: str, schedule_factory=ScheduleInterleaved1F1B, *,
-    module_settings=None, checkpointing=False, concurrent_overlap=False, layers_per_stage=1,
+    module_settings=None, checkpointing=False, concurrent_overlap=False, layers_per_stage=1, require_level0_mesh=False,
 ) -> None:
     """Drive PP + HSDP + Interleaved 1F1B and assert loss + grad parity vs single-card."""
     device = initialize_device()
@@ -289,6 +289,9 @@ def _assert_pp_hsdp_vpp_matches_reference(
             "reshard_after_backward": True,
             "requires_gradient_sync": True,
         }
+    if require_level0_mesh:
+        topology = (_PP_SIZE, _DP_SIZE, _FSDP_SIZE, dist.get_world_size())
+        assert topology == (2, 2, 2, 8), f"{case_name}: expected PP2/DP2/FSDP2 on 8 ranks, got {topology}"
     if not _check_hsdp_topology(case_name, dist.get_world_size(), rank):
         return
 
@@ -382,13 +385,13 @@ def test_pp_hsdp_vpp_interleaved_1f1b_matches_reference() -> None:
         Every step's global loss and every owned gradient match the reference within
         ``rtol=1e-5`` / ``atol=1e-6``.
     """
-    _assert_pp_hsdp_vpp_matches_reference("pp_hsdp_vpp_interleaved_1f1b")
+    _assert_pp_hsdp_vpp_matches_reference("pp_hsdp_vpp_interleaved_1f1b", require_level0_mesh=True)
 
 
 def test_pp_hsdp_vpp_dxdw_split_matches_reference() -> None:
     """Torch PP+HSDP split backward should match the full-model reference."""
     _assert_pp_hsdp_vpp_matches_reference(
-        "pp_hsdp_vpp_dxdw_split",
+        "pp_hsdp_vpp_dxdw_split", require_level0_mesh=True,
         schedule_factory=partial(ScheduleInterleaved1F1B, overlap_b_f=True, enable_dxdw_split=True),
     )
 

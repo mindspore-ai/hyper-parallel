@@ -16,8 +16,10 @@
 import gc
 import importlib
 import json
+import math
 import os
 from pathlib import Path
+import statistics
 import subprocess
 import sys
 import time
@@ -37,6 +39,7 @@ from hyper_parallel.core.activation_memory import (
 _TOKEN_NUM = 16384
 _HIDDEN_SIZE = 2048
 _LAYER_NUM = 20
+_MAX_EXCLUDE_STEP_TIME_RATIO = 1.10
 _SWAP_TOKEN_NUM = 256
 _SWAP_HIDDEN_SIZE = 256
 _SWAP_LAYER_NUM = 4
@@ -325,7 +328,6 @@ def _run_exclude() -> Dict[str, Any]:
     forward_bytes = torch.npu.memory_allocated() - baseline_bytes
     loss.backward()
     _synchronize()
-
     return {
         "loss": float(loss.detach().cpu()),
         "matmul_calls": calls["matmul"],
@@ -491,7 +493,7 @@ def _disable_input_rematerialization(args: Any, kwargs: Any) -> tuple:
     return ()
 
 
-def _run_host_performance_comparison() -> Dict[str, Any]:
+def _run_host_performance_comparison(*, paired: bool = False) -> Dict[str, Any]:
     """Compare optimized and legacy host-visible step time on one warmed network."""
     torch.use_deterministic_algorithms(True)
     torch.manual_seed(2030)
@@ -514,7 +516,11 @@ def _run_host_performance_comparison() -> Dict[str, Any]:
             loss.backward()
             _synchronize()
             _clear_grads(net)
-        order = ("legacy", "current", "current", "legacy", "legacy", "current")
+            del tensor, loss
+        order = (
+            ("legacy", "current", "current", "legacy") * 3
+            if paired else ("legacy", "current", "current", "legacy", "legacy", "current")
+        )
         for mode in order:
             set_mode(mode)
             tensor = input_data.detach().clone().requires_grad_()
@@ -537,6 +543,10 @@ def _run_host_performance_comparison() -> Dict[str, Any]:
             "samples": len(values),
         }
     result["ratio"] = result["current"]["total_ms"] / result["legacy"]["total_ms"]
+    if paired:
+        result["ratio"] = statistics.median(
+            current / legacy for current, legacy in zip(timings["current"], timings["legacy"])
+        )
     return result
 
 
@@ -611,8 +621,8 @@ def _run_mode(mode: str) -> Dict[str, Any]:
         return _run_swap_save_chain(swap=True, group_swap=False, use_cpu_pool=False, reentrant=True)
     if mode == "reentrant_group_swap_pool_save_chain":
         return _run_swap_save_chain(swap=True, group_swap=True, use_cpu_pool=True, reentrant=True)
-    if mode == "host_performance_comparison":
-        return _run_host_performance_comparison()
+    if mode in ("host_performance_comparison", "host_performance_level0"):
+        return _run_host_performance_comparison(paired=mode == "host_performance_level0")
     if mode == "long_stability":
         return _run_long_stability()
     if mode != "legacy_exclude":
@@ -665,7 +675,11 @@ def test_rmsnorm_matmul_checkpoint_exclude_memory() -> None:
     """Optimized exclusion should retain less memory than legacy exclusion."""
     excluded = _run_mode_in_subprocess("exclude")
     legacy = _run_mode_in_subprocess("legacy_exclude")
+    _assert_exclude_memory(excluded, legacy)
 
+
+def _assert_exclude_memory(excluded: dict, legacy: dict) -> None:
+    """Keep the same loss, recompute count and memory checks in both levels."""
     assert excluded["loss"] == legacy["loss"]
     assert excluded["matmul_calls"] == _LAYER_NUM
     assert legacy["matmul_calls"] == _LAYER_NUM
@@ -676,6 +690,26 @@ def test_rmsnorm_matmul_checkpoint_exclude_memory() -> None:
     peak_gap = legacy["peak_bytes"] - excluded["peak_bytes"]
     assert abs(forward_gap - expected_gap) <= tolerance
     assert abs(peak_gap - expected_gap) <= tolerance
+
+
+def test_rmsnorm_matmul_checkpoint_exclude_level0() -> None:
+    """Check memory and loss, then bound warmed step latency on the same NPU."""
+    excluded = _run_mode_in_subprocess("exclude")
+    legacy = _run_mode_in_subprocess("legacy_exclude")
+    _assert_exclude_memory(excluded, legacy)
+    result = _run_mode_in_subprocess("host_performance_level0")
+    current_ms = result["current"]["total_ms"]
+    legacy_ms = result["legacy"]["total_ms"]
+    ratio = result["ratio"]
+    print(
+        f"checkpoint exclude: current={current_ms:.3f} ms, legacy={legacy_ms:.3f} ms, paired ratio={ratio:.3f}, "
+        f"peak={excluded['peak_bytes']} bytes, legacy_peak={legacy['peak_bytes']} bytes",
+        flush=True,
+    )
+    assert math.isfinite(ratio) and 0 < ratio <= _MAX_EXCLUDE_STEP_TIME_RATIO, (
+        f"Checkpoint exclusion latency ratio {ratio:.3f} exceeds {_MAX_EXCLUDE_STEP_TIME_RATIO:.2f}: "
+        f"current={current_ms:.3f} ms, legacy={legacy_ms:.3f} ms"
+    )
 
 
 def test_adjacent_save_regions_execute_once_and_replay_cached_outputs() -> None:
@@ -731,6 +765,20 @@ def test_checkpoint_exclude_save_chain_group_swap_cpu_pool() -> None:
     pooled = _run_mode_in_subprocess("group_swap_pool_save_chain")
 
     _assert_swap_save_chain_matches_baseline(baseline, pooled)
+    assert pooled["group_managed_tensor_count"] > 0
+    assert 0 < pooled["pool_allocated_bytes"] <= pooled["pool_capacity_bytes"]
+
+
+def test_checkpoint_exclude_save_chain_swap_level0() -> None:
+    """Reuse one isolated reference for the per-tensor and pooled swap checks."""
+    baseline = _run_mode_in_subprocess("swap_save_chain_baseline")
+    swapped = _run_mode_in_subprocess("swap_save_chain")
+    pooled = _run_mode_in_subprocess("group_swap_pool_save_chain")
+
+    _assert_swap_save_chain_matches_baseline(baseline, swapped)
+    _assert_swap_save_chain_matches_baseline(baseline, pooled)
+    assert swapped["group_managed_tensor_count"] == 0
+    assert swapped["pool_allocated_bytes"] == 0
     assert pooled["group_managed_tensor_count"] > 0
     assert 0 < pooled["pool_allocated_bytes"] <= pooled["pool_capacity_bytes"]
 

@@ -16,24 +16,18 @@
 
 from pathlib import Path
 
-import pytest
-
-from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import TorchCase, parallel_run_ascend_batches
+
+_WORKER = str(Path(__file__).with_name("_test_optimizer_step_hccl.py").resolve())
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-@pytest.mark.parametrize("source", ("online", "metadata"))
-def test_optimizer_step_loading_hccl(source: str) -> None:
-    """Feature: Window double buffering on NPU.
-    Description: Prepare next-window inputs while DP2/TP2 ranks compute and issue model-group collectives.
-    Expectation: H2D, A2A, TP broadcasts and complete-step checkpoint replay preserve exact samples.
-
-    Args:
-        source: Online or precomputed metadata case to run on four NPUs.
-    """
-    # Give each source mode its own NPU stream pools.
-    torchrun_case(
-        file_name=str(Path(__file__).with_name("_test_optimizer_step_hccl.py")),
-        case_name=f"test_optimizer_step_loading_hccl[{source}]", num_proc=4,
-    )
+def test_optimizer_step_loading_hccl() -> None:
+    """Check DP2/TP2 input staging, concurrent collectives, and checkpoint replay."""
+    # Online and metadata each start on a fresh WORLD. Share only the training ranks
+    # across windows; each loader still creates and tears down its own data producer.
+    parallel_run_ascend_batches([
+        TorchCase(_WORKER, f"test_optimizer_step_loading_hccl[{source}]", num_proc=4)
+        for source in ("online", "metadata")
+    ])
