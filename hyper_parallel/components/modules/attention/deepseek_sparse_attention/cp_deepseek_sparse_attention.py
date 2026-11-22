@@ -152,27 +152,38 @@ def _gather_key_banks(
     index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
     metadata: CPSparseAttentionSequenceMetadata,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """Gather the three key banks, then select complete causal prefixes."""
-    index_query, index_key, weights = index_states
+    """Gather each layer's KV and only a Full layer's Indexer key bank.
+
+    Shared layers consume their leader's already-gathered Indexer states and
+    local-query Top-K. Their own main-attention KV must still be exchanged.
+    Every rank follows the same construction-time role and collective order.
+    """
     query, latent_kv, query_rope, key_rope = attention_states
-    tensors = (index_key, latent_kv, key_rope)
+    tensors = (index_states[1], latent_kv, key_rope) if index_states else (latent_kv, key_rope)
     if overlap:
         pending = tuple(context.launch_gather_sequence(tensor, dim=1) for tensor in tensors)
         gathered = tuple(receipt.wait()[0] for receipt in pending)
     else:
         gathered = tuple(context.gather_sequence(tensor, dim=1)[0] for tensor in tensors)
+    indexer_bank_count = 1 if index_states else 0
     if metadata.key_ranges:
         # Repeated prefixes remain in autograd so their key gradients accumulate
         # before the existing gather adjoint reduces them to the source shards.
-        index_key, latent_kv, key_rope = (
+        gathered = (
             torch.cat([tensor.flatten(0, 1)[begin:end] for begin, end in metadata.key_ranges]).unsqueeze(0)
             for tensor in gathered
         )
     else:
-        index_key, latent_kv, key_rope = (
+        gathered = (
             tensor[:, :metadata.kv_prefix_length].contiguous() for tensor in gathered
         )
-    return (index_query, index_key, weights), (query, latent_kv, query_rope, key_rope)
+    if indexer_bank_count:
+        index_key, latent_kv, key_rope = gathered
+        ready_index_states = (index_states[0], index_key, index_states[2])
+    else:
+        latent_kv, key_rope = gathered
+        ready_index_states = ()
+    return ready_index_states, (query, latent_kv, query_rope, key_rope)
 
 
 class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
@@ -213,7 +224,7 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         self, index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
         metadata: CPSparseAttentionSequenceMetadata,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Gather three banks in fixed order and consume their causal prefixes.
+        """Gather owned banks in fixed order and consume their causal prefixes.
 
         All readiness receipts belong to this invocation. The existing gather
         adjoint sums consumers into each source shard, including the zero

@@ -101,6 +101,31 @@ class MTPOutput:
     logits: tuple[torch.Tensor, ...]
 
 
+def _share_mtp_indexers(layers: Sequence[nn.Module]) -> None:
+    """Tie DSA Indexer modules across MTP depths when their config opts in."""
+    attention_by_layer = [
+        {
+            name: module for name, module in layer.named_modules()
+            if callable(getattr(module, "share_mtp_indexer_from", None))
+        }
+        for layer in layers
+    ]
+    if not any(getattr(module, "index_share_for_mtp_iteration", False)
+               for modules in attention_by_layer for module in modules.values()):
+        return
+    if any(not modules for modules in attention_by_layer):
+        raise ValueError("index_share_for_mtp_iteration requires a DSA attention in every MTP iteration")
+    if any(not getattr(module, "index_share_for_mtp_iteration", False)
+           for modules in attention_by_layer for module in modules.values()):
+        raise ValueError("All MTP DSA attentions must agree on index_share_for_mtp_iteration")
+    leader_paths = tuple(attention_by_layer[0])
+    for modules in attention_by_layer[1:]:
+        if tuple(modules) != leader_paths:
+            raise ValueError("MTP iterations must contain DSA attentions at matching module paths")
+        for path in leader_paths:
+            modules[path].share_mtp_indexer_from(attention_by_layer[0][path])
+
+
 class MultiTokenPrediction(nn.Module):
     """Run independent MTP depths sequentially with ground-truth future tokens.
 
@@ -114,6 +139,10 @@ class MultiTokenPrediction(nn.Module):
         exchange, packed-document boundaries, generation/KV caching or automatic
         Trainer integration. Those belong to the model adapter. A distributed
         adapter may also call individual layers with already-aligned inputs.
+        When every DSA attention is configured with
+        ``index_share_for_mtp_iteration=True``, matching attention paths across MTP
+        depths register one shared Indexer parameter set. Each depth still computes
+        its own projections and Top-K for its input sequence.
     """
 
     def __init__(self, layers: Sequence[nn.Module]) -> None:
@@ -121,6 +150,7 @@ class MultiTokenPrediction(nn.Module):
         super().__init__()
         if not layers:
             raise ValueError("MTP requires at least one prediction layer")
+        _share_mtp_indexers(layers)
         self.layers = nn.ModuleList(layers)
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, *,

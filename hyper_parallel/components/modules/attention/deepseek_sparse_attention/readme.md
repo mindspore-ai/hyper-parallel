@@ -23,15 +23,17 @@ plan_overrides:
         kv_cp_size: 2
         kv_cp_strategy: allgather
         cp_comm_overlap: true
+        dense_warmup: null
 ```
 
-CP 的三个配置参数写在 `replace.implementation` 下：
+这些构造选项写在 `replace.implementation` 下：
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `kv_cp_size` | `1` | 上下文并行大小，与 `accelerator.cp_size` 保持一致；1 表示不开启 CP。 |
 | `kv_cp_strategy` | `allgather` | KV 通信策略，当前仅支持 `allgather`。 |
 | `cp_comm_overlap` | `false` | 是否启用异步 KV 收集。 |
+| `dense_warmup` | `null` | `null` 跟随模型的 `dsa_dense_warm_up`；`true`/`false` 固定 dense warm-up 或 sparse 阶段。 |
 
 TP 度和总 CP 度仍写在 `accelerator` 中，改 `accelerator.cp_size` 时须同步改 `kv_cp_size`。
 `*.self_attn` 匹配完整的注意力模块，框架自动选择本地或上下文并行实现；
@@ -54,3 +56,12 @@ CP 按序列维切分输入和输出，不切分参数。例如 TP2 × CP2 时�
 一半 query token，Indexer 仍保留完整的头数。TP1 时所有参数都不做 TP 切分。
 
 表中描述的是计算布局；启用 FSDP 后，参数的存储分片仍由 FSDP 管理。
+
+## V3.2 Indexer Share
+
+V3.2 local/CP member 支持 `dsa_indexer_types`、`dsa_index_topk_freq`、
+`dsa_index_skip_topk_offset` 和 `dsa_index_share_loss`。Shared 层复用前方 Full 层的选择，
+不含自身 Indexer 参数。通用 MTP 组件可用 `index_share_for_mtp_iteration: true` 共享各 MTP 深度的
+Indexer 参数；各深度仍独立生成 Top-K。该选项只有在模型构造了 `MultiTokenPrediction`/`build_mtp` 时生效。
+CP 下 Full 收集三路 key bank，Shared 只收集本层 main KV/RoPE key；
+具体配置、边界和验证见 [Indexer Share 设计](../../../../../docs/design/dsa_indexer_share.md)。

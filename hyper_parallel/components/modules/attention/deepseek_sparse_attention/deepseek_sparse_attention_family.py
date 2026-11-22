@@ -20,6 +20,7 @@ from typing import Any
 
 from torch import nn
 
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import resolve_index_share_plan
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, register_module_family,
 )
@@ -42,6 +43,27 @@ def validate_sparse_attention_family(*, config: Any, module: nn.Module | None, c
     heads = getattr(module, "num_heads", getattr(config, "num_attention_heads", None))
     if heads % member.axis_sizes["tp"]:
         raise ValueError("Sparse-attention heads must be divisible by TP degree")
+
+
+def validate_generic_sparse_attention_family(
+    *, config: Any, module: nn.Module | None, context: Any, member: Any,
+) -> None:
+    """Keep MOME and parameter sinks local until their own distributed algorithms exist."""
+    validate_sparse_attention_family(config=config, module=module, context=context, member=member)
+    config = config if module is None else module.config
+    if resolve_index_share_plan(config).enabled and getattr(config, "model_type", None) != "deepseek_v32":
+        raise ValueError("Indexer sharing is supported only for DeepSeek-V3.2")
+    use_mome = getattr(module, "use_mome", getattr(config, "use_mome", False))
+    sink_count = getattr(module, "param_sink_number", getattr(config, "param_sink_number", 0))
+    if (member.axis_sizes["tp"] > 1 or member.axis_sizes["cp"] > 1) and (
+        use_mome or sink_count > 0
+    ):
+        raise ValueError("MOME and parameter-sink sparse attention require TP1 and CP1")
+    projection = getattr(module, "linear_proj", None)
+    if member.axis_sizes["tp"] > 1 and getattr(projection, "bias", None) is not None and (
+        not isinstance(projection, nn.Linear) or getattr(projection, "skip_bias_add", False)
+    ):
+        raise ValueError("TP sparse attention requires standard nn.Linear output-bias semantics")
 
 
 def sparse_attention_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
@@ -106,7 +128,7 @@ def sparse_attention_parallel_spec(*, module: nn.Module, member: Any) -> Paralle
             ),
             "prepare_attention_inputs": ("hidden_states", "position_embeddings", "metadata", "use_dense"),
             "exchange_attention": ("inputs",),
-            "run_attention": ("index_states", "attention_states", "sequence_lengths", "use_dense"),
+            "run_attention": ("index_states", "attention_states", "sequence_lengths", "use_dense", "index_share_context"),
             "project_output": ("output",),
         },
         validate=validate_sparse_attention_layout,
@@ -157,6 +179,6 @@ register_module_family(ModuleFamily(
     },
     default_variant="local", parallel_axis="cp",
     variant_rules=(VariantRule({"parallel": True}, "cp"),),
-    sharding=sparse_attention_sharding, validate=validate_sparse_attention_family,
+    sharding=sparse_attention_sharding, validate=validate_generic_sparse_attention_family,
     parallel_spec=sparse_attention_parallel_spec,
 ))
