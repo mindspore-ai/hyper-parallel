@@ -17,15 +17,21 @@
 from __future__ import annotations
 from collections.abc import Mapping
 from functools import lru_cache
-from math import isfinite
+from math import isfinite, prod
 from typing import Any
 import torch
 from torch import nn
 from torch.nn import functional as F
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
-from hyper_parallel.components.modules.moe.moe_utils import router_sharding, validate_router_layout
+from hyper_parallel.components.modules.moe.moe_utils import (
+    local_router_metadata,
+    router_sharding,
+    validate_router_layout,
+)
 from hyper_parallel.models.replacement import module_replacement
+from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.losses.moe_aux_loss import sequence_load_balancing_loss
 from hyper_parallel.distributed.module_binding import ParallelBinding, ParallelModuleSpec
 
 
@@ -196,23 +202,49 @@ class GateModule(nn.Module):
         return []
 
     def forward(self, hidden_states: torch.Tensor,
-                correction_bias: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
-        """Return flattened logits, scaled weights and selected expert IDs."""
+                correction_bias: torch.Tensor | None = None, *,
+                token_mask: torch.Tensor | None = None,
+                sequence_ids: torch.Tensor | None = None, num_sequences: int | None = None,
+                sequence_partition_groups: tuple | None = None) -> tuple[torch.Tensor, ...]:
+        """Return logits [T,E], learned weights [T,K] and actual dispatch IDs [T,K].
+
+        Args:
+            hidden_states: Source activations [..., hidden_size].
+            correction_bias: Optional additional selection-only expert bias.
+            token_mask: Boolean token metadata excluding padding from balancing statistics.
+            sequence_ids: Int64 logical sample IDs for packed/partitioned sequences.
+            num_sequences: Number of logical samples when sequence_ids is provided.
+            sequence_partition_groups: Override existing token-partition groups for aux-loss.
+        """
         if hidden_states.ndim < 2 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError("hidden_states must end in hidden_size and include a token dimension")
+        token_mask, sequence_ids = self._metadata(hidden_states, token_mask, sequence_ids)
         logits = F.linear(  # pylint: disable=not-callable
             hidden_states.reshape(-1, self.hidden_size).float(), self.weight.float())
+        scores = routing_scores(logits, self.scoring_func)
         weights, indices = select_topk_scores(
-            routing_scores(logits, self.scoring_func), top_k=self.top_k, correction_bias=correction_bias,
+            scores, top_k=self.top_k, correction_bias=correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             normalize_topk=self.normalize_topk, sorted_indices=self.sorted_indices)
-        weights, indices = self._finish_routing(weights, indices)
+        weights, indices = self._finish_routing(
+            hidden_states, logits, weights, indices, token_mask, sequence_ids,
+            num_sequences, sequence_partition_groups, scores=scores,
+        )
         return logits, weights, indices
 
-    def _finish_routing(self, weights: torch.Tensor,
-                        indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _finish_routing(self, hidden: torch.Tensor, logits: torch.Tensor, weights: torch.Tensor,
+                        indices: torch.Tensor, token_mask: torch.Tensor | None,
+                        sequence_ids: torch.Tensor | None, num_sequences: int | None,
+                        sequence_partition_groups: tuple | None, *, scores: torch.Tensor | None = None,
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply training to the final expert IDs and their learned weights."""
         if self.fix_router:
             indices = balanced_expert_indices(indices, self.num_experts, self.router_ep_size)
+        if scores is None:
+            scores = routing_scores(logits, self.scoring_func) if self.training and self.aux_loss_coeff else logits
+        weights = self._apply_router_training(
+            hidden, scores, weights, indices, token_mask, sequence_ids, num_sequences, sequence_partition_groups,
+        )
         return weights, indices
 
 
@@ -225,6 +257,14 @@ class GateModule(nn.Module):
         )
         if not isinstance(self.fix_router, bool):
             raise ValueError("moe_router_force_load_balancing must be bool")
+        for name, aliases in (
+                ("aux_loss_coeff", ("moe_aux_loss_coeff", "aux_loss_coeff", "router_aux_loss_coeff")),
+        ):
+            value = _setting(sources, aliases, 0.0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
+                raise ValueError(f"{aliases[0]} must be finite and nonnegative")
+            setattr(self, name, float(value))
+        self.last_aux_loss = None
         self.router_ep_size = 1
         self.router_tp_mesh = None
         self.sequence_partition_groups = ()
@@ -263,6 +303,48 @@ class GateModule(nn.Module):
         self.router_tp_mesh = tp_mesh
         self.sequence_partition_groups = sequence_groups
         self.expert_bias_update_groups = dp_groups + sequence_groups
+
+
+    def _metadata(self, hidden: torch.Tensor, token_mask: torch.Tensor | None,
+                  sequence_ids: torch.Tensor | None) -> tuple:
+        return tuple(local_router_metadata(value, hidden, self.router_tp_mesh)
+                     for value in (token_mask, sequence_ids))
+
+
+    def _apply_router_training(self, hidden: torch.Tensor, scores: torch.Tensor, weights: torch.Tensor,
+                               indices: torch.Tensor, token_mask: torch.Tensor | None,
+                               sequence_ids: torch.Tensor | None,
+                               num_sequences: int | None, groups: tuple | None) -> torch.Tensor:
+        """Attach auxiliary gradients to the selected routes."""
+        if token_mask is not None and (token_mask.shape != hidden.shape[:-1] or token_mask.dtype != torch.bool
+                                       or token_mask.device != hidden.device):
+            raise ValueError("token_mask must be boolean and match local token shape and device")
+        valid = None if token_mask is None else token_mask.reshape(-1)
+        self.last_aux_loss = None
+        if self.training and self.aux_loss_coeff:
+            auxiliary = self._sequence_auxiliary(
+                hidden, scores, indices, valid, sequence_ids, num_sequences, groups,
+            )
+            self.last_aux_loss = auxiliary.detach()
+            weights = aux_loss_auto_scale(weights, auxiliary * self.aux_loss_coeff)
+        return weights
+
+
+    def _sequence_auxiliary(self, hidden: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
+                            valid: torch.Tensor | None, sequence_ids: torch.Tensor | None,
+                            num_sequences: int | None, groups: tuple | None) -> torch.Tensor:
+        """Resolve token ownership and evaluate sequence load balancing."""
+        if sequence_ids is None:
+            num_sequences = prod(hidden.shape[:-2])
+            sequence_ids = torch.arange(num_sequences, device=hidden.device).repeat_interleave(hidden.shape[-2])
+            num_sequences = max(1, num_sequences)
+        elif (sequence_ids.shape != hidden.shape[:-1] or sequence_ids.dtype != torch.int64
+              or sequence_ids.device != hidden.device or num_sequences is None):
+            raise ValueError("sequence_ids must be local int64 token metadata with num_sequences")
+        return sequence_load_balancing_loss(
+            scores, indices, sequence_ids.reshape(-1), num_sequences, valid,
+            self.sequence_partition_groups if groups is None else groups,
+        )
 
 
 
@@ -362,12 +444,20 @@ class MegaGateModule(GateModule):
 
 
     def _torch_forward(self, hidden_states: torch.Tensor,
-                       image_mask: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
-        """Use base gate math while keeping optional modality bias owned by MegaGate."""
-        correction_bias = self.bias
-        if image_mask is not None and self.bias_vl is not None:
-            correction_bias = torch.where(image_mask.reshape(-1, 1), self.bias_vl, self.bias)
-        return super().forward(hidden_states, correction_bias)
+                       image_mask: torch.Tensor | None, **metadata: Any) -> tuple[torch.Tensor, ...]:
+        """Keep fused vision selection local to this variant; training counts stay standard."""
+        if image_mask is None:
+            return super().forward(hidden_states, correction_bias=self.bias, **metadata)
+        correction_bias = torch.where(image_mask.reshape(-1, 1), self.bias_vl, self.bias)
+        logits = F.linear(  # pylint: disable=not-callable
+            hidden_states.reshape(-1, self.hidden_size).float(), self.weight.float())
+        scores = routing_scores(logits, self.scoring_func)
+        weights, indices = select_topk_scores(
+            scores, top_k=self.top_k, correction_bias=correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            normalize_topk=self.normalize_topk, sorted_indices=self.sorted_indices)
+        weights, indices = self._finish_routing(hidden_states, logits, weights, indices, scores=scores, **metadata)
+        return logits, weights, indices
 
     def _native_forward(self, hidden_states: torch.Tensor,
                         image_mask: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
@@ -381,22 +471,40 @@ class MegaGateModule(GateModule):
 
     # The fused NPU API takes a modality mask in the second argument.
     def forward(self, hidden_states: torch.Tensor,  # pylint: disable=arguments-renamed
-                image_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
-        """Use shared Gate math or the equivalent native sqrt-softplus NPU route."""
+                image_mask: torch.Tensor | None = None, *, token_mask: torch.Tensor | None = None,
+                sequence_ids: torch.Tensor | None = None, num_sequences: int | None = None,
+                sequence_partition_groups: tuple | None = None) -> tuple[torch.Tensor, ...]:
+        """Use shared Gate math or the native sqrt-softplus NPU route.
+
+        Args:
+            hidden_states: Source activations [..., hidden_size].
+            image_mask: Boolean local token metadata for vision correction bias.
+            token_mask: Boolean local token metadata excluding padding from statistics.
+            sequence_ids: Int64 local logical sample IDs.
+            num_sequences: Logical sample count when sequence_ids is provided.
+            sequence_partition_groups: Override token-partition groups for aux-loss.
+        """
         if hidden_states.ndim < 2 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError("hidden_states must end in hidden_size and include a token dimension")
+        token_mask, sequence_ids = self._metadata(hidden_states, token_mask, sequence_ids)
+        image_mask = local_router_metadata(image_mask, hidden_states, self.router_tp_mesh)
         if image_mask is not None:
             if self.bias_vl is None:
                 raise ValueError("image_mask requires vision_enabled=True when constructing MegaGate")
-            if (image_mask.shape != hidden_states.shape[:2] or image_mask.dtype != torch.bool
+            if (image_mask.shape != hidden_states.shape[:-1] or image_mask.dtype != torch.bool
                     or image_mask.device != hidden_states.device):
                 raise ValueError("image_mask must be BOOL [batch, sequence] on the hidden_states device")
         if self.scoring_func != "sqrtsoftplus" or hidden_states.device.type != "npu" or hidden_states.numel() == 0:
-            return self._torch_forward(hidden_states, image_mask)
+            return self._torch_forward(hidden_states, image_mask, token_mask=token_mask,
+                                       sequence_ids=sequence_ids, num_sequences=num_sequences,
+                                       sequence_partition_groups=sequence_partition_groups)
         if image_mask is not None and not image_mask.is_contiguous():
             raise ValueError("image_mask must be contiguous for native MegaGate")
         logits, weights, indices = self._native_forward(hidden_states, image_mask)
-        weights, indices = self._finish_routing(weights, indices)
+        weights, indices = self._finish_routing(
+            hidden_states, logits, weights, indices, token_mask, sequence_ids,
+            num_sequences, sequence_partition_groups,
+        )
         return logits, weights, indices
 
     @classmethod

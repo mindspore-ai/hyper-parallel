@@ -18,3 +18,14 @@
 
 例如 `E=8,P=4` 为 `0,2,4,6,1,3,5,7`。要求 `P` 整除 `E`。
 绑定时 `P` 从现有 EP mesh 取得，包含 TP-extend-EP；未绑定的单卡组件按 `P=1`。
+
+### aux-loss
+
+复用 sequence balancing 公式，每个 logical sequence 计算：
+`E * sum(实际 assignment 比例 * 无偏归一化 score 的均值)`，再对非空样本平均。
+`token_mask` 排除 padding。普通 `[B,S,H]` 输入按 B 区分样本；
+packed/跨 rank 分片输入可传 `sequence_ids` 与 `num_sequences` 明确样本边界。
+
+通过已有 `aux_loss_auto_scale(weights, coeff * loss)` 注入辅助梯度，forward weights 数值不变。
+`last_aux_loss` 为 detach 后的原始指标，**不要再次加进 task loss**。
+Trainer 原有 `aux_loss_scale_context` / `bind_aux_loss_scale` 继续负责梯度累积和 loss scaling。

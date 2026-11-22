@@ -26,6 +26,28 @@ from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 
 
+def local_router_metadata(
+    tensor: torch.Tensor | None, states: torch.Tensor, tp_mesh: Any,
+) -> torch.Tensor | None:
+    """Align masks or logical sample IDs with the router's actual TP token slice.
+
+    Args:
+        tensor: Local metadata or metadata before the TP token slice.
+        states: Router input ending in the hidden dimension.
+        tp_mesh: Existing token-partition TP mesh, or None for replicated tokens.
+
+    Returns:
+        Metadata matching exactly the router input token dimensions.
+    """
+    if tensor is None or tensor.shape == states.shape[:-1]:
+        return tensor
+    length = states.shape[-2]
+    expected = (*states.shape[:-2], length * tp_mesh.size()) if tp_mesh is not None else None
+    if expected is None or tuple(tensor.shape) != expected:
+        raise ValueError("router metadata must match local or TP-gathered token dimensions")
+    return tensor.narrow(-1, tp_mesh.get_local_rank() * length, length)
+
+
 def router_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
     """Declare complete replicated router state without another token boundary.
 

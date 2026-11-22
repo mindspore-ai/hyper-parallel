@@ -1013,6 +1013,11 @@ class BaseTrainer(Stateful, ABC):
 
         External providers expose their owned parameters through ``parameters``
         and normalize those gradients in ``prepare_optimizer_step`` instead.
+
+        Args:
+            loss: Summed step objective before token normalization.
+            loss_dict: Step loss metrics, normalized in place.
+            denominator: Optional precomputed valid-token count.
         """
         if denominator is None:
             denominator = self._loss_denominator()
@@ -1034,7 +1039,12 @@ class BaseTrainer(Stateful, ABC):
         return loss / denominator
 
     def prepare_optimizer_step(self, loss: float, loss_dict: Dict[str, float]) -> tuple[float, Any]:
-        """Normalize the step objective before clipping and optimizer preparation."""
+        """Normalize the step objective before clipping and optimizer preparation.
+
+        Args:
+            loss: Summed step objective before token normalization.
+            loss_dict: Step loss metrics, normalized in place.
+        """
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)
