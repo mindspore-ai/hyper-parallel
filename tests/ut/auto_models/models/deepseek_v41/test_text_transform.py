@@ -23,7 +23,7 @@ from hyper_parallel.data.batching.build_collate_fn import (
     TextPackingCollator,
 )
 from hyper_parallel.data.batching.dynamic_batch import TokenBudgetCandidateBuffer
-from hyper_parallel.models.deepseek_v41.adapter.data.text_transform import (
+from hyper_parallel.models.deepseek_v41.dataset_preprocessing.text_transform import (
     DeepseekV41TextTransform,
 )
 
@@ -34,6 +34,7 @@ class _StubTokenizer:
     eos_token_id = 9
 
     @staticmethod
+
     def encode(text, add_special_tokens=False):
         """Map each character to its ordinal token id."""
         del add_special_tokens

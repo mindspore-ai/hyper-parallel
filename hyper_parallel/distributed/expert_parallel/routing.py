@@ -31,7 +31,7 @@ Split out of components/distributed/ep_utils.py in stage 4e.
 
 import logging
 import math
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -380,7 +380,7 @@ def _balanced_expert_indices(
     return indices.view(token_count, experts_per_token)
 
 
-def make_balanced_router(real_router):
+def make_balanced_router(real_router: Callable) -> Callable:
     """Wrap ``real_router`` in a benchmark-only variant with a uniform expert load.
 
     The real adapter still runs -- so its weights stay differentiable and the
@@ -453,6 +453,7 @@ MOE_ROUTER_ADAPTERS = {
     "default": _softmax_topk_router,
     "qwen2moe": _topk_router_module,
     "qwen2_moe": _topk_router_module,
+    "topk_router": _topk_router_module,
     "qwen3moe": _topk_router_module,
     "qwen3_moe": _topk_router_module,
     "mixtral": _topk_router_module,
@@ -477,7 +478,7 @@ for _alias, _adapter in list(MOE_ROUTER_ADAPTERS.items()):
 del _alias, _adapter
 
 
-def resolve_moe_router(router, fix_router: bool = False):
+def resolve_moe_router(router: Union[str, Callable], fix_router: bool = False) -> Callable:
     """Resolve a router adapter, optionally to its benchmark-only balanced variant.
 
     ``fix_router`` is the switch every archetype factory exposes; it has to mean the

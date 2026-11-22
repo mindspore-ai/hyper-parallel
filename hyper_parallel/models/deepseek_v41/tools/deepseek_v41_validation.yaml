@@ -9,7 +9,7 @@ model:
   # first cloned with GIT_LFS_SKIP_SMUDGE=1; validation never fetches weights.
   id_or_path: /local/path/to/DeepSeek-V4.1-Flash
   builder:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+    _target_: hyper_parallel.models.deepseek_v41.validation.cropped_model.build_cropped_deepseek_v41
     config_path: /local/path/to/DeepSeek-V4.1-Flash
     engram_assets_path: /local/path/to/engram_depth_preserving_d8.json
     # Keep all 40 decoder layers and native role indices. Scale parameter
@@ -30,8 +30,8 @@ reference:
 launcher:
   # Python module launched by torchrun for every generated matrix case.
   module: examples.training_demo.train_text
-  # Keep the runnable Trainer recipe in examples; resolve relative to this manifest.
-  config: ../../../../examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml
+  # The timing recipe retains the same validation crop; resolve relative to this manifest.
+  config: ./nd_train_deepseek_v41_timing.yaml
   # Per-process-group launch timeout in seconds.
   timeout_seconds: 7200
 

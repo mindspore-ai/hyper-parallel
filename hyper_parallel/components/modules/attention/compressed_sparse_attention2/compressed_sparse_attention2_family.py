@@ -119,6 +119,7 @@ def _validate(*, config: Any, module: nn.Module | None, context: Any, member: An
 
 def _build_local(*, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
                  module_fqn: str = "", context: Any = None, use_fused_ops: bool = False,
+                 norm_cast_order: str | None = None,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
                  indexer_balance_block_size: int | None = None,
                  indexer_zigzag_min_length: int | None = None) -> nn.Module:
@@ -126,7 +127,8 @@ def _build_local(*, config: Any = None, module: nn.Module | None = None, layer_i
     del module_fqn, indexer_load_balance, main_kv_comm, indexer_balance_block_size, indexer_zigzag_min_length
     implementation = (_TPCompressedSparseAttention2 if context is not None and context.get("tp_size", 1) > 1
                       else CompressedSparseAttention2Module)
-    return implementation(module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops)
+    return implementation(module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops,
+                          norm_cast_order=norm_cast_order)
 
 
 _reference = partial(_build_local, use_fused_ops=False)
@@ -139,7 +141,7 @@ _cp_fused = partial(CPCompressedSparseAttention2, use_fused_ops=True)
 def CompressedSparseAttention2(  # pylint: disable=invalid-name
         *, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
         module_fqn: str = "", context: Any = None, mesh: Any = None,
-        use_fused_ops: bool = False, indexer_load_balance: str = "none",
+        use_fused_ops: bool = False, norm_cast_order: str | None = None, indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
         indexer_zigzag_min_length: int | None = None,
 ) -> nn.Module:
@@ -153,6 +155,7 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
         context: Job topology and construction facts.
         mesh: Optional prebuilt mesh for direct construction and layout binding.
         use_fused_ops: Select all three native entries; unsupported calls raise explicitly.
+        norm_cast_order: Native norm rounding policy; None follows the audited HF source contract.
         indexer_load_balance: none, zigzag, greedy or hybrid; only selection tasks move.
         main_kv_comm: all_gather or document-prefix all_to_all_v.
         indexer_balance_block_size: Greedy/hybrid task size, defaulting to 2048.
@@ -160,7 +163,7 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
     """
     return build_family(
         CompressedSparseAttention2, config=config, module=module, layer_idx=layer_idx,
-        module_fqn=module_fqn, context=context, mesh=mesh, use_fused_ops=use_fused_ops,
+        module_fqn=module_fqn, context=context, mesh=mesh, use_fused_ops=use_fused_ops, norm_cast_order=norm_cast_order,
         indexer_load_balance=indexer_load_balance, main_kv_comm=main_kv_comm,
         indexer_balance_block_size=indexer_balance_block_size,
         indexer_zigzag_min_length=indexer_zigzag_min_length,

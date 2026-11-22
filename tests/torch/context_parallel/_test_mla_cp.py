@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import partial
 from datetime import timedelta
 import inspect
 import json
@@ -32,7 +33,8 @@ from torch.utils.checkpoint import checkpoint
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
 from hyper_parallel.components.modules import MultiLatentAttention
-from hyper_parallel.models.kimi_k3.adapter.mla import KimiMultiLatentAttention
+from hyper_parallel.components.modules import GatedMultiLatentAttention
+
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.apply import apply_sharding_plan
@@ -46,6 +48,9 @@ from tests.common.mla_cp_utils import (
     attention_options, make_mla, position_embeddings,
     make_deepseek_model, replace_and_load_mla,
 )
+
+
+KimiMultiLatentAttention = partial(GatedMultiLatentAttention, source_contract="tensor")
 
 
 def _npu_device() -> torch.device:

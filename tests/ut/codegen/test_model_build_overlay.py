@@ -16,48 +16,63 @@
 
 import ast
 import builtins
+import unittest
+import weakref
 from functools import wraps
 from importlib import util
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
-import unittest
 from unittest.mock import Mock, patch
-import weakref
 
 import torch
 from torch import nn
+from transformers import DeepseekV3Config
 
+from hyper_parallel.codegen.emit.modeling import verify_recorded_patch_bundle
+from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
+from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
+from hyper_parallel.codegen.emit.snapshot_patches import emission_patches_from_snapshot_payload
+from hyper_parallel.codegen.inline.component_source import render_component_source
+from hyper_parallel.codegen.inline.ir import ImportPatch
+from hyper_parallel.codegen.inline.observations import collect_source_observations
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+from hyper_parallel.codegen.inline.pipeline import _materialize_imported_forward_hosts
+from hyper_parallel.codegen.inline.recognition import _function_source_qualname, _source_qualname
+from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.model_build_overlay import (
-    _observe_plan, _observe_replacement_installations, _observe_replacements, use_codegen_model_build_overlay,
+    _observe_plan,
+    _observe_replacement_installations,
+    _observe_replacements,
+    use_codegen_model_build_overlay,
 )
 from hyper_parallel.codegen.session import CodegenBuildSession
-from hyper_parallel.codegen.inline.observations import collect_source_observations
-from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
-from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
-from hyper_parallel.codegen.inline.ir import ImportPatch
-from hyper_parallel.codegen.inline.recognition import _function_source_qualname, _source_qualname
-from hyper_parallel.codegen.inline.pipeline import _materialize_imported_forward_hosts
-from hyper_parallel.codegen.emit.snapshot_patches import emission_patches_from_snapshot_payload
-from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
-from hyper_parallel.codegen.emit.modeling import verify_recorded_patch_bundle
-from hyper_parallel.distributed.recipe_spec import inner_wrapper, ModuleShardingSpec
-from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, inner_wrapper
 from hyper_parallel.models import HyperAutoModelForCausalLM, module_build
 from hyper_parallel.models._transformers import auto_model, model_builder
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.kimi_k26.modeling_kimi_k26 import KimiLanguageModel, bind_context_parallel
 from hyper_parallel.models.module_build import attach_build_context, build_module_context
-from hyper_parallel.models.kimi_k26.adapter.distributed.context_parallel import bind_context_parallel
 from hyper_parallel.models.replacement import (
-    MethodReplacementSpec, ModuleReplacementRequest, ModuleReplacementSpec, apply_module_replacements,
-    compile_module_replacements, method_replacement, module_replacement,
+    MethodReplacementSpec,
+    ModuleReplacementRequest,
+    ModuleReplacementSpec,
+    apply_module_replacements,
+    compile_module_replacements,
+    method_replacement,
+    module_replacement,
 )
 from tests.common.module_family_fixtures import (
-    FamilyModelConfig, LinearFamily, LocalLinear, ParallelLinear, create_family_model, register_linear_family,
+    FamilyModelConfig,
+    LinearFamily,
+    LocalLinear,
+    ParallelLinear,
+    create_family_model,
+    register_linear_family,
 )
 
 
@@ -107,11 +122,22 @@ class _ObservedLayer(nn.Module):
         return value * 2
 
 
-class _ObservedTextTower(nn.Module):
-    """Expose the keyword input contract consumed by the native Kimi CP wrapper."""
+class _ObservedTextTower(KimiLanguageModel):
+    """Exercise native input preparation while observing the decoder call."""
 
-    def forward(self, **kwargs: Any) -> dict[str, Any]:
-        """Return prepared inputs for exact comparisons with the native wrapper."""
+    def __init__(self) -> None:
+        """Initialize a tiny real decoder while observing only its input preparation."""
+        config = DeepseekV3Config.from_dict({
+            "vocab_size": 32, "hidden_size": 16, "intermediate_size": 32, "moe_intermediate_size": 8,
+            "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 2,
+            "q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 4, "qk_rope_head_dim": 4,
+            "v_head_dim": 4, "n_routed_experts": 4, "num_experts_per_tok": 2, "first_k_dense_replace": 0,
+            "n_group": 1, "topk_group": 1,
+        })
+        super().__init__(config)
+
+    def _run_language(self, **kwargs: Any) -> dict[str, Any]:
+        """Return the native class's prepared decoder inputs."""
         return kwargs
 
 
@@ -193,10 +219,10 @@ class TestOfflinePlanObservation(unittest.TestCase):
         code.co_firstlineno = 20
         self.assertIsNone(_source_qualname(ast.parse(source), code))
 
-    def test_kimi_cp_closure_without_code_qualname(self):
+    def test_kimi_owned_cp_source_without_code_qualname(self):
         """The legacy interpreter path keeps rank independence and the complete native input contract."""
         with patch("hyper_parallel.codegen.inline.recognition.getattr", _legacy_code_getattr, create=True):
-            self.test_kimi_cp_closure_emits_rank_independent_source_and_preserves_inputs()
+            self.test_kimi_owned_cp_source_preserves_inputs()
 
     def test_plan_projection_never_executes_wrapper_or_queries_distributed_state(self):
         """An active CP declaration remains visible with no runtime mesh API available."""
@@ -238,8 +264,8 @@ class TestOfflinePlanObservation(unittest.TestCase):
         runtime_mesh.get_local_rank.assert_not_called()
         runtime_mesh.get_group.assert_not_called()
 
-    def test_kimi_cp_closure_emits_rank_independent_source_and_preserves_inputs(self):
-        """Read the real native closure offline and execute its emitted body for both CP peers."""
+    def test_kimi_owned_cp_source_preserves_inputs(self):
+        """The owned Kimi input protocol emits no forward patch and keeps runtime rank binding."""
         rendered_sources = []
         values = torch.arange(32).reshape(1, 8, 4)
         padding = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
@@ -252,22 +278,20 @@ class TestOfflinePlanObservation(unittest.TestCase):
                 target = model.model.language_model
                 original = target.forward
                 bind_context_parallel(model, SimpleNamespace(cp_size=2, cp_rank=rank))
+                self.assertIs(target.forward.__func__, original.__func__)
+                self.assertEqual(_function_source_qualname(target.forward), "KimiLanguageModel.forward")
                 session = CodegenBuildSession()
                 session.record_source({"model_type": "kimi_k25"})
                 session.mark_not_required("no_parameter_layout")
                 with patch.object(torch.distributed, "get_rank", side_effect=AssertionError("runtime rank query")), \
                         patch.object(torch.distributed, "new_group", side_effect=AssertionError("runtime group")):
                     session.observe_final_forwards(model, {"model.language_model": original})
+                    expanded = render_component_source(type(target))
                 payload = session.finish()._emission_view()["plan"]
-                rules = collect_source_observations(SimpleNamespace(injections=payload["injections"]))
-                patches = build_strategy_patches(rules)
-                source = "class _ObservedTextTower:\n    def forward(self, **kwargs):\n        return kwargs\n"
-                rendered = apply_patch_set(source, patches)
+                self.assertIsNone(payload)
+                rendered = "\n".join(expanded.imports) + "\n" + expanded.source
                 rendered_sources.append(rendered)
-                self.assertIn(".get_local_rank()", rendered)
-                self.assertIn(".size()", rendered)
                 self.assertNotIn("cp_rank = 0", rendered)
-                self.assertNotIn("get_group", rendered)
                 with TemporaryDirectory() as directory:
                     path = Path(directory) / "kimi_cp.py"
                     path.write_text(rendered, encoding="utf-8")
@@ -275,10 +299,8 @@ class TestOfflinePlanObservation(unittest.TestCase):
                     module = util.module_from_spec(spec)
                     spec.loader.exec_module(module)
                     generated = module._ObservedTextTower()
-                    cp_mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda value=rank: value)
-                    generated._hp_boundary = SimpleNamespace(compiled=SimpleNamespace(
-                        mesh={"cp": cp_mesh}, mesh_dim_names=("cp",)))
-                    inputs = {"inputs_embeds": values, "attention_mask": padding, "use_cache": True,
+                    generated.bind_context_parallel(2, rank)
+                    inputs = {"inputs_embeds": values, "attention_mask": padding, "use_cache": False,
                               "extra_option": "preserved"}
                     expected, actual = target(**inputs), generated.forward(**inputs)
                     self.assertEqual(set(actual), set(expected))
@@ -289,9 +311,11 @@ class TestOfflinePlanObservation(unittest.TestCase):
                             self.assertEqual(actual[name], expected[name])
                     self.assertEqual(tuple(actual["inputs_embeds"].shape), (1, 4, 4))
                     torch.testing.assert_close(actual["position_ids"], torch.arange(rank * 4, (rank + 1) * 4)[None])
-                    self.assertTrue(inputs["use_cache"])
+                    self.assertFalse(inputs["use_cache"])
                     with self.assertRaisesRegex(TypeError, "by keyword"):
                         generated.forward(values)
+                    with self.assertRaisesRegex(ValueError, "KV cache"):
+                        generated.forward(**{**inputs, "use_cache": True})
         self.assertEqual(rendered_sources[0], rendered_sources[1])
 
     def test_cp_like_scalar_without_native_context_provenance_remains_an_error(self):

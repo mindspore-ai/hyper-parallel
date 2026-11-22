@@ -20,24 +20,18 @@ lightning indexer 为每个 query 选出 `index_topk` 个 key（官方 config �
 
 ```text
 models/deepseek_v32/
-├── __init__.py
-├── adapter/
-│   ├── conversion/
-│   │   └── module_replacement.py    # RMSNorm/DSA 工厂及历史专家入口
-│   ├── policies/
-│   │   └── sharding.py              # MLA 与 indexer 的 TP 分片规则
-│   ├── materialization.py           # 加载权重后恢复 RoPE 的 buffer
-│   └── registration.py              # ModelAdapterSpec
-├── generated/                       # codegen 生成的模型代码，仅 codegen: true 时使用
-└── recipes/
-    ├── run_parallel_offline.sh      # 在 8 卡上启动 train_parallel_offline.yaml
-    ├── train.yaml                   # 加载官方 checkpoint 的单进程配方
-    └── train_parallel_offline.yaml  # 8 层裁剪模型的 8 卡配方
+├── __init__.py                      # 模型包入口，不构造模型
+├── deepseek_v32_spec.py             # 公共模块族、模型身份及有限旧 YAML 名称声明
+├── generated/                      # 可选 codegen 产物，不拥有公共算法
+└── recipes/                        # 训练、数据与拓扑配置；模块族规则由 spec 声明
+    ├── run_parallel_offline.sh      # 八卡启动脚本
+    ├── train.yaml                   # 发布模型训练配置
+    └── train_parallel_offline.yaml  # 离线八卡裁剪配置
 ```
 
 ## 功能
 
-- **NPU 模块替换**，由 recipe 的 `plan_overrides` 选用：`*.input_layernorm`、`*.post_attention_layernorm`、
+- **NPU 模块族**，由 [deepseek_v32_spec.py](deepseek_v32_spec.py) 选择：`*.input_layernorm`、`*.post_attention_layernorm`、
   `model.norm` 换成融合 `RMSNorm`；`*.self_attn` 换成 `DeepseekSparseAttention`，indexer 与稀疏 attention 走
   CANN 融合算子；`*.mlp.experts` 选择[路由专家模块族](../../components/modules/moe/grouped_experts/README.md)。
 - **并行**：FSDP、TP（含 loss parallel）、CP、EP。不支持 PP 和 sequence parallel。
@@ -72,27 +66,22 @@ torchrun --standalone --nproc_per_node=1 \
 
 ### 多卡
 
-用命令行覆盖设置并行拓扑。recipe 将整个 `*.self_attn` 模块替换为 `DeepseekSparseAttention`，在 `cp_size > 1`
-时自动选择 CP 成员。`kv_cp_size` 须与 `accelerator.cp_size` 一致；示例使用 `allgather` 并开启通信重叠。
-参数含义见 [稀疏注意力说明](../../components/modules/attention/deepseek_sparse_attention/readme.md)。
-保留 recipe 的其他模块替换；CP2 的 attention 条目如下。专家模块族根据作业 mesh 选择 local/EP 执行，保留原生
-MoE 的路由和共享专家逻辑，不要再叠加旧的 `deepseekv3_ep_compute_fn` 方法替换。
+在 recipe 或命令行中配置并行拓扑。spec 为整个 attention 边界选择 `DeepseekSparseAttention`，
+并从 `accelerator.cp_size` 自动推导 `kv_cp_size`；模块族在 `cp_size > 1` 时选择 CP 成员。
+spec 使用 `allgather` 并开启通信重叠，参数含义见
+[稀疏注意力说明](../../components/modules/attention/deepseek_sparse_attention/readme.md)。
+`GroupedExperts` 同样根据作业 mesh 选择 local/EP 执行，源 MoE 保留路由和共享专家编排。
+模块匹配、构建和权重转换由 spec 与模块族负责，recipe 无需提供 `plan_overrides`。
 
 ```yaml
-plan_overrides:
-  - match: "*.self_attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.DeepseekSparseAttention
-        kv_cp_size: 2
-        kv_cp_strategy: allgather
-        cp_comm_overlap: true
-  - match: "*.mlp.experts"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.GroupedExperts
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 4
+  loss_parallel: true
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 2
 ```
 
 例如 8 卡、TP2 × CP2 × DP2、EP4：
@@ -101,7 +90,7 @@ plan_overrides:
 torchrun --standalone --nproc_per_node=8 \
   scripts/train_lm.py <你的 recipe> \
   --accelerator.tp_size=2 --accelerator.cp_size=2 --accelerator.ep_size=4 \
-  --accelerator.loss_parallel=true \
+  --accelerator.loss_parallel=true --training.global_batch_size=2 \
   --fsdp_config.dp_shard_size=2 --fsdp_config.edp_shard_size=2
 ```
 

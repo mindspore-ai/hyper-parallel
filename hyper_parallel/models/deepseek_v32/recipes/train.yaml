@@ -1,10 +1,9 @@
 # DeepSeek-V3.2 single-device Trainer recipe.
 #
 # The model configuration, tokenizer, and weights come from the official
-# Hugging Face checkpoint. Parallel topology sections are intentionally
-# omitted, so Trainer defaults keep TP/CP/EP/PP and FSDP degrees at 1. The
+# Hugging Face checkpoint. Parallel degrees use the Trainer defaults of 1. The
 # DSA family selects its CP member when accelerator.cp_size is greater than 1;
-# set the attention's kv_cp_size to the same value when enabling CP.
+# the spec derives kv_cp_size from the job mesh.
 #
 # DeepSeek-V3.2 is a very large model; running this recipe requires a device
 # with enough memory for the selected checkpoint and optimizer states. Local
@@ -20,6 +19,8 @@ model:
   attn_implementation: eager
   force_hf: true
 
+model_init_dtype: float32
+
 training:
   train_iters: 3
   train_samples: null
@@ -32,33 +33,12 @@ training:
   seed: 42
   enable_full_determinism: true
 
-plan_overrides:
-  - match:
-      - "*.input_layernorm"
-      - "*.post_attention_layernorm"
-      - model.norm
-    replace:
-      kind: module
-      implementation:
-        _target_: >-
-          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
-  - match: "*.self_attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: >-
-          hyper_parallel.components.modules.DeepseekSparseAttention
-        kv_cp_size: 1
-        kv_cp_strategy: allgather
-        cp_comm_overlap: true
-        # null follows dsa_dense_warm_up; true/false fixes the stage.
-        dense_warmup: null
-  - match: "*.mlp.experts"
-    replace:
-      kind: module
-      implementation:
-        _target_: >-
-          hyper_parallel.components.modules.GroupedExperts
+fsdp_config:
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+
 mixed_precision:
   enabled: false
 
@@ -118,6 +98,7 @@ dataloader:
 
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     lr: 1.0e-5

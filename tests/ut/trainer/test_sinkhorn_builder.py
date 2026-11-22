@@ -26,7 +26,7 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import Float16Opt
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.sinkhorn import Sinkhorn
-from hyper_parallel.models.deepseek_v41.adapter.optim.headwise_muon import build_reshape_fn
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import build_muon_reshape_fn as build_reshape_fn
 from hyper_parallel.trainer.config.target import Target
 
 
@@ -210,7 +210,8 @@ class TestHeadwiseMuon(unittest.TestCase):
                 torch.manual_seed(91)
                 param = nn.Parameter(torch.randn(rows, 4))
                 param.model_name = name
-                heads = [nn.Parameter(value.clone()) for value in param.detach().split(2)]
+                # Torch exposes this runtime callable through a native or generated descriptor.
+                heads = [nn.Parameter(value.clone()) for value in param.detach().split(2)]  # pylint: disable=not-callable
                 optimizer = Muon([param], reshape_fn=build_reshape_fn(2, 1))
                 reference = Muon(heads)
                 for _ in range(3):

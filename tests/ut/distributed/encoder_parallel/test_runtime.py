@@ -14,8 +14,9 @@
 # ============================================================================
 """One-rank visual runtime compared with the unchanged DeepSeek encoder."""
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import yaml
@@ -25,10 +26,8 @@ from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP, init_devic
 from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
 from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.distributed.encoder_parallel.runtime import EncoderParallelRuntime
-from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
-from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import (
-    get_deepseek_v41_encoder_parallel_spec,
-)
+from hyper_parallel.models.deepseek_v41.components.vision_transformer import get_deepseek_v41_encoder_parallel_spec
+from hyper_parallel.models.deepseek_v41.dataset_adapter import DeepseekV41DatasetAdapter
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -115,6 +114,60 @@ class TestEncoderRuntime(unittest.TestCase):
         self.assertTrue(torch.equal(native_output, candidate_output))
         self.assertTrue(torch.equal(pixels.grad, candidate_pixels.grad))
 
+    def test_encoder_cp_can_span_independent_decoder_dp_parents(self):
+        """Encoder CP2 borrows two DP resources even when decoder TP and CP are both one."""
+        mesh = init_device_mesh("cpu", (2, 1, 1), mesh_dim_names=("dp", "cp", "tp"),
+                                rank_list=(0, 1), init_backend=False)
+        context = SimpleNamespace(**{**vars(self.context), "device_mesh": mesh})
+        runtime = EncoderParallelRuntime(
+            config=EncoderParallelConfig(enabled=True, encoder_cp_size=2), mesh_context=context,
+            model=self.model, spec=get_deepseek_v41_encoder_parallel_spec(),
+            execution_options={"micro_batch_size": 1, "compile_enabled": False, "validate_placement": False},
+        )
+        self.assertTrue(runtime.cross_decoder_parents)
+        self.assertEqual(runtime.encoder_cp_mesh.size(), 2)
+        self.assertEqual(runtime.parent_mesh.size(), 2)
+        self.assertEqual(runtime.encoder_dp_size, 1)
+        self.assertEqual(runtime.decoder_mesh.size(), 1)
+
+
+    def test_minimal_resource_domain_is_not_the_full_job_mesh(self) -> None:
+        """The flattened domain must not collide with the cached full resource mesh."""
+        mesh = init_device_mesh("cpu", (4, 2, 1), mesh_dim_names=("dp", "cp", "tp"),
+                                rank_list=tuple(range(8)), init_backend=False)
+        runtime = EncoderParallelRuntime.__new__(EncoderParallelRuntime)
+        runtime.mesh_context = SimpleNamespace(device_mesh=mesh)
+        runtime.config = EncoderParallelConfig(enabled=True, encoder_cp_size=4)
+        runtime.encoder_dp_size = 1
+        runtime._bind_resource_domain(4, 2)  # pylint: disable=protected-access
+        self.assertEqual(runtime.parent_mesh.size(), 4)
+        self.assertEqual(runtime.encoder_cp_mesh.size(), 4)
+        self.assertEqual(mesh.size(), 8)
+
+    def test_metadata_errors_are_agreed_across_decoder_parents(self):
+        """Both the rejecting parent and a clean DP peer leave before data collectives."""
+        for local_bad in (False, True):
+            runtime = EncoderParallelRuntime.__new__(EncoderParallelRuntime)
+            runtime.model = nn.Linear(1, 1)
+            runtime.decoder_mesh = SimpleNamespace(size=lambda: 2, get_group=lambda: "decoder")
+            runtime.global_mesh = SimpleNamespace(size=lambda: 4, get_group=lambda: "global")
+
+            def gather(peers, value, **kwargs):
+                del kwargs
+                peers[0].copy_(value)
+                peers[1].copy_(value + int(local_bad))
+
+            def reject_on_all_parents(invalid, **kwargs):
+                self.assertEqual(kwargs["group"], "global")
+                invalid.fill_(1)
+
+            with patch("torch.distributed.is_initialized", return_value=True), \
+                    patch("torch.distributed.all_gather", side_effect=gather), \
+                    patch("torch.distributed.all_reduce", side_effect=reject_on_all_parents) as agree:
+                with self.assertRaisesRegex(ValueError, "metadata differs"):
+                    runtime.finalize_plan((), SimpleNamespace(cp_local_length=8))
+                self.assertEqual(agree.call_count, 1)
+
     def test_recipe_matches_all_vision_attention_blocks(self):
         """Feature: one recipe glob covers the released vision block depth.
 
@@ -190,7 +243,7 @@ class TestEncoderRuntime(unittest.TestCase):
         }
         parallel_context = SimpleNamespace(tp_rank=0, cp_rank=0, tp_world_size=1, cp_world_size=1)
         options = {"sequence_parallel": False}
-        inner = DeepseekV41Runtime()
+        inner = DeepseekV41DatasetAdapter()
         prepared = self.runtime.preflight_batch(batch)
         expected = inner.build(batch=batch, parallel_context=parallel_context, options=options)
         expected_plan = self.runtime.finalize_plan(*prepared)

@@ -14,25 +14,25 @@
 # ============================================================================
 """V4.1 modality balancing across backward, recomputation and optimizer steps."""
 
+import unittest
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
-import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     _configure_router_statistics,
     deepseek_v41_ep_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
 from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from tests.common.mark_utils import arg_mark
 
 
@@ -88,7 +88,7 @@ class TestModalityRouterBalance(unittest.TestCase):
             _, weights = router_fn(target, states)
             return weights.sum(-1).reshape(*states.shape[:-1], 1).expand_as(states)
 
-        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
         for coefficient, rate in ((0.0, 0.0), (0.0001, 0.0), (0.0, 0.001), (0.0001, 0.001)):
             with self.subTest(aux=coefficient, bias=rate):
                 router = make_router(rate, coefficient)
@@ -100,7 +100,7 @@ class TestModalityRouterBalance(unittest.TestCase):
                 with (
                     patch(f"{prefix}.bind_local_expert_forward"),
                     patch(f"{prefix}.ep_routed_forward", side_effect=dispatch) as routed,
-                    patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.sequence_load_balancing_loss",
+                    patch("hyper_parallel.models.deepseek_v41.components.modality_router.sequence_load_balancing_loss",
                           return_value=router.weight.sum() * 0 + 1) as seq_loss,
                 ):
                     compute = deepseek_v41_ep_compute_fn(
@@ -324,7 +324,7 @@ class TestModalityRouterBalance(unittest.TestCase):
             router_fn(target, states)
             return torch.zeros_like(states)
 
-        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
         expert_mesh = Mock()
         expert_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
         with patch(f"{prefix}.bind_local_expert_forward"), patch(f"{prefix}.ep_routed_forward", side_effect=dispatch):

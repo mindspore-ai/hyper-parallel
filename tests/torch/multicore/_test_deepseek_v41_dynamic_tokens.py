@@ -30,7 +30,7 @@ from torch.nn import functional
 from hyper_multicore import MegaMoeExperts, SwiGLUParameters
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import (
     DeepseekV41MegaMoeExperts,
 )
 from tests.torch.multicore._integration import EXTENDED_LEVEL1

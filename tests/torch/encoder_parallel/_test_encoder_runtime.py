@@ -23,7 +23,7 @@ from torch import nn
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.distributed.encoder_parallel.runtime import EncoderParallelRuntime
-from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import (
+from hyper_parallel.models.deepseek_v41.components.vision_transformer import (
     get_deepseek_v41_encoder_parallel_spec,
     replace_vision_attention,
 )

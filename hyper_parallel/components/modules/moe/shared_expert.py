@@ -24,17 +24,20 @@ from typing import Any, Literal, Optional
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
+
+from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
 )
-
-from hyper_parallel.components.checkpoint import ConcatenateWithSections
-from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.swiglu_mlp_family import (
-    SwiGLUMLPModule, _validate_mlp_config, local_swiglu, _activation_settings,
+from hyper_parallel.components.modules.common.swiglu_mlp import (
+    SwiGLUMLPModule,
+    _activation_settings,
+    _validate_mlp_config,
+    local_swiglu,
 )
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
+from hyper_parallel.models.replacement import module_replacement
 
 
 class LinearWithMatmul(nn.Linear):

@@ -37,21 +37,19 @@ from torch.utils.checkpoint import DefaultDeviceType
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
 from hyper_parallel.components.modules import CompressedSparseAttention2
-from hyper_parallel.components.modules.module_family import get_family_build_info
-from hyper_parallel.models.module_build import prepare_model_components
-from hyper_parallel.models.replacement import ModuleReplacementRequest
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention
-
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
-    CompressedSparseAttention2Module, SharedCompressedAttentionState, _apply_v41_rope,
+    CompressedSparseAttention2Module,
+    SharedCompressedAttentionState,
+    _apply_v41_rope,
 )
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.cp_compressed_sparse_attention2 import (
-    CPCompressedSparseAttention2, _CPIndexer,
+    CPCompressedSparseAttention2,
+    _CPIndexer,
 )
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
     CSA2Indexer,
 )
-from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
+from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.core.activation_memory.api import (
     checkpoint_exclude_wrapper,
     checkpoint_wrapper,
@@ -59,9 +57,13 @@ from hyper_parallel.core.activation_memory.api import (
 from hyper_parallel.core.activation_memory.wrapper import (
     CheckpointExcludeWrapper,
 )
-from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
+from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import (
     configure_deepseek_v41_activation_checkpointing,
 )
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention
+from hyper_parallel.models.module_build import prepare_model_components
+from hyper_parallel.models.replacement import ModuleReplacementRequest
 
 HIDDEN, HEADS, HEAD_DIM, GROUPS, OUT_PER_GROUP = 8, 2, 8, 2, 4
 BATCH, SEQUENCE, RATIO, LAYER = 1, 8, 2, 20

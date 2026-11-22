@@ -30,7 +30,7 @@ from hyper_parallel.components.modules import GroupedExperts
 from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (
     GroupedExpertsConfig, GroupedExpertsModule,
 )
-from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import (
     build_deepseek_v41_checkpoint_mapping,
 )
 from hyper_parallel.models.replacement import (

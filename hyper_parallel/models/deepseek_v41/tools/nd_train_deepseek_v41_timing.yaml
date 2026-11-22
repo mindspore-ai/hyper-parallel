@@ -1,27 +1,6 @@
-# The launcher the repeat script reads when it times layouts of this crop.
-#
-# It trains exactly what train_deepseek_v41_online.yaml trains, and differs from it
-# in the three things a timing round needs:
-#
-#   - No checkpointing. A round launches the same job many times, and a save of
-#     the full state costs more wall clock than the steps being measured.
-#   - Grouped GEMM off in the expert compute function, so every layout in a round
-#     runs the one expert path and a comparison between layouts is a comparison of
-#     the layouts.
-#   - No drafter plan overrides. They apply only when a drafter depth is asked for,
-#     which a timing round never does.
-#
-# The cost model prices this file, and the sapp-parallel-strategy skill ships it as a
-# template, so a round times the job the model priced. Keep the two in step: the
-# skill refuses to write a round's command where this launcher states anything the
-# model did not price, apart from the fields the script sets for each run and the
-# paths it takes from the node.
-#
-# The model, Engram assets, tokenizer and data paths below are placeholders. The
-# repeat script passes the node's own on every launch.
-# Relative output paths are resolved from the repository root, not this tools directory.
+# Timing uses the explicit validation crop below; module families own their CP/EP layouts.
 model:
-  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  _target_: hyper_parallel.models.deepseek_v41.validation.cropped_model.build_cropped_deepseek_v41
   config_path: /path/to/DeepSeek-V4.1-Flash
   engram_assets_path: ./output/training_demo/deepseek_v41/engram_depth_preserving_d8.json
   text_parameter_divisor: 8
@@ -64,132 +43,6 @@ fsdp_config:
   forward_prefetch_depth: 1
   backward_prefetch_depth: 1
   comm_fusion: false
-plan_overrides:
-- match:
-  - model.layers.*.attn_hc
-  - model.layers.*.ffn_hc
-  replace:
-    kind: module
-    implementation:
-      _target_: hyper_parallel.components.modules.mhc.mhc_family.PipelinedMhc
-- match: model.layers.*.engram
-  replace:
-    kind: module
-    implementation:
-      _target_: hyper_parallel.components.modules.engram.engram_family.Engram
-- match: model.layers.*.self_attn
-  replace:
-    kind: module
-    implementation:
-      _target_: hyper_parallel.components.modules.CompressedSparseAttention2
-- match: model.layers.*.*_hc
-  region_dispatch: false
-  params:
-    fn:
-      tp: replicate
-    base:
-      tp: replicate
-    scale:
-      tp: replicate
-  in_src:
-    hidden_streams:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-  in_dst:
-    hidden_streams:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-  out_src:
-    pre:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-  out_dst:
-    pre:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-- match: model.layers.*.*_hc
-  when: sequence_parallel
-  in_src:
-    hidden_streams:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-  in_dst:
-    hidden_streams:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-  out_src:
-    pre:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-  out_dst:
-    pre:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-- match: model.layers.*.engram
-  params:
-    q_weight:
-      tp: replicate
-    k_weight:
-      tp: replicate
-    embed.weight:
-      ep: shard(0)
-    wkv.weight:
-      tp: replicate
-- match: model.layers.*.engram.forward
-  when: ep
-  region_dispatch: false
-  replace:
-    kind: method
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-- match: '*.mlp.forward'
-  when: ep
-  region_dispatch: false
-  replace:
-    kind: method
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: false
 mixed_precision:
   enabled: false
 activation_checkpoint:
@@ -231,7 +84,7 @@ dataloader:
     source_type: online
     attention_mode: compressed
     runtime_input_adapter:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+      _target_: hyper_parallel.models.deepseek_v41.dataset_adapter.DeepseekV41DatasetAdapter
       include_position_ids: false
       include_image_sequence_start: false
   sampler_type: single
@@ -256,6 +109,10 @@ optimizer:
     muon_nesterov: true
     muon_ns_steps: 5
     muon_ns_variant: asym5
+    reshape_fn:
+      _target_: hyper_parallel.models.deepseek_v41.deepseek_v41_spec.build_muon_reshape_fn
+      attention_head_dim: 512
+      indexer_head_dim: 128
   adamw_config:
     adamw_lr: 1.0e-05
     adamw_weight_decay: 0.01

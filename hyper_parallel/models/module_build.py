@@ -27,7 +27,8 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules.module_family import (
-    FamilyBoundary, FamilyBuildInfo, _build_family_member, _context_from_mesh, collect_family_modules, resolve_family,
+    FamilyBoundary, FamilyBuildInfo, FamilyRequest, _build_family_member, _context_from_mesh,
+    collect_family_modules, get_family_build_info, resolve_family,
     validate_family_context,
 )
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
@@ -50,8 +51,12 @@ def resolve_effective_model_spec(config: Any, explicit: ModelAdapterSpec | None 
     Returns:
         The effective immutable spec or None for a fully self-described model.
     """
-    identities = tuple(value for value in (
-        getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()),
+    configs = (config,)
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        configs += (get_text_config(),)
+    identities = tuple(value for candidate in configs for value in (
+        getattr(candidate, "model_type", None), *(getattr(candidate, "architectures", None) or ()),
     ) if value)
     if explicit is not None:
         if not isinstance(explicit, ModelAdapterSpec):
@@ -204,6 +209,22 @@ def _prepare_family_member(
                                          module_fqn=boundary.fqns[0], context=context)
     _adopt_family_state(source, candidate, boundary.fqns[0])
     return candidate, replace(info, resolved=member)
+
+
+def _reconfigure_direct_family(
+    source: nn.Module, request: FamilyRequest, *, module_fqn: str, context: Mapping[str, Any],
+) -> nn.Module:
+    """Select a native member from its saved config while retaining all logical tensors."""
+    info = get_family_build_info(source)
+    if info is None or info.origin != "direct" or info.request.target is not request.target:
+        raise ValueError("native family overrides must retain the original public family")
+    _validate_family_lifetime(source)
+    member = resolve_family(request, context=context)
+    with torch.device("meta"):
+        candidate = _build_family_member(request, member, config=info.config_snapshot,
+                                         module_fqn=module_fqn, context=context)
+    _adopt_family_state(source, candidate, module_fqn)
+    return candidate
 
 
 def _finalize_family_modules(model: nn.Module, context: Mapping[str, Any]) -> nn.Module:

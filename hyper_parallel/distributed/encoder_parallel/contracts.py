@@ -36,6 +36,7 @@ class EncoderWorkItem:
     payload_start: int
     payload_stop: int
     metadata: Mapping[str, Any]
+    source_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class EncoderSegment:
     packed_offset: int
 
     @property
+
     def is_dummy(self) -> bool:
         """A missing image identifies the synchronization-only segment."""
         return self.item is None

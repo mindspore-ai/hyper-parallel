@@ -48,7 +48,8 @@ def _has_vlm_chain() -> bool:
     install without libhccl).
     """
     try:
-        from transformers import AutoProcessor  # noqa: F401
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from transformers import AutoProcessor  # noqa: F401  # pylint: disable=import-outside-toplevel,unused-import
     except ImportError:
         return False
     return True
@@ -76,7 +77,8 @@ class TestPadTarget(unittest.TestCase):
 
     @staticmethod
     def _transform(**kwargs):
-        from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import KimiVLMChatTransform
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import KimiVLMChatTransform  # pylint: disable=import-outside-toplevel
 
         return KimiVLMChatTransform(processor=object(), max_seq_len=8192, **kwargs)
 
@@ -112,7 +114,8 @@ class TestPadTarget(unittest.TestCase):
         Description: Pad a 300-token sample with pad_granularity=128.
         Expectation: Every sequence field grows to 384 and labels pad with IGNORE_INDEX.
         """
-        from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import _SEQ_FIELDS
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import _SEQ_FIELDS  # pylint: disable=import-outside-toplevel
 
         transform = self._transform(pad_granularity=128)
         out = transform._truncate_and_pad(_sample(300))

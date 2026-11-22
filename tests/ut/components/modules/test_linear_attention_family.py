@@ -13,20 +13,25 @@
 # limitations under the License.
 # ============================================================================
 """Essential linear-attention family ownership, promotion and packed-lifetime contracts."""
-from copy import deepcopy
-from types import SimpleNamespace
 import unittest
+from copy import deepcopy
+from functools import partial
+from itertools import product
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
 
-from tests.common.mark_utils import arg_mark
-
-from hyper_parallel.components.modules import KimiDeltaAttention, GatedDeltaNet
+from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
+from hyper_parallel.components.modules import GatedDeltaNet, KimiDeltaAttention
 from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.models.module_build import prepare_model_components
+from hyper_parallel.models.replacement import ModuleReplacementRequest
+from tests.common.mark_utils import arg_mark
 
 
 def _layer(kind, **options):
@@ -110,6 +115,71 @@ class TestLinearAttentionFamily(unittest.TestCase):
                           backend="ascendc", context={"cp_size": 4})
         with self.assertRaisesRegex(ValueError, "ulysses_degree"):
             _layer("kda", context={"cp_size": 4}, ulysses_degree=3)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_gdn_grouped_source_conversion_and_gradients(self):
+        """Feature: TP-compatible GDN weight layout.
+        Description: Compare grouped QKV/conv with raw HF GDN, including packed resets and export.
+        Expectation: Outputs, dX, parameter gradients and inverse checkpoint conversion agree.
+        """
+        # Qwen3.5 uses value/key head ratios 1, 2, 3 and 4 across model sizes.
+        for ratio, offsets in product((1, 2, 3, 4), ((0, 9), (0, 2, 6, 9))):
+            config = qwen.Qwen3_5TextConfig.from_dict({
+                "hidden_size": 16,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2 * ratio,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 3,
+            })
+            with self.subTest(ratio=ratio, offsets=offsets), patch.object(qwen, "FusedRMSNormGated", None, create=True):
+                torch.manual_seed(319)
+                reference = qwen.Qwen3_5GatedDeltaNet(config, 0)
+                reference.causal_conv1d_fn = None
+                reference.chunk_gated_delta_rule = partial(qwen.torch_chunk_gated_delta_rule, chunk_size=4)
+                reference.in_proj_qkv.bias = nn.Parameter(torch.randn(reference.conv_dim) * .01)
+                reference.conv1d.bias = nn.Parameter(torch.randn(reference.conv_dim) * .01)
+                reference.A_log.requires_grad_(False)
+                source = deepcopy(reference)
+                original = {name: value.clone() for name, value in source.state_dict().items()}
+                model = nn.ModuleDict({"attention": source})
+                request = ModuleReplacementRequest(("attention",), GatedDeltaNet, {"chunk_size": 4})
+                model, transforms = prepare_model_components(model, {"module_replacement_requests": (request,)})
+                model.config = config
+                # The checkpoint loader retains the applied mapping for source-format export.
+                model._weight_conversions = transforms  # pylint: disable=protected-access
+                candidate = model.attention
+                with self.assertRaisesRegex(TypeError, "hidden_states"):
+                    candidate()
+                with self.assertRaisesRegex(TypeError, "positional arguments"):
+                    candidate(torch.randn(1, 9, 16), None, None, None)
+                promoted = GatedDeltaNet(module=candidate, chunk_size=4, context={"cp_size": 2},
+                                         ulysses_degree=None)
+                self.assertIs(promoted.in_proj_qkv.weight, candidate.in_proj_qkv.weight)
+                self.assertFalse(candidate.A_log.requires_grad)
+                for name, tensor in source.state_dict().items():
+                    torch.testing.assert_close(tensor, original[name], rtol=0, atol=0)
+                restored = revert_weight_conversion(model, model.state_dict())
+                for name, tensor in original.items():
+                    torch.testing.assert_close(restored[f"attention.{name}"], tensor, rtol=0, atol=0)
+                inputs = (torch.randn(1, 9, 16) * .1).requires_grad_()
+                copied = inputs.detach().clone().requires_grad_()
+                expected = torch.cat([reference(inputs[:, start:end])
+                                      for start, end in zip(offsets, offsets[1:])], dim=1)
+                actual = (candidate(copied, None, None, cu_seqlens=offsets) if len(offsets) == 2 else
+                          candidate(hidden_states=copied, cu_seqlens=offsets))
+                torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+                gradient = torch.randn_like(actual)
+                expected.backward(gradient)
+                actual.backward(gradient)
+                torch.testing.assert_close(copied.grad, inputs.grad, rtol=3e-5, atol=3e-6)
+                gradients = {name: parameter.grad for name, parameter in reference.named_parameters()}
+                expected_gradients = dict(gradients)
+                for transform in candidate.make_transforms():
+                    expected_gradients.update(transform.operations[0].convert(
+                        gradients, transform.source_patterns, transform.target_patterns))
+                for name, parameter in candidate.named_parameters():
+                    torch.testing.assert_close(parameter.grad, expected_gradients[name], rtol=5e-5, atol=5e-6)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

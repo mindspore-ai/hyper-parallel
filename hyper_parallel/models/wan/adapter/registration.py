@@ -12,29 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Register the upstream Diffusers Wan model and its HyperParallel adapters."""
+"""Compatibility import for the model-root Wan specification."""
 
-from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.registry import register_model_adapter
-
-
-def _load_replacements():
-    """Return Wan module-replacement declarations lazily."""
-    from hyper_parallel.models.wan.adapter import replacements  # pylint: disable=C0415
-    return replacements
-
-
-def _load_dit_provider():
-    """Return the Wan DiT construction provider lazily."""
-    from hyper_parallel.models.wan.dit_adapter import WanDiTModelProvider  # pylint: disable=C0415
-    return WanDiTModelProvider
-
-
-WAN_ADAPTER_SPEC = ModelAdapterSpec(
-    architecture="WanTransformer3DModel",
-    model_type="wan",
-    replacements=_load_replacements,
-    dit=_load_dit_provider,
-)
+from hyper_parallel.models.wan.wan_spec import MODEL_SPEC as WAN_ADAPTER_SPEC
 
 register_model_adapter(WAN_ADAPTER_SPEC)

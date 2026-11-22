@@ -453,7 +453,8 @@ class TestNativeStageSource(unittest.TestCase):
         native = import_module(self.cp_type.__module__)
         hidden = torch.ones(1, 2, 4)
         probe = SimpleNamespace(cp_context=SimpleNamespace(size=2), fuse_qkv=False,
-                                project_query=Mock(return_value=hidden), project_key=Mock(return_value=hidden),
+                                project_query_state=Mock(return_value=(hidden, None)),
+                                project_key=Mock(return_value=hidden),
                                 project_value=Mock(return_value=hidden),
                                 _transfer_input=Mock(side_effect=lambda value, **_: (value, None)))
         prepared = generated.prepare_attention_inputs(probe, hidden, None)

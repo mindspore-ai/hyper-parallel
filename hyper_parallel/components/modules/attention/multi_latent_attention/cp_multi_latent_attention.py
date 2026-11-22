@@ -78,6 +78,7 @@ class MLADimensions:
             raise ValueError("rope_dim must be even")
 
     @property
+
     def qk_dim(self) -> int:
         """Return the score dimension, including the decoupled RoPE band."""
         return self.nope_dim + self.rope_dim
@@ -118,16 +119,19 @@ class MLACPPlan:
             raise ValueError("MLA KV AllGather and hybrid CP currently require TP1")
 
     @property
+
     def local_heads(self) -> int:
         """Heads in the persistent TP parameter shard, before CP redistribution."""
         return self.dimensions.heads // self.tp_degree
 
     @property
+
     def compute_heads(self) -> int:
         """Heads used by this rank's query-partition attention kernel."""
         return self.local_heads // self.ulysses_degree
 
     @property
+
     def all_gather_degree(self) -> int:
         """Number of query owners for each Ulysses head partition."""
         return self.cp_degree // self.ulysses_degree
@@ -375,7 +379,10 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
                  module_fqn: str = "", context: Any = None,
                  strategy: str = "expanded_ulysses", overlap: bool = False,
                  ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
-                 rotary_fn: Callable | None = None, attention_interface: Callable | None = None) -> None:
+                 rotary_fn: Callable | None = None, attention_interface: Callable | None = None,
+                 fuse_latent_qkv: bool = True, use_fused_norm: bool | None = None,
+                 use_fused_rotary_pos_emb: bool = True, key_expansion_layout: str = "bsnd",
+                 use_nope: bool | None = None) -> None:
         """Choose CP ownership before parameter sharding and FSDP construction.
 
         Args:
@@ -391,10 +398,21 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
             attention_interface: Optional FA callback returning BSND output and weights.
         """
         del module_fqn
+        if not isinstance(use_fused_rotary_pos_emb, bool):
+            raise TypeError("use_fused_rotary_pos_emb must be bool")
         for name, callback in (("rotary_fn", rotary_fn), ("attention_interface", attention_interface)):
             if callback is not None and not callable(callback):
                 raise TypeError(f"{name} must be callable")
-        super().__init__(module=module, config=config)
+        if key_expansion_layout not in ("bsnd", "bnsd"):
+            raise ValueError("key_expansion_layout must be bsnd or bnsd")
+        norm_options = {} if use_fused_norm is None else {"use_fused_norm": use_fused_norm}
+        if key_expansion_layout != "bsnd":
+            norm_options["key_expansion_layout"] = key_expansion_layout
+        if use_nope is not None:
+            norm_options["use_nope"] = use_nope
+        if not use_fused_rotary_pos_emb:
+            norm_options["use_fused_rotary_pos_emb"] = False
+        super().__init__(module=module, config=config, fuse_latent_qkv=fuse_latent_qkv, **norm_options)
         self.rotary_fn = rotary_fn
         if attention_interface is not None:
             self.attention_interface = attention_interface
@@ -709,7 +727,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         key_nope, value = self.project_key_value_parts(state.kv_latent, heads=self.cp_plan.local_heads)
         # Keep K assembly inside V's communication window.
         key_nope = launch_input(value, key_nope, input_a2a.value)
-        key = self.assemble_key(key_nope, key_rope)
+        key = self.assemble_key(key_nope, key_rope, layout=self.key_expansion_layout)
         # K is complete; Q projection and its model-defined rotation can cover it.
         query_latent = launch_input(key, state.query_latent, input_a2a.key)
         query = self.project_query(

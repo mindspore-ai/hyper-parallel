@@ -20,7 +20,7 @@ from torch.nn import functional
 
 from hyper_parallel.distributed.encoder_parallel.attention import EncoderAttentionContext, activate_encoder_attention
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderSegment, EncoderWorkItem
-from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41EncoderParallelAttention
+from hyper_parallel.models.deepseek_v41.components.vision_transformer import DeepseekV41EncoderParallelAttention
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionAttention
 
 

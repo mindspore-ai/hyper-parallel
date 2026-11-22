@@ -183,6 +183,7 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
     _cp_context: CPContext | None = None
 
     @staticmethod
+
     def parallel_module_spec() -> ParallelModuleSpec:
         """Declare operand exchange while the local algorithm owns mathematical dispatch."""
         local_spec = sparse_attention_parallel_spec(module=None, member=None)
@@ -197,11 +198,13 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         context = binding.cp_context
         if context is None or context.size <= 1:
             raise ValueError("DeepSeek sparse-attention CP member requires an active CPContext")
-        if self.kv_cp_size != context.size:
+        if self.kv_cp_size is not None and self.kv_cp_size != context.size:
             raise ValueError("kv_cp_size must equal the bound CPContext size")
         if self._cp_context is not None and self._cp_context.mesh is not context.mesh:
             raise ValueError("DeepSeek sparse-attention CP member already belongs to another mesh")
         super().bind_parallel(binding)
+
+        self.kv_cp_size = context.size
         self._cp_context = context
 
     def prepare_key_bank(

@@ -3,11 +3,20 @@
 # Launch from the repository root with the NPU environment and editable install ready:
 # torchrun --standalone --nproc_per_node=8 --module scripts.train_vl hyper_parallel/models/qwen3_8/recipes/train_online_vlm.yaml
 model:
-  _target_: hyper_parallel.models.qwen3_5_moe.adapter.vlm.build_qwen_vlm
+  # Source boundaries and public module families are declared by the model spec.
+  model_spec:
+    _target_: hyper_parallel.models.qwen3_5.qwen3_5_spec.build_model_spec
+    multimodal: true
+    backend: triton
+    conv_backend: triton
+    ulysses_degree: null
+  _target_: hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: path/to/model_weights
   torch_dtype: bfloat16
   attn_implementation: sdpa
-  force_hf: true
+  force_hf: false
+
+model_init_dtype: float32
 
 training:
   train_iters: 100
@@ -38,7 +47,7 @@ fsdp_config:
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
+    cast_forward_inputs: false
   replicate_params: []
   reshard_after_forward: true
   reshard_after_backward: true
@@ -46,23 +55,6 @@ fsdp_config:
   forward_prefetch_depth: 1
   backward_prefetch_depth: 1
   comm_fusion: false
-
-plan_overrides:
-  - match: "model.language_model.layers.*.linear_attn"
-    replace:
-      kind: module
-      source_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
-      exact_type: true
-      implementation:
-        _target_: hyper_parallel.components.modules.GatedDeltaNet
-        backend: triton
-        conv_backend: triton
-        ulysses_degree: null
-  - match: "model.language_model.layers.*.self_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_ulysses_cp_wrapper
 
 mixed_precision:
   enabled: false
@@ -78,7 +70,7 @@ dataset:
     pretrained_model_name_or_path: path/to/model_weights
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   # JSON/JSONL messages with image paths, or Parquet messages + images[].bytes/path.
-  data_path: /home/chaoran/datasets/llava_1k_en/messages.jsonl
+  data_path: /path/to/datasets/llava_1k_en/messages.jsonl
   data_config: {}
   data_transform:
     _target_: hyper_parallel.data.omni.omni_transform.AutoProcessorTransform

@@ -22,18 +22,21 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as torch_checkpoint_wrapper
+import yaml
 from safetensors.torch import save_file
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as torch_checkpoint_wrapper
 
 from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper, checkpoint_wrapper
-from hyper_parallel.models.deepseek_v41.adapter.validation import cropped_model
-from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Engram, DeepseekV41ForCausalLM
+from hyper_parallel.models.deepseek_v41.validation import cropped_model
+from hyper_parallel.models.deepseek_v41.validation.cropped_model import (
     build_cropped_deepseek_v41,
     build_deepseek_v41_validation_config,
 )
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Engram, DeepseekV41ForCausalLM
 from hyper_parallel.tools.model_integration.integration_validator import resolve_model_validation_spec
+from hyper_parallel.trainer.config.resolver import resolve_component
+from hyper_parallel.trainer.config.target import Target
 
 
 def _write_engram_assets(
@@ -146,6 +149,31 @@ def _write_released_config(directory: str) -> Path:
 
 class TestDeepseekV41ValidationCrop(unittest.TestCase):
     """Depth crops preserve retained model roles and reject inconsistent layouts."""
+
+    def test_production_recipe_retains_released_dimensions_and_rejects_scaled_assets(self) -> None:
+        """Resolve the production config target with complete source dimensions and official hash cardinalities."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets_path = _write_engram_assets(directory, 40, (1, 14), 32)
+            assets = json.loads(assets_path.read_text(encoding="utf-8"))
+            source = json.loads(config_path.read_text(encoding="utf-8"))
+            source["text_config"].update(engram_num_embeddings=assets["num_embeddings"], engram_vocab_size=16)
+            config_path.write_text(json.dumps(source), encoding="utf-8")
+            recipe = Path(cropped_model.__file__).resolve().parents[1] / "recipes/train.yaml"
+            raw = yaml.safe_load(recipe.read_text(encoding="utf-8"))["model"]["config"]
+            raw.update(config_path=directory, engram_assets_path=str(assets_path), enable_vision=True)
+            target = resolve_component(raw, annotation=Target, path="$.model.config")
+            config = target.build()
+            for name in ("hidden_size", "num_hidden_layers", "num_attention_heads", "q_lora_rank", "o_lora_rank"):
+                self.assertEqual(getattr(config, name), source["text_config"][name])
+            self.assertEqual(config.num_local_experts, 384)
+            self.assertEqual(config.v41_vision_num_hidden_layers, 32)
+            self.assertEqual(config.v41_model_mode, "full")
+            self.assertEqual(config.v41_candidate_source_layer_id, 20)
+            assets["head_dim"] //= 2
+            assets_path.write_text(json.dumps(assets), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "head_dim"):
+                target.build()
 
     def test_shared_state_requirements_follow_retained_layer_roles(self):
         """Resolve shared-state requirements from actual cropped model roles.

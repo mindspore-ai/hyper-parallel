@@ -15,6 +15,7 @@
 """CPU adapter contracts and real HF replacement/checkpoint coverage for MLA CP."""
 
 from copy import deepcopy
+from functools import partial
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,13 +51,17 @@ from hyper_parallel.components.modules.attention.multi_latent_attention.cp_mla_b
 from hyper_parallel.components.modules.attention.gated_multi_latent_attention.cp_gated_mla_backward_overlap import (
     GatedMLAInputState, GatedMLAOutputProjectionState,
 )
-from hyper_parallel.models.kimi_k3.adapter.mla import KimiMultiLatentAttention
+
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
+from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config.resolver import resolve_config
 from hyper_parallel.trainer.config.parallelism import normalize_distributed_setup_overrides
 from tests.common.mla_cp_utils import (
     TestCPMesh, make_cp_mla, make_mla, make_deepseek_model, replace_and_load_mla,
 )
+
+
+KimiMultiLatentAttention = partial(GatedMultiLatentAttention, source_contract="tensor")
 
 
 def _reference_attention(module, query, key, value, attention_mask=None, **kwargs):
@@ -362,7 +367,6 @@ class TestMLAContextParallel(unittest.TestCase):
                 for actual_grad, expected_grad in zip(actual_grads, expected_grads):
                     torch.testing.assert_close(actual_grad, expected_grad)
 
-
     def test_selective_kv_routes_preserve_batch_and_sum_consumers(self) -> None:
         """Feature: Selective causal KV distribution with repeated consumers.
 
@@ -541,7 +545,7 @@ class TestMLAModel(unittest.TestCase):
     def test_recipe_selects_family_without_forward_rewrite(self) -> None:
         """Feature: The shipped MLA recipe uses one topology-aware family request.
 
-        Description: Resolve the actual YAML fragment and normalize the Trainer setup.
+        Description: Resolve the recipe and load its module-family defaults from the model spec.
         Expectation: Only algorithm options enter the request; no method rewrite or runtime resources leak in.
         """
         # CI runs copied tests against the installed package, outside the source tree.
@@ -551,8 +555,12 @@ class TestMLAModel(unittest.TestCase):
                    optimizer={"_target_": "torch.optim.AdamW", "lr": 1e-4})
         setup = DistributedSetup(mesh_context=MeshContext(tp_size=2, cp_size=4))
         normalize_distributed_setup_overrides(setup, resolve_config(raw))
-        self.assertEqual(len(setup.module_replacement_requests), 1)
-        request = setup.module_replacement_requests[0]
+        self.assertFalse(setup.module_replacement_requests)
+        source = make_deepseek_model()
+        spec = get_model_adapter("deepseek_v3")
+        context = build_module_context(setup, model_spec=spec, config=source.config)
+        requests = spec.replacements(model=source, context=context)
+        request = next(item for item in requests if item.target is MultiLatentAttention)
         self.assertIs(request.target, MultiLatentAttention)
         self.assertEqual(request.kwargs["strategy"], "expanded_ulysses")
         self.assertFalse({"module", "module_fqn", "context", "mesh"} & set(request.kwargs))

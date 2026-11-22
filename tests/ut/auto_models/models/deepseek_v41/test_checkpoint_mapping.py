@@ -26,11 +26,11 @@ from torch import nn
 from transformers.utils.hub import get_checkpoint_shard_files
 
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import HuggingFaceCheckpointer
-from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import (
     build_deepseek_v41_checkpoint_mapping,
 )
 
-from hyper_parallel.models.deepseek_v41.adapter.validation import cropped_model
+from hyper_parallel.models.deepseek_v41.validation import cropped_model
 
 
 class _RouterModel(nn.Module):
@@ -77,7 +77,6 @@ class TestCheckpointMapping(unittest.TestCase):
                     torch.testing.assert_close(gate.bias_vl, source["layers.0.ffn.gate.bias_vl"], rtol=0, atol=0)
                     torch.testing.assert_close(model.model.layers[0].input_layernorm.weight,
                                                source["layers.0.attn_norm.weight"], rtol=0, atol=0)
-
 
     def test_runtime_crop_index_is_readable_by_transformers(self) -> None:
         """Filtered runtime indexes retain metadata required by the initial HF load."""

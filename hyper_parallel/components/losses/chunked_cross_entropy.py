@@ -65,6 +65,7 @@ class _PrecomputedChunkLoss(torch.autograd.Function):
     """Precompute per-chunk gradients and replay them in outer backward."""
 
     @staticmethod
+
     def forward(
         ctx: Any,
         hidden_states: torch.Tensor,
@@ -104,6 +105,7 @@ class _PrecomputedChunkLoss(torch.autograd.Function):
 
     @staticmethod
     @once_differentiable
+
     def backward(ctx: Any, grad_loss_sum: torch.Tensor | None) -> tuple:
         """Replay private gradients with the Trainer's upstream scale."""
         if grad_loss_sum is None:
@@ -250,15 +252,27 @@ class ChunkedCausalLMLoss(nn.Module):
     ``mean_global_loss``.
     """
 
-    def __init__(self, chunk_size: int = 1024, ignore_index: int = -100) -> None:
-        """Initialize and validate the per-rank sequence chunk options."""
+    def __init__(self, chunk_size: int = 1024, ignore_index: int = -100,
+                 labels_are_shifted: bool = True) -> None:
+        """Initialize chunk options and the dataset target alignment.
+
+        Args:
+            chunk_size: Number of token rows evaluated per CE chunk.
+            ignore_index: Target value excluded from CE and token accounting.
+            labels_are_shifted: Require pre-shifted targets by default. False permits raw labels
+                and shifts their mask with them; explicit shift_labels always take precedence.
+        """
         super().__init__()
         _validate_chunk_options(chunk_size, ignore_index)
+        if not isinstance(labels_are_shifted, bool):
+            raise TypeError("labels_are_shifted must be a bool")
         self.chunk_size = chunk_size
         self.ignore_index = ignore_index
+        self.labels_are_shifted = labels_are_shifted
         self._model_is_bound = False
 
     @staticmethod
+
     def _parallel_size(distributed_setup: Any, name: str) -> int:
         """Read one topology size from the shared mesh context."""
         mesh = getattr(distributed_setup, "mesh_context", None)
@@ -287,6 +301,10 @@ class ChunkedCausalLMLoss(nn.Module):
                 f"ignore_index={IGNORE_INDEX}, got {self.ignore_index}"
             )
 
+        if not self.labels_are_shifted and self._parallel_size(distributed_setup, "cp_size") > 1:
+            raise NotImplementedError(
+                "Raw-label chunked loss requires CP1; shift global labels before CP partitioning instead"
+            )
         tp_size = self._parallel_size(distributed_setup, "tp_size")
         pp_size = self._parallel_size(distributed_setup, "pp_size")
         loss_parallel = bool(
@@ -298,6 +316,13 @@ class ChunkedCausalLMLoss(nn.Module):
                 f"and loss_parallel=false; got tp_size={tp_size}, "
                 f"pp_size={pp_size}, loss_parallel={loss_parallel}"
             )
+
+        if getattr(model, "supports_chunked_loss", False):
+            head = getattr(model, "lm_head", None)
+            if not getattr(head, "supports_chunked_cross_entropy", False):
+                raise TypeError("native chunked models must own a compatible terminal head")
+            self._model_is_bound = True
+            return
 
         # Lazy imports keep generic loss-package import independent of concrete
         # model families and their optional backend dependencies.
@@ -333,15 +358,19 @@ class ChunkedCausalLMLoss(nn.Module):
         if not self._model_is_bound:
             raise RuntimeError("ChunkedCausalLMLoss must be bound before model forward")
         targets = loss_inputs.get("shift_labels")
-        if not isinstance(targets, torch.Tensor):
-            raise ValueError(
-                "ChunkedCausalLMLoss requires pre-shifted shift_labels aligned "
-                "with every local hidden position"
-            )
         loss_mask = loss_inputs.get("loss_mask")
+        shift_raw = not isinstance(targets, torch.Tensor) and not self.labels_are_shifted
+        if shift_raw:
+            targets = loss_inputs.get("labels")
+        if not isinstance(targets, torch.Tensor):
+            raise ValueError("ChunkedCausalLMLoss requires aligned targets: shift_labels or configured raw labels")
         if loss_mask is not None:
             if not isinstance(loss_mask, torch.Tensor) or loss_mask.shape != targets.shape:
                 raise ValueError("loss_mask must be a Tensor with the same shape as targets")
+        if shift_raw:
+            targets = functional.pad(targets, (0, 1), value=self.ignore_index)[..., 1:].contiguous()
+            if loss_mask is not None:
+                loss_mask = functional.pad(loss_mask.to(torch.bool), (0, 1), value=False)[..., 1:].contiguous()
 
         prepared = dict(model_inputs)
         # A legacy one-dictionary caller may leave loss-only fields in
