@@ -31,7 +31,7 @@ from examples.torch.module_family.config import (
     MegaMhcConfig, RMSNormConfig, SwiGLUMLPConfig, GateConfig, MegaGateConfig,
 )
 from hyper_parallel.components.modules import MegaMhc, RMSNorm, SwiGLUMLP, OffsetRMSNorm, SharedExpert
-from hyper_parallel.components.modules.gate_family import Gate
+from hyper_parallel.components.modules.moe.router import Gate
 from tests.common.mhc_reference import torch_mega_mhc
 
 
@@ -88,7 +88,7 @@ def test_mega_mhc_family_npu() -> None:
 
 
 def test_ordinary_mega_mhc_family_npu() -> None:
-    """Ordinary shifted boundary matches the pre-existing independent Torch golden on NPU."""
+    """Ordinary shifted boundary matches the pre-existing independent eager golden on NPU."""
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     device = torch.device("npu", torch.npu.current_device())
     member = MegaMhc(config=MegaMhcConfig(128)).to(device)
@@ -215,7 +215,7 @@ def test_router_contracts_npu() -> None:
 
 
 def test_mega_gate_family_npu() -> None:
-    """Exercise real fused Route/RouteGrad against both the original module and its Torch reference."""
+    """Exercise real fused Route/RouteGrad against both the original module and its eager reference."""
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     device = torch.device("npu", torch.npu.current_device())
     torch.manual_seed(73)

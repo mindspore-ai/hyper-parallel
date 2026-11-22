@@ -369,6 +369,6 @@ def SharedExpert(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="shared_expert", baseline=SharedExpert,
-    variants={"local": "hyper_parallel.components.modules.shared_expert_family.SharedExpertModule"},
+    variants={"local": "hyper_parallel.components.modules.moe.shared_expert.SharedExpertModule"},
     default_variant="local",
 ))

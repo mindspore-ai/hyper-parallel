@@ -21,7 +21,8 @@ from unittest.mock import Mock, patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback, sync_and_update_expert_bias
+from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
+from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
 )
@@ -98,7 +99,7 @@ class TestModalityRouterBalance(unittest.TestCase):
                 counts = torch.tensor([[2, 0, 0], [0, 0, 2]]) if rate else torch.zeros(2, 3, dtype=torch.long)
                 torch.testing.assert_close(router.tokens_per_expert, counts)
                 text_before, image_before = router.bias.clone(), router.bias_vl.clone()
-                with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as reduce_counts:
+                with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as reduce_counts:
                     MoEMonitorCallback(router).on_step_end()
                 self.assertEqual(reduce_counts.call_count, int(rate > 0))
                 torch.testing.assert_close(router.bias - text_before, rate * torch.tensor([-1., 1., 1.]))
@@ -215,7 +216,7 @@ class TestModalityRouterBalance(unittest.TestCase):
         groups = (object(), object())
         router.expert_bias_update_groups = groups
         router.tokens_per_expert[0, 0] = 1
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as reduce_counts:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as reduce_counts:
             sync_and_update_expert_bias(router, dp_group=object())
         self.assertEqual([call.kwargs["group"] for call in reduce_counts.call_args_list], list(groups))
 

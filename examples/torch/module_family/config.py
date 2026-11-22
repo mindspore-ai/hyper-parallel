@@ -237,19 +237,6 @@ class RotaryEmbeddingConfig:
 
 
 @dataclass(frozen=True)
-class TokenChoiceTopKRouterConfig:
-    """Public router math; expert bias and auxiliary-loss state stay at the caller."""
-
-    dim: int
-    num_experts: int
-    top_k: int = 1
-    score_func: str = "sigmoid"
-    num_expert_groups: int | None = None
-    num_limited_groups: int | None = None
-    route_scale: float = 1.0
-
-
-@dataclass(frozen=True)
 class GateConfig:
     """Shared gate contract with optional MegaGate modality correction state."""
 

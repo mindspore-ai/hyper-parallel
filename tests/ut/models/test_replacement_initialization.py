@@ -26,16 +26,16 @@ from safetensors.torch import save_file
 import torch
 from torch import nn
 
-from examples.torch.module_family.config import EngramConfig, SpatialMergeProjectorConfig, TokenChoiceTopKRouterConfig
-from hyper_parallel.components.modules import Engram, SpatialMergeProjector, TokenChoiceTopKRouter
+from examples.torch.module_family.config import EngramConfig, SpatialMergeProjectorConfig
+from hyper_parallel.components.modules import Engram, SpatialMergeProjector
 from hyper_parallel.components.modules.engram import EngramModule
 from hyper_parallel.components.modules.linear import Linear
-from hyper_parallel.components.modules.router_family import TokenChoiceTopKRouterModule
 from hyper_parallel.components.modules.common.spatial_merge_projector import SpatialMergeProjectorModule
 from hyper_parallel.models._transformers.model_builder import _initialize_model_weights, _materialize_and_load_model
 from hyper_parallel.models.replacement import (
     ModuleReplacementSpec, apply_module_replacements, compile_module_replacements, module_replacement,
 )
+from tests.common.mark_utils import arg_mark
 
 
 @module_replacement
@@ -95,7 +95,6 @@ def _child_module_cases() -> tuple:
     }
     return (
         (SpatialMergeProjector, SpatialMergeProjectorModule, SpatialMergeProjectorConfig(4, 8, 4)),
-        (TokenChoiceTopKRouter, TokenChoiceTopKRouterModule, TokenChoiceTopKRouterConfig(4, 4, top_k=2)),
         (Engram, EngramModule, EngramConfig(assets, 0, 8, 2, 4, padded_num_embeddings=40)),
     )
 
@@ -145,8 +144,12 @@ class _NativeInitModel(nn.Module):
 class TestReplacementInitialization(unittest.TestCase):
     """Validate the declared reset policy without changing ordinary Linear initialization."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_custom_reset_requires_make_transforms(self) -> None:
-        """Reject a reset-only replacement before it changes the model tree."""
+        """Feature: Replacement initialization.
+        Description: Reject a reset-only replacement before it changes the model tree.
+        Expectation: Custom reset requires make transforms.
+        """
         model = nn.Sequential(nn.Linear(3, 2, bias=False))
         source = model[0]
         plan = compile_module_replacements(model, [ModuleReplacementSpec(
@@ -156,8 +159,12 @@ class TestReplacementInitialization(unittest.TestCase):
             apply_module_replacements(model, plan)
         self.assertIs(model[0], source)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_empty_transforms_enable_materialized_reset(self) -> None:
-        """Use an inherited custom reset after native initialization even with no checkpoint transforms."""
+        """Feature: Replacement initialization.
+        Description: Use an inherited custom reset after native initialization even with no checkpoint transforms.
+        Expectation: Empty transforms enable materialized reset.
+        """
         with torch.device("meta"):
             model = _NativeInitModel()
         source = model.projection
@@ -175,8 +182,12 @@ class TestReplacementInitialization(unittest.TestCase):
         self.assertEqual(replacement.reset_calls, 1)
         torch.testing.assert_close(replacement.weight, torch.full((2, 3), 2.0))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_inherited_transforms_satisfy_custom_reset_contract(self) -> None:
-        """Accept a parent conversion declaration with either an inherited or overridden reset."""
+        """Feature: Replacement initialization.
+        Description: Accept a parent conversion declaration with either an inherited or overridden reset.
+        Expectation: Inherited transforms satisfy custom reset contract.
+        """
         for factory, expected in ((_InheritedTransformsLinear, 2.0), (_ResetWithInheritedTransformsLinear, 3.0)):
             with self.subTest(factory=factory.__name__):
                 self.assertNotIn("make_transforms", vars(factory))
@@ -190,8 +201,12 @@ class TestReplacementInitialization(unittest.TestCase):
                 self.assertEqual(model.projection.reset_calls, 1)
                 torch.testing.assert_close(model.projection.weight, torch.full((2, 3), expected))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_adopted_children_keep_native_initialization(self) -> None:
-        """The materialization pipeline never replaces native child initialization with Torch defaults."""
+        """Feature: Replacement initialization.
+        Description: The materialization pipeline never replaces native child initialization with Torch defaults.
+        Expectation: Adopted children keep native initialization.
+        """
         for factory, implementation, config in _child_module_cases():
             with self.subTest(factory=factory.__name__):
                 with torch.device("meta"):
@@ -217,8 +232,12 @@ class TestReplacementInitialization(unittest.TestCase):
                 for parameter in model.parameters():
                     self.assertTrue(torch.isfinite(parameter).all())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_fallback_initializes_children_once(self) -> None:
-        """Direct and replacement builds initialize owned scales and each Torch child once."""
+        """Feature: Replacement initialization.
+        Description: Direct and replacement builds initialize owned scales and each Torch child once.
+        Expectation: Fallback initializes children once.
+        """
         for factory, implementation, config in _child_module_cases():
             for replace_source in (False, True):
                 with self.subTest(factory=factory.__name__, replacement=replace_source):
@@ -241,8 +260,12 @@ class TestReplacementInitialization(unittest.TestCase):
                     for parameter in model.parameters():
                         self.assertTrue(torch.isfinite(parameter).all())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_fallback_reset_does_not_repeat_marked_module(self) -> None:
-        """Run one reset when the root has no native initialization method."""
+        """Feature: Replacement initialization.
+        Description: Run one reset when the root has no native initialization method.
+        Expectation: Fallback reset does not repeat marked module.
+        """
         with torch.device("meta"):
             model = nn.Sequential(nn.Linear(3, 2, bias=False))
         plan = compile_module_replacements(model, [ModuleReplacementSpec(
@@ -254,8 +277,12 @@ class TestReplacementInitialization(unittest.TestCase):
         self.assertEqual(model[0].reset_calls, 1)
         torch.testing.assert_close(model[0].weight, torch.full((2, 3), 2.0))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_loading_does_not_reset_marked_module(self) -> None:
-        """Load real checkpoint values without executing the declared random initialization policy."""
+        """Feature: Replacement initialization.
+        Description: Load real checkpoint values without executing the declared random initialization policy.
+        Expectation: Checkpoint loading does not reset marked module.
+        """
         with torch.device("meta"):
             model = _NativeInitModel()
         mapping = []
@@ -274,8 +301,12 @@ class TestReplacementInitialization(unittest.TestCase):
         self.assertEqual(model.projection.reset_calls, 0)
         torch.testing.assert_close(model.projection.weight, expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_inherited_torch_reset_keeps_native_initialization(self) -> None:
-        """Preserve HF-style native initialization for an ordinary Linear replacement."""
+        """Feature: Replacement initialization.
+        Description: Preserve HF-style native initialization for an ordinary Linear replacement.
+        Expectation: Inherited torch reset keeps native initialization.
+        """
         with torch.device("meta"):
             model = _NativeInitModel()
         plan = compile_module_replacements(model, [ModuleReplacementSpec(

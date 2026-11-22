@@ -22,14 +22,14 @@ import torch
 from torch import nn
 from hyper_multicore.modules.mega_gate import MegaGate as CoreMegaGate
 
-from examples.torch.module_family.config import GateConfig, TokenChoiceTopKRouterConfig, MegaGateConfig
+from examples.torch.module_family.config import GateConfig, MegaGateConfig
 from hyper_parallel.components.modules import get_family_build_info
-from hyper_parallel.components.modules.router_family import (
-    TokenChoiceTopKRouter, routing_scores, select_topk_scores,
+from hyper_parallel.components.modules.moe.router import (
+    Gate, GateModule, MegaGateModule, routing_scores, select_topk_scores,
 )
-from hyper_parallel.components.modules.gate_family import Gate, GateModule, MegaGateModule
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
 from hyper_parallel.components.modules.family import get_module_family
+from tests.common.mark_utils import arg_mark
 
 
 def _reference(weight, hidden, bias, scoring, top_k, scale, normalize):
@@ -55,11 +55,16 @@ def _reference(weight, hidden, bias, scoring, top_k, scale, normalize):
 class TestRouterContracts(unittest.TestCase):
     """Keep incompatible scoring/selection/state protocols explicitly separated."""
 
-    def setUp(self):
+    def setUp(self) -> None:
+        """Seed deterministic router inputs."""
         torch.manual_seed(20261117)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_scoring_selection_and_all_gradients(self):
-        """Logits/weights/indices match a per-row oracle across scoring, normalization and bias shapes."""
+        """Feature: Router contracts.
+        Description: Logits/weights/indices match a per-row oracle across scoring, normalization and bias shapes.
+        Expectation: Scoring selection and all gradients.
+        """
         for scoring in ("sigmoid", "softmax", "sqrtsoftplus"):
             for normalize in (False, True):
                 for batched_bias in (False, True):
@@ -82,8 +87,12 @@ class TestRouterContracts(unittest.TestCase):
                         torch.testing.assert_close(left.grad, right.grad, atol=2e-6, rtol=2e-5)
                         torch.testing.assert_close(member.weight.grad, weight.grad, atol=2e-6, rtol=2e-5)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_source_meta_empty_update_restore_and_registration(self):
-        """Public state survives source adoption, meta construction, an optimizer step and restore."""
+        """Feature: Router contracts.
+        Description: Public state survives source adoption, meta construction, an optimizer step and restore.
+        Expectation: Source meta empty update restore and registration.
+        """
         config = GateConfig(4, 6, 2)
         source = GateModule(config=config).eval()
         source.weight.requires_grad_(False)
@@ -116,8 +125,12 @@ class TestRouterContracts(unittest.TestCase):
         self.assertEqual(tuple(empty[0].shape), (0, 6))
         self.assertEqual(tuple(empty[1].shape), (0, 2))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_model_router_reuses_math_without_owning_model_state(self):
-        """Model correction bias/state stays outside the public math boundary."""
+        """Feature: Router contracts.
+        Description: Model correction bias/state stays outside the public math boundary.
+        Expectation: Model router reuses math without owning model state.
+        """
         config = SimpleNamespace(hidden_size=4, num_local_experts=6, num_experts_per_tok=2,
                                  scoring_func="sigmoid", routed_scaling_factor=1.5,
                                  v41_vision_enabled=True, router_aux_loss_coef=0.0)
@@ -141,22 +154,12 @@ class TestRouterContracts(unittest.TestCase):
         copied = deepcopy(model)
         self.assertIsNot(copied.weight, model.weight)
 
-    def test_token_choice_group_contract_is_not_logits_contract(self):
-        """Existing group-first selection cannot be silently replaced by select-then-normalize routing."""
-        member = TokenChoiceTopKRouter(config=TokenChoiceTopKRouterConfig(
-            2, 4, top_k=2, num_expert_groups=2, num_limited_groups=1, route_scale=1.7))
-        member.gate.weight.data.copy_(torch.tensor([[2., 0.], [1., 0.], [-1., 0.], [-2., 0.]]))
-        weights, indices, counts = member(torch.tensor([[1., 0.]]), torch.tensor([0., 0., 100., 100.]))
-        self.assertEqual(set(indices.flatten().tolist()), {0, 1})
-        torch.testing.assert_close(weights.sort(-1).values,
-                                   (torch.sigmoid(torch.tensor([[2., 1.]])) * 1.7).sort(-1).values)
-        self.assertEqual(counts.tolist(), [1, 1, 0, 0])
-        with self.assertRaises(ValueError):
-            TokenChoiceTopKRouter(config=TokenChoiceTopKRouterConfig(
-                2, 4, top_k=3, num_expert_groups=2, num_limited_groups=1))
-
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mega_gate_class_source_and_rng(self):
-        """The Gate mega member uses a class and source adoption does not consume initialization RNG."""
+        """Feature: Router contracts.
+        Description: The Gate mega member uses a class and source adoption does not consume initialization RNG.
+        Expectation: Mega gate class source and rng.
+        """
         source = CoreMegaGate(hidden_size=4, num_experts=6, top_k=2, vision_enabled=True,
                               scoring_func="sigmoid", routed_scaling_factor=1.0)
         before = torch.random.get_rng_state()
@@ -173,8 +176,12 @@ class TestRouterContracts(unittest.TestCase):
             meta = Gate(config=MegaGateConfig(4, 6, 2), implementation="mega")
         self.assertTrue(meta.weight.is_meta)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_routing_contracts(self):
-        """Invalid mathematical settings and unsupported bias layouts fail at boundaries."""
+        """Feature: Router contracts.
+        Description: Invalid mathematical settings and unsupported bias layouts fail at boundaries.
+        Expectation: Invalid routing contracts.
+        """
         config = GateConfig(4, 6, 2)
         for update in ({"top_k": 0}, {"top_k": True}, {"top_k": 7}, {"scoring_func": "unknown"},
                        {"routed_scaling_factor": float("nan")}, {"normalize_topk": 1},
@@ -187,8 +194,12 @@ class TestRouterContracts(unittest.TestCase):
             with self.subTest(shape=bias.shape), self.assertRaises(ValueError):
                 select_topk_scores(torch.rand(3, 6), top_k=2, correction_bias=bias)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_projection_preserves_enclosing_autocast_policy(self):
-        """The new ordinary contract retains the existing source projection's AMP dtype behavior."""
+        """Feature: Router contracts.
+        Description: The new ordinary contract retains the existing source projection's AMP dtype behavior.
+        Expectation: Projection preserves enclosing autocast policy.
+        """
         member = GateModule(config=GateConfig(4, 6, 2, routed_scaling_factor=1.7))
         source = CoreMegaGate(hidden_size=4, num_experts=6, top_k=2, scoring_func="sigmoid",
                               routed_scaling_factor=1.7)

@@ -19,26 +19,30 @@ import unittest
 
 import torch
 
-from examples.torch.module_family.config import TokenChoiceTopKRouterConfig
+from examples.torch.module_family.config import GateConfig
 
 from hyper_parallel.components.modules.module_family import get_module_family
+from tests.common.mark_utils import arg_mark
 
 
 class TestFamilyImportCompatibility(unittest.TestCase):
     """Keep old import identities without duplicate implementation or registration."""
 
-    def test_default_member_names_are_local(self):
-        """The public ordinary member has one stable name across the migrated families."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_default_member_names_are_local(self) -> None:
+        """Feature: Module family member names.
+        Description: Inspect migrated canonical registrations.
+        Expectation: Every family retains a local default member.
+        """
         entries = (
             ("common.rms_norm", ("RMSNorm", "OffsetRMSNorm")),
             ("swiglu_mlp_family", ("SwiGLUMLP",)),
-            ("shared_expert_family", ("SharedExpert",)),
+            ("moe.shared_expert", ("SharedExpert",)),
             ("common.rotary_embedding", ("RotaryEmbedding",)),
             ("common.spatial_merge_projector", ("SpatialMergeProjector",)),
-            ("router_family", ("TokenChoiceTopKRouter",)),
+            ("moe.router", ("Gate",)),
             ("mhc.mhc_family", ("MHCPre", "MHCPost", "PipelinedMhc", "MegaMhc")),
             ("engram.engram_family", ("Engram",)),
-            ("gate_family", ("Gate",)),
         )
         for module_name, factories in entries:
             module = importlib.import_module(f"hyper_parallel.components.modules.{module_name}")
@@ -49,13 +53,18 @@ class TestFamilyImportCompatibility(unittest.TestCase):
                     self.assertIn("local", family.variants)
 
 
-    def test_family_exports(self):
-        """Public exports use the canonical family classes and builders."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_family_exports(self) -> None:
+        """Feature: Canonical public exports.
+        Description: Compare package exports with the canonical implementations.
+        Expectation: Each factory registers once and keeps its public identity.
+        """
         public = importlib.import_module("hyper_parallel.components.modules")
         for name, cls, factory in (
             ("common.rms_norm", "RMSNormModule", "RMSNorm"),
             ("swiglu_mlp_family", "SwiGLUMLPModule", "SwiGLUMLP"),
-            ("shared_expert_family", "SharedExpertModule", "SharedExpert"),
+            ("moe.shared_expert", "SharedExpertModule", "SharedExpert"),
+            ("moe.router", "GateModule", "Gate"),
         ):
             with self.subTest(name=name):
                 canonical = importlib.import_module(f"hyper_parallel.components.modules.{name}")
@@ -67,8 +76,12 @@ class TestFamilyImportCompatibility(unittest.TestCase):
                 self.assertIs(get_module_family(getattr(public, factory)),
                               get_module_family(getattr(canonical, factory)))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_package_exports(self):
-        """Old mHC/Engram paths expose the same objects as the implementation files."""
+        """Feature: Family import compatibility.
+        Description: Old mHC/Engram paths expose the same objects as the implementation files.
+        Expectation: Package exports.
+        """
         for package, implementation, cls, factory in (
             ("mhc", "mhc_pre", "MhcPreModule", "MHCPre"),
             ("mhc", "mhc_post", "MhcPostModule", "MHCPost"),
@@ -87,17 +100,21 @@ class TestFamilyImportCompatibility(unittest.TestCase):
                 self.assertTrue(getattr(getattr(family, factory), "_hp_module_replacement", False))
                 self.assertIsNotNone(get_module_family(getattr(family, factory)))
 
-    def test_public_router_is_the_canonical_family(self):
-        """Root imports support config construction and source replacement through the same family."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_public_router_is_the_canonical_family(self) -> None:
+        """Feature: Public router factory.
+        Description: Build directly and replace a source through public imports.
+        Expectation: Both paths use the canonical family and preserve source state.
+        """
         public = importlib.import_module("hyper_parallel.components.modules")
-        canonical = importlib.import_module("hyper_parallel.components.modules.router_family")
-        self.assertIs(public.TokenChoiceTopKRouter, canonical.TokenChoiceTopKRouter)
-        self.assertEqual(get_module_family(public.TokenChoiceTopKRouter).name, "token_choice_topk_router")
-        direct = public.TokenChoiceTopKRouter(config=TokenChoiceTopKRouterConfig(4, 6, 2))
-        self.assertIs(type(direct), canonical.TokenChoiceTopKRouterModule)
-        source = canonical.TokenChoiceTopKRouterModule(config=TokenChoiceTopKRouterConfig(4, 6, 2)).eval()
-        adopted = public.TokenChoiceTopKRouter(module=source)
-        self.assertIs(adopted.gate, source.gate)
+        canonical = importlib.import_module("hyper_parallel.components.modules.moe.router")
+        self.assertIs(public.Gate, canonical.Gate)
+        self.assertEqual(get_module_family(public.Gate).name, "gate")
+        direct = public.Gate(config=GateConfig(4, 6, 2))
+        self.assertIs(type(direct), canonical.GateModule)
+        source = canonical.GateModule(config=GateConfig(4, 6, 2)).eval()
+        adopted = public.Gate(module=source)
+        self.assertIs(adopted.weight, source.weight)
         self.assertFalse(adopted.training)
         values = torch.randn(3, 4)
         for actual, expected in zip(adopted(values), source(values)):

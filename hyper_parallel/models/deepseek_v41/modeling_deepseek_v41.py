@@ -43,10 +43,10 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
-from hyper_parallel.components.modules.shared_expert_family import SharedExpertModule
 from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
+from hyper_parallel.components.modules.moe.shared_expert import SharedExpertModule
 from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation
-from hyper_parallel.components.modules.router_family import routing_scores, select_topk_scores
+from hyper_parallel.components.modules.moe.router import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post

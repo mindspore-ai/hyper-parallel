@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HF-style local gate: projection, scoring and unbiased TopK weights; model state stays outside."""
+"""Gate and token-choice routing protocols with shared family registration."""
+
 from __future__ import annotations
 from collections.abc import Mapping
 from functools import lru_cache
@@ -37,13 +38,12 @@ def routing_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
     raise ValueError(f"unsupported router scoring_func: {scoring_func!r}")
 
 
+
 def select_topk_scores(scores: torch.Tensor, *, top_k: int, correction_bias: torch.Tensor | None = None,
                        routed_scaling_factor: float = 1.0, normalize_topk: bool = True,
                        sorted_indices: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Select with correction bias, then gather unbiased weights and optionally normalize.
 
-    This contract has no group mask. TokenChoiceTopKRouter retains its separate
-    scale-before-group/selection behavior and weights/indices/counts protocol.
     """
     if scores.ndim != 2 or not scores.is_floating_point():
         raise ValueError("scores must be a floating [tokens, experts] tensor")
@@ -66,6 +66,7 @@ def select_topk_scores(scores: torch.Tensor, *, top_k: int, correction_bias: tor
     if normalize_topk:
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
     return weights * routed_scaling_factor, indices
+
 
 
 class GateModule(nn.Module):
@@ -154,12 +155,14 @@ class GateModule(nn.Module):
         return logits, weights, indices
 
 
+
 @lru_cache(maxsize=None)
 def _plan_for_device(device: torch.device) -> Any:
     # HyperMulticore is optional and its runtime is needed only for native NPU calls.
     from hyper_multicore.modules.mega_gate.plan import build_mega_gate_plan  # pylint: disable=import-outside-toplevel
 
     return build_mega_gate_plan(device)
+
 
 
 class MegaGateModule(GateModule):
@@ -260,7 +263,8 @@ class MegaGateModule(GateModule):
                          image_mask=None if image_mask is None else image_mask.view(-1),
                          top_k=self.top_k, routed_scaling_factor=self.routed_scaling_factor)
 
-    def forward(self, hidden_states: torch.Tensor,
+    # The fused NPU API takes a modality mask in the second argument.
+    def forward(self, hidden_states: torch.Tensor,  # pylint: disable=arguments-renamed
                 image_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
         """Use shared Gate math or the equivalent native sqrt-softplus NPU route."""
         if hidden_states.ndim < 2 or hidden_states.shape[-1] != self.hidden_size:
@@ -285,6 +289,7 @@ class MegaGateModule(GateModule):
         return cls(module=module)
 
 
+
 @module_replacement
 def Gate(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
@@ -294,10 +299,17 @@ def Gate(  # pylint: disable=invalid-name
                         context=context, mesh=mesh, implementation=implementation)
 
 
+
 register_module_family(ModuleFamily(
     name="gate", baseline=Gate,
-    variants={"local": "hyper_parallel.components.modules.gate_family.GateModule",
-              "mega": "hyper_parallel.components.modules.gate_family.MegaGateModule"},
+    variants={"local": "hyper_parallel.components.modules.moe.router.GateModule",
+              "mega": "hyper_parallel.components.modules.moe.router.MegaGateModule"},
     default_variant="local", selector_specs={"implementation": SelectorSpec(str, "local")},
     variant_rules=(VariantRule({"implementation": "mega", "parallel": False}, "mega"),),
 ))
+
+
+__all__ = [
+    "Gate", "GateModule", "MegaGateModule",
+    "routing_scores", "select_topk_scores",
+]

@@ -29,10 +29,8 @@ from unittest.mock import MagicMock, call, patch
 import torch  # pylint: disable=C0413
 
 from hyper_parallel.core.activation_memory.api import checkpoint_wrapper, checkpoint_exclude_wrapper, swap_wrapper
-from hyper_parallel.components.modules.moe_utils import (  # pylint: disable=C0413
-    MoEMonitorCallback,
-    sync_and_update_expert_bias,
-)
+from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
+from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo  # pylint: disable=C0413
 
 
@@ -61,7 +59,7 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         dp_group = GroupInfo("dp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, dp_group=dp_group)
 
@@ -73,7 +71,7 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         mock_pg = MagicMock(spec=torch.distributed.ProcessGroup)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, dp_group=mock_pg)
 
@@ -88,7 +86,7 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
             moe.tokens_per_expert, torch.tensor([2.0, 4.0, 6.0, 8.0]),
         )
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
             mock_all_reduce.side_effect = lambda tensor, **_kwargs: tensor.mul_(2)
             sync_and_update_expert_bias(moe, dp_group=group)
 
@@ -102,7 +100,7 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         cp_group = GroupInfo("cp_group", MagicMock(), 2)
         dp_group = GroupInfo("dp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(
                 moe, lr=1e-3, tp_group=tp_group, cp_group=cp_group, dp_group=dp_group,
@@ -129,7 +127,7 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         tp_group = GroupInfo("tp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, tp_group=tp_group)
 
@@ -141,7 +139,7 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         cp_group = GroupInfo("cp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, cp_group=cp_group)
 
@@ -152,7 +150,7 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
 class TestMoEMonitorCallback(unittest.TestCase):
     """Unit tests for MoEMonitorCallback (Layer 1+2 of the three-layer architecture)."""
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_wrapped_router_is_counted_once(self, mock_sync):
         """Checkpointing leaves logical layer weights and bias-update count unchanged."""
         for wrap in (checkpoint_wrapper, checkpoint_exclude_wrapper, swap_wrapper):
@@ -223,7 +221,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
         model.modules.return_value = list(moe_layers)
         return model, moe_layers
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_lbm01_iterates_moe_layers(self, mock_sync):
         """LB-M01: on_step_end iterates all MoE layers and calls sync per layer."""
         model, moe_layers = self._make_model_with_moe_layers(num_layers=3)
@@ -242,7 +240,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
                 num_recomputations=1,
             )
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_lbm02_skip_disabled_layers(self, mock_sync):
         """LB-M02: Layers with enable_expert_bias=False are skipped."""
         model, _ = self._make_model_with_moe_layers(
@@ -330,7 +328,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
         callback.on_step_end.assert_called_once_with()
         callback.remove()
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_lbm05_stores_mean_aux_loss(self, mock_sync):  # pylint: disable=W0613
         """LB-M05: the monitor exposes the mean of the latest layer aux losses."""
         model, moe_layers = self._make_model_with_moe_layers(num_layers=2)
@@ -343,7 +341,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
         self.assertIsInstance(callback.last_mean_aux_loss, torch.Tensor)
         torch.testing.assert_close(callback.last_mean_aux_loss, torch.tensor(0.2))
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_lbm05b_no_aux_loss_stores_none(self, mock_sync):  # pylint: disable=W0613
         """LB-M05b: last_mean_aux_loss is None when all layers have no aux_loss."""
         model, _ = self._make_model_with_moe_layers(num_layers=2)
@@ -353,7 +351,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
 
         self.assertIsNone(callback.last_mean_aux_loss)
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_aux_loss_available_with_bias_updates_disabled(self, mock_sync):
         """
         Feature: Auxiliary-loss logging.
@@ -368,7 +366,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
         mock_sync.assert_not_called()
         self.assertEqual(callback.last_mean_aux_loss, 1.25)
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_aux_loss_passes_source_tensor_through_until_logging(self, mock_sync):
         """
         Feature: Unified eager and graph auxiliary-loss access.
@@ -391,7 +389,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
         layers[0].last_aux_loss = None
         self.assertIsNone(callback.last_mean_aux_loss)
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_lbm06_multi_layer_different_num_experts(self, mock_sync):
         """LB-M06: Multi-layer with different num_experts, each synced correctly."""
         model, moe_layers = self._make_model_with_moe_layers(
@@ -413,7 +411,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
         self.assertIs(call_moe_args[0], moe_layers[0])
         self.assertIs(call_moe_args[1], moe_layers[1])
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.components.modules.moe.moe_utils.sync_and_update_expert_bias")
     def test_lbm07_no_moe_layers_no_error(self, mock_sync):
         """LB-M07: Model with no MoE layers does not trigger sync or error."""
         model = MagicMock()
