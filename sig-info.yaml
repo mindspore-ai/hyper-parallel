@@ -1,0 +1,68 @@
+name: Parallel Training System
+description: Parallel Training System SIG（Special Interest Group）是 MindSpore 开源社区下聚焦于利用分布式并行技术加速AI大模型训练的技术团队，团队致力于提升语言、多模态、全模态等大模型在分布式并行训练场景下的易用性与性能等方面的表现，提供可高效开发、灵活组合多种并行策略的并行编程范式，简化并行编程的复杂度，为开发者带来极简高效的分布式并行训练体验。
+description_en: The Parallel Training System SIG (Special Interest Group) is a technical team within the MindSpore open-source community focused on accelerating AI large model training using distributed parallel technologies. The team is dedicated to enhancing the usability and performance of large models (such as language, multimodal, and omnidirectional models) in distributed parallel training scenarios. It provides a parallel programming paradigm that enables efficient development and flexible combination of various parallel strategies, simplifies the complexity of parallel programming, and offers developers an extremely simple and efficient distributed parallel training experience.
+created_on: '2025-10-11'
+mailing_list: dev@mindspore.cn
+mature_level: startup
+mentors:
+- github_id: mr-cheng-li
+  name: Li Cheng
+  organization: University of Science and Technology of China
+  email: chengli7@ustc.edu.cn
+# Roster field | Scope for reviewing and merging PRs | Additional responsibility
+# maintainers  | All SIG repositories                | Set the SIG's technical direction
+# repo-admin   | Listed repositories                 | Manage settings and access for those repositories
+# committers   | Listed repositories                 | —
+# Maintainers and repo admins both perform committer duties within the scope shown above.
+# Maintainer and repo-admin are separate appointments. A person may hold both.
+# GitHub enforces repository permissions and branch rules for these operations.
+maintainers:
+- github_id: suteng
+  name: Su Teng
+  organization: HUAWEI
+  email: suteng@huawei.com
+- github_id: yangzhenzhang02
+  name: Yang Zhenzhang
+  organization: HUAWEI
+  email: yangzhenzhang@huawei.com
+- github_id: kisnwangg
+  name: Wang Kaisheng
+  organization: HUAWEI
+  email: wangkaisheng2@huawei.com
+- github_id: yaoyifanx
+  name: Yao Yifan
+  organization: HUAWEI
+  email: yaoyifan1@huawei.com
+- github_id: liuchongming74
+  name: Liu Chongming
+  organization: HUAWEI
+  email: liuchongming1@huawei.com
+repositories:
+- repo:
+  - mindspore-ai/hyper-parallel
+  repo-admin:
+  - github_id: xingleixu123
+    name: Xu Xinglei
+    organization: Huawei
+    email: xuxinglei1@huawei.com
+  - github_id: yanwei-liu-hw
+    name: Liu Yanwei
+    organization: HUAWEI
+    email: liuyanwei6@huawei.com
+  committers:
+  - github_id: lichen666
+    name: Li Chen
+    organization: HUAWEI
+    email: lichen79@huawei.com
+  - github_id: DavidFFFan
+    name: Fan Dawei
+    organization: HUAWEI
+    email: fandawei2@huawei.com
+  - github_id: mxysfive
+    name: Meng Xiangyu
+    organization: HUAWEI
+    email: mengxiangyu22@huawei.com
+  - github_id: yu-chen-code
+    name: Shi Zhenyu
+    organization: HUAWEI
+    email: shizhenyu5@huawei.com
