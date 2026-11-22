@@ -55,7 +55,12 @@ class _RouterWithLoad(nn.Module):
         self.register_buffer("bias", torch.zeros(counts.shape))
 
     def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
-        """Apply the requested bias step to experts above or below the mean load."""
+        """Apply the requested bias step to experts above or below the mean load.
+
+        Args:
+            lr: Bias update step size.
+            num_recomputations: Number of counted forwards per microbatch.
+        """
         counts = self.tokens_per_expert.float() / num_recomputations
         self.bias.add_((counts.mean() - counts).sign(), alpha=lr)
         self.tokens_per_expert.zero_()

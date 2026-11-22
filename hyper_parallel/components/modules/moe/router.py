@@ -12,27 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""One Gate family owning routing and optional training state."""
-
+"""One Gate family owning routing, optional training state and MegaGate execution."""
 from __future__ import annotations
+
 from collections.abc import Mapping
 from functools import lru_cache
 from math import isfinite, prod
 from typing import Any
+
 import torch
 from torch import nn
 from torch.nn import functional as F
-from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
-from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
-from hyper_parallel.components.modules.moe.moe_utils import (
-    local_router_metadata,
-    router_sharding,
-    validate_router_layout,
-)
-from hyper_parallel.models.replacement import module_replacement
+
+from hyper_parallel.components.checkpoint.weight_conversion import ConversionOps, WeightConverter, WeightRenaming
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.losses.moe_aux_loss import sequence_load_balancing_loss
+from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
+from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
+from hyper_parallel.components.modules.moe.moe_utils import (
+    accumulate_router_load, local_router_metadata, router_sharding,
+    update_router_bias, validate_router_layout,
+)
 from hyper_parallel.distributed.module_binding import ParallelBinding, ParallelModuleSpec
+from hyper_parallel.models.materialization import register_rebuildable_buffer
+from hyper_parallel.models.replacement import module_replacement
 
 
 def _setting(sources: tuple, names: tuple[str, ...], default: Any) -> Any:
@@ -43,6 +46,49 @@ def _setting(sources: tuple, names: tuple[str, ...], default: Any) -> Any:
                 return value
     return default
 
+
+class _InitialRouterBias(ConversionOps):
+    """Derive training-only correction bias when importing a bias-free HF router."""
+
+    def __init__(self, reverse: bool = False) -> None:
+        self.reverse = reverse
+
+    def convert(self, input_dict: dict[str, Any], source_patterns: list[str],
+                target_patterns: list[str], **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Preserve the projection and initialize only newly introduced FP32 bias.
+
+        Args:
+            input_dict: Native projection on import, family projection/bias on export.
+            source_patterns: Collected source keys in the router scope.
+            target_patterns: Projection key and, on import, correction-bias key.
+            **kwargs: Additional checkpoint-loader context, unused.
+
+        Returns:
+            Unchanged projection plus zero FP32 bias on import; projection on HF export.
+        """
+        del kwargs
+        weight = input_dict[source_patterns[0]]
+        weight = weight[0] if isinstance(weight, list) else weight
+        result = {target_patterns[0]: weight}
+        if not self.reverse:
+            result[target_patterns[1]] = torch.zeros(weight.shape[0], device=weight.device, dtype=torch.float32)
+        return result
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        """Exclude derived correction state only when exporting a native HF checkpoint."""
+        return _InitialRouterBias(reverse=not self.reverse)
+
+
+def _router_transforms(module: nn.Module, projection: str) -> list[WeightRenaming | WeightConverter]:
+    """Keep native state and derive correction bias only when it has no source key."""
+    parameters = dict(module.named_parameters())
+    if "bias" in parameters and not module.source_has_correction_bias:
+        return [WeightConverter(source_patterns=projection, target_patterns=[projection, "bias"],
+                                operations=[_InitialRouterBias()]),
+                *(WeightRenaming(source_patterns=name, target_patterns=name)
+                  for name in parameters if name not in (projection, "bias"))]
+    return [WeightRenaming(source_patterns=name, target_patterns=name) for name in parameters]
 
 
 def routing_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
@@ -61,12 +107,10 @@ def routing_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
     raise ValueError(f"unsupported router scoring_func: {scoring_func!r}")
 
 
-
 def select_topk_scores(scores: torch.Tensor, *, top_k: int, correction_bias: torch.Tensor | None = None,
                        routed_scaling_factor: float = 1.0, normalize_topk: bool = True,
                        sorted_indices: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Select with correction bias, then gather unbiased weights and optionally normalize.
-
 
     Args:
         scores: Floating unbiased expert scores [tokens, experts].
@@ -99,7 +143,6 @@ def select_topk_scores(scores: torch.Tensor, *, top_k: int, correction_bias: tor
     return weights * routed_scaling_factor, indices
 
 
-
 def balanced_expert_indices(indices: torch.Tensor, num_experts: int, ep_size: int = 1) -> torch.Tensor:
     """Replace destinations with the existing deterministic owner-major routing pattern.
 
@@ -125,14 +168,15 @@ def balanced_expert_indices(indices: torch.Tensor, num_experts: int, ep_size: in
     return fixed.reshape_as(indices).to(indices.dtype)
 
 
-
 class GateModule(nn.Module):
     """Own common gate configuration, projection state, initialization and routing math.
 
-    Projection still follows the enclosing Torch autocast policy, as the model
-    source does. Optional training state is shared with the token-choice Router;
+    Projection uses FP32 operands under the enclosing Torch autocast policy.
+    The same module owns optional balancing state and parallel statistics;
     fused execution belongs to the MegaGate variant.
     """
+
+    fp32_parameter_names = ("bias",)
 
     def __init__(self, *, config: Any = None, module: nn.Module | None = None,
                  context: Mapping[str, Any] | None = None) -> None:
@@ -143,6 +187,7 @@ class GateModule(nn.Module):
         if module is not None:
             self._validate_source(module)
         source = config if config is not None else module
+        self.source_has_correction_bias = module is not None and getattr(module, "bias", None) is not None
         self._set_routing_settings(source)
         if module is None:
             self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
@@ -191,15 +236,17 @@ class GateModule(nn.Module):
     def reset_parameters(self) -> None:
         """Initialize the projection after direct/meta construction."""
         nn.init.normal_(self.weight, std=self.initializer_range)
+        bias = getattr(self, "bias", None)
+        if bias is not None:
+            nn.init.zeros_(bias)
 
-    def make_transforms(self) -> list:
-        """Declare that this member keeps parameter names and layouts unchanged.
+    def make_transforms(self) -> list[WeightRenaming | WeightConverter]:
+        """Map native projection/state and derive optional training-only correction bias.
 
         Returns:
-            An empty converter list, matching members whose initialization is
-            fully owned by ``reset_parameters``.
+            Native state mappings and, when required, a zero FP32 bias initializer.
         """
-        return []
+        return _router_transforms(self, "weight")
 
     def forward(self, hidden_states: torch.Tensor,
                 correction_bias: torch.Tensor | None = None, *,
@@ -219,6 +266,9 @@ class GateModule(nn.Module):
         if hidden_states.ndim < 2 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError("hidden_states must end in hidden_size and include a token dimension")
         token_mask, sequence_ids = self._metadata(hidden_states, token_mask, sequence_ids)
+        own_bias = getattr(self, "bias", None)
+        if own_bias is not None:
+            correction_bias = own_bias if correction_bias is None else own_bias + correction_bias
         logits = F.linear(  # pylint: disable=not-callable
             hidden_states.reshape(-1, self.hidden_size).float(), self.weight.float())
         scores = routing_scores(logits, self.scoring_func)
@@ -247,10 +297,9 @@ class GateModule(nn.Module):
         )
         return weights, indices
 
-
     def _init_router_training(self, source: Any, context: Mapping[str, Any] | None,
                               weight: nn.Parameter, module: nn.Module | None = None) -> None:
-        """Resolve router options and initialize parallel routing state."""
+        """Resolve router options and install state for backward accounting."""
         sources = (*tuple((context or {}).get("module_configs", ())), source)
         self.fix_router = _setting(
             sources, ("moe_router_force_load_balancing", "fix_router", "router_fix_router"), False,
@@ -258,18 +307,69 @@ class GateModule(nn.Module):
         if not isinstance(self.fix_router, bool):
             raise ValueError("moe_router_force_load_balancing must be bool")
         for name, aliases in (
-                ("aux_loss_coeff", ("moe_aux_loss_coeff", "aux_loss_coeff", "router_aux_loss_coeff")),
-        ):
+                ("aux_loss_coeff", (
+                    "moe_aux_loss_coeff", "aux_loss_coeff", "router_aux_loss_coeff",
+                )),
+                ("expert_bias_update_rate", (
+                    "moe_router_bias_update_rate", "expert_bias_update_rate", "router_bias_update_rate",
+                ))):
             value = _setting(sources, aliases, 0.0)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
                 raise ValueError(f"{aliases[0]} must be finite and nonnegative")
             setattr(self, name, float(value))
+        self.enable_expert_bias = self.expert_bias_update_rate > 0
         self.last_aux_loss = None
         self.router_ep_size = 1
         self.router_tp_mesh = None
         self.sequence_partition_groups = ()
         self.expert_bias_update_groups = None
+        counts = getattr(module, "tokens_per_expert", None)
+        if module is not None and counts is None and not self.enable_expert_bias:
+            # A source without bias balancing has no registered counter to preserve.
+            self.tokens_per_expert = None
+            return
+        if counts is None:
+            counts = torch.zeros(self.num_experts, dtype=torch.int64, device=weight.device)
+        if not all((counts.shape == (self.num_experts,), counts.dtype == torch.int64, counts.device == weight.device)):
+            raise ValueError("source tokens_per_expert must be int64 [num_experts] on the weight device")
+        self.register_buffer("tokens_per_expert", counts, persistent=False)
+        register_rebuildable_buffer(self, "tokens_per_expert", value=torch.zeros(
+            self.num_experts, dtype=torch.int64, device="cpu",
+        ))
+        if self.enable_expert_bias:
+            self._register_correction_state(module, weight)
 
+    def _register_correction_state(self, module: nn.Module | None, weight: nn.Parameter) -> None:
+        """Create or adopt the expert bias used for auxiliary-loss-free balancing."""
+        parameter = getattr(module, "bias", None)
+        if parameter is None:
+            parameter = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32, device=weight.device),
+                                     requires_grad=False)
+        else:
+            if (not isinstance(parameter, nn.Parameter) or parameter.shape != (self.num_experts,)
+                    or parameter.dtype != torch.float32 or parameter.device != weight.device):
+                raise ValueError("source bias must be an FP32 Parameter [num_experts] on the weight device")
+            parameter.requires_grad_(False)
+        self.register_parameter("bias", parameter)
+
+    def _apply(self, fn: Any, recurse: bool = True) -> Any:
+        """Keep selection correction state and its gradients FP32 during dtype conversion."""
+        parameters = tuple(getattr(self, name, None) for name in self.fp32_parameter_names)
+        protected = {id(value) for parameter in parameters if parameter is not None
+                     for value in (parameter, parameter.grad) if value is not None}
+
+        def apply(tensor: torch.Tensor) -> torch.Tensor:
+            """Apply storage conversion while preserving correction precision.
+
+            Args:
+                tensor: Parameter, gradient or buffer visited by the module conversion.
+            """
+            converted = fn(tensor)
+            if id(tensor) not in protected or converted.dtype == torch.float32:
+                return converted
+            return converted.float() if tensor.is_meta else tensor.to(device=converted.device, dtype=torch.float32)
+
+        return super()._apply(apply, recurse=recurse)
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
         """Declare a replicated router that borrows existing statistics meshes."""
@@ -277,7 +377,6 @@ class GateModule(nn.Module):
             protocol="moe.router.statistics", binding_kind="mesh",
             stages={"forward": ("hidden_states",)}, validate=validate_router_layout,
         )
-
 
     def bind_parallel(self, binding: ParallelBinding) -> None:
         """Bind source-token statistics independently of expert transport.
@@ -304,18 +403,16 @@ class GateModule(nn.Module):
         self.sequence_partition_groups = sequence_groups
         self.expert_bias_update_groups = dp_groups + sequence_groups
 
-
     def _metadata(self, hidden: torch.Tensor, token_mask: torch.Tensor | None,
                   sequence_ids: torch.Tensor | None) -> tuple:
         return tuple(local_router_metadata(value, hidden, self.router_tp_mesh)
                      for value in (token_mask, sequence_ids))
 
-
     def _apply_router_training(self, hidden: torch.Tensor, scores: torch.Tensor, weights: torch.Tensor,
                                indices: torch.Tensor, token_mask: torch.Tensor | None,
                                sequence_ids: torch.Tensor | None,
                                num_sequences: int | None, groups: tuple | None) -> torch.Tensor:
-        """Attach auxiliary gradients to the selected routes."""
+        """Attach auxiliary gradients and count the routes consumed by backward."""
         if token_mask is not None and (token_mask.shape != hidden.shape[:-1] or token_mask.dtype != torch.bool
                                        or token_mask.device != hidden.device):
             raise ValueError("token_mask must be boolean and match local token shape and device")
@@ -327,8 +424,9 @@ class GateModule(nn.Module):
             )
             self.last_aux_loss = auxiliary.detach()
             weights = aux_loss_auto_scale(weights, auxiliary * self.aux_loss_coeff)
+        if self.training and self.enable_expert_bias:
+            weights = accumulate_router_load(weights, indices, token_mask, self.tokens_per_expert)
         return weights
-
 
     def _sequence_auxiliary(self, hidden: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
                             valid: torch.Tensor | None, sequence_ids: torch.Tensor | None,
@@ -346,6 +444,23 @@ class GateModule(nn.Module):
             self.sequence_partition_groups if groups is None else groups,
         )
 
+    @torch.no_grad()
+    def update_expert_bias(self, lr: float | None = None, num_recomputations: int = 1) -> None:
+        """Update selection state once after the step's consumed backwards.
+
+        Args:
+            lr: Override update speed, otherwise use the configured rate.
+            num_recomputations: Compatibility argument; backward counters need no replay correction.
+        """
+        del num_recomputations
+        rate = self.expert_bias_update_rate if lr is None else lr
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not isfinite(rate) or rate < 0:
+            raise ValueError("lr must be finite and nonnegative")
+        rate = float(rate)
+        if self.enable_expert_bias:
+            update_router_bias(self.bias, self.tokens_per_expert, rate)
+        if self.tokens_per_expert is not None:
+            self.tokens_per_expert.zero_()
 
 
 @lru_cache(maxsize=None)
@@ -356,7 +471,6 @@ def _plan_for_device(device: torch.device) -> Any:
     return build_mega_gate_plan(device)
 
 
-
 class MegaGateModule(GateModule):
     """Extend the ordinary gate with correction biases and a fused NPU route.
 
@@ -364,6 +478,7 @@ class MegaGateModule(GateModule):
     supplies the native function and plan, without owning this module's state.
     """
 
+    fp32_parameter_names = ("bias", "bias_vl")
 
     def __init__(self, *, config: Any = None, module: nn.Module | None = None,
                  module_fqn: str = "", context: Mapping[str, Any] | None = None) -> None:
@@ -382,9 +497,17 @@ class MegaGateModule(GateModule):
         if not isinstance(vision_enabled, bool):
             raise TypeError("vision_enabled must be bool")
         super().__init__(config=config, module=module, context=context)
+        self._initialize_correction_state(module, vision_enabled)
+
+    def _initialize_correction_state(self, module: nn.Module | None, vision_enabled: bool) -> None:
+        """Initialize or adopt the fused backend's text and optional image biases."""
+        vision_enabled = vision_enabled or getattr(self, "bias_vl", None) is not None
         for name in ("bias", "bias_vl"):
             if name == "bias_vl" and not vision_enabled:
                 self.register_parameter(name, None)
+                continue
+            existing = getattr(self, name, None)
+            if existing is not None:
                 continue
             if module is None:
                 parameter = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32, device=self.weight.device))
@@ -395,12 +518,10 @@ class MegaGateModule(GateModule):
                     raise ValueError(f"source {name} must be an FP32 Parameter [num_experts] on the weight device")
             setattr(self, name, parameter)
 
-
     def reset_parameters(self) -> None:
-        """Reset the common projection and MegaGate-specific correction state."""
+        """Reset common projection/bias and the fused variant's optional vision bias."""
         super().reset_parameters()
-        nn.init.zeros_(self.bias)
-        if self.bias_vl is not None:
+        if getattr(self, "bias_vl", None) is not None:
             nn.init.zeros_(self.bias_vl)
 
     @classmethod
@@ -417,37 +538,11 @@ class MegaGateModule(GateModule):
         if module.__class__ is not SourceMegaGate:
             raise TypeError("MegaGate family accepts only the public MegaGate; use a model adapter for other routers")
 
-    def make_transforms(self) -> list:
-        """Declare that this member keeps parameter names and layouts unchanged.
-
-        Returns:
-            An empty converter list, matching members whose initialization is
-            fully owned by ``reset_parameters``.
-        """
-        return []
-
-
-    def _apply(self, fn: Any, recurse: bool = True) -> MegaGateModule:
-        """Preserve declared FP32 parameters and gradients during conversion."""
-        # Keep correction values and their gradients FP32 through model dtype conversion.
-        protected = {id(parameter) for parameter in (self.bias, self.bias_vl) if parameter is not None}
-        protected.update(id(parameter.grad) for parameter in self.parameters() if parameter.grad is not None
-                         and id(parameter) in protected)
-
-        def apply(tensor: torch.Tensor) -> torch.Tensor:
-            converted = fn(tensor)
-            if id(tensor) not in protected or converted.dtype == torch.float32:
-                return converted
-            return converted.float() if tensor.is_meta else tensor.to(device=converted.device, dtype=torch.float32)
-
-        return super()._apply(apply, recurse=recurse)
-
-
     def _torch_forward(self, hidden_states: torch.Tensor,
                        image_mask: torch.Tensor | None, **metadata: Any) -> tuple[torch.Tensor, ...]:
         """Keep fused vision selection local to this variant; training counts stay standard."""
         if image_mask is None:
-            return super().forward(hidden_states, correction_bias=self.bias, **metadata)
+            return super().forward(hidden_states, **metadata)
         correction_bias = torch.where(image_mask.reshape(-1, 1), self.bias_vl, self.bias)
         logits = F.linear(  # pylint: disable=not-callable
             hidden_states.reshape(-1, self.hidden_size).float(), self.weight.float())
@@ -520,7 +615,6 @@ class MegaGateModule(GateModule):
         return cls(module=module)
 
 
-
 @module_replacement
 def Gate(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
@@ -528,7 +622,6 @@ def Gate(  # pylint: disable=invalid-name
     """Build a local gate or the compatible MegaGate execution variant."""
     return build_family(Gate, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, implementation=implementation)
-
 
 
 register_module_family(ModuleFamily(
@@ -539,7 +632,6 @@ register_module_family(ModuleFamily(
     selector_specs={"implementation": SelectorSpec(str, "local")},
     variant_rules=(VariantRule({"implementation": "mega", "parallel": False}, "mega"),),
 ))
-
 
 
 __all__ = [

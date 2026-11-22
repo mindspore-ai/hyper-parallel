@@ -142,9 +142,7 @@ class DeepseekV41MegaGate(MegaGate):
         del num_recomputations
         if lr is None:
             lr = self.expert_bias_update_rate
-        update_modality_bias(self.bias, self.tokens_per_expert[0], lr)
-        if self.bias_vl is not None:
-            update_modality_bias(self.bias_vl, self.tokens_per_expert[1], lr)
+        update_modality_bias(self.bias, self.tokens_per_expert, lr, vision_bias=self.bias_vl)
         self.tokens_per_expert.zero_()
 
 

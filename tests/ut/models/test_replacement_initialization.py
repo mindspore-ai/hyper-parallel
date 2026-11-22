@@ -214,7 +214,7 @@ class TestReplacementInitialization(unittest.TestCase):
                     model = _NativeChildrenModel(source)
                 source_parameters = dict(source.named_parameters())
                 plan = compile_module_replacements(model, [ModuleReplacementSpec(("component",), factory)])
-                apply_module_replacements(model, plan)
+                apply_module_replacements(model, plan, weights_mapping=[])
                 for name, parameter in source_parameters.items():
                     self.assertIs(model.component.get_parameter(name), parameter)
                 model.to_empty(device="cpu")
@@ -246,7 +246,7 @@ class TestReplacementInitialization(unittest.TestCase):
                         model = nn.Sequential(constructor(config=config))
                     if replace_source:
                         plan = compile_module_replacements(model, [ModuleReplacementSpec(("0",), factory)])
-                        apply_module_replacements(model, plan)
+                        apply_module_replacements(model, plan, weights_mapping=[])
                     model.to_empty(device="cpu")
                     with ExitStack() as stack:
                         resets = [stack.enter_context(patch.object(

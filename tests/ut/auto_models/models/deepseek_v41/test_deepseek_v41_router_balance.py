@@ -14,7 +14,9 @@
 # ============================================================================
 """V4.1 modality balancing across backward, recomputation and optimizer steps."""
 
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 import unittest
 from unittest.mock import Mock, patch
 
@@ -29,6 +31,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
 from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
 from hyper_parallel.trainer.base import BaseTrainer
+from tests.common.mark_utils import arg_mark
 
 
 def make_router(rate: float = 0.001, coefficient: float = 0.0001) -> DeepseekV41TopKRouter:
@@ -53,6 +56,7 @@ class TestModalityRouterBalance(unittest.TestCase):
         self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
         DefaultDeviceType.set_device_type("cpu")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_ep_auxiliary_coefficients_independently_disable_statistics(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -68,8 +72,16 @@ class TestModalityRouterBalance(unittest.TestCase):
         mesh.__getitem__ = Mock(return_value=dp)
         images = torch.tensor([[False, True, False, True]])
 
-        def dispatch(target, states, *, router_fn, ep_group):
-            """Consume the real routing weights without expert communication."""
+        def dispatch(target: Any, states: torch.Tensor, *, router_fn: Callable,
+                     ep_group: Any) -> torch.Tensor:
+            """Consume the real routing weights without expert communication.
+
+            Args:
+                target: Native MoE owner.
+                states: Local token activations.
+                router_fn: Existing adapter routing entry.
+                ep_group: Mock communication group.
+            """
             del ep_group
             _, weights = router_fn(target, states)
             return weights.sum(-1).reshape(*states.shape[:-1], 1).expand_as(states)
@@ -106,6 +118,7 @@ class TestModalityRouterBalance(unittest.TestCase):
                 torch.testing.assert_close(router.bias_vl - image_before, rate * torch.tensor([1., 1., -1.]))
                 torch.testing.assert_close(router.tokens_per_expert, torch.zeros(2, 3, dtype=torch.long))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_and_accumulation_count_each_microbatch_once(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -119,9 +132,17 @@ class TestModalityRouterBalance(unittest.TestCase):
                 valid = torch.tensor([[True, True, False, True]])
 
                 def forward(
-                        hidden: torch.Tensor, router=router, image_mask=images, token_mask=valid,
+                        hidden: torch.Tensor, router: DeepseekV41TopKRouter = router,
+                        image_mask: torch.Tensor = images, token_mask: torch.Tensor = valid,
                 ) -> torch.Tensor:
-                    """Return the routing-weight carrier to the checkpoint wrapper."""
+                    """Return the routing-weight carrier to the checkpoint wrapper.
+
+                    Args:
+                        hidden: Local token activations.
+                        router: Native V4.1 router under test.
+                        image_mask: Image token metadata.
+                        token_mask: Valid token metadata.
+                    """
                     return router(hidden, image_mask, token_mask)[1]
 
                 for _ in range(2):
@@ -133,6 +154,7 @@ class TestModalityRouterBalance(unittest.TestCase):
                 torch.testing.assert_close(router.tokens_per_expert, torch.tensor([[4, 0, 0], [0, 0, 2]]))
                 self.assertFalse(router.tokens_per_expert.requires_grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_frozen_router_still_records_load_when_experts_train(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -148,6 +170,7 @@ class TestModalityRouterBalance(unittest.TestCase):
         torch.testing.assert_close(router.tokens_per_expert, torch.tensor([[2, 0, 0], [0, 0, 0]]))
         self.assertIsNone(router.weight.grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_independent_updates_empty_modality_and_reset(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -169,6 +192,7 @@ class TestModalityRouterBalance(unittest.TestCase):
         self.assertFalse(router.bias_vl.requires_grad)
         self.assertNotIn("tokens_per_expert", router.state_dict())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_optimizer_step_updates_once_after_all_optimizers(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -189,6 +213,7 @@ class TestModalityRouterBalance(unittest.TestCase):
         trainer.step_optimizers_and_schedulers()
         torch.testing.assert_close(router.bias - before, torch.tensor([-0.001, 0.001, 0.001]))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_materialization_resets_nonpersistent_counts(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -206,6 +231,7 @@ class TestModalityRouterBalance(unittest.TestCase):
         router.bfloat16()
         self.assertEqual(router.tokens_per_expert.dtype, torch.long)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_model_owned_groups_override_generic_defaults(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -220,6 +246,7 @@ class TestModalityRouterBalance(unittest.TestCase):
             sync_and_update_expert_bias(router, dp_group=object())
         self.assertEqual([call.kwargs["group"] for call in reduce_counts.call_args_list], list(groups))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_eval_disabled_and_invalid_update_rate(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -234,6 +261,7 @@ class TestModalityRouterBalance(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "router_bias_update_rate"):
                 make_router(rate)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_tp_ep_metadata_alignment_and_bias_statistics_domain(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -257,8 +285,16 @@ class TestModalityRouterBalance(unittest.TestCase):
         images = torch.tensor([[False, False, True, False]])
         valid = torch.tensor([[True, False, True, True]])
 
-        def dispatch(target, states, *, router_fn, ep_group):
-            """Exercise the real gate call without expert communication."""
+        def dispatch(target: Any, states: torch.Tensor, *, router_fn: Callable,
+                     ep_group: Any) -> torch.Tensor:
+            """Exercise the real gate call without expert communication.
+
+            Args:
+                target: Native MoE owner.
+                states: Local token activations.
+                router_fn: Existing adapter routing entry.
+                ep_group: Mock communication group.
+            """
             del ep_group
             router_fn(target, states)
             return torch.zeros_like(states)

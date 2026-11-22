@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Step-level MoE monitoring for Trainer and independent loops."""
+"""Step-level MoE monitoring, also callable from an independent training loop."""
 
 from typing import Any, Optional
 
@@ -65,8 +65,8 @@ class MoEMonitorCallback:
 
     Note:
         Sync dimensions use ``dp_group``/``tp_group``/``cp_group`` (not ``ep_group``).
-        EP does not need synchronization because all EP ranks have identical
-        routing data (``tokens_per_expert`` shape = ``[total_experts]``).
+        The adapter reduces unique data and token partition axes. A TP-extended
+        dispatch group overlaps those axes and must not be reduced again.
     """
 
     def __init__(
@@ -130,7 +130,7 @@ class MoEMonitorCallback:
     def register(self, optimizer: Any) -> None:
         """Register an optimizer post-hook to auto-trigger :meth:`on_step_end`.
 
-        On PyTorch 2.0+, uses ``optimizer.register_step_post_hook``.
+        Uses ``optimizer.register_step_post_hook``.
         The hook fires after each ``optimizer.step()`` call, so that
         expert bias is updated once parameters have been updated. Repeated
         calls replace the existing hook registration.
