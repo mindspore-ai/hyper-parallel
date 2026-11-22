@@ -112,6 +112,7 @@ def _configure_router_statistics(gate: Any, mesh: Any, tp_mesh: Any, cp_mesh: An
 @module_replacement
 def replace_deepseek_v41_grouped_experts(
         *, module: torch.nn.Module, module_fqn: str, context: Mapping[str, Any],
+        moonep: bool = False, moonep_replica_capacity: int | None = None,
 ) -> torch.nn.Module:
     """Adopt the packed V4.1 projections with native FP32 clamped SwiGLU.
 
@@ -119,6 +120,8 @@ def replace_deepseek_v41_grouped_experts(
         module: Original routed experts with the packed Transformers layout.
         module_fqn: Path of the routed experts in the model.
         context: Builder context for selecting the local or EP member.
+        moonep: Use collective MoonEP while preserving the model-owned activation policy.
+        moonep_replica_capacity: Maximum distinct remote experts per execution rank.
 
     Returns:
         GroupedExperts family member preserving the source parameters.
@@ -138,7 +141,9 @@ def replace_deepseek_v41_grouped_experts(
         module=module, module_fqn=module_fqn, context=context,
         activation=partial(deepseek_v41_swiglu, limit=module.limit),
     )
-    return GroupedExperts(module=source, module_fqn=module_fqn, context=context)
+    experts = GroupedExperts(module=source, module_fqn=module_fqn, context=context,
+                             moonep=moonep, moonep_replica_capacity=moonep_replica_capacity)
+    return experts
 
 
 def _router(

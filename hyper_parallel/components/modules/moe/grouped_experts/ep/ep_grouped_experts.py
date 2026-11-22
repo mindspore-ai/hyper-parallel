@@ -79,7 +79,8 @@ class EPGroupedExperts(GroupedExpertsModule):
         Args:
             binding: Job-owned EP resources with matching global expert ownership.
         """
-        if not isinstance(binding.ep_context, EPContext) or binding.ep_context.num_experts != self.config.num_experts:
+        # MoonEP subclasses EPContext but its dispatch consumes a different plan protocol.
+        if binding.ep_context.__class__ is not EPContext or binding.ep_context.num_experts != self.config.num_experts:
             raise ValueError("binding requires an EP context with the same global expert count")
         if self.ep_context is not None and self.ep_context is not binding.ep_context:
             raise ValueError("EP experts already have a different communication owner")

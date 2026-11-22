@@ -28,6 +28,41 @@ from hyper_parallel.trainer.config import TrainerConfig, entries_to_module_repla
 from hyper_parallel.trainer.config.resolver import resolve_config
 
 
+def cpu_token_permute(tokens: torch.Tensor, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Emulate the NPU token permutation and its source-to-permuted map."""
+    flat_indices = indices.reshape(-1).to(torch.int64)
+    order = flat_indices.argsort(stable=True)
+    inverse = torch.empty_like(order, dtype=torch.int32)
+    inverse.scatter_(0, order, torch.arange(order.numel(), dtype=torch.int32))
+    return tokens.index_select(0, order // indices.shape[1]), inverse
+
+
+def cpu_token_unpermute(
+    values: torch.Tensor, inverse: torch.Tensor, probabilities: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Emulate the fused inverse permutation, optional weighting and top-k sum."""
+    source_slots = values.index_select(0, inverse.to(torch.int64))
+    if probabilities is None:
+        return source_slots
+    source_slots = source_slots.reshape(*probabilities.shape, values.shape[-1])
+    return (source_slots * probabilities.unsqueeze(-1)).sum(dim=1)
+
+
+def cpu_swiglu(inputs: torch.Tensor) -> torch.Tensor:
+    """Emulate the existing fused SwiGLU boundary for hardware-independent routing tests."""
+    gate, up = inputs.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+def cpu_grouped_matmul(
+    inputs: torch.Tensor, weights: torch.Tensor, *, group_list: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the same expert row selection as grouped GEMM using CPU batched matmul."""
+    counts = torch.diff(group_list, prepend=group_list.new_zeros(1))
+    expert_ids = torch.arange(counts.numel(), device=counts.device).repeat_interleave(counts)
+    return torch.bmm(inputs.unsqueeze(1), weights.index_select(0, expert_ids)).squeeze(1)
+
+
 class PackedExperts(nn.Module):
     """Transformers-layout packed experts with an explicit reference forward."""
 

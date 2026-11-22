@@ -35,6 +35,7 @@ from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts
 from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsConfig
 from hyper_parallel.core.activation_memory.api import checkpoint
 from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
+from hyper_parallel.distributed.expert_parallel.moonep_context import MoonEPContext
 from hyper_parallel.distributed.module_binding import (
     MeshBinding, ParallelBinding, ParallelModuleSpec, bind_parallel_modules,
 )
@@ -61,6 +62,15 @@ class _Experts(nn.Module):
     def forward(self, hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         """Retain the old three-tensor call throughout both transport variants."""
         context = self.ep_context
+        if isinstance(context, MoonEPContext):
+            count = hidden.shape[0]
+            rows = torch.arange(count)
+            plan = {"token_send": [count, 0], "token_recv": [count, 0],
+                    "source_order": rows, "source_inverse": rows,
+                    "counts": torch.tensor([count, 0]), "receive_order": rows}
+            hidden, _, _, inverse = context.dispatch(hidden, plan=plan)
+            values = self.proj(hidden) * weights
+            return context.combine(values, plan, inverse)
         hidden, _, _, send, receive, inverse = context.dispatch(hidden, ids.flatten())
         values = self.proj(hidden) * weights
         return context.combine(values, send, receive, inverse)
@@ -138,7 +148,7 @@ class TestSharedExpertOverlap(unittest.TestCase):
         Description: Compare both EP contexts under full-MoE and experts-only checkpointing.
         Expectation: Outputs, all gradients and accumulated microbatches match serial exactly.
         """
-        for context_type, replay in product((EPContext,),
+        for context_type, replay in product((EPContext, MoonEPContext),
                                            ("none", "parent", "parent_reentrant", "experts", "experts_reentrant")):
             with self.subTest(context=context_type.__name__, replay=replay):
                 expert_replay = {"experts": False, "experts_reentrant": True}.get(replay)
@@ -182,7 +192,7 @@ class TestSharedExpertOverlap(unittest.TestCase):
         Description: Bind the planned expert without a model-specific forward replacement.
         Expectation: The context borrows the sibling shared module and retains checkpoint names and identities.
         """
-        for moon, enabled in product((False,), (False, True)):
+        for moon, enabled in product((False, True), (False, True)):
             with self.subTest(moon=moon, enabled=enabled):
                 model = _MoE(EPContext(_mesh(), num_experts=4))
                 keys = set(model.state_dict())
@@ -195,7 +205,7 @@ class TestSharedExpertOverlap(unittest.TestCase):
                 bind_parallel_modules(model, plan, mesh)
                 context = model.experts.ep_context
                 self.assertEqual(context.overlap_shared_expert, enabled)
-                self.assertIsInstance(context, EPContext)
+                self.assertIsInstance(context, MoonEPContext if moon else EPContext)
                 self.assertIs(context._shared_expert(), model.shared_experts)
                 self.assertEqual(keys, set(model.state_dict()))
                 for name, parameter in parameters.items():
@@ -286,6 +296,24 @@ class TestSharedExpertOverlap(unittest.TestCase):
         model.shared_experts = nn.Linear(8, 8).double()
         bind_shared_expert_overlap(model, "experts", model.experts.ep_context)
         self.assertIsNone(model.experts.ep_context._shared_state)
-        for cls in (EPContext,):
+        self.assertTrue(issubclass(MoonEPContext, EPContext))
+        for cls in (EPContext, MoonEPContext):
             for method in (cls.dispatch, cls.combine):
                 self.assertNotIn("overlap_compute", inspect.signature(method).parameters)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_ordinary_experts_reject_moon_context_despite_inheritance(self) -> None:
+        """Feature: Backend-specific transport schedules.
+        Description: Try binding a MoonEP subclass to the ordinary EP expert member.
+        Expectation: The mismatched dispatch protocol is rejected before binding; ordinary EP still binds.
+        """
+        experts = EPGroupedExperts(config=GroupedExpertsConfig(4, 8, 12, num_layers=2))
+        moon = MoonEPContext(_mesh(), num_experts=4)
+        mesh = MeshBinding(SimpleNamespace())
+        self.assertIsInstance(moon, EPContext)
+        with self.assertRaisesRegex(ValueError, "binding requires"):
+            experts.bind_parallel(ParallelBinding(mesh, ep_context=moon))
+        self.assertIsNone(experts.ep_context)
+        ordinary = EPContext(_mesh(), num_experts=4)
+        experts.bind_parallel(ParallelBinding(mesh, ep_context=ordinary))
+        self.assertIs(experts.ep_context, ordinary)

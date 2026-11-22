@@ -12,13 +12,17 @@
 | 内容 | 实现位置 | 职责 |
 | --- | --- | --- |
 | Gate | [moe/router.py](router.py) | logits、learned TopK、fix-router；返回 logits/weights/实际 IDs |
-| 公共训练状态 | [GateModule](router.py) | 可选 aux-loss、选择 bias、mask/sequence metadata、并行资源绑定 |
+| 训练状态 | [GateModule](router.py) | 可选 aux-loss、选择 bias、mask/sequence metadata、并行资源绑定 |
 | sequence aux-loss | [losses/moe_aux_loss.py](../../losses/moe_aux_loss.py) | 不依赖具体模型的 sequence balancing 公式 |
 | 负载与更新 | [moe_utils.py](moe_utils.py) | backward 计数、跨组同步、step bias 更新 |
 | step 调度 | [MoEMonitorCallback](../../../trainer/callbacks/moe_monitor_callback.py) | 遍历模型并在 optimizer step 后更新 |
 | 共享专家 | [shared_expert.py](shared_expert.py)、[shared_expert_overlap.py](shared_expert_overlap.py) | 共享计算与普通 EP dispatch 的组合 |
 
-旧 `modules/gate.py`、`router.py`、`shared_expert.py`、`moe_utils.py` 已删除；路由统一为一个 Gate family，实现在 `moe/router.py`；仓内引用迁到新路径，family 只注册一次。
+旧 `modules/gate.py`、`router.py`、`shared_expert.py`、`moe_utils.py` 已删除。
+路由统一为 `moe/router.py` 中的一个 `Gate` family，普通和 MegaGate 分别是 `local`、`mega` 成员。
+`GateModule` 直接管理训练状态，不再使用 `RouterTrainingMixin` 或单独的 `router_training.py`。
+统一返回 `logits、weights、indices`；需要当前派发计数时可对 `indices` 使用 `torch.bincount`。
+旧 MoE 示例中的独立 Router 保留；各模型的分组选择等原生路由计算保持原有路径。
 用户继续从 `hyper_parallel.components.modules` 导入公开模块。新组件不依赖 Trainer；独立循环可直接调用同步更新函数。
 V4.1 的 adapter 保留模态 mask 与双行计数，复用公共计数、偏置更新及 aux-loss 公式。
 原生 gate 的调用接口和更新时机保持不变。
@@ -168,7 +172,7 @@ self.gate = Gate(config=routing_config, context={'module_configs': (model_config
 ```
 
 这部分属于后续模型整改；本次不为旧模型追加替换父层 forward 的 adapter。
-单组件用户也可直接在 `routing_config` 中设置上述 `router_*` 字段，不需要上层 config 或 Trainer。
+单组件用户也可直接在 `routing_config` 中设置上述三个 `moe_*` 字段，不需要上层 config 或 Trainer。
 
 独立训练循环（`router` / `experts` 已构造并按需绑定）：
 
@@ -253,11 +257,18 @@ SharedExpert 随机初始化对齐 Megatron MLP：FC1 使用 `N(0, init_method_s
 该规则只用于随机初始化，采用已有模块或加载 checkpoint 不会重置已加载的投影。
 保留 separate 源布局且未配置 clamp/FP32 激活时，共享 FC1 直接执行源 `act_fn(gate_proj(x)) * up_proj(x)`。
 
+## 验证边界
+
+CPU UT 检查新 Gate 的真实路由统计、aux 梯度、mask、累积、checkpoint、统计组、
+兼容导入与共享分支调度，保留旧模型 aux-loss 回归。
+NPU 通信与 GMM 的 EP+FSDP 二进制精度、10/1000 step 训练和性能验收需要另行实机完成；
+CPU 替身通过不代表这些验收已经完成。
+
 ## `moe_utils` 的职责
 
 `router_sharding` 是本次新增，原 Gate 注册没有这项布局声明；旧模型主要使用模型外层切分模板。
 它声明 Gate 的全部参数在计算轴复制，不创建 token 重新分布边界，FSDP 存储切分仍由主流程负责。
-Gate 共用这一布局声明，通过 `bind_parallel` 绑定并行信息。
+Gate 通过 `bind_parallel` 绑定并行信息。
 
 | 方法 | 输入和输出 | 用途 |
 | --- | --- | --- |
@@ -272,3 +283,42 @@ Gate 共用这一布局声明，通过 `bind_parallel` 绑定并行信息。
 `routing_scores`、TopK 选择、`balanced_expert_indices` 统一放在 `router.py`；序列辅助损失在
 `components/losses/moe_aux_loss.py`；监控与 optimizer hook 在 `trainer/callbacks/moe_monitor_callback.py`。
 工具文件不负责专家计算、dispatch/combine，也不重复规约已经覆盖的 EP group。
+
+## 集合通信 MoonEP
+
+```yaml
+plan_overrides:
+  - match: "model.layers.*.mlp.experts"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+        megakernel: false
+        moonep: true
+        moonep_replica_capacity: null  # 默认 E/EP；0 表示不允许远端副本
+```
+
+EP>1 选择 `MoonEPGroupedExperts`；EP=1 提醒并回退普通 GroupedExperts。`megakernel` 和 `moonep`
+不能同时开启。capacity 是每个 rank 可执行的不同远端专家数量，不是 token 丢弃容量。
+不足以容纳规划时明确报错，不丢 token、不静默改变路由。
+
+调用链为：算法第一次 fused permute → 全局整数计数规划 → 必要权重副本 all-to-all →
+slot dispatch → 接收端第二次 fused permute → 原 `compute_experts` → owner unpermute →
+返回 all-to-all → 算法最终 unpermute/top-k 合并。共享 FC1/FC2 分别进入相同的 dispatch/combine 窗口。
+两种 `routing_weight_mode` 均保持原来的概率应用位置，逻辑专家 ID 不随物理执行位置改变。
+
+只交换本次实际需要的完整专家矩阵；临时 Tensor 的可微 all-to-all 和 index-select adjoint 将梯度加回
+home 参数，之后才由原 FSDP/optimizer 消费。没有临时 Parameter、手工 unshard 或跨微批缓存。
+规划保存在本次 forward 的局部字典中；checkpoint replay 根据相同路由计数确定性重建。
+
+本版本参考 [PR #1485](https://github.com/mindspore-ai/hyper-parallel/pull/1485)、
+[MoonEP/FSDP 分支](https://github.com/yaoyifanx/hyper-parallel/tree/moonep_with_fsdp_native_overlap_20261109)、
+[官方规划参考](https://github.com/MoonshotAI/MoonEP/blob/master/tests/planning_reference.py) 和
+[Kimi-K3 报告 §5.2.1、附录 E](https://arxiv.org/html/2607.24653v2)。默认容量采用 E/EP，保留最小迁移候选与
+whole-deficit 回退；使用全部 home 行加本次需要的 remote 行作为计算表。
+
+本次只实现基础集合通信：没有去冗余、跨调用预取、额外通信组或官方零拷贝融合通信。
+整数直方图需要一次设备到 CPU 的规划同步；常规 autograd 会保留本次计算所需的临时权重，
+未接入参考分支的全层共享副本内存池。动态划分专家 token 会改变权重梯度求和分组，
+因此不能承诺 BF16 参数梯度与普通 EP 二进制相同；需按真实硬件的前反向与训练曲线分别验收。
+旧模型的原生 gate 保留；只替换 experts 不会使新 Gate 的训练特性自动生效。

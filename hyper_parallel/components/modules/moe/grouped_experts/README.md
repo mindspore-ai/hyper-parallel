@@ -26,7 +26,7 @@ from hyper_parallel.components.modules.moe.grouped_experts import GroupedExperts
 ```
 
 `hyper_parallel.components.modules.GroupedExperts` 统一导出本目录的新专家族工厂。
-默认本地计算复用现有 NPU grouped-GEMM；Mega 已接入 HyperMulticore 融合 executor，MoonEP 仍是构建时明确拒绝的骨架。
+默认本地计算复用现有 NPU grouped-GEMM；Mega 已接入 HyperMulticore 融合 executor，MoonEP 提供集合通信实现。
 
 ## 维度与 slot
 

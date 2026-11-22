@@ -100,7 +100,7 @@ class ParallelBinding:
 
     mesh_binding: MeshBinding
     cp_context: CPContext | None = None
-    ep_context: EPContext | MoonEPContext | None = None
+    ep_context: EPContext | None = None
 
 
 def validate_parallel_module(module: nn.Module, parallel: ParallelModuleSpec, sharding: Any, context: Any) -> None:
@@ -163,16 +163,19 @@ def _validate_expert_ownership(module, parallel, sharding, context):
             raise ValueError("EPContext supports balanced contiguous expert Shard(0) ownership")
 
 
-def _build_ep_context(mesh_binding: MeshBinding, parallel: ParallelModuleSpec) -> EPContext | MoonEPContext:
-    """Choose the declared runtime and configure ordinary EP shared computation."""
+def _build_ep_context(mesh_binding: MeshBinding, parallel: ParallelModuleSpec) -> EPContext:
+    """Choose the declared EP runtime while borrowing the existing expert mesh."""
     moonep = parallel.options.get("moonep", False)
     if not isinstance(moonep, bool):
         raise ValueError("the moonep runtime option must be bool")
     mesh = mesh_binding.axis_mesh("ep")
+    overlap = parallel.options.get("overlap_shared_expert", True)
     if moonep:
-        return MoonEPContext(mesh, num_experts=parallel.options["num_experts"])
-    return EPContext(mesh, num_experts=parallel.options["num_experts"],
-                     overlap_shared_expert=parallel.options.get("overlap_shared_expert", True))
+        return MoonEPContext(mesh, num_experts=parallel.options["num_experts"],
+                             replica_capacity=parallel.options.get("moonep_replica_capacity"),
+                             overlap_shared_expert=overlap)
+    return EPContext(mesh, num_experts=parallel.options["num_experts"], overlap_shared_expert=overlap)
+
 
 def bind_parallel_modules(model: nn.Module, plan: Any, mesh_context: Any) -> None:
     """Inject shared resources after layout and before activation wrappers/FSDP2.
@@ -202,7 +205,7 @@ def bind_parallel_modules(model: nn.Module, plan: Any, mesh_context: Any) -> Non
     for fqn, module, binding in prepared:
         module.bind_parallel(binding)
         module._hp_parallel_binding = binding  # pylint: disable=protected-access
-        if isinstance(binding.ep_context, EPContext):
+        if binding.ep_context is not None:
             bind_shared_expert_overlap(model, fqn, binding.ep_context)
     model._hp_parallel_module_specs = dict(plan.parallel_modules)  # pylint: disable=protected-access
 

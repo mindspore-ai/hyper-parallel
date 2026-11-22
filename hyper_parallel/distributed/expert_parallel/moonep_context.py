@@ -12,113 +12,144 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Reserved MoonEP planning, transport and temporary expert-weight lifecycle."""
+"""Collective MoonEP transport with invocation-local plans and fixed home ownership."""
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from numbers import Integral
+from typing import Any
 
+import torch
+import torch.distributed as dist
 from torch import Tensor
 
+from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
+from hyper_parallel.distributed.expert_parallel.moonep_planner import compile_plan, select_allocation
 
-class MoonEPContext:
-    """Borrow a TP-extend-EP mesh while keeping parameter ownership fixed.
 
-    Runtime plans must be invocation-local, distinguish logical expert IDs
-    from compute-table rows, and be replayable during activation recomputation.
-    This scaffold allocates no communication buffers or temporary Parameters.
-    """
+class MoonEPContext(EPContext):
+    """Reuse EP collectives while dynamically balancing execution, without prefetch caches."""
 
-    def __init__(self, mesh: Any, *, num_experts: int) -> None:
-        """Record existing resources without creating process groups.
+    def __init__(self, mesh: Any, *, num_experts: int, replica_capacity: int | None = None,
+                 overlap_shared_expert: bool = True) -> None:
+        """Borrow the existing mesh and bound the number of remote experts per rank.
 
         Args:
-            mesh: Existing one-dimensional expert mesh, including dense TP ranks.
-            num_experts: Global home expert count, divisible by the EP mesh size.
+            mesh: Existing one-dimensional TP-extend-EP mesh.
+            num_experts: Global number of home experts, divisible by the mesh size.
+            replica_capacity: Maximum distinct remote experts per rank; None means E/EP.
+            overlap_shared_expert: Run bound shared FC1/FC2 during token exchanges.
         """
-        if mesh is None or mesh.ndim != 1:
-            raise ValueError("MoonEPContext requires an existing one-dimensional HP expert mesh")
-        if num_experts < 1 or num_experts % mesh.size():
-            raise ValueError("num_experts must be positive and divisible by EP size")
-        self.mesh = mesh
-        self.num_experts = num_experts
-        self.local_experts = num_experts // mesh.size()
-        self.rank = mesh.get_local_rank()
+        super().__init__(mesh, num_experts=num_experts, overlap_shared_expert=overlap_shared_expert)
+        capacity = self.local_experts if replica_capacity is None else replica_capacity
+        if isinstance(capacity, bool) or not isinstance(capacity, Integral) or capacity < 0:
+            raise ValueError("moonep_replica_capacity must be a nonnegative integer or None")
+        self.replica_capacity = int(capacity)
 
-    def plan(self, hidden_states: Tensor, topk_ids: Tensor, topk_weights: Tensor) -> object:
-        """Reserve a per-call allocation/transport plan from original token routes.
+    def plan(self, expert_ids: Tensor) -> dict:
+        """Compile a deterministic plan from all sources' prepared slot counts.
 
         Args:
-            hidden_states: Original tokens [T,H].
-            topk_ids: Global model-selected expert IDs [T,K].
-            topk_weights: Final differentiable routing probabilities [T,K].
+            expert_ids: Global integer expert IDs [S], in source expert-major order.
 
         Returns:
-            Opaque plan mapping compute rows to home experts, retained through backward/recompute.
+            Per-call transport splits, permutations and compute-table counts.
         """
-        raise NotImplementedError("MoonEP load planning and invocation replay are not implemented")
+        ids = expert_ids.to(torch.int64)
+        counts = ids.new_zeros(self.num_experts).scatter_add_(0, ids, torch.ones_like(ids))
+        gathered = [torch.empty_like(counts) for _ in range(self.mesh.size())]
+        if self.mesh.size() > 1:
+            dist.all_gather(gathered, counts, group=self.mesh.get_group())
+        else:
+            gathered[0] = counts
+        # The collective baseline plans on small integer histograms, like PR #1485.
+        # This eager synchronization is not the official fused device planner.
+        global_counts = torch.stack(gathered).cpu().numpy()
+        allocation = select_allocation(global_counts, self.replica_capacity)
+        return compile_plan(global_counts, allocation, ids, self.rank)
 
-    def dispatch(
-        self, hidden_states: Tensor, topk_ids: Tensor, topk_weights: Tensor, plan: object,
-        *, routing_weight_mode: Literal["output", "before_fc2"] = "before_fc2",
-    ) -> tuple[Tensor, Tensor, Tensor | None]:
-        """Reserve expert-major dispatch in the plan's compute-table order.
+    # MoonEP deliberately keeps the plan-based entry point while inheriting EP runtime state.
+    def dispatch(  # pylint: disable=arguments-differ
+        self, hidden_states: Tensor, routing_weights: Tensor | None = None,
+        *, plan: dict,
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
+        """Send source slots to planned execution ranks, then perform the second permute.
 
         Args:
-            hidden_states: Original tokens [T,H]; do not expand slots twice.
-            topk_ids: Global model-selected expert IDs [T,K].
-            topk_weights: Final differentiable routing probabilities [T,K].
-            plan: This invocation's saved allocation and transport plan.
-            routing_weight_mode: Probability placement from the module's algorithm configuration.
+            hidden_states: Prepared expert-major slots [S,H].
+            routing_weights: Optional differentiable before-FC2 probabilities [S].
+            plan: Invocation-local result of plan().
 
         Returns:
-            Expert-major activations [R,H], counts [C], optional probabilities [R].
-            Preserve router gradients and leave output-mode weighting to combine.
+            Compute-major activations [R,H], counts [C], optional probabilities [R],
+            and the receiver inverse permutation [R]. C includes home and remote rows.
         """
-        raise NotImplementedError("MoonEP token dispatch and differentiable transport are not implemented")
+        send, receive, order = plan["token_send"], plan["token_recv"], plan["source_order"]
+        asynchronous = self._overlap_ready("fc1")
+        hidden = self._exchange(hidden_states.index_select(0, order), send, receive, async_op=asynchronous)
+        weights = None
+        if routing_weights is not None:
+            weights = self._exchange(routing_weights.index_select(0, order).unsqueeze(-1), send, receive,
+                                     async_op=asynchronous).reshape(-1)
+        if asynchronous:
+            self._run_overlap("fc1", hidden, weights)
+        counts, receive_order = plan["counts"], plan["receive_order"]
+        if hidden.shape[0] and hidden.device.type == "npu":
+            # torch_npu is optional for CPU import and planning tests.
+            from hyper_parallel.components.functional.moe_token_permute import (  # pylint: disable=C0415
+                moe_token_permute,
+            )
 
-    def prefetch_weights(self, gate_up_proj: Tensor, down_proj: Tensor, plan: object) -> tuple[Tensor, Tensor]:
-        """Reserve complete local/replica weight views for the shared expert math.
+            rows = torch.arange(counts.numel(), device=counts.device).repeat_interleave(
+                counts, output_size=hidden.shape[0],
+            )
+            ids = torch.empty_like(rows).scatter_(0, receive_order, rows)
+            hidden, inverse = moe_token_permute(hidden.contiguous(), ids.to(torch.int32).unsqueeze(-1))
+        else:
+            hidden = hidden.index_select(0, receive_order)
+            inverse = torch.empty_like(receive_order, dtype=torch.int32).scatter_(
+                0, receive_order, torch.arange(receive_order.numel(), device=receive_order.device, dtype=torch.int32),
+            )
+        if weights is not None:
+            weights = weights.index_select(0, receive_order)
+        return hidden, counts, weights, inverse
+
+    def expert_weights(self, gate_up: Tensor, down: Tensor, plan: dict) -> tuple[Tensor, Tensor]:
+        """Exchange only needed replicas using differentiable all-to-all.
 
         Args:
-            gate_up_proj: Current home-local FC1 weights, read after FSDP unshard hooks.
-            down_proj: Current home-local FC2 weights with matching expert rows.
-            plan: Per-call compute-row mapping; never a cross-step parameter cache.
+            gate_up: Materialized home FC1 weights [E/EP,2I,H].
+            down: Materialized home FC2 weights [E/EP,H,I].
+            plan: This invocation's remote expert requests and split sizes.
 
         Returns:
-            Weights [C,H,2I] / [C,I,H]; temporary rows must return gradients to their home owners.
+            Home rows followed by temporary remote rows. The collective adjoint
+            returns replica gradients to home before the original Parameters' hooks.
+            No Parameter, FSDP storage state or process group is created here.
         """
-        raise NotImplementedError("MoonEP weight prefetch and temporary compute views are not implemented")
+        if not plan["weight_exchange"]:
+            return gate_up, down
+        indices = plan["send_experts"]
+        packet = torch.cat((gate_up.index_select(0, indices).flatten(1),
+                            down.index_select(0, indices).flatten(1)), dim=1)
+        remote = self._exchange(packet, plan["weight_send"], plan["weight_recv"])
+        first, second = remote.split((gate_up[0].numel(), down[0].numel()), dim=1)
+        return (torch.cat((gate_up, first.reshape(-1, *gate_up.shape[1:]))),
+                torch.cat((down, second.reshape(-1, *down.shape[1:]))))
 
-    def combine(
-        self, values: Tensor, topk_weights: Tensor, output_shape: tuple[int, ...], plan: object,
-        *, routing_weight_mode: Literal["output", "before_fc2"] = "before_fc2",
+    # The forward plan owns the split sizes and source order required by MoonEP combine.
+    def combine(  # pylint: disable=arguments-differ
+        self, values: Tensor, plan: dict, recv_inverse: Tensor,
     ) -> Tensor:
-        """Reserve return transport and exactly one token restoration/top-k sum.
+        """Unpermute at the compute owner and return source expert-major slots.
 
         Args:
-            values: Expert outputs in the plan's compute-slot order.
-            topk_weights: Original token/top-k probabilities [T,K].
-            output_shape: Original hidden-state shape [...,H].
-            plan: This invocation's inverse transport information.
-            routing_weight_mode: Probability placement from the module's algorithm configuration.
+            values: Compute-major expert outputs [R,H].
+            plan: Saved forward transport and source inverse mapping.
+            recv_inverse: Receiver permutation returned by dispatch().
 
         Returns:
-            Routed token output in output_shape, with probabilities applied once.
-            This token-level result must not pass through ordinary unpermute again.
+            Source expert-major outputs [S,H], before the algorithm's final unpermute.
         """
-        raise NotImplementedError("MoonEP output combine and router-weight backward are not implemented")
-
-    def reduce_grad(self, gate_up_grad: Tensor, down_grad: Tensor, plan: object) -> tuple[Tensor, Tensor]:
-        """Reserve autograd-owned replica gradient return before FSDP reduction.
-
-        Args:
-            gate_up_grad: Compute-table FC1 gradients [C,H,2I], including temporary rows.
-            down_grad: Compute-table FC2 gradients [C,I,H], including temporary rows.
-            plan: The same invocation's home mapping, kept alive through backward.
-
-        Returns:
-            Home-local gradients with replica contributions summed exactly once.
-            The future autograd bridge must complete this before framework gradient reduction.
-        """
-        raise NotImplementedError("MoonEP replica gradient return and FSDP lifecycle integration are not implemented")
+        values = super().combine(values, plan["token_send"], plan["token_recv"], recv_inverse)
+        return values.index_select(0, plan["source_inverse"].to(torch.int64))
