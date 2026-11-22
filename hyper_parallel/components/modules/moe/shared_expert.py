@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from functools import partial
-from typing import Any, Optional
+from math import isfinite, sqrt
+from typing import Any, Literal, Optional
 
 import torch
 from torch import nn
@@ -70,7 +71,11 @@ class LinearWithMatmul(nn.Linear):
     def forward(  # pylint: disable=redefined-builtin
         self, input: torch.Tensor
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Apply matmul and optionally return bias for external addition."""
+        """Apply matmul and optionally return bias for external addition.
+
+        Args:
+            input: Activations ending in in_features.
+        """
         output = torch.matmul(input, self.weight.t().contiguous())
         if self.skip_bias_add:
             return output, self.bias
@@ -184,7 +189,11 @@ class SharedExpertModule(nn.Module):
             return
 
         def glu(x: torch.Tensor) -> torch.Tensor:
-            """Apply the configured gated linear unit."""
+            """Apply the configured gated linear unit.
+
+            Args:
+                x: Concatenated gate/up activations.
+            """
             gate, value = torch.chunk(x, 2, dim=-1)
             return activation_func(gate) * value
 
@@ -203,37 +212,23 @@ class SharedExpertModule(nn.Module):
     ) -> None:
         """Build the high-performance module from a Transformers shared expert."""
         super().__init__()
-        del module_fqn, context
+        if (config is None) == (module is None):
+            raise ValueError("provide exactly one of config or module")
+        self._ep_context = None
+        del module_fqn
+        source_config = config if config is not None else getattr(module, "config", None)
+        self.num_layers = (context or {}).get("num_layers", getattr(
+            source_config, "num_layers", getattr(source_config, "num_hidden_layers", None)))
+        self.init_method_std = getattr(source_config, "init_method_std", 0.02)
         if not isinstance(preserve_source_layout, bool):
             raise TypeError("preserve_source_layout must be bool")
         self._preserve_source_layout = preserve_source_layout
         self.swiglu_limit, self.activation_dtype = _activation_settings(
             config if config is not None else module, limit=swiglu_limit, activation_dtype=activation_dtype)
         self.limit = self.swiglu_limit
-        if config is None and module is None:
-            raise ValueError("provide exactly one of config or module")
         if config is not None:
-            if module is not None:
-                raise ValueError("provide config or module, not both")
-            _validate_mlp_config(config)
-            if not isinstance(config.return_bias_tuple, bool):
-                raise TypeError("return_bias_tuple must be bool")
-            self.config = config
-            self._gate_size = self._up_size = config.intermediate_size
-            self._source_is_fused = False
-            self._source_is_separate = True
-            self._return_bias_tuple = config.return_bias_tuple
-            self.activation_func = partial(local_swiglu, limit=self.swiglu_limit,
-                                           activation_dtype=self.activation_dtype)
-            if self._preserve_source_layout:
-                if config.return_bias_tuple:
-                    raise ValueError("separate SharedExpert returns a tensor, not a bias tuple")
-                self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
-                self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
-                self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.bias)
-                return
-            self.linear_fc1 = LinearWithMatmul(config.hidden_size, 2 * config.intermediate_size, bias=config.bias)
-            self.linear_fc2 = LinearWithMatmul(config.intermediate_size, config.hidden_size, bias=config.bias)
+            self._initialize_from_config(config)
+            self.reset_parameters()
             return
         config = getattr(module, "config", None)
         self.config = config
@@ -257,6 +252,8 @@ class SharedExpertModule(nn.Module):
         gate_proj, up_proj, down_proj = self._separate_projections(module)
         if self._preserve_source_layout:
             self.gate_proj, self.up_proj, self.down_proj = gate_proj, up_proj, down_proj
+            if isinstance(getattr(module, "act_fn", None), nn.Module):
+                self.act_fn = module.act_fn
             self._initialize_activation(module, config)
             self._set_clamped_activation(config)
             self._return_bias_tuple = False
@@ -267,6 +264,29 @@ class SharedExpertModule(nn.Module):
         self._set_clamped_activation(config)
         self._return_bias_tuple = False
         self.train(module.training)
+
+    def _initialize_from_config(self, config: Any) -> None:
+        """Create the separate gate, up and down projections for a new shared expert."""
+        _validate_mlp_config(config)
+        if not isinstance(config.return_bias_tuple, bool):
+            raise TypeError("return_bias_tuple must be bool")
+        self.config = config
+        self._gate_size = self._up_size = config.intermediate_size
+        self._source_is_fused = False
+        self._source_is_separate = True
+        self._return_bias_tuple = config.return_bias_tuple
+        self.activation_func = partial(local_swiglu, limit=self.swiglu_limit,
+                                       activation_dtype=self.activation_dtype)
+        if self._preserve_source_layout:
+            if config.return_bias_tuple:
+                raise ValueError("separate SharedExpert returns a tensor, not a bias tuple")
+            self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
+            self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
+            self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.bias)
+            return
+        self.linear_fc1 = LinearWithMatmul(config.hidden_size, 2 * config.intermediate_size, bias=config.bias)
+        self.linear_fc2 = LinearWithMatmul(config.intermediate_size, config.hidden_size, bias=config.bias)
+        return
 
     def _set_clamped_activation(self, config: Any) -> None:
         if self.swiglu_limit > 0 or self.activation_dtype == "float32":
@@ -319,23 +339,61 @@ class SharedExpertModule(nn.Module):
             )
         return transforms
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor | None = None,
-        *,
-        x: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Apply the shared-expert MLP while preserving the source return contract."""
-        if (hidden_states is None) == (x is None):
-            raise ValueError("provide exactly one of hidden_states or x")
-        hidden_states = x if hidden_states is None else hidden_states
+    split_forward_supported = True
+
+    def bind_ep_context(self, context: Any) -> None:
+        """Borrow the transport owner without registering another module or parameter tree.
+
+        Args:
+            context: EP context scheduling this shared expert's FC1 and FC2.
+        """
+        if self._ep_context is not None and self._ep_context is not context:
+            raise ValueError("shared expert already has an EP communication owner")
+        self._ep_context = context
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Consume an overlapped result before repeating module/FSDP hooks.
+
+        The two scheduled stages use normal module calls. The later model call
+        only consumes their result, so it must not gather the same weights again.
+        """
+        if self._ep_context is not None and kwargs.get("stage", "full") == "full":
+            hidden = args[0] if args else kwargs.get("hidden_states", kwargs.get("x"))
+            output = self._ep_context.take_shared_output(hidden)
+            if output is not None:
+                return output
+        return super().__call__(*args, **kwargs)
+
+    def forward_fc1(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the first projection and activation during dispatch.
+
+        Args:
+            hidden_states: Original shared-branch tokens [..., hidden_size].
+
+        Returns:
+            Activated intermediate [..., intermediate_size], retaining source dtype policy.
+        """
         if self._preserve_source_layout:
+            if self.swiglu_limit <= 0 and self.activation_dtype == "input" and hasattr(self, "act_fn"):
+                return self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
             intermediate = torch.cat((self.gate_proj(hidden_states), self.up_proj(hidden_states)), dim=-1)
-            return self.down_proj(self.activation_func(intermediate).to(hidden_states.dtype))
+            return self.activation_func(intermediate).to(hidden_states.dtype)
         intermediate, bias = self.linear_fc1(hidden_states)
         if bias is not None:
             intermediate = intermediate + bias
-        intermediate = self.activation_func(intermediate)
+        return self.activation_func(intermediate)
+
+    def forward_fc2(self, intermediate: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply the second projection during combine, preserving the output-bias protocol.
+
+        Args:
+            intermediate: This invocation's activated FC1 output [..., intermediate_size].
+
+        Returns:
+            Shared output [..., hidden_size], or the source's (output, output_bias) pair.
+        """
+        if self._preserve_source_layout:
+            return self.down_proj(intermediate)
         output, output_bias = self.linear_fc2(intermediate)
         if not self._return_bias_tuple:
             if output_bias is not None:
@@ -343,15 +401,49 @@ class SharedExpertModule(nn.Module):
             return output
         return output, output_bias
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor | None = None,
+        *,
+        x: torch.Tensor | None = None,
+        stage: Literal["full", "fc1", "fc2"] = "full",
+    ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply the shared-expert MLP while preserving the source return contract.
+
+        Args:
+            hidden_states: Source token activations; mutually exclusive with x.
+            x: Compatibility alias for hidden_states.
+            stage: Full MLP, FC1 plus activation, or FC2 using an already activated intermediate.
+                Staged callers use module(..., stage=...) so module/FSDP hooks still run.
+        """
+        if (hidden_states is None) == (x is None):
+            raise ValueError("provide exactly one of hidden_states or x")
+        hidden_states = x if hidden_states is None else hidden_states
+        if stage == "fc1":
+            return self.forward_fc1(hidden_states)
+        if stage == "fc2":
+            return self.forward_fc2(hidden_states)
+        if stage != "full":
+            raise ValueError("shared expert stage must be full, fc1 or fc2")
+        return self.forward_fc2(self.forward_fc1(hidden_states))
+
     def reset_parameters(self) -> None:
-        """Initialize owned projections after meta materialization."""
+        """Use Megatron's normal FC1 and depth-scaled output-layer initialization."""
+        if isinstance(self.num_layers, bool) or not isinstance(self.num_layers, int) or self.num_layers < 1:
+            raise ValueError("shared expert initialization requires num_layers in config or replacement context")
+        if (isinstance(self.init_method_std, bool) or not isinstance(self.init_method_std, (int, float))
+                or not isfinite(self.init_method_std) or self.init_method_std < 0):
+            raise ValueError("init_method_std must be finite and nonnegative")
+        output_std = self.init_method_std / sqrt(2.0 * self.num_layers)
         if self._preserve_source_layout:
-            self.gate_proj.reset_parameters()
-            self.up_proj.reset_parameters()
-            self.down_proj.reset_parameters()
-            return
-        self.linear_fc1.reset_parameters()
-        self.linear_fc2.reset_parameters()
+            projections = ((self.gate_proj, self.init_method_std), (self.up_proj, self.init_method_std),
+                           (self.down_proj, output_std))
+        else:
+            projections = ((self.linear_fc1, self.init_method_std), (self.linear_fc2, output_std))
+        for projection, std in projections:
+            nn.init.normal_(projection.weight, mean=0.0, std=std)
+            if projection.bias is not None:
+                nn.init.zeros_(projection.bias)
 
 
 @module_replacement

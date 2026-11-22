@@ -372,7 +372,7 @@ DeepSeek-V4.1 也直接使用上面的公共 target，无需模型专用 Mega re
 
 ### 精度与验证边界
 
-新路径保留 router 输入输出、概率位置、pre-SiLU clamp 和共享专家的父级执行顺序；不新增随机路由或 loss hook。
+新路径保留 router 输入输出、概率位置、pre-SiLU clamp 和共享专家的父级合并顺序；不新增随机路由或 loss hook。
 初始化沿用新专家族规则：FC1 std 为 `init_method_std`，FC2 std 为
 `init_method_std / sqrt(2 * num_layers)`。旧 `DeepseekV41MegaMoeExperts` 两层均使用 initializer_range，
 且初始化存储为 EIO；因此同 seed 重新随机初始化不构成可比的二进制精度实验。
@@ -671,5 +671,6 @@ HF packed 来源使用 `output`，保留原模型在 FC2 后应用概率的位�
 
 默认实现是无 bias SwiGLU 的 NPU grouped-GEMM，允许 dense TP 配合作业的 TP-extend-EP 布局。
 GPU、MoonEP runtime、专家内部 ETP、任意 HF 来源和旧训练状态迁移尚未完成。Mega 融合内核接口已接入，原生 NPU 精度与性能仍需验收。
-router、aux-loss、共享专家、padding mask 和通信 overlap 调度属于模型组装；本期三 Tensor 契约不支持 capacity/drop 哨兵。
+router、aux-loss、共享专家算法、padding mask 和输出合并保留在模型中。共享计算的通信掩盖由 EPContext 调度，
+不改变模型 forward 和专家的三 Tensor 接口；本期不支持 capacity/drop 哨兵。
 本页说明当前代码接口与语义，不代表已通过本次数值、多卡训练或性能验收。

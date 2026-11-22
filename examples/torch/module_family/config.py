@@ -129,6 +129,10 @@ class EngramConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        self._initialize_hash_assets()
+
+    def _initialize_hash_assets(self) -> None:
+        """Copy hash assets and resolve the table capacity after scalar validation."""
         object.__setattr__(self, "assets", deepcopy(dict(self.assets)))
         mapping = NgramHashMapping(self.assets, self.layer_id)
         rows = self.padded_num_embeddings
@@ -187,12 +191,16 @@ class SharedExpertConfig(SwiGLUMLPConfig):
     """Shared SwiGLU projections with an explicit output-bias protocol."""
 
     return_bias_tuple: bool = False
+    num_layers: int = 1
+    init_method_std: float = 0.02
 
     def __init__(self, hidden_size: int, intermediate_size: int, bias: bool = False,
                  return_bias_tuple: bool = False, *, swiglu_limit: float = 0.0,
-                 activation_dtype: str | None = None) -> None:
+                 activation_dtype: str | None = None, num_layers: int = 1, init_method_std: float = 0.02) -> None:
         """Keep the shared output protocol positional and activation policy explicit."""
         object.__setattr__(self, "return_bias_tuple", return_bias_tuple)
+        object.__setattr__(self, "num_layers", num_layers)
+        object.__setattr__(self, "init_method_std", init_method_std)
         super().__init__(hidden_size, intermediate_size, bias, swiglu_limit, activation_dtype)
 
     def __post_init__(self) -> None:

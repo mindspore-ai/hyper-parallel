@@ -58,6 +58,7 @@ class EPGroupedExperts(GroupedExpertsModule):
     def __init__(
         self, *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
         module_fqn: str = "", context: Mapping[str, Any] | None = None,
+        overlap_shared_expert: bool = True,
     ) -> None:
         """Construct canonical parameters without acquiring communication resources.
 
@@ -66,9 +67,11 @@ class EPGroupedExperts(GroupedExpertsModule):
             module: Canonical member or packed expert source, exclusive with config.
             module_fqn: Source module path used in diagnostics.
             context: Job facts and source/ancestor configuration.
+            overlap_shared_expert: Enable context-owned shared FC1/FC2 scheduling.
         """
         super().__init__(config=config, module=module, module_fqn=module_fqn, context=context)
         self.ep_context: EPContext | None = None
+        self.overlap_shared_expert = overlap_shared_expert
 
     def bind_parallel(self, binding: ParallelBinding) -> None:
         """Borrow the common binder's EP context, rejecting missing or conflicting resources.
@@ -135,5 +138,5 @@ class EPGroupedExperts(GroupedExpertsModule):
                 "combine": ("values", "send_splits", "recv_splits", "recv_inverse"),
             },
             validate=validate_ep_layout,
-            options={"num_experts": self.config.num_experts},
+            options={"num_experts": self.config.num_experts, "overlap_shared_expert": self.overlap_shared_expert},
         )

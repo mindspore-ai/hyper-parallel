@@ -114,6 +114,8 @@ def _validate_mega_layout(*, module, sharding, context) -> None:
 class EPMegaGroupedExperts(GroupedExpertsModule):
     """Run one fused token-level call; the kernel owns its transport and restoration."""
 
+    shared_expert_overlap_supported = False
+
     def __init__(self, *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
                  module_fqn: str = "", context: Mapping[str, Any] | None = None,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,

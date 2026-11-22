@@ -15,6 +15,7 @@
 
 """MLP and shared-expert production construction parity."""
 import unittest
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import torch
@@ -28,6 +29,7 @@ from hyper_parallel.components.modules import (
 )
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementSpec
+from tests.common.mark_utils import arg_mark
 
 
 class SourceMLP(nn.Module):
@@ -40,11 +42,11 @@ class SourceMLP(nn.Module):
         self.up_proj = nn.Linear(16, 32, bias=bias, device=device, dtype=dtype)
         self.down_proj = nn.Linear(32, 16, bias=bias, device=device, dtype=dtype)
 
-    def compute(self, x):
+    def compute(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the independent source expression."""
         return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Preserve the MLP source keyword."""
         return self.compute(x)
 
@@ -52,12 +54,13 @@ class SourceMLP(nn.Module):
 class SourceShared(SourceMLP):
     """Shared expert source keyword contract."""
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply source math with shared-expert keyword."""
         return self.compute(hidden_states)
 
 
-def check_parity(factory, source_type, device="cpu", dtype=torch.float32, bias=True):
+def check_parity(factory: Callable, source_type: type[nn.Module], device: str = "cpu",
+                 dtype: torch.dtype = torch.float32, bias: bool = True) -> None:
     """Compare real replacement, gradients, one update and checkpoint state."""
     source = source_type(device=device, dtype=dtype, bias=bias)
     reference = source_type(device=device, dtype=dtype, bias=bias)
@@ -102,12 +105,16 @@ class TestMLPFamily(unittest.TestCase):
         self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
         DefaultDeviceType.set_device_type("cpu")
 
-    def test_model_owned_config(self):
-        """Projection validation is independent of example configuration classes."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_model_owned_config(self) -> None:
+        """Feature: Model-owned module family configuration.
+        Description: Validate dimensions and explicit global depth without example config dependencies.
+        Expectation: Both families execute valid projections and reject invalid dimensions.
+        """
         for factory in (SwiGLUMLP, SharedExpert):
             with self.subTest(factory=factory.__name__):
                 config = SimpleNamespace(hidden_size=8, intermediate_size=16, bias=False,
-                                         return_bias_tuple=False)
+                                         return_bias_tuple=False, num_layers=1)
                 member = factory(config=config)
                 self.assertEqual(member(torch.randn(2, 8)).shape, (2, 8))
                 config.intermediate_size = 0
@@ -117,15 +124,23 @@ class TestMLPFamily(unittest.TestCase):
             SharedExpert(config=SimpleNamespace(hidden_size=8, intermediate_size=16,
                                                       bias=False, return_bias_tuple=1))
 
-    def test_replacement_parity(self):
-        """Preserve loaded projections through actual model preparation."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_replacement_parity(self) -> None:
+        """Feature: MLP and shared expert module family.
+        Description: Preserve loaded projections through actual model preparation.
+        Expectation: Loaded projections, outputs, gradients and one optimizer update match the source.
+        """
         for factory, source in ((SwiGLUMLP, SourceMLP), (SharedExpert, SourceShared)):
             for bias in (False, True):
                 with self.subTest(factory=factory.__name__, bias=bias):
                     check_parity(factory, source, bias=bias)
 
-    def test_fused_shared_identity_and_bias(self):
-        """Already fused shared sources retain projections and output-bias tuples."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fused_shared_identity_and_bias(self) -> None:
+        """Feature: MLP and shared expert module family.
+        Description: Already fused shared sources retain projections and output-bias tuples.
+        Expectation: Replacement keeps projection identity and preserves tensor or output/bias return values.
+        """
         source = SharedExpert(config=SharedExpertConfig(16, 32, True, True))
         candidate = SharedExpert(module=source)
         self.assertIs(candidate.linear_fc1, source.linear_fc1)
@@ -141,8 +156,12 @@ class TestMLPFamily(unittest.TestCase):
         self.assertIsInstance(tensor_candidate(x), torch.Tensor)
         torch.testing.assert_close(tensor_candidate(x), tensor_source(x))
 
-    def test_freezing_and_recomputation(self):
-        """Packed projections keep freezing and recompute the same gradients."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_freezing_and_recomputation(self) -> None:
+        """Feature: MLP and shared expert module family.
+        Description: Packed projections keep freezing and recompute the same gradients.
+        Expectation: Frozen projections remain frozen and checkpoint replay produces the same input gradients.
+        """
         for factory, source_type in ((SwiGLUMLP, SourceMLP), (SharedExpert, SourceShared)):
             source = source_type()
             source.eval()
@@ -157,8 +176,12 @@ class TestMLPFamily(unittest.TestCase):
             checkpoint(candidate, y, use_reentrant=False).sum().backward()
             torch.testing.assert_close(x.grad, y.grad)
 
-    def test_packed_checkpoint_sections(self):
-        """The declared packing operation reverses both weight and bias sections."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_packed_checkpoint_sections(self) -> None:
+        """Feature: MLP and shared expert module family.
+        Description: The declared packing operation reverses both weight and bias sections.
+        Expectation: Packing and its inverse preserve all source weight and bias values.
+        """
         source = SourceMLP()
         for name in ("weight", "bias"):
             operation = ConcatenateWithSections((32, 32))
@@ -168,8 +191,12 @@ class TestMLPFamily(unittest.TestCase):
             for key, value in values.items():
                 torch.testing.assert_close(restored[key], value)
 
-    def test_direct_meta_and_tuple(self):
-        """Direct and meta construction preserve explicit return protocols."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_direct_meta_and_tuple(self) -> None:
+        """Feature: MLP and shared expert module family.
+        Description: Direct and meta construction preserve explicit return protocols.
+        Expectation: Materialized direct members execute and preserve the configured output protocol.
+        """
         for factory, config in (
             (SwiGLUMLP, SwiGLUMLPConfig(16, 32)),
             (SharedExpert, SharedExpertConfig(16, 32)),
@@ -188,16 +215,24 @@ class TestMLPFamily(unittest.TestCase):
                     self.assertEqual(output.shape, (2, 16))
                 self.assertEqual(get_family_build_info(member).origin, "direct")
 
-    def test_invalid_config(self):
-        """Reject ambiguous dimensions and conflicting construction sources."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_invalid_config(self) -> None:
+        """Feature: MLP and shared expert module family.
+        Description: Reject ambiguous dimensions and conflicting construction sources.
+        Expectation: Invalid dimensions and conflicting construction sources raise ValueError.
+        """
         for size in (0, -1, True, 1.5):
             with self.subTest(size=size), self.assertRaises(ValueError):
                 SwiGLUMLPConfig(size, 32)
         with self.assertRaises(ValueError):
             SwiGLUMLP(config=SwiGLUMLPConfig(16, 32), module=SourceMLP())
 
-    def test_shared_x_source_keyword(self):
-        """The equivalent x input spelling is accepted without weakening matching."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_shared_x_source_keyword(self) -> None:
+        """Feature: MLP and shared expert module family.
+        Description: The equivalent x input spelling is accepted without weakening matching.
+        Expectation: Both keyword spellings produce the same result and duplicate inputs are rejected.
+        """
         model = nn.Sequential(SourceMLP())
         context = {"module_replacements": (ModuleReplacementSpec(("0",), SharedExpert),)}
         model, _ = prepare_model_components(model, context)

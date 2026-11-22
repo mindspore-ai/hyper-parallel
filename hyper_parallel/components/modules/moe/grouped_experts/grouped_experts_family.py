@@ -43,6 +43,8 @@ def validate_grouped_experts(
 ) -> None:
     """Validate expert count and reject unfinished execution before adopting a source."""
     del context
+    if not isinstance(member.arguments.get("overlap_shared_expert", True), bool):
+        raise ValueError("overlap_shared_expert must be bool")
     if module is not None and not isinstance(module, GroupedExpertsModule):
         gate_up = getattr(module, "gate_up_proj", None)
         if not isinstance(gate_up, nn.Parameter) or gate_up.ndim != 3:
@@ -91,7 +93,7 @@ def grouped_experts_sharding(
 def GroupedExperts(  # pylint: disable=invalid-name
     *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Any = None, mesh: Any = None,
-    megakernel: bool = False, moonep: bool = False,
+    megakernel: bool = False, moonep: bool = False, overlap_shared_expert: bool = True,
     dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
     capacity_growth_factor: float | None = None,
 ) -> nn.Module:
@@ -105,6 +107,7 @@ def GroupedExperts(  # pylint: disable=invalid-name
         mesh: Existing job mesh, outside serialized family arguments.
         megakernel: Select fused Mega transport/compute for EP>1; EP=1 warns and uses local GMM.
         moonep: Select the reserved MoonEP execution member when True.
+        overlap_shared_expert: Let ordinary/Moon EP schedule a bound shared family member.
         dispatch_mode: Mega transport policy, push or pull.
         initial_capacity_factor: Mega push receive-capacity factor; None uses the backend default.
         capacity_growth_factor: Mega push growth factor; None uses the backend default.
@@ -116,6 +119,7 @@ def GroupedExperts(  # pylint: disable=invalid-name
     """
     return build_family(GroupedExperts, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, megakernel=megakernel, moonep=moonep,
+                        overlap_shared_expert=overlap_shared_expert,
                         dispatch_mode=dispatch_mode, initial_capacity_factor=initial_capacity_factor,
                         capacity_growth_factor=capacity_growth_factor)
 

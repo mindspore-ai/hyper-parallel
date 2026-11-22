@@ -191,6 +191,68 @@ sync_and_update_expert_bias(router)  # 逻辑 step 后一次；已绑定时使�
 也可使用 `hyper_parallel.trainer.callbacks.MoEMonitorCallback` 遍历整个模型，
 手动调用 `on_step_end()` 或注册 optimizer post-hook；三种调度方式只选一种。
 
+## 共享专家的双阶段通信掩盖
+
+新专家族默认 `overlap_shared_expert=True`。开关传给 EPContext；MoonEPContext 直接继承 EPContext。
+模型的 forward、路由接口以及 dispatch/combine 入参保持原有形式，不再传入计算回调。
+
+```yaml
+plan_overrides:
+  - match: 'model.layers.*.mlp.experts'
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+        megakernel: false
+        moonep: false
+        overlap_shared_expert: true
+```
+
+公共 `bind_parallel_modules` 在布局后、激活包装/FSDP 前绑定同一 MoE 下的 SharedExpert 成员。
+绑定仅借用共享模块，不复制参数、不改 checkpoint 名称、不改写模型 forward。
+MoE 的原始调用仍是 `routed = self.experts(...)`，随后 `shared = self.shared_experts(hidden_states)`。
+
+```text
+MoE pre-hook 保存本次原始 tokens
+→ counts 交换
+→ dispatch 发起异步 payload all-to-all → shared(..., stage="fc1")
+→ 接收端 permute / routed GMM
+→ combine 发起异步 payload all-to-all → shared(..., stage="fc2")
+→ 来源端 unpermute
+→ 模型正常调用 shared_experts，消费本次已计算结果
+→ 原有 shared gating / mask / merge
+→ MoE post-hook 清理状态
+```
+
+**FC1 掩盖 dispatch，FC2 掩盖 combine**。counts 交换保持原流程。
+两个阶段均使用共享模块的正常调用，保留其 FSDP hooks；最后取结果时不再执行第三次共享 forward 或 gather。
+不手工 unshard、不保存权重副本。共享 FC1 的中间结果在 FC2 后释放；最终输出在模型消费后移出缓存。
+调用状态通过 ContextVar 隔离，正常退出和异常退出均清理，不跨 microbatch 复用。
+共享专家先于 routed experts 执行时保留原来的串行顺序。
+
+SharedExpert 复用 `stage="fc1"`、`stage="fc2"`：FC1 返回激活后的 `[..., I]`，FC2 返回原有 Tensor
+或 `(output, bias)`。激活、bias 和 dtype 顺序沿用完整 forward，原有共享门控与合并仍由模型执行。
+未迁移的原生共享模块没有此协议时保留串行路径，不猜测其激活或投影语义。
+EP=1、没有共享专家以及 MegaKernel 成员均不启用这套分阶段调度。
+后端没有非均匀异步交换时仍沿用同步 fallback，不保证实际掩盖收益。
+
+完整 MoE 的 Torch/Hyper checkpoint 会重新建立本次状态。
+只 checkpoint experts 的非重入场景使用 Hyper checkpoint 的已有 invocation resource 保存原始共享输入的 shape，
+在 replay 时从恢复的 experts 输入重建阶段，不额外保留原始激活。直接使用 Torch checkpoint 包住 experts 时应提供
+相应 recompute context，或覆盖整个 MoE。
+只 checkpoint experts 的重入场景在 no-grad 前向中保留串行共享计算，避免共享专家丢失梯度。
+FC1/FC2 抛错时等待该阶段已发起的 payload，再传递原异常。
+
+独立组件无需 Trainer，可在包装 FSDP 前调用
+`ep_context.bind_shared_expert(moe_module, moe_module.shared_experts, moe_module.experts)`；不需要修改模型 forward。
+
+SharedExpert 随机初始化对齐 Megatron MLP：FC1 使用 `N(0, init_method_std)`，FC2 使用
+`N(0, init_method_std / sqrt(2 * num_layers))`，默认 `init_method_std=0.02`，bias 清零。
+全局层数由构建器通过 `context["num_layers"]` 传入；独立使用时在配置中提供 `num_layers`
+或 `num_hidden_layers`。示例单层配置显式使用 `num_layers=1`。
+该规则只用于随机初始化，采用已有模块或加载 checkpoint 不会重置已加载的投影。
+保留 separate 源布局且未配置 clamp/FP32 激活时，共享 FC1 直接执行源 `act_fn(gate_proj(x)) * up_proj(x)`。
+
 ## `moe_utils` 的职责
 
 `router_sharding` 是本次新增，原 Gate 注册没有这项布局声明；旧模型主要使用模型外层切分模板。

@@ -192,6 +192,8 @@ class GroupedExpertsModule(nn.Module):
     router, shared experts, auxiliary loss and model masks remain outside this module.
     """
 
+    shared_expert_overlap_supported = True
+
     def __init__(
         self, *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
         module_fqn: str = "", context: Mapping[str, Any] | None = None,
