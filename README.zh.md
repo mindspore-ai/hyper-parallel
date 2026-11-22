@@ -133,6 +133,15 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide)，公开�
 
 ---
 
+## 版本发布
+
+HyperParallel 采用语义化版本，计划每月发布一个 Beta 版、每季度发布一个稳定版。
+发布稳定版前，维护者会评审候选版本，核实 wheel 包已按目标 glibc 版本构建，并确认完整测试套件通过。
+维护承诺、PyTorch 兼容性政策和发布验收条件见[发布流程](docs/contributing/release.zh.md)。
+已发布的 wheel 包和版本说明见 [GitHub Releases](https://github.com/mindspore-ai/hyper-parallel/releases)。
+
+---
+
 ## 🤝 加入我们
 
 欢迎提交 Issue 和 Pull Request。开发环境、测试、评审和社区发布流程见[社区贡献指南](CONTRIBUTING.zh.md)。

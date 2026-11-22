@@ -132,6 +132,16 @@ See the [Feature Guides](docs/index.md#feature-guides) for TP, CP, EP, and PP co
 
 ---
 
+## Releases
+
+HyperParallel uses semantic versioning and targets one beta release per month and one stable release per quarter.
+Before publishing a stable release, maintainers review the candidate, verify that its wheels build against the target
+glibc version, and confirm that the full test suite passes. The [release process](docs/contributing/release.md)
+covers the maintenance commitment, PyTorch compatibility, and release criteria.
+Published wheels and release notes are available on [GitHub Releases](https://github.com/mindspore-ai/hyper-parallel/releases).
+
+---
+
 ## 🤝 Join Us
 
 Issues and pull requests are welcome. Start with the [Contribution Guide](CONTRIBUTING.md) for development setup, testing, review, and the community release workflow.
