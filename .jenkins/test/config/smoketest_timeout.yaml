@@ -17,5 +17,6 @@ ascend910b:
   process_group: 720
   swap_optimizer: 2400
   optimizer: 2400
+  functional: 180
   multicore: 960
   auto_models: 1200

@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.core.optimizer import get_hyper_optimizer
-from hyper_parallel.core.optimizer.muon import _NS_ASYM5_COEFFS, _NS_LEGACY_COEFFS
+from hyper_parallel.core.optimizer.muon import Muon, _NS_ASYM5_COEFFS, _NS_LEGACY_COEFFS
 
 
 class TestMuonNSBackendFactory(unittest.TestCase):
@@ -68,6 +68,42 @@ class TestMuonNSBackendFactory(unittest.TestCase):
         )
         self.assertIs(chain.optimizer.zeropower_fn, self.callback)
         self.builder.assert_not_called()
+
+    def test_native_kernel_flag_replaces_both_symmetric_products(self) -> None:
+        """Route only the enabled group to the symmetric kernel on each NS iteration."""
+        groups = [
+            {"params": [self.parameters[0]]},
+            {"params": [self.parameters[1]], "use_kernel": False},
+        ]
+        for transformed in (False, True):
+            with self.subTest(transformed=transformed):
+                kwargs = {"muon_use_kernel": True, "ns_steps": 2}
+                if transformed:
+                    kwargs["ns_transform_fn"] = lambda _name, _tensor: None
+                chain = get_hyper_optimizer(self.model, groups, [], muon_kwargs=kwargs)
+                for parameter in self.parameters:
+                    parameter.grad = torch.ones_like(parameter)
+
+                with patch("hyper_parallel.core.optimizer.muon.symmetric_matmul", wraps=torch.matmul) as kernel:
+                    chain.step()
+
+                self.assertEqual(kernel.call_count, 4)
+                for gram_call, square_call in zip(kernel.call_args_list[::2], kernel.call_args_list[1::2]):
+                    left, right = gram_call.args
+                    torch.testing.assert_close(right, left.mT)
+                    gram_buffer = gram_call.kwargs["out"]
+                    self.assertIs(square_call.args[0], gram_buffer)
+                    self.assertIs(square_call.args[1], gram_buffer)
+
+    def test_loading_pre_kernel_checkpoint_keeps_configured_default(self) -> None:
+        """Recover the runtime flag when an older checkpoint has no group setting."""
+        optimizer = Muon(self.parameters, use_kernel=True)
+        checkpoint = optimizer.state_dict()
+        checkpoint["param_groups"][0].pop("use_kernel")
+
+        optimizer.load_state_dict(checkpoint)
+
+        self.assertIs(optimizer.param_groups[0]["use_kernel"], True)
 
     def test_invalid_backend_and_callback_conflict(self) -> None:
         """Typos and conflicting explicit requests must fail before loading the backend."""
