@@ -15,8 +15,10 @@
 """Unit tests for trainer lifecycle cleanup."""
 
 import importlib
+import io
+import logging
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -152,6 +154,64 @@ class TestHcclDeterminismSetup(unittest.TestCase):
                         base_module.BaseTrainer._setup(trainer)
 
 
+class TestStepOneOperatorBackends(unittest.TestCase):
+    """Check the first optimizer-step report across ranks."""
+
+    def test_rank_zero_prints_all_backend_triples_at_step_one(self) -> None:
+        """Print deduplicated triples to stderr even at ERROR logging level."""
+        trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+        trainer.state = SimpleNamespace(global_step=1)
+        trainer._callbacks = []  # pylint: disable=protected-access
+        local = (("rms_norm", "fp32_affine", "torch_npu"),)
+        remote = (*local, ("rms_norm", "fp32_affine", "native"), ("swiglu", "standard", "native"))
+
+        def gather(reports: list, usage: tuple) -> None:
+            self.assertEqual(usage, local)
+            reports[:] = [local, remote]
+
+        self.addCleanup(base_module.logger.setLevel, base_module.logger.level)
+        base_module.logger.setLevel(logging.ERROR)
+        with (
+            patch.object(base_module, "get_world_size_safe", return_value=2),
+            patch.object(base_module, "get_global_rank_safe", return_value=0),
+            patch.object(base_module.ops, "used_backends", return_value=local),
+            patch.object(base_module.dist, "all_gather_object", side_effect=gather) as collective,
+            redirect_stderr(io.StringIO()) as output,
+        ):
+            trainer.on_step_end()
+            trainer.state.global_step = 2
+            trainer.on_step_end()
+
+        collective.assert_called_once()
+        self.assertEqual(
+            output.getvalue(),
+            "Fused operator backends used in training step 1\n\n"
+            "Op        Variant      Backend\n"
+            "--------  -----------  ---------\n"
+            "rms_norm  fp32_affine  native\n"
+            "rms_norm  fp32_affine  torch_npu\n"
+            "swiglu    standard     native\n",
+        )
+
+    def test_nonzero_rank_participates_with_empty_local_usage(self) -> None:
+        """A rank with no local backend usage still participates in the step-one collective."""
+        trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+        trainer.state = SimpleNamespace(global_step=1)
+        trainer._callbacks = []  # pylint: disable=protected-access
+
+        with (
+            patch.object(base_module, "get_world_size_safe", return_value=2),
+            patch.object(base_module, "get_global_rank_safe", return_value=1),
+            patch.object(base_module.ops, "used_backends", return_value=()),
+            patch.object(base_module.dist, "all_gather_object") as collective,
+            redirect_stderr(io.StringIO()) as output,
+        ):
+            trainer.on_step_end()
+
+        collective.assert_called_once_with([(), ()], ())
+        self.assertEqual(output.getvalue(), "")
+
+
 class TestBaseTrainerExternalState(unittest.TestCase):
     """Cover the host external-state branches of optimizer build and clip."""
 
@@ -160,6 +220,7 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         """Return a build_optimizer stub that captures the wrap_dense hook."""
         def build_optimizer(optimizer_config: Any, *, wrap_dense: Any) -> Any:
             """Capture wrap_dense and return the prebuilt optimizer."""
+            del optimizer_config
             captured["wrap_dense"] = wrap_dense
             return built
         return build_optimizer

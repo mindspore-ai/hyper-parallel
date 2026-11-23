@@ -19,3 +19,4 @@ ascend910b:
   optimizer: 2400
   multicore: 960
   auto_models: 1200
+  ops: 1200
