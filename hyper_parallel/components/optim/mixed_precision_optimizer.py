@@ -15,7 +15,8 @@
 """Megatron-aligned fp32 main-parameter optimizer composition."""
 
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -25,6 +26,8 @@ from hyper_parallel.core.optimizer.dtensor_compat import (
     is_dtensor,
     to_local_if_dtensor,
 )
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 
 
@@ -46,7 +49,7 @@ def _copy_tensor(destination: torch.Tensor, source: torch.Tensor) -> None:
 
 
 def _gradient_for_param(
-        optimizer_param: nn.Parameter,
+        optimizer_param: torch.Tensor,
         gradient: torch.Tensor,
 ) -> torch.Tensor:
     """Validate gradient layout and cast dtype on the gradient's existing device.
@@ -101,224 +104,179 @@ def _gradient_for_param(
     return prepared_gradient
 
 
-class MixedPrecisionOptimizer:
-    """Base composition for an optimizer that owns precision-conversion state."""
+@dataclass(frozen=True)
+class _ParameterBinding:
+    """Describe optimizer storage independently of eager or graph execution."""
 
-    def __init__(self, optimizer: ChainedOptimizer, model: nn.Module) -> None:
-        """Bind the inner optimizer and expose its scheduler-facing state.
+    model: nn.Parameter
+    optimizer: nn.Parameter
+    layout: Optional[Layout] = None
+    local_shape: tuple[int, ...] = ()
+    owns_storage: bool = False
+    storage_ptr: Optional[int] = None
+    checkpoint_name: Optional[str] = None
+
+    def local_view(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return the valid local storage without changing distributed metadata.
+
+        Args:
+            tensor: Model or gradient tensor containing the physical local shard.
+        """
+        local = to_local_if_dtensor(tensor)
+        if self.layout is not None and local.ndim:
+            return local.narrow(0, 0, self.local_shape[0])
+        return local
+
+
+class MixedPrecisionOptimizer:
+    """Share gradient, update and checkpoint flows over final parameter bindings."""
+
+    def __init__(
+            self, optimizer: ChainedOptimizer, model: nn.Module, *,
+            fp32_main_params: bool = True, defer_binding: bool = False,
+    ) -> None:
+        """Expose the inner optimizer while optionally deferring final storage.
 
         Args:
             optimizer: Chained leaf-optimizer composition.
             model: Module containing the computation parameters.
+            fp32_main_params: Whether low-precision parameters have FP32 main weights.
+            defer_binding: Whether final parameter shards are not available yet.
         """
         self.optimizer = optimizer
         self.model = model
         self.optimizers_dict: dict[str, Any] = optimizer.optimizers_dict
         self.chained_optimizers: list[Any] = optimizer.chained_optimizers
         self.param_groups: list[dict[str, Any]] = optimizer.param_groups
-
-    def prepare_grads(self) -> None:
-        """Prepare model gradients for the inner optimizer."""
-        raise NotImplementedError
-
-    def step_with_ready_grads(self, closure: Any = None) -> Any:
-        """Update parameters after :meth:`prepare_grads` completed.
-
-        Args:
-            closure: Optional callable that reevaluates the model and returns loss.
-        """
-        raise NotImplementedError
-
-    def reload_model_params(self) -> None:
-        """Reload optimizer-owned parameters from the registered model."""
-        raise NotImplementedError
-
-
-class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
-    """Update fp32 main params and copy them back to fp16/bf16 model params."""
-
-    def __init__(self, optimizer: ChainedOptimizer, model: nn.Module) -> None:
-        """Replace leaf optimizer params with fp32 main parameters.
-
-        Args:
-            optimizer: Chained AdamW/Muon optimizer over model parameters.
-            model: Module containing the computation parameters.
-        """
-        super().__init__(optimizer, model)
-        self.float16_groups: list[list[nn.Parameter]] = []
-        self.fp32_from_float16_groups: list[list[nn.Parameter]] = []
-        self.fp32_from_fp32_groups: list[list[nn.Parameter]] = []
+        self.fp32_main_params = fp32_main_params
+        self._bound = not defer_binding
+        self._bindings: list[_ParameterBinding] = []
+        self._main_param_by_fqn: dict[str, nn.Parameter] = {}
         self.model_param_by_optimizer_param: dict[nn.Parameter, nn.Parameter] = {}
-        self._build_model_and_main_param_groups()
-        self.optimizer_param_by_model_param = {
-            model_param: optimizer_param
-            for optimizer_param, model_param in self.model_param_by_optimizer_param.items()
-        }
-        self.optimizer.reset_optimizer_parameters(
-            self.model_param_by_optimizer_param
+        self.optimizer_param_by_model_param: dict[nn.Parameter, nn.Parameter] = {}
+
+    def _register_parameter_bindings(self, bindings: list[_ParameterBinding]) -> None:
+        """Index independent main weights without mistaking aliases for copies."""
+        self._bindings = bindings
+        self.model_param_by_optimizer_param.clear()
+        self.model_param_by_optimizer_param.update(
+            (binding.optimizer, binding.model)
+            for binding in bindings if binding.optimizer is not binding.model
         )
-        self.param_groups = self.optimizer.param_groups
-
-        parameter_names = {
-            parameter: name for name, parameter in model.named_parameters()
-        }
         self._main_param_by_fqn = {
-            parameter_names[model_param]: optimizer_param
-            for optimizer_param, model_param in self.model_param_by_optimizer_param.items()
+            (binding.checkpoint_name if binding.checkpoint_name is not None else binding.model.model_name):
+                binding.optimizer
+            for binding in bindings if binding.owns_storage
         }
 
-    def _build_model_and_main_param_groups(self) -> None:
-        """Build Megatron-compatible model and main-parameter group views."""
-        parameter_names = {
-            parameter: name for name, parameter in self.model.named_parameters()
-        }
-        for leaf_optimizer in self.chained_optimizers:
-            for optimizer_group in leaf_optimizer.param_groups:
-                float16_group = []
-                fp32_from_float16_group = []
-                fp32_from_fp32_group = []
-                for param_index, model_param in enumerate(optimizer_group["params"]):
-                    model_param.main_grad = None
-                    if model_param.dtype == torch.float32:
-                        model_param.main_param = model_param
-                        fp32_from_fp32_group.append(model_param)
-                        continue
-                    if model_param.dtype not in (torch.float16, torch.bfloat16):
-                        raise TypeError(
-                            "Float16OptimizerWithFloat16Params supports trainable "
-                            "float16, bfloat16, or float32 parameters; "
-                            f"{parameter_names[model_param]} has dtype {model_param.dtype}"
-                        )
+    def _require_bound(self) -> None:
+        """Require final shard views before optimizer operations use them."""
+        if not self._bound:
+            raise RuntimeError(
+                "Compile and bind graph optimizer parameters before updating or restoring optimizer state"
+            )
 
-                    main_param = nn.Parameter(
-                        model_param.detach().to(dtype=torch.float32),
-                        requires_grad=model_param.requires_grad,
-                    )
-                    main_param.model_name = model_param.model_name
-                    model_param.main_param = main_param
-                    optimizer_group["params"][param_index] = main_param
-                    if model_param in leaf_optimizer.state:
-                        leaf_optimizer.state[main_param] = leaf_optimizer.state.pop(model_param)
-
-                    float16_group.append(model_param)
-                    fp32_from_float16_group.append(main_param)
-                    self.model_param_by_optimizer_param[main_param] = model_param
-
-                self.float16_groups.append(float16_group)
-                self.fp32_from_float16_groups.append(fp32_from_float16_group)
-                self.fp32_from_fp32_groups.append(fp32_from_fp32_group)
+    @staticmethod
+    def _prepare_bound_gradient(binding: _ParameterBinding, gradient: torch.Tensor) -> torch.Tensor:
+        """Validate an existing DTensor or describe a declared local shard."""
+        if binding.layout is None or is_dtensor(gradient):
+            return _gradient_for_param(binding.optimizer, gradient)
+        local = binding.local_view(gradient.detach())
+        prepared = _gradient_for_param(to_local_if_dtensor(binding.optimizer), local)
+        return DTensor.from_local_with_layout(prepared, binding.layout, shape=binding.layout.tensor_shape)
 
     def _copy_model_grads_to_main_grads(self) -> None:
-        """Transfer model gradients to fp32 optimizer params, casting dtype only.
-
-        The producer must supply the optimizer parameter's device and layout.
-        Rebind existing ``main_grad`` buffers to the prepared gradient and clear
-        model ``grad``. The local source reference is overwritten before the
-        next conversion or released on return, so reference counting reclaims
-        converted source buffers before the optimizer step.
-        External owners of shared gradient storage remain responsible for it.
-        """
-        for model_group, main_group in zip(
-                self.float16_groups,
-                self.fp32_from_float16_groups,
-        ):
-            for model_param, main_param in zip(model_group, main_group):
-                model_gradient = model_param.main_grad
-                if model_gradient is None:
-                    model_gradient = model_param.grad
-                main_param.grad = (
-                    _gradient_for_param(main_param, model_gradient)
-                    if model_gradient is not None else None
+        """Prepare final gradients while preserving producer ownership semantics."""
+        for binding in self._bindings:
+            if binding.storage_ptr is not None and binding.model.data_ptr() != binding.storage_ptr:
+                raise RuntimeError(
+                    f"Graph parameter storage changed after optimizer binding: {binding.model.model_name}"
                 )
-                if model_param.main_grad is not None:
-                    model_param.main_grad = main_param.grad
-                model_param.grad = None
-
-        for fp32_group in self.fp32_from_fp32_groups:
-            for model_param in fp32_group:
-                model_gradient = model_param.main_grad
-                if model_gradient is not None:
-                    model_param.grad = _gradient_for_param(model_param, model_gradient)
-                    model_param.main_grad = model_param.grad
+            model_gradient = getattr(binding.model, "main_grad", None)
+            had_main_grad = model_gradient is not None
+            if binding.optimizer is binding.model and not had_main_grad:
+                continue
+            if model_gradient is None:
+                model_gradient = binding.model.grad
+            binding.optimizer.grad = (
+                self._prepare_bound_gradient(binding, model_gradient)
+                if model_gradient is not None else None
+            )
+            if had_main_grad:
+                binding.model.main_grad = binding.optimizer.grad
+            if binding.optimizer is not binding.model:
+                binding.model.grad = None
 
     @torch.no_grad()
     def _copy_main_params_to_model_params(self) -> None:
-        """Copy updated fp32 main params to fp16/bf16 model params."""
-        for model_group, main_group in zip(
-                self.float16_groups,
-                self.fp32_from_float16_groups,
-        ):
-            for model_param, main_param in zip(model_group, main_group):
-                _copy_tensor(model_param, main_param)
+        """Copy owned main weights back and clear invalid physical padding."""
+        for binding in self._bindings:
+            if binding.owns_storage:
+                _copy_tensor(binding.local_view(binding.model), binding.optimizer)
+            if binding.layout is not None:
+                local = to_local_if_dtensor(binding.model)
+                if local.ndim and binding.local_shape[0] < local.shape[0]:
+                    local[binding.local_shape[0]:].zero_()
 
     @torch.no_grad()
     def _copy_model_params_to_main_params(self) -> None:
-        """Refresh fp32 main params from fp16/bf16 model params."""
-        for model_group, main_group in zip(
-                self.float16_groups,
-                self.fp32_from_float16_groups,
-        ):
-            for model_param, main_param in zip(model_group, main_group):
-                _copy_tensor(main_param, model_param)
+        """Refresh only optimizer-owned main weights from valid model shards."""
+        for binding in self._bindings:
+            if binding.owns_storage:
+                _copy_tensor(binding.optimizer, binding.local_view(binding.model))
 
     def prepare_grads(self) -> None:
-        """Make fp32 main gradients ready for AdamW/Muon."""
+        """Prepare model gradients for the shared inner optimizer."""
+        self._require_bound()
         self._copy_model_grads_to_main_grads()
 
     def step_with_ready_grads(self, closure: Any = None) -> Any:
-        """Update main params, then copy them back to model params.
+        """Update final optimizer parameters and synchronize model storage.
 
         Args:
-            closure: Optional callable that reevaluates the model and returns loss.
-
-        Returns:
-            The inner optimizer step result.
+            closure: Optional loss closure forwarded to the leaf optimizers.
         """
+        self._require_bound()
         loss = self.optimizer.step(closure=closure)
         self._copy_main_params_to_model_params()
         return loss
 
     def step(self, closure: Any = None) -> Any:
-        """Prepare gradients and execute one mixed-precision optimizer step.
+        """Prepare gradients and execute one eager optimizer update.
 
         Args:
-            closure: Optional callable that reevaluates the model and returns loss.
-
-        Returns:
-            The inner optimizer step result.
+            closure: Optional loss closure forwarded to the leaf optimizers.
         """
         self.prepare_grads()
         return self.step_with_ready_grads(closure=closure)
 
     def reload_model_params(self) -> None:
-        """Initialize main params from the current model parameter values."""
+        """Initialize owned main parameters from the current model values."""
+        self._require_bound()
         self._copy_model_params_to_main_params()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
-        """Clear inner grads plus runtime-only model grad/main_grad state.
+        """Clear inner gradients and model-side runtime accumulation state.
 
         Args:
-            set_to_none: Whether inner gradients are reset to ``None``.
+            set_to_none: Whether inner optimizer gradients should be released.
         """
         self.optimizer.zero_grad(set_to_none=set_to_none)
-        for model_param in self.optimizer_param_by_model_param:
-            model_param.grad = None
-            model_param.main_grad = None
-            if hasattr(model_param, "grad_added_to_main_grad"):
-                model_param.grad_added_to_main_grad = False
-        for fp32_group in self.fp32_from_fp32_groups:
-            for model_param in fp32_group:
-                model_param.grad = None
-                model_param.main_grad = None
-                if hasattr(model_param, "grad_added_to_main_grad"):
-                    model_param.grad_added_to_main_grad = False
+        for binding in self._bindings:
+            binding.model.grad = None
+            if hasattr(binding.model, "main_grad"):
+                binding.model.main_grad = None
+            if hasattr(binding.model, "grad_added_to_main_grad"):
+                binding.model.grad_added_to_main_grad = False
 
     def state_dict(self) -> dict[str, Any]:
-        """Append fp32 main weights to the existing optimizer FQN state."""
+        """Append independent FP32 main weights to the common FQN state."""
+        self._require_bound()
         state_dict = self.optimizer.state_dict()
-        state_dict[MIXED_PRECISION_OPTIMIZER_STATE_KEY] = {
-            FP32_MAIN_PARAM_STATE_KEY: dict(self._main_param_by_fqn),
-        }
+        if self.fp32_main_params:
+            state_dict[MIXED_PRECISION_OPTIMIZER_STATE_KEY] = {
+                FP32_MAIN_PARAM_STATE_KEY: dict(self._main_param_by_fqn),
+            }
         return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -327,7 +285,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         Args:
             state_dict: Optimizer state containing leaf and main-param entries.
         """
+        self._require_bound()
         optimizer_state = dict(state_dict)
+        if not self.fp32_main_params:
+            optimizer_state.pop(MIXED_PRECISION_OPTIMIZER_STATE_KEY, None)
+            self.optimizer.load_state_dict(optimizer_state)
+            self.param_groups = self.optimizer.param_groups
+            return
         if MIXED_PRECISION_OPTIMIZER_STATE_KEY not in optimizer_state:
             self.optimizer.load_state_dict(optimizer_state)
             self.param_groups = self.optimizer.param_groups
@@ -369,6 +333,86 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         with torch.no_grad():
             for parameter_fqn, main_param in self._main_param_by_fqn.items():
                 _copy_tensor(main_param, checkpoint_main_params[parameter_fqn])
+
+
+class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
+    """Create eager FP32 main weights while sharing optimizer runtime flows."""
+
+    def __init__(self, optimizer: ChainedOptimizer, model: nn.Module) -> None:
+        """Replace leaf optimizer params with fp32 main parameters.
+
+        Args:
+            optimizer: Chained AdamW/Muon optimizer over model parameters.
+            model: Module containing the computation parameters.
+        """
+        super().__init__(optimizer, model)
+        self.float16_groups: list[list[nn.Parameter]] = []
+        self.fp32_from_float16_groups: list[list[nn.Parameter]] = []
+        self.fp32_from_fp32_groups: list[list[nn.Parameter]] = []
+        self.model_param_by_optimizer_param: dict[nn.Parameter, nn.Parameter] = {}
+        self._build_model_and_main_param_groups()
+        self.optimizer_param_by_model_param = {
+            model_param: optimizer_param
+            for optimizer_param, model_param in self.model_param_by_optimizer_param.items()
+        }
+        self.optimizer.reset_optimizer_parameters(
+            self.model_param_by_optimizer_param
+        )
+        self.param_groups = self.optimizer.param_groups
+
+        parameter_names = {parameter: name for name, parameter in model.named_parameters()}
+        bindings = [
+            _ParameterBinding(model_param, main_param, owns_storage=True,
+                              checkpoint_name=parameter_names[model_param])
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups)
+            for model_param, main_param in zip(model_group, main_group)
+        ]
+        bindings.extend(
+            _ParameterBinding(parameter, parameter)
+            for group in self.fp32_from_fp32_groups for parameter in group
+        )
+        self._register_parameter_bindings(bindings)
+
+    def _build_model_and_main_param_groups(self) -> None:
+        """Build Megatron-compatible model and main-parameter group views."""
+        parameter_names = {
+            parameter: name for name, parameter in self.model.named_parameters()
+        }
+        for leaf_optimizer in self.chained_optimizers:
+            for optimizer_group in leaf_optimizer.param_groups:
+                float16_group = []
+                fp32_from_float16_group = []
+                fp32_from_fp32_group = []
+                for param_index, model_param in enumerate(optimizer_group["params"]):
+                    model_param.main_grad = None
+                    if model_param.dtype == torch.float32:
+                        model_param.main_param = model_param
+                        fp32_from_fp32_group.append(model_param)
+                        continue
+                    if model_param.dtype not in (torch.float16, torch.bfloat16):
+                        raise TypeError(
+                            "Float16OptimizerWithFloat16Params supports trainable "
+                            "float16, bfloat16, or float32 parameters; "
+                            f"{parameter_names[model_param]} has dtype {model_param.dtype}"
+                        )
+
+                    main_param = nn.Parameter(
+                        model_param.detach().to(dtype=torch.float32),
+                        requires_grad=model_param.requires_grad,
+                    )
+                    main_param.model_name = model_param.model_name
+                    model_param.main_param = main_param
+                    optimizer_group["params"][param_index] = main_param
+                    if model_param in leaf_optimizer.state:
+                        leaf_optimizer.state[main_param] = leaf_optimizer.state.pop(model_param)
+
+                    float16_group.append(model_param)
+                    fp32_from_float16_group.append(main_param)
+                    self.model_param_by_optimizer_param[main_param] = model_param
+
+                self.float16_groups.append(float16_group)
+                self.fp32_from_float16_groups.append(fp32_from_float16_group)
+                self.fp32_from_fp32_groups.append(fp32_from_fp32_group)
 
 
 __all__ = [

@@ -34,6 +34,7 @@ __all__ = ["GraphCompiler"]
 
 import logging
 import math
+from copy import copy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -139,6 +140,8 @@ class GraphCompiler:
         self._parameter_groups = {}
         self._parameter_shapes = {}
         self._parameter_layouts = None
+        self._optimizer_layout_source = None
+        self._optimizer_parameter_layouts = None
         self._layout_signature = None
         self.device = device or (
             torch.device("npu")
@@ -190,6 +193,63 @@ class GraphCompiler:
             self._joint_graph.graph_module.parameter_layouts = self._parameter_layouts
         return self._parameter_layouts
 
+    @property
+    def optimizer_parameter_layouts(self) -> Optional[dict]:
+        """Return logical layouts and valid local shapes after physical sharding.
+
+        Gradient clipping describes padded storage, whereas matrix optimizers
+        must exclude padding from their logical matrices. The valid local shape
+        follows the pass's ceil-chunk sharding, including empty trailing shards.
+        """
+        layouts = self.parameter_layouts
+        if layouts is None:
+            return None
+        if layouts is self._optimizer_layout_source:
+            return self._optimizer_parameter_layouts
+        sharded = getattr(self._joint_graph.graph_module, "fsdp_sharded_param_names", frozenset())
+        result = {}
+        for name, parameter in self.model.named_parameters():
+            if parameter not in layouts:
+                continue
+            shape = self._parameter_shapes.get(name, tuple(parameter.shape))
+            local_shape = tuple(parameter.shape)
+            if name in sharded:
+                mesh = self._parameter_meshes.get(name)
+                if mesh is None:
+                    mesh = self._expert_fsdp_mesh if name in self._expert_param_names else self._fsdp_mesh
+                axis = next(index for index, axis_name in enumerate(mesh.mesh_dim_names)
+                            if axis_name in ("fsdp_shard", "edp_shard", "fsdp", "dp", "dp_shard"))
+                rank = mesh.get_coordinate()[axis]
+                valid_rows = min(local_shape[0], max(shape[0] - rank * local_shape[0], 0))
+                local_shape = (valid_rows, *local_shape[1:])
+            source = self.source_layout_for_parameter(name)
+            if source is not None and source[1] is not None:
+                source_layout = Layout.from_device_mesh(source[1])
+                source_layout.set_placements(tuple(source[0]))
+                source_layout.placement_to_tensor_map(len(shape))
+                shape = source_layout.get_global_shape(shape)
+            layout = layouts[parameter]
+            if tuple(shape) != tuple(layout.tensor_shape):
+                layout = copy(layout)
+                layout.set_tensor_meta(tuple(shape), make_contiguous_strides_for(shape), parameter.dtype)
+            result[parameter] = (layout, local_shape)
+        self._optimizer_layout_source = layouts
+        self._optimizer_parameter_layouts = result
+        return result
+
+    def _validate_compile_mode(self) -> None:
+        """Reject unsupported ownership and dynamic pipeline combinations."""
+        external = get_model_external_state(self.model)
+        if external is not None and external.parameters:
+            raise ValueError("GraphCompiler does not support externally managed parameters yet")
+
+        if (
+            self.dynamic or self.dynamic_arg_dims is not None
+        ) and self.pass_config.pp_enabled:
+            raise ValueError(
+                "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
+            )
+
     def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
@@ -201,16 +261,7 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
-        external = get_model_external_state(self.model)
-        if external is not None and external.parameters:
-            raise ValueError("GraphCompiler does not support externally managed parameters yet")
-
-        if (
-            self.dynamic or self.dynamic_arg_dims is not None
-        ) and self.pass_config.pp_enabled:
-            raise ValueError(
-                "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
-            )
+        self._validate_compile_mode()
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
 
@@ -295,12 +346,20 @@ class GraphCompiler:
         return loss, loss_dict
 
     def set_pytree_pre_hook(self, hook: Callable[[], None]) -> "GraphCompiler":
-        """Register a no-arg hook run immediately before first compilation."""
+        """Register a no-arg hook run immediately before first compilation.
+
+        Args:
+            hook: Callback that prepares model state before tracing.
+        """
         self._pytree_pre_hook = hook
         return self
 
     def to(self, device: torch.device) -> "GraphCompiler":
-        """Move the model to ``device`` and remember it for graph execution."""
+        """Move the model to ``device`` and remember it for graph execution.
+
+        Args:
+            device: Target device for the model and graph inputs.
+        """
         self.device = torch.device(device)
         self.model = self.model.to(self.device)
         return self
