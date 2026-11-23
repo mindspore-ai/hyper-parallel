@@ -76,22 +76,50 @@ losses = schedule.run(local_batch)
 
 ---
 
-## PP+FSDP Integration
-
-Use FSDP inside each PP stage to shard parameters and further reduce per-device memory usage:
+## PP+FSDP/HSDP Integration
 
 ```python
-from hyper_parallel import PipelineStage, Schedule1F1B, fully_shard, init_device_mesh
+from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B, fully_shard, init_device_mesh
 
-mesh = init_device_mesh("npu", (pp_size, dp_size), mesh_dim_names=("pp", "dp"))
-
-# Apply FSDP inside each PP stage.
-for stage_model in split_models:
-    fully_shard(stage_model, mesh=mesh["dp"])
-
-# PipelineStage supports FSDP integration through MetaStep.
-stage = PipelineStage(stage_model, stage_index, stage_num=pp_size)
+mesh = init_device_mesh(
+    "npu", (pp_size, replicate_size, shard_size),
+    mesh_dim_names=("pp", "replicate", "shard"),
+)
+parameter_mesh = mesh["replicate", "shard"]  # Use mesh["shard"] for FSDP.
+stages = []
+for stage_index, stage_model in local_model_chunks:
+    fully_shard(stage_model, mesh=parameter_mesh)
+    stage_model.set_reshard_after_forward(True)   # Release full parameters after forward.
+    stage_model.set_reshard_after_backward(True)  # Release full parameters after backward.
+    stage_model.set_requires_gradient_sync(True)  # ReduceScatter on each backward microbatch.
+    stages.append(PipelineStage(
+        stage_model, stage_index, total_stage_num, device=device,
+        group=mesh["pp"].get_group(), mesh=mesh["pp"],
+    ))
+# The schedule synchronizes gradients across replicas on each stage's last backward.
+schedule = ScheduleInterleaved1F1B(stages, micro_batch_num=8)
 ```
+
+| Configuration | Reshard after forward | Reshard after backward | ReduceScatter per microbatch |
+| --- | --- | --- | --- |
+| ZeRO1 | `False` | `False` | `False` |
+| ZeRO2 | `False` | `False` | `True` |
+| ZeRO3 | `True` | `True` | `True` |
+| Rebuild parameters, synchronize at the end | `True` | `True` | `False` |
+
+PP+FSDP/HSDP support checklist
+
+- [x] GPipe, 1F1B, and interleaved 1F1B
+- [x] Full backward and split input/weight backward
+- [x] Nested and grouped `fully_shard` units under a sharded stage root
+- [x] Non-reentrant activation checkpointing
+- [x] [HSDP gradient overlap](pipeline_parallel_overlap_b_f.md#hsdp-gradient-overlap)
+- [ ] Forward-only HSDP stages
+- [ ] Communication fusion (`comm_fusion=True`)
+- [ ] Parameter or optimizer offload
+- [ ] Activation swap with sharded stages
+- [ ] MPipe
+- [ ] `torch.compile`
 
 ---
 

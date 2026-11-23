@@ -324,15 +324,33 @@ class HSDPStateV2:
                 self._wait_prev_reduce_scatter_without_all_reduce()
 
             # Step 3: issue current reduce_scatter
-            self._issue_reduce_scatter_for_current_module()
+            self.issue_reduce_scatter_for_current_module()
 
             # Step 4: issue previous fused all-reduce asynchronously
-            self._issue_prev_fused_all_reduce(prev_group)
+            self.issue_prev_fused_all_reduce(prev_group)
         else:
             self.post_backward_for_comm_fusion()
 
-    def _issue_reduce_scatter_for_current_module(self):
-        """Issue reduce_scatter for current module's parameters with fused all-reduce support.
+    def accumulate_grads_in_reduce_dtype_and_reshard(self) -> None:
+        """Accumulate unsharded gradients in the reduction dtype and reshard if enabled."""
+        for hsdp_param in self.hsdp_params:
+            hsdp_param.accumulate_unsharded_grad_if_needed()
+        if self.reshard_after_backward:
+            self.shard()
+        if not self.reduce_grads:
+            for hsdp_param in self.hsdp_params:
+                hsdp_param.to_accumulated_grad_if_needed()
+
+    def wait_reduce_scatter(self) -> List[AllReduceParamGroup]:
+        """Wait queued reductions and return the replica groups ready to launch."""
+        groups = []
+        while self.scheduler_ctx.pre_reduce_scatter_params:
+            groups.extend(self._wait_prev_reduce_scatter())
+            self._wait_prev_reduce_scatter_without_all_reduce()
+        return groups
+
+    def issue_reduce_scatter_for_current_module(self) -> None:
+        """Issue and queue ReduceScatter for the current module's parameters.
 
         This method groups parameters by their replicate_process_group and:
         1. For params without all_reduce needs: issue reduce_scatter directly
@@ -354,7 +372,6 @@ class HSDPStateV2:
             if skip_param:
                 continue
             params_to_reduce.append(hsdp_param)
-
         params_without_all_reduce = []
         all_reduce_groups = []
 
@@ -386,7 +403,6 @@ class HSDPStateV2:
         for group_key, hsdp_params in groups_by_comm.items():
             if group_key is None:
                 continue
-
             # Create AllReduceParamGroup for fused all-reduce
             group = AllReduceParamGroup(
                 replicate_group=hsdp_params[0].mesh_info.replicate_process_group,
@@ -412,7 +428,7 @@ class HSDPStateV2:
 
             all_reduce_groups.append(group)
 
-        # Empty slots preserve the interval measured in non-fused module units.
+        # Empty entries preserve the interval measured in module units.
         self.scheduler_ctx.pre_reduce_scatter_params.append(params_without_all_reduce)
         self.scheduler_ctx.pre_all_reduce_groups.append(all_reduce_groups)
 
@@ -436,14 +452,10 @@ class HSDPStateV2:
                     reduced_grad = hsdp_param.reduce_scatter_output()
                     hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, torch.distributed.ReduceOp.SUM)
                     hsdp_param.clear_reduce_scatter_output()
-                    if hsdp_param.unsharded_accumulated_grad_data is not None:
-                        hsdp_param.unsharded_accumulated_grad = None
-                    elif hsdp_param.unsharded_param.grad is not None:
-                        hsdp_param.unsharded_param.grad = None
             return prev_groups
         return []
 
-    def _issue_prev_fused_all_reduce(self, prev_groups: List[AllReduceParamGroup]) -> None:
+    def issue_prev_fused_all_reduce(self, prev_groups: List[AllReduceParamGroup]) -> None:
         """Step 4: issue the previous module's fused all-reduce asynchronously.
 
         The all-reduce work is collected in ``pending_all_reduce_groups``
@@ -495,10 +507,6 @@ class HSDPStateV2:
                 )
                 pre_hsdp_param.reduce_partial_output = None
 
-            if pre_hsdp_param.unsharded_accumulated_grad_data is not None:
-                pre_hsdp_param.unsharded_accumulated_grad = None
-            elif pre_hsdp_param.unsharded_param.grad is not None:
-                pre_hsdp_param.unsharded_param.grad = None
         self._sync_current_stream_if_needed(need_synchronize)
 
     def wait_and_split_all_reduce_work_groups(self) -> None:

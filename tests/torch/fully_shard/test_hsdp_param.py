@@ -83,17 +83,21 @@ def test_hsdp_param_group2_gloo():
     Feature: parallel run case in fully_shard
     Description:
         1.test_hsdp_param_v2_all_gather_comm
-        2.test_hsdp_param_v2_prefetch_unshard
-        3.test_hsdp_param_v2_unshard_shard_cycle
-        4.test_hsdp_param_v2_reduce_scatter_grad
+        2.test_hsdp_param_v2_unshard_shard_cycle
+        3.test_hsdp_param_v2_reduce_scatter_grad
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_all_gather_comm", num_proc=2),
-        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_prefetch_unshard", num_proc=2),
         TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_unshard_shard_cycle", num_proc=2),
         TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_reduce_scatter_grad", num_proc=2),
     ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_prefetch_unshard_gloo() -> None:
+    """Verify asynchronous parameter prefetch and unshard with two Gloo ranks."""
+    torchrun_case(_TEST_HSDP_PARAM, "test_hsdp_param_v2_prefetch_unshard", num_proc=2)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")

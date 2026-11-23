@@ -16,7 +16,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -217,9 +217,14 @@ class TestReentrantStage(unittest.TestCase):
         self.assertIsNone(stage.args_recv_info[0][0].buffer)
         self.assertIsNone(stage.grad_recv_info[0][0].buffer)
 
-    def test_hsdp_reentrant_rejected_before_forward(self):
-        """Only the split path rejects unvalidated sharded parameter identity."""
+    def test_hsdp_reentrant_split_backward_is_rejected(self):
+        """The split path rejects reentrant checkpoint replay with HSDP."""
         module = _CheckpointBlock({"first": 0, "second": 0, "exclude": 0})
+        scheduler = Mock()
+        scheduler.cell = module
+        scheduler.scheduler_ctx = SimpleNamespace(root_module=module, all_hsdp_schedulers=[scheduler])
+        scheduler.hsdp_state.hsdp_params = []
+        module.hsdp_scheduler = scheduler
         with patch("hyper_parallel.core.pipeline_parallel._stage.HSDPModule", _CheckpointBlock):
             stage, _ = _stage(module, 1)
             with self.assertRaisesRegex(ValueError, "Reentrant PP split with FSDP/HSDP is unsupported"):
@@ -276,7 +281,7 @@ class TestReentrantStage(unittest.TestCase):
         """A checkpoint with no stage-owned parameters still performs DW."""
         external = torch.nn.Parameter(torch.tensor(2.0))
         stage, (value,) = _stage(_ClosureOnlyCheckpoint(external), 1)
-        self.assertEqual(stage._get_trainable_params(), ())
+        self.assertEqual(stage._get_pp_autograd_params(), ())
         stage.backward_input_one_chunk(0)
         torch.testing.assert_close(value.grad, torch.tensor(2.0))
         self.assertIsNone(external.grad)

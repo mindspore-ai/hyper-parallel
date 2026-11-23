@@ -30,7 +30,7 @@ if EXTENDED_LEVEL1:
                        for vision in (False, True) for mode in ("push", "pull")]
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard",
           essential_mark="essential")
 def test_deepseek_v41_megamoe_single_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Check routed/shared outputs and gradients through the V4.1 MegaMoe adapter."""

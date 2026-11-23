@@ -106,6 +106,7 @@ def _fake_param(
     hsdp_param.orig_dtype = dtype
     hsdp_param.param_dtype = param_dtype
     hsdp_param.reduce_dtype = None
+    hsdp_param.get_source_replicate_process_group.return_value = None
     hsdp_param.reduce_comm_dtype.side_effect = lambda grad=None: hsdp_param.reduce_dtype or (
         grad.dtype if grad is not None else dtype
     )
@@ -944,6 +945,49 @@ class TestReduceBuckets(unittest.TestCase):
             hsdp_param.all_reduce_comm_ctx.all_reduce_output,
             torch.tensor([4.0, 6.0]),
         )
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
+    def test_fused_tp_sum_runs_between_shard_and_replica_reductions(self, mock_rs, mock_ar):
+        """TP-replicated gradients use a fused SUM even with AVG for HSDP."""
+        shard_group = _FakeGroup()
+        replica_group = _FakeGroup()
+        tp_group = _FakeGroup()
+        mesh = _mesh_info(HSDPMeshInfo, shard_group=shard_group, replicate_group=replica_group)
+        params = [_fake_param([0.0, 0.0], mesh_info=mesh) for _ in range(3)]
+        for param in params:
+            _set_unsharded_grad(param, torch.ones(4))
+        for param in params[:2]:
+            param.get_source_replicate_process_group.return_value = tp_group
+        events = []
+
+        def reduce_scatter(**kwargs):
+            kwargs["output"].copy_(kwargs["input"].view(2, -1).sum(dim=0))
+            return MagicMock(wait=lambda: events.append("rs_wait"))
+
+        def all_reduce(gradient, *, group, op, async_op):
+            self.assertEqual(op, dist.ReduceOp.SUM)
+            if group is tp_group:
+                self.assertFalse(async_op)
+                self.assertEqual(gradient.numel(), 4)
+                events.append("tp_sum")
+            else:
+                self.assertIs(group, replica_group)
+                self.assertTrue(async_op)
+                events.append("replica_sum")
+            gradient.mul_(group.size())
+            return MagicMock() if async_op else None
+
+        mock_rs.side_effect = reduce_scatter
+        mock_ar.side_effect = all_reduce
+        group = HSDPParamGroup(params, device=torch.device("cpu"))
+        group.foreach_reducescatter(dist.ReduceOp.AVG)
+        group.wait_reduce_scatter_and_issue_all_reduce()
+        group.wait_all_reduce_and_save_grad()
+
+        self.assertEqual(events, ["rs_wait", "tp_sum", "replica_sum"])
+        for param, expected in zip(params, (2.0, 2.0, 1.0)):
+            torch.testing.assert_close(param.all_reduce_comm_ctx.all_reduce_output, torch.full((2,), expected))
 
     @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
     @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")

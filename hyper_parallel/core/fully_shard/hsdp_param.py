@@ -387,7 +387,7 @@ class HSDPParamV2:
 
     @property
     def reduce_partial_output(self) -> Optional[torch.Tensor]:
-        """Return RS results pending replica all-reduce or gradient application."""
+        """Return reduce-scatter results accumulated before the final micro-step."""
         return self._reduce_partial_output
 
     @reduce_partial_output.setter
@@ -412,24 +412,28 @@ class HSDPParamV2:
             return self.unsharded_accumulated_grad_data.dtype
         if self.unsharded_param.grad is not None:
             return self.unsharded_grad_data.dtype
-        return self.orig_dtype
+        return self.param_dtype or self.orig_dtype
 
-    def reduce_scatter_output(self) -> Optional[torch.Tensor]:
-        """
-        Get the reduce-scatter output tensor and wait for asynchronous operation to complete.
+    def wait_reduce_scatter(self) -> None:
+        """Wait before reading the result or releasing the transferred input.
 
-        Returns:
-            torch.Tensor: The sharded gradient tensor after reduce-scatter operation.
+        The current gradient slots belong to a later backward and must remain
+        untouched. Results stay in ``reduce_scatter_comm_ctx`` until consumed.
         """
         if self.reduce_scatter_comm_ctx.reduce_scatter_handle is not None:
             self.reduce_scatter_comm_ctx.reduce_scatter_handle.wait()
             self._grad.untyped_storage().resize_(0)
             self._grad = None
             self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+
+    def reduce_scatter_output(self) -> Optional[torch.Tensor]:
+        """Return the sharded gradient after waiting for its reduction."""
+        self.wait_reduce_scatter()
         return self.reduce_scatter_comm_ctx.reduce_scatter_output
 
     def clear_reduce_scatter_output(self) -> None:
         """Clear the reduce-scatter output tensor to free memory."""
+        self.wait_reduce_scatter()
         self.reduce_scatter_comm_ctx.reduce_scatter_output = None
         self._grad = None
 
@@ -508,10 +512,6 @@ class HSDPParamV2:
             else:
                 self.sharded_param.main_grad._local_tensor += reduced_grad
                 self.sharded_param.grad = None
-        if self.unsharded_accumulated_grad_data is not None:
-            self.unsharded_accumulated_grad = None
-        elif self.unsharded_param.grad is not None:
-            self.unsharded_param.grad = None
         return need_synchronize
 
     def _resolve_hsdp_placement(
@@ -735,13 +735,9 @@ class HSDPParamV2:
             self.allgather_comm_ctx.allgather_output = None
 
         if hasattr(self, "_unsharded_param"):
-            # Keep one stable ``_unsharded_param`` object across unshard cycles:
-            # autograd-facing module state captured during forward must still be
-            # the same object in backward. Only its storage is refreshed above,
-            # which also avoids reusing stale weights after ``optimizer.step()``
-            # mutates the sharded local shard alone (the non-dim-0 unpack path
-            # materializes a contiguous copy, so a stale ``.data`` would not see
-            # the update).
+            # Autograd attaches gradients to the parameter object captured in forward.
+            # Keep that Parameter and its .data binding for its lifetime. Refresh
+            # values by writing into its existing storage at each unshard.
             return
 
         unsharded_param = torch.as_strided(
@@ -1149,6 +1145,11 @@ class HSDPParamV2:
                           The buffer must have ``padded_sharded_param_size.numel()`` elements
                           and the reduction dtype.
         """
+        if (
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle is not None
+            or self.reduce_scatter_comm_ctx.reduce_scatter_output is not None
+        ):
+            raise RuntimeError("Consume the previous ReduceScatter before reusing its communication slot")
         if self.unsharded_accumulated_grad is not None:
             self._grad = self.unsharded_accumulated_grad_data
             self.unsharded_accumulated_grad = None
@@ -1158,7 +1159,7 @@ class HSDPParamV2:
         self._grad = self._grad.to(self.reduce_comm_dtype(self._grad))
         shard_dim = self.hsdp_placement.dim
         if self.shard_world_size <= 1:
-            self._grad = self._grad.view(-1)
+            self._grad = self._grad.contiguous().view(-1)
         elif shard_dim != 0:
             grad_chunks = torch.chunk(self._grad, self.shard_world_size, dim=shard_dim)
             self._grad = torch.cat(grad_chunks, dim=0).contiguous().view(-1)
@@ -1170,7 +1171,7 @@ class HSDPParamV2:
                 padded_grad = self._grad.new_zeros(padded_unsharded_size)
                 padded_grad.narrow(0, 0, self._grad.size(0)).copy_(self._grad)
                 self._grad = padded_grad
-            self._grad = self._grad.view(-1)
+            self._grad = self._grad.contiguous().view(-1)
         apply_gradient_scaling_factor(self._grad, self.gradient_scaling_factor)
 
         shard_process_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
@@ -1273,8 +1274,14 @@ class HSDPParamV2:
             reduced_grad: Gradient to reduce.
             reduce_op: Reduction operation for the non-FSDP source axes.
         """
+        group = self.get_source_replicate_process_group()
+        if group is not None:
+            dist.all_reduce(reduced_grad, op=reduce_op, group=group, async_op=False)
+
+    def get_source_replicate_process_group(self) -> Optional[dist.ProcessGroup]:
+        """Return the group for replicated source axes outside the FSDP mesh."""
         if self.source_shard_info is None or not self.source_shard_info.placements:
-            return
+            return None
         # Use the same deduplicated source layout as sharded storage. Native
         # DTensor compute metadata can include DP/CP axes already reduced by
         # FSDP; reducing those axes again would multiply validate-mode grads.
@@ -1285,7 +1292,7 @@ class HSDPParamV2:
             if placement.is_replicate()
         )
         if not replicate_mesh_dims:
-            return
+            return None
         mesh_dim_names = source_mesh.mesh_dim_names
         if mesh_dim_names is None:
             raise ValueError(
@@ -1293,15 +1300,7 @@ class HSDPParamV2:
             )
         replicate_mesh_dim_names = tuple(mesh_dim_names[mesh_dim] for mesh_dim in replicate_mesh_dims)
         replicate_mesh = source_mesh[replicate_mesh_dim_names].flatten()
-        replicate_world_size = replicate_mesh.size()
-        if replicate_world_size <= 1:
-            return
-        dist.all_reduce(
-            reduced_grad,
-            op=reduce_op,
-            group=replicate_mesh.get_group(),
-            async_op=False,
-        )
+        return replicate_mesh.get_group() if replicate_mesh.size() > 1 else None
 
 
 def set_requires_grad_if_needed(
