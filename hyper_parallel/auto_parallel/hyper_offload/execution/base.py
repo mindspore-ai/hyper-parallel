@@ -29,9 +29,7 @@ from torch.utils._pytree import TreeSpec, tree_flatten, tree_unflatten
 from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 
 if TYPE_CHECKING:
-    from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import (
-        ResidencyManager,
-    )
+    from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import ResidencyManager
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +64,9 @@ class OpaqueRegionEnd(torch.autograd.Function):
     """Autograd function to mark the end of an opaque region."""
 
     @staticmethod
-    def forward(ctx: Any, executor: BaseExecutor, func_name: str, dummy: torch.Tensor, *outputs: Any) -> Any:  # pylint: disable=unused-argument
+    def forward(  # pylint: disable=unused-argument
+        ctx: Any, executor: BaseExecutor, func_name: str, dummy: torch.Tensor, *outputs: Any,
+    ) -> Any:
         """Forward pass for the end boundary.
 
         Wraps raw tensors into :class:`ShadowTensor` **inside** the
@@ -246,7 +246,7 @@ class BaseExecutor(ABC):
         self.op_idx += 1
 
     @abstractmethod
-    def on_op_end(self, result: Any) -> Any:
+    def on_op_end(self, result) -> Any:
         """Lifecycle callback after the operator is executed.
 
         Responsible for trace recording, phase-specific post-actions,

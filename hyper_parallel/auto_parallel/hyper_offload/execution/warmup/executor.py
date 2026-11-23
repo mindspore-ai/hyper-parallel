@@ -26,31 +26,19 @@ Physical state transitions are delegated to
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from typing import Any
 
 import torch
 from torch.utils._pytree import tree_flatten
 
 from hyper_parallel.auto_parallel.hyper_offload.execution.base import BaseExecutor
-from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
-from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import (
-    ActivationTracker,
-)
-from hyper_parallel.auto_parallel.hyper_offload.ir.replay import OpGuide
-from hyper_parallel.auto_parallel.hyper_offload.ir.trace import (
-    AccessKind,
-    ActivationTrace,
-    StorageAccess,
-    TraceOp,
-)
-from hyper_parallel.auto_parallel.hyper_offload.runtime.bandwidth import (
-    profile_transfer_bandwidth,
-)
-from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import (
-    ResidencyManager,
-)
 from hyper_parallel.auto_parallel.hyper_offload.runtime.timer import DeviceTimer
+from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
+from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import ActivationTracker
+from hyper_parallel.auto_parallel.hyper_offload.ir.replay import OpGuide
+from hyper_parallel.auto_parallel.hyper_offload.ir.trace import AccessKind, ActivationTrace, StorageAccess, TraceOp
+from hyper_parallel.auto_parallel.hyper_offload.runtime.bandwidth import profile_transfer_bandwidth
+from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import ResidencyManager
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +121,7 @@ class WarmupExecutor(BaseExecutor):
     # Lifecycle hooks
     # ------------------------------------------------------------------
 
-    def on_op_begin(self, func: Callable[..., Any], args: tuple, kwargs: dict) -> None:
+    def on_op_begin(self, func, args, kwargs) -> None:
         """Before op: enforce memory budget and fault inputs back to device."""
         super().on_op_begin(func, args, kwargs)
 
@@ -150,7 +138,7 @@ class WarmupExecutor(BaseExecutor):
         }
         self._timer.start()
 
-    def on_op_end(self, result: Any) -> Any:
+    def on_op_end(self, result) -> Any:
         """After op: record trace, residency metadata, and return shadowed result."""
         op_duration_ms = self._timer.stop()
 
@@ -165,7 +153,11 @@ class WarmupExecutor(BaseExecutor):
         if hasattr(func, "_schema") and func._schema.is_mutable:  # pylint: disable=protected-access
             flat_args = iter_tensors((args, {}))
             for idx, arg_info in enumerate(func._schema.arguments):  # pylint: disable=protected-access
-                if arg_info.alias_info is not None and arg_info.alias_info.is_write and idx < len(flat_args):  # pylint: disable=protected-access
+                if (
+                    arg_info.alias_info is not None
+                    and arg_info.alias_info.is_write
+                    and idx < len(flat_args)
+                ):
                     mutated_tensor_ids.add(id(flat_args[idx]))
 
         seen: set[tuple[int, AccessKind]] = set()

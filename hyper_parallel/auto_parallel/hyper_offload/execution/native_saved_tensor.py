@@ -16,7 +16,7 @@
 
 from functools import lru_cache
 import logging
-from pathlib import Path
+from importlib import import_module
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +27,11 @@ def get_native_saved_tensor() -> type | None:
 
     Returns:
         A native saved-value type, or None when an optional extension
-        toolchain is unavailable.
+        binary is unavailable.
     """
     try:
-        # Building the optional extension must not make importing HyperOffload
-        # depend on a compiler or import the build toolchain on the hot path.
-        from torch.utils.cpp_extension import load  # pylint: disable=import-outside-toplevel
-
-        module = load(
-            name="hyperoffload_saved_tensor",
-            sources=[str(Path(__file__).with_suffix(".cpp"))],
-            extra_cflags=["-O2"],
-            verbose=False,
+        module = import_module(
+            "hyper_parallel.auto_parallel.hyper_offload.execution._native_saved_tensor"
         )
     except (ImportError, OSError, RuntimeError) as error:
         logger.warning("Native saved-tensor helper unavailable; using regular detach: %s", error)

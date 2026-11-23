@@ -27,7 +27,7 @@ from hyper_parallel.high_availability.config import RecoveryConfig
 from hyper_parallel.components.ops.catalog import builtin_registry
 
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
-from hyper_parallel.trainer.config.hyper_offload import HyperOffloadConfig
+from hyper_parallel.auto_parallel.hyper_offload.api.config import HyperOffloadConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,

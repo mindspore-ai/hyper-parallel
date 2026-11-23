@@ -23,7 +23,7 @@ import torch
 
 from hyper_parallel.auto_parallel.hyper_offload import OffloadConfig, OffloadSession
 from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.trainer.config.hyper_offload import HyperOffloadConfig
+from hyper_parallel.auto_parallel.hyper_offload.api.config import HyperOffloadConfig
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 
@@ -78,7 +78,7 @@ class TestHyperOffloadConfig(unittest.TestCase):
         trainer = BaseTrainer.__new__(BaseTrainer)
         trainer.config = SimpleNamespace(
             accelerator=SimpleNamespace(loss_parallel=False),
-            hyper_offload=HyperOffloadConfig(True, 4096, 8192),
+            hyper_offload=HyperOffloadConfig(enable=True, max_resident_activation_mb=4096, max_offload_activation_mb=8192),
         )
         with patch("hyper_parallel.trainer.base.OffloadSession") as session:
             trainer._build_training_context()
@@ -171,13 +171,13 @@ class TestHyperOffloadTrainingLifecycle(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def test_success_closes_session_before_distributed_teardown(self) -> None:
-        """Keep the policy during training, then release it before process cleanup."""
+        """Close the session after training and before process cleanup."""
         self.trainer.train()
         self.assertEqual(self.events, ["train_end", "close", "synchronize", "destroy"])
         self.trainer.hyper_offload_context.close.assert_called_once_with()
 
     def test_training_failure_closes_session_and_preserves_the_error(self) -> None:
-        """An interrupted run must release its lease even while Trainer remains alive."""
+        """An interrupted run must close its session even while Trainer remains alive."""
         error = RuntimeError("training failed")
         self.trainer.on_train_begin.side_effect = error
         with self.assertRaises(RuntimeError) as raised:
@@ -188,7 +188,7 @@ class TestHyperOffloadTrainingLifecycle(unittest.TestCase):
         self.trainer.destroy_distributed.assert_not_called()
 
     def test_cleanup_failure_does_not_mask_the_training_error(self) -> None:
-        """Report an allocator restoration failure while preserving the causal error."""
+        """Report a session cleanup failure while preserving the causal error."""
         self.trainer.on_train_begin.side_effect = ValueError("training failed")
         self.trainer.hyper_offload_context.close.side_effect = RuntimeError("restore failed")
         with self.assertLogs("hyper_parallel.trainer.base", level="ERROR"):
@@ -196,7 +196,7 @@ class TestHyperOffloadTrainingLifecycle(unittest.TestCase):
                 self.trainer.train()
 
     def test_cleanup_failure_after_success_is_propagated(self) -> None:
-        """Do not report a successful cleanup when native allocator restoration failed."""
+        """Do not report a successful cleanup when session cleanup failed."""
         self.trainer.hyper_offload_context.close.side_effect = RuntimeError("restore failed")
         with self.assertRaisesRegex(RuntimeError, "restore failed"):
             self.trainer.train()

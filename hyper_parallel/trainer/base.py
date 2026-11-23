@@ -49,7 +49,7 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
-from hyper_parallel.auto_parallel.hyper_offload import OffloadConfig, OffloadSession
+from hyper_parallel.auto_parallel.hyper_offload import OffloadSession
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
@@ -611,10 +611,7 @@ class BaseTrainer(Stateful, ABC):
         offload = self.config.hyper_offload
         self.hyper_offload_context = nullcontext()
         if offload.enable:
-            self.hyper_offload_context = OffloadSession(OffloadConfig(
-                max_resident_activation_mb=offload.max_resident_activation_mb,
-                max_offload_activation_mb=offload.max_offload_activation_mb,
-            ))
+            self.hyper_offload_context = OffloadSession(offload)
             logger.info("HyperOffload enabled: peak planner with communication masking; %s", offload)
         self.graph_compiler: Optional[GraphCompiler] = None
 
@@ -1319,9 +1316,9 @@ class BaseTrainer(Stateful, ABC):
             if isinstance(offload_context, OffloadSession):
                 try:
                     offload_context.close()
-                # Preserve the causal training error if allocator restoration fails.
+                # Preserve the causal training error if session cleanup fails.
                 except BaseException:  # pylint: disable=broad-exception-caught
-                    logger.exception("Failed to restore the HyperOffload allocator after training error.")
+                    logger.exception("Failed to close the HyperOffload session after training error.")
             raise
 
         if isinstance(offload_context, OffloadSession):

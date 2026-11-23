@@ -99,8 +99,15 @@ with session:
     loss = model(x); loss.backward()
 ```
 
-Call `session.close()` outside the context after finishing optimizer work to release
-its allocator policy. A later context entry can reuse the session.
+HyperOffload preserves externally configured allocator settings, including
+`expandable_segments:True`. Set the backend allocator environment variable before
+starting Python. `session.close()` validates that the session is idle and allows reuse.
+
+The saved-tensor C++ helper is compiled offline by `execution/Makefile` and packaged
+with the wheel through the repository build entry `bash build.sh`. The component
+entry `bash hyper_parallel/auto_parallel/hyper_offload/build.sh` also stages the
+compiled helper independently, following the indexed component convention. Runtime loading does not invoke a compiler; when the optional
+binary is unavailable, HyperOffload falls back to regular detach.
 
 ### Native autograd replay
 

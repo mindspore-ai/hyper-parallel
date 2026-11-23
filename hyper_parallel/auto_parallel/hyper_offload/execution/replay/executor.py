@@ -32,13 +32,8 @@ from hyper_parallel.auto_parallel.hyper_offload.execution.base import BaseExecut
 from hyper_parallel.auto_parallel.hyper_offload.execution.framework import dispatch_framework_read
 from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 from hyper_parallel.auto_parallel.hyper_offload.ir.replay import OpGuide
-from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import (
-    ResidencyActionType,
-    ResidencySchedule,
-)
-from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import (
-    ResidencyManager,
-)
+from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import ResidencyActionType, ResidencySchedule
+from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import ResidencyManager
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +221,7 @@ class ReplayExecutor(BaseExecutor):
     # Lifecycle hooks
     # ------------------------------------------------------------------
 
-    def on_op_begin(self, func: Callable, args: tuple, kwargs: dict) -> None:
+    def on_op_begin(self, func, args, kwargs) -> None:
         """Before op: execute pre-actions."""
         super().on_op_begin(func, args, kwargs)
         if self.op_idx >= len(self._guide):
@@ -273,11 +268,9 @@ class ReplayExecutor(BaseExecutor):
             elif action.kind == ResidencyActionType.RELEASE_HOST:
                 self.residency_manager.release_host(action.storage_id)
             else:
-                raise RuntimeError(
-                    f"unsupported pre action {action} at op={self.op_idx}"
-                )
+                raise RuntimeError(f"unsupported pre action {action} at op={self.op_idx}")
 
-    def on_op_end(self, result: Any) -> Any:
+    def on_op_end(self, result) -> Any:
         """After op: validate output structure, shadow outputs, then execute post-actions.
 
         The order is critical: :meth:`apply_shadows` must run **before**
@@ -321,9 +314,7 @@ class ReplayExecutor(BaseExecutor):
             elif action.kind == ResidencyActionType.RELEASE_HOST:
                 self.residency_manager.release_host(sid)
             else:
-                raise RuntimeError(
-                    f"unsupported post action {action} at op={self.op_idx}"
-                )
+                raise RuntimeError(f"unsupported post action {action} at op={self.op_idx}")
 
         # Sparse replay may execute many native ops before the next managed
         # boundary. Do not retain its input tensors throughout that interval.

@@ -25,9 +25,7 @@ from dataclasses import dataclass
 
 import torch
 
-from hyper_parallel.auto_parallel.hyper_offload.runtime.pinned_memory import (
-    PinnedMemoryPool,
-)
+from hyper_parallel.auto_parallel.hyper_offload.runtime.pinned_memory import PinnedMemoryPool
 
 logger = logging.getLogger(__name__)
 
