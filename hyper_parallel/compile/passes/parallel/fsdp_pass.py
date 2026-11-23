@@ -28,6 +28,11 @@ simplefsdp's ``data_parallel`` modes:
   sharded on ``fsdp``; forward all_gather on ``fsdp``, backward reduce_scatter
   on ``fsdp`` then all_reduce on ``dp_replicate``.
 
+``FsdpParamSpec`` may override the shard and replicate axes per parameter.
+This is how expert parameters use their own EDP topology: shard on
+``edp_shard`` and, when ``edp_replicate > 1``, all-reduce the local shard on
+``edp_replicate`` — the same chain as HSDP but on expert-only groups.
+
 Responsibilities:
 1. Identify parameter placeholders belonging to DP-wrapped modules
    (via GraphParallelPlan, exact FQN or pattern)
@@ -82,12 +87,21 @@ class FsdpParamSpec:
 
     ``mode`` selects the top-level policy; ``pad_policy`` only applies when
     ``mode == "shard"`` and dim 0 is not divisible by ``degree``.
+
+    ``replicate_group_name`` / ``replicate_degree`` add a second, orthogonal
+    data-parallel axis (HSDP's ``dp_replicate`` or EDP's ``edp_replicate``).
+    The primary axis (``group_name`` / ``degree``) is reduced first, then the
+    replicate axis: a sharded parameter reduce-scatters on the shard group and
+    all-reduces the local shard on the replicate group; a replicated parameter
+    all-reduces on the replicate group only.
     """
 
     group_name: str
     degree: int
     mode: str = "shard"
     pad_policy: str = "pad"
+    replicate_group_name: Optional[str] = None
+    replicate_degree: int = 1
 
     def __post_init__(self) -> None:
         if self.mode not in ("shard", "replicate", "skip"):
@@ -96,6 +110,17 @@ class FsdpParamSpec:
             raise ValueError(f"Invalid FSDP pad policy: {self.pad_policy!r}")
         if isinstance(self.degree, bool) or not isinstance(self.degree, int) or self.degree < 1:
             raise ValueError(f"FSDP shard degree must be a positive integer, got {self.degree!r}")
+        if (
+            isinstance(self.replicate_degree, bool)
+            or not isinstance(self.replicate_degree, int)
+            or self.replicate_degree < 1
+        ):
+            raise ValueError(
+                "FSDP replicate degree must be a positive integer, got "
+                f"{self.replicate_degree!r}"
+            )
+        if self.replicate_degree > 1 and not self.replicate_group_name:
+            raise ValueError("A replicate degree > 1 requires replicate_group_name")
 
 
 @dataclass(frozen=True)
@@ -288,6 +313,8 @@ class _GradReductionInfo:
     group_name: str
     degree: int
     reduction: GradientReduction
+    replicate_group_name: Optional[str] = None
+    replicate_degree: int = 1
 
 
 def _iter_arg_nodes(node: fx.Node) -> Iterator[fx.Node]:
@@ -430,7 +457,7 @@ class FSDPPass(GraphPass):
         )
         param_nodes = classification.sharded_nodes
         graph_module.fsdp_sharded_param_names = frozenset(
-            node.meta["param_name"] for node in param_nodes if self._dp_mode != "ddp"
+            node.meta["param_name"] for node in param_nodes
         )
 
         _LOG.info(
@@ -499,7 +526,6 @@ class FSDPPass(GraphPass):
         self._fsdp_plan = kwargs.get("fsdp_plan")
         self._gradient_reductions = dict(kwargs.get("gradient_reductions", {}))
         self._source_gradient_groups = dict(kwargs.get("source_gradient_groups", {}))
-        self._default_spec = FsdpParamSpec(self._fsdp_group_name, self._fsdp_degree)
         self._dp_replicate_group_name = kwargs.get(
             "dp_replicate_group_name", self._dp_replicate_group_name
         )
@@ -513,6 +539,24 @@ class FSDPPass(GraphPass):
             )
         else:
             self._dp_replicate_degree = replicate_degree
+        if self._dp_mode == "ddp":
+            self._default_spec = FsdpParamSpec(
+                self._dp_replicate_group_name,
+                self._dp_replicate_degree,
+                mode="replicate",
+            )
+        elif self._dp_mode == "hsdp":
+            self._default_spec = FsdpParamSpec(
+                self._fsdp_group_name,
+                self._fsdp_degree,
+                replicate_group_name=self._dp_replicate_group_name,
+                replicate_degree=self._dp_replicate_degree,
+            )
+        else:
+            self._default_spec = FsdpParamSpec(
+                self._fsdp_group_name,
+                self._fsdp_degree,
+            )
         self._parallel_plan = kwargs.get("parallel_plan", self._parallel_plan)
         model = kwargs.get("model")
         if model is None:
@@ -550,13 +594,13 @@ class FSDPPass(GraphPass):
     ) -> fx.GraphModule:
         """Insert gather / grad-reduce / reshard and shard the live model.
 
-        DDP replicates parameters: no all_gather, no live-model sharding and no
-        reshard — only the gradient all-reduce path runs. FSDP/HSDP also
-        all_gather each parameter for the forward and pad/shard the live model
-        in place.
+        Parameters whose spec shards on a real axis (FSDP/HSDP/EDP) also
+        all_gather for the forward and are pad/sharded in the live model.
+        Parameters whose spec only reduces a replicate axis (DDP, or a
+        singleton expert shard) keep their full storage.
         """
         param_nodes = classification.sharded_nodes
-        if self._dp_mode != "ddp":
+        if param_nodes:
             graph_module = self._insert_all_gather_for_params(
                 graph_module, param_nodes, pass_config
             )
@@ -574,7 +618,7 @@ class FSDPPass(GraphPass):
             model,
         )
 
-        if self._dp_mode != "ddp":
+        if param_nodes:
             # Reshard: free each replicated parameter once forward is done and
             # re-gather + rematerialize it for the backward. Runs after the
             # grad reduction so the grad path is untouched; no-op when disabled.
@@ -761,15 +805,17 @@ class FSDPPass(GraphPass):
     ) -> bool:
         """Decide whether a marked param is kept replicated instead of sharded.
 
-        A marked param whose dim 0 is not divisible by ``fsdp_degree`` cannot be
-        chunked evenly. A 0-dim scalar cannot be padded along dim 0, so it stays
-        replicated and its gradient is averaged over the shard axis. Every
-        other non-divisible param is recorded for pad-sharding (mirroring eager
-        ``fully_shard``): dim 0 is zero-padded to a multiple of the degree, so
-        it is still sharded and gradient-reduced. DDP has no shard axis, so
-        every marked param is handled the same way regardless of divisibility.
+        A marked param whose dim 0 is not divisible by its shard degree cannot
+        be chunked evenly. A 0-dim scalar cannot be padded along dim 0, so it
+        stays replicated and its gradient is averaged over the shard axis.
+        Every other non-divisible param is recorded for pad-sharding (mirroring
+        eager ``fully_shard``): dim 0 is zero-padded to a multiple of the
+        degree, so it is still sharded and gradient-reduced. The divisibility
+        decision is driven by the param's own spec (dense ``fsdp``/``hsdp`` or
+        expert ``fsdp_expert``), not the dense ``dp_mode``: a replicated-only
+        dense mode (``ddp``) may still shard expert params on ``fsdp_expert``.
         """
-        if self._dp_mode == "ddp" or param is None:
+        if param is None:
             return False
         spec = self._param_spec(fqn)
         _, degree = self._param_group(fqn)
@@ -836,11 +882,12 @@ class FSDPPass(GraphPass):
 
         After this, model.parameters() yields the local shards.
         """
-        # Use the FSDP group's local rank (NOT the global rank) as the
-        # chunk index — when fsdp_degree < world_size (TP+FSDP), the global
-        # rank exceeds the chunk count and causes IndexError.
-        fsdp_pg = _resolve_process_group(self._fsdp_group_name)
-        group_ranks = {self._fsdp_group_name: dist.get_rank(group=fsdp_pg)}
+        # Use each param's own group's local rank (NOT the global rank) as the
+        # chunk index — when a shard degree < world_size (TP+FSDP, EDP), the
+        # global rank exceeds the chunk count and causes IndexError. Resolved
+        # lazily per distinct group so a replicated-only mode (DDP) never
+        # touches the dense "fsdp" group, which is not registered in that mode.
+        group_ranks = {}
         sharded_count = 0
 
         for name, param in model.named_parameters():
@@ -1086,11 +1133,11 @@ class FSDPPass(GraphPass):
         function; gradient ``i`` (output index ``i+1``) corresponds to the
         ``i``-th trainable parameter (``state_fqns`` order, buffers and frozen
         params skipped, mirrored by ``_build_trainable_state_indices``). For a
-        parameter in ``sharded_param_indices`` (a real shard axis) the mode
-        decides the collective chain: ``fsdp`` reduce_scatters on the ``fsdp``
-        group (Replicate -> Shard); ``ddp`` all_reduces on ``dp_replicate``;
-        ``hsdp`` reduce_scatters on ``fsdp`` then all_reduces on
-        ``dp_replicate`` (shard axis first, so the cross-axis message is
+        parameter in ``sharded_param_indices`` (a real shard axis) the per-spec
+        chain applies: reduce_scatter on the spec's primary ``group_name``
+        (Replicate -> Shard), then, when the spec carries a
+        ``replicate_group_name`` with degree > 1 (HSDP / EDP), all_reduce on
+        that replicate axis (shard axis first, so the cross-axis message is
         already sharded). Pad-sharded params (``_padded_params``) zero-pad their
         ``[n, ...]`` gradient back to ``[n_pad, ...]`` first so the local
         gradient matches the padded shard.
@@ -1162,7 +1209,9 @@ class FSDPPass(GraphPass):
                 continue
 
             reduction_info = _GradReductionInfo(
-                group_name, degree, self._gradient_reductions.get(fqn, _DEFAULT_GRADIENT_REDUCTION)
+                group_name, degree, self._gradient_reductions.get(fqn, _DEFAULT_GRADIENT_REDUCTION),
+                replicate_group_name=spec.replicate_group_name,
+                replicate_degree=spec.replicate_degree,
             )
             with graph.inserting_before(output_node):
                 new_returned[i] = self._build_grad_reduction_nodes(
@@ -1207,16 +1256,17 @@ class FSDPPass(GraphPass):
         """Build and return the waited gradient-reduction node for ``grad_node``.
 
         The returned (wait) node replaces ``grad_node`` in the graph output.
-        Emits the mode-specific chain (see ``_insert_grad_reduction``). When
+        Emits the per-spec reduction chain: the primary axis (shard
+        ``reduce_scatter`` or replicate ``all_reduce``) followed by the optional
+        replicate axis (HSDP ``dp_replicate`` / EDP ``edp_replicate``). When
         ``pad_info`` is given the parameter is pad-sharded: the real ``[n, ...]``
         gradient is zero-padded on dim 0 to ``[n_pad, ...]`` before the
         reduce_scatter, so the scattered local gradient matches the padded live
         shard (mirrors eager ``fully_shard``'s padded grad buffer). When
-        ``replicated`` is True the parameter is a 0-dim scalar that could not be
-        sharded, so its gradient is reduced over the shard group with
-        ``all_reduce`` instead of reduce-scattered — the graph and the live
-        model both keep the parameter full, so a reduce_scatter would change the
-        shape and desync them.
+        ``replicated`` is True the parameter stays full, so its gradient is
+        reduced over the primary group with ``all_reduce`` instead of
+        reduce-scattered — a reduce_scatter would change the shape and desync
+        the graph from the live model.
 
         Every collective is waited on before its result is consumed. A chained
         collective runs on a different process-group stream (HSDP's
@@ -1226,11 +1276,13 @@ class FSDPPass(GraphPass):
         which orders the all_reduce stream after the reduce_scatter stream.
         """
         group_name, degree = info.group_name, info.degree
+        replicate_group = info.replicate_group_name
+        replicate_degree = info.replicate_degree
+        has_replicate = bool(replicate_group) and replicate_degree > 1
+        emitted = False
         reduced = grad_node
         if info.reduction.scale is not None:
             reduced = graph.call_function(torch.mul, args=(reduced, info.reduction.scale))
-        if degree == 1 and self._dp_mode == "fsdp":
-            return reduced
         if pad_info is not None:
             # constant_pad_nd's pad tuple runs last-dim-first: pad dim 0 on the
             # right by ``dim0_pad`` and leave every other dim untouched.
@@ -1246,25 +1298,29 @@ class FSDPPass(GraphPass):
                     "dtype": value.dtype,
                     "device": str(value.device),
                 }
-        if replicated:
-            # Replicated parameter (a 0-dim scalar, or a partial-plan leftover
-            # that fell back to DDP): average the full gradient over the shard
-            # group so every replica takes the same optimizer step. DDP mode has
-            # no shard group — the replicate all_reduce below handles it.
-            if self._dp_mode in ("fsdp", "hsdp"):
-                ar_node = graph.call_function(
-                    _c10d_functional.all_reduce,
-                    args=(reduced, info.reduction.reduce_op, group_name),
-                )
+        if replicated and degree > 1:
+            # Replicated parameter (a 0-dim scalar, a DDP parameter, or a
+            # partial-plan leftover): average the full gradient over the primary
+            # group so every replica takes the same optimizer step. DDP's
+            # primary group *is* the replicate axis, so tag it as such.
+            ar_node = graph.call_function(
+                _c10d_functional.all_reduce,
+                args=(reduced, info.reduction.reduce_op, group_name),
+            )
+            if group_name == self._dp_replicate_group_name:
+                ar_node.meta["comm_type"] = "dp_all_reduce"
+                ar_node.meta["dp_replicate_degree"] = degree
+                ar_node.meta["autograd_backward"] = True
+            else:
                 ar_node.meta["comm_type"] = "fsdp_all_reduce"
-                ar_node.meta["comm_group"] = group_name
                 ar_node.meta["fsdp_degree"] = degree
-                reduced = ar_node
-                # HSDP chains the replicate all_reduce (a different process-group
-                # stream) after the shard all_reduce, so wait first.
-                if self._dp_mode == "hsdp":
-                    reduced = self._insert_wait(graph, reduced)
-        elif self._dp_mode in ("fsdp", "hsdp"):
+                ar_node.meta["autograd_backward"] = True
+            ar_node.meta["comm_group"] = group_name
+            reduced = ar_node
+            emitted = True
+            if has_replicate:
+                reduced = self._insert_wait(graph, reduced)
+        elif not replicated and degree > 1:
             # Matmul backward can return a transposed view on NPU, including dense router weights.
             reduced = graph.call_method("contiguous", args=(reduced,))
             rs_node = graph.call_function(
@@ -1281,24 +1337,25 @@ class FSDPPass(GraphPass):
             rs_node.meta["fsdp_degree"] = degree
             rs_node.meta["autograd_backward"] = True
             reduced = rs_node
-            # HSDP chains all_reduce (a different process-group stream) after
-            # the reduce_scatter, so wait first; plain FSDP waits on the final
-            # node only.
-            if self._dp_mode == "hsdp":
+            emitted = True
+            # A following replicate-axis all_reduce runs on another stream, so
+            # wait first; otherwise only the final node is waited on below.
+            if has_replicate:
                 reduced = self._insert_wait(graph, reduced)
 
-        if self._dp_mode in ("ddp", "hsdp"):
+        if has_replicate:
             ar_node = graph.call_function(
                 _c10d_functional.all_reduce,
-                args=(reduced, info.reduction.reduce_op, self._dp_replicate_group_name),
+                args=(reduced, info.reduction.reduce_op, replicate_group),
             )
             ar_node.meta["comm_type"] = "dp_all_reduce"
-            ar_node.meta["comm_group"] = self._dp_replicate_group_name
-            ar_node.meta["dp_replicate_degree"] = self._dp_replicate_degree
+            ar_node.meta["comm_group"] = replicate_group
+            ar_node.meta["dp_replicate_degree"] = replicate_degree
             ar_node.meta["autograd_backward"] = True
             reduced = ar_node
+            emitted = True
 
-        return self._insert_wait(graph, reduced)
+        return self._insert_wait(graph, reduced) if emitted else reduced
 
     @staticmethod
     def _insert_wait(graph: fx.Graph, tensor_node: fx.Node) -> fx.Node:

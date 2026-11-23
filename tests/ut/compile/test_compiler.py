@@ -155,7 +155,7 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
         first = compiler.parameter_layouts
         self.assertIs(compiler.parameter_layouts, first)
         old = model.weight
-        model.weight = nn.Parameter(old.detach().clone())
+        model.weight = nn.Parameter(old.clone().detach())
         updated = compiler.parameter_layouts
         self.assertIsNot(updated, first)
         self.assertIn(model.weight, updated)
@@ -640,7 +640,7 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         self.assertNotIn("gradient_reductions", comp._build_pass_kwargs())
         comp._expert_param_names = {"weight"}
         comp._expert_fsdp_mesh = MagicMock()
-        comp._expert_fsdp_mesh.size.return_value = 2
+        comp._expert_shard_degree = 2
         kwargs = comp._build_pass_kwargs()
         self.assertEqual(set(kwargs["gradient_reductions"]), {"weight"})
         self.assertEqual(kwargs["gradient_reductions"]["weight"].reduce_op, "sum")
@@ -846,6 +846,52 @@ class TestParameterLayoutMeshFallback(unittest.TestCase):
                 self.assertEqual(expert_layout.mesh.mesh_dim_names, ("edp_shard", "ep"))
                 self.assertEqual(expert_layout.placements, (Replicate(), Shard(0)))
                 self.assertEqual(expert_layout.tensor_shape, (2 * ep, 4))
+
+    def test_expert_layout_includes_edp_replicate_axis(self):
+        """Expert layouts describe replication and sharding, in mesh order."""
+        dense = init_device_mesh(
+            "cpu",
+            (8,),
+            mesh_dim_names=("fsdp_shard",),
+            rank_list=tuple(range(8)),
+            init_backend=False,
+        )
+        expert = init_device_mesh(
+            "cpu",
+            (2, 2, 2),
+            mesh_dim_names=("edp_replicate", "edp_shard", "ep"),
+            rank_list=tuple(range(8)),
+            init_backend=False,
+        )
+        model = nn.Module()
+        model.dense = nn.Parameter(torch.ones(2, 4))
+        model.experts = nn.Linear(4, 2, bias=False)
+        model.experts.local_expert_count = 2
+        context = MeshContext(
+            fsdp_non_moe_mesh=dense,
+            fsdp_moe_mesh=expert,
+            dp_size=8,
+            dp_shard_size=8,
+            ep_size=2,
+            edp_shard_size=2,
+        )
+        compiler = GraphCompiler(model, _mse_train_fn, mesh_context=context)
+        with patch.object(compiler, "_register_mesh_group"):
+            compiler._init_device_mesh(context)
+        compiler._bind_parameter_meshes()
+        compiler._joint_graph = SimpleNamespace(
+            graph_module=SimpleNamespace(
+                fsdp_sharded_param_names=frozenset({"experts.weight"})
+            )
+        )
+        expert_layout = compiler.parameter_layouts[model.experts.weight]
+        self.assertEqual(
+            expert_layout.mesh.mesh_dim_names, ("edp_replicate", "edp_shard", "ep")
+        )
+        self.assertTrue(expert_layout.placements[0].is_replicate())
+        self.assertTrue(expert_layout.placements[1].is_shard(0))
+        self.assertTrue(expert_layout.placements[2].is_shard(0))
+        self.assertEqual(expert_layout.tensor_shape, (8, 4))
 
     def test_legacy_named_world_metadata_flattens_dp_and_cp(self):
         """Retain world-only layout queries without a dense mesh or FSDP config."""
