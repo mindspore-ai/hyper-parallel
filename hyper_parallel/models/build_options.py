@@ -277,6 +277,9 @@ class FSDP2Config:
     reshard_after_forward: bool = True
     reshard_after_backward: bool = True
     requires_grad_sync: bool = True
+    # Reduce exact zeros for params with no grad, keeping collectives
+    # rank-invariant; default False preserves skipping.
+    zero_grad_for_missing_params: bool = False
     backward_prefetch_depth: int = 1
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False

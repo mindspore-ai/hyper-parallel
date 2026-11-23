@@ -612,6 +612,26 @@ def _get_total_norm(
     return total_p ** (1.0 / norm_type)
 
 
+def _all_reduce_maybe_offloaded(tensor, *, op, group):
+    """In-place ``dist.all_reduce`` that tolerates CPU-offloaded tensors.
+
+    With FSDP2 CPU offload the sharded gradients (and the small norm scalars
+    derived from them) live on the host, but the process group is created with
+    a device-only backend (``backend: nccl`` on GPU, ``hccl`` on NPU) that has
+    no CPU collective. Run the collective on the group's default device and
+    copy the result back in place so callers that reuse ``tensor`` afterwards
+    (accumulation, coalesce views) keep working.
+    """
+    pg_device = dist.distributed_c10d._get_pg_default_device(group)
+    if tensor.device.type != pg_device.type:
+        device_tensor = tensor.to(pg_device)
+        dist.all_reduce(device_tensor, op=op, group=group)
+        tensor.copy_(device_tensor.to(device=tensor.device, dtype=tensor.dtype))
+        return tensor
+    dist.all_reduce(tensor, op=op, group=group)
+    return tensor
+
+
 def _total_norm_inf(  # pylint: disable=R0913,R0917
     grad_groups, norm_type, mesh_cache, device, reduce_op,
 ):

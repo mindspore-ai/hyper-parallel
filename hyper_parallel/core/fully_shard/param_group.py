@@ -615,6 +615,11 @@ class HSDPParamGroup:
                 unsharded_grad = hsdp_param.unsharded_accumulated_grad_data
             elif hsdp_param.unsharded_param.grad is not None:
                 unsharded_grad = hsdp_param.unsharded_grad_data
+            elif hsdp_param.zero_grad_for_missing_params:
+                param = hsdp_param.unsharded_param
+                unsharded_grad = torch.zeros(
+                    param.shape, dtype=param.dtype, device=param.device
+                )
             else:
                 continue
             shard_group = (

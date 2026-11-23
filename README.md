@@ -47,6 +47,7 @@ HyperParallel provides distributed parallel acceleration for Ascend SuperPoDs. D
 
 ## 📣 Latest News
 
+- [Nov. 12, 2026]: [Qwen/Qwen3-Omni-30B-A3B model support](hyper_parallel/models/qwen3_omni/recipes/train.yaml)
 - [Oct. 15, 2026]: [DeepSeek-V4.1-Flash model support](docs/deepseek_v41_article/README.md)
 - [Oct. 9, 2026]: [moonshotai/Kimi-K2.6 model support](hyper_parallel/models/kimi_k26/README.md)
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B model support](examples/training_demo/README.md#full-pretrained-model)
@@ -64,6 +65,7 @@ See the [model roadmap](https://github.com/mindspore-ai/hyper-parallel/issues/13
 | Qwen3 | [Model entry](hyper_parallel/models/qwen3) |
 | Qwen3-MoE | [Recipes](hyper_parallel/models/qwen3_moe/recipes) |
 | Qwen3-VL-MoE | [Model adapter](hyper_parallel/models/qwen3_vl_moe) |
+| Qwen3-Omni | [Model adapter](hyper_parallel/models/qwen3_omni) |
 | Qwen3.5 Dense | [Model entry](hyper_parallel/models/qwen3_5) |
 | DeepSeek-V3 | [Recipes](hyper_parallel/models/deepseek_v3/recipes) |
 | DeepSeek-V3.2 | [Recipes](hyper_parallel/models/deepseek_v32/recipes) |

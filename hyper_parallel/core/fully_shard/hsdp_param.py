@@ -198,6 +198,7 @@ class HSDPParamV2:
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
         self._init_sharded_param(param, shard_placement_fn)
         self.unsharded_accumulated_grad = None
+        self.zero_grad_for_missing_params = False
         self._param_fqn: Optional[str] = None
         self.unsharded_param_buffers: List[torch.Tensor] = []
         self.allgather_comm_ctx = AllGatherCommCtx()
@@ -1152,9 +1153,16 @@ class HSDPParamV2:
         if self.unsharded_accumulated_grad is not None:
             self._grad = self.unsharded_accumulated_grad_data
             self.unsharded_accumulated_grad = None
-        else:
+        elif self.unsharded_param.grad is not None:
             self._grad = self.unsharded_grad_data
             self.unsharded_param.grad = None
+        elif self.zero_grad_for_missing_params:
+            param = self.unsharded_param
+            self._grad = torch.zeros(
+                param.shape, dtype=param.dtype, device=param.device
+            )
+        else:
+            return
         self._grad = self._grad.to(self.reduce_comm_dtype(self._grad))
         shard_dim = self.hsdp_placement.dim
         if self.shard_world_size <= 1:

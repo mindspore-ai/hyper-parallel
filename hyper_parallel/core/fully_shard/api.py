@@ -395,6 +395,17 @@ class HSDPModule:
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
 
+    def set_zero_grad_for_missing_params(self, enabled: bool, *, recurse: bool = True) -> None:
+        """Set zero-grad substitution for this module and optionally its descendants."""
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
+        self_module = cast(nn.Module, self)
+        for _, module in self_module.named_modules() if recurse else (("", self),):
+            if isinstance(module, HSDPModule):
+                module.hsdp_scheduler.set_zero_grad_for_missing_params(enabled)
+
     def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
         """Set forward resharding for this module and optionally its descendants."""
         if not isinstance(reshard_after_forward, bool):
