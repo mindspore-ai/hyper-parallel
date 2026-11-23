@@ -24,13 +24,13 @@ from typing import Any, Protocol
 
 import torch
 
-from hyper_parallel.auto_parallel.hyper_offload.execution.native_saved_tensor import get_native_saved_tensor
 from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import ResidencyActionType as Action
 from hyper_parallel.auto_parallel.hyper_offload.ir.trace import AccessKind
 
 
-@dataclass(frozen=True, slots=True)
+# Python 3.10+ dataclass options are absent from the gate checker's older stdlib model.
+@dataclass(frozen=True, slots=True)  # pylint: disable=unexpected-keyword-arg
 class SavedSlot:
     """Metadata for a saved value; never owns the recorded activation."""
 
@@ -69,11 +69,11 @@ class SavedTensorRecorder:
             tensor: Tensor being saved by autograd.
         """
         sid = (tensor.storage_id if isinstance(tensor, ShadowTensor)
-               else self.executor._tracker.get_activation_sid(tensor))
+               else self.executor._tracker.get_activation_sid(tensor))  # pylint: disable=protected-access
         index = len(self.slots)
         self.slots.append(SavedSlot(sid, tensor_metadata(tensor), self.executor.op_idx))
         self.save_unpack_counts.append(len(self.unpacks))
-        return index, tensor.detach(), tensor._version
+        return index, tensor.detach(), tensor._version  # pylint: disable=protected-access
 
     def unpack(self, packed: tuple) -> torch.Tensor:
         """Record the backward access anchor and restore the saved tensor.
@@ -82,7 +82,7 @@ class SavedTensorRecorder:
             packed: Save slot and detached tensor from pack.
         """
         index, tensor, version = packed
-        if tensor._version != version:
+        if tensor._version != version:  # pylint: disable=protected-access
             raise RuntimeError("a tensor saved for backward was modified in place")
         self.unpacks.append((index, self.executor.op_idx))
         return tensor
@@ -97,7 +97,7 @@ class NativeSavedValue(Protocol):
         """Return a saved view after checking its shared version counter."""
 
 
-@dataclass(slots=True)
+@dataclass(slots=True)  # pylint: disable=unexpected-keyword-arg
 class SavedNative:
     """Keep native autograd values detached and preserve mutation checks."""
 
@@ -107,12 +107,12 @@ class SavedNative:
 
     def unpack(self) -> torch.Tensor:
         """Check mutations before returning a Python-managed saved view."""
-        if self.tensor._version != self.version:
+        if self.tensor._version != self.version:  # pylint: disable=protected-access
             raise RuntimeError("a tensor saved for backward was modified in place")
         return self.tensor
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True)  # pylint: disable=unexpected-keyword-arg
 class SavedActivation:
     """Reference moved storage without retaining its original device bytes."""
 
@@ -138,7 +138,6 @@ class SavedTensorReplay:
             selected: Storage IDs selected by the unchanged planner.
         """
         self.manager = manager
-        self._native_saved_tensor = get_native_saved_tensor()
         self.slot_count = len(slots)
         self.slots = {index: slot for index, slot in enumerate(slots) if slot.storage_id in selected}
         self.selected = selected
@@ -174,6 +173,20 @@ class SavedTensorReplay:
         for slot in recorder.slots:
             if slot.storage_id is not None and slot.storage_id in used and slot.op_id < backward:
                 first_saves.setdefault(slot.storage_id, slot.op_id)
+        positions, writes = SavedTensorReplay._saved_access_positions(trace, first_saves)
+        for sid, accesses in positions.items():
+            boundary = bisect_left(accesses, backward)
+            if not 0 < boundary < len(accesses) or sid in trace.retained_sids:
+                continue
+            if not SavedTensorReplay._writes_are_immutable(first_saves[sid], writes.get(sid, []), trace):
+                continue
+            start, end = accesses[boundary - 1], accesses[boundary]
+            if end > start + 1:
+                trace.preferred_eviction_gaps.append((sid, start, end))
+
+    @staticmethod
+    def _saved_access_positions(trace: Any, first_saves: dict[int, int]) -> tuple[dict, dict]:
+        """Collect distinct operator accesses and writes for saved storages."""
         positions, writes = {}, {}
         for op_id, op in enumerate(trace.ops):
             for access in op.accesses:
@@ -185,15 +198,7 @@ class SavedTensorReplay:
                     rows.append(op_id)
                 if access.kind == AccessKind.WRITE:
                     writes.setdefault(sid, []).append(op_id)
-        for sid, accesses in positions.items():
-            boundary = bisect_left(accesses, backward)
-            if not 0 < boundary < len(accesses) or sid in trace.retained_sids:
-                continue
-            if not SavedTensorReplay._writes_are_immutable(first_saves[sid], writes.get(sid, []), trace):
-                continue
-            start, end = accesses[boundary - 1], accesses[boundary]
-            if end > start + 1:
-                trace.preferred_eviction_gaps.append((sid, start, end))
+        return positions, writes
 
     @staticmethod
     def _immutable_save_slots(sid: int, recorder: SavedTensorRecorder, trace: Any) -> bool:
@@ -211,6 +216,7 @@ class SavedTensorReplay:
 
     @staticmethod
     def _writes_are_immutable(first_save: int, writes: list[int], trace: Any) -> bool:
+        """Check that writes preserve storage before and after its first save."""
         aliases = {"detach.default", "view.default", "_unsafe_view.default", "alias.default", "t.default",
                    "transpose.int", "permute.default", "slice.Tensor", "select.int", "as_strided.default",
                    "squeeze.default", "squeeze.dim", "unsqueeze.default", "expand.default",
@@ -242,15 +248,8 @@ class SavedTensorReplay:
             schedule: Schedule returned by the planner.
         """
         copies = cls._copy_actions(schedule)
-        counts = Counter((action.storage_id, action.kind) for action in copies)
         selected = {action.storage_id for action in copies}
-        if not selected or not recorder.unpacks or selected & trace.retained_sids:
-            return None
-        if any(counts[sid, kind] != 1 for sid in selected for kind in (Action.COPY_D2H, Action.COPY_H2D)):
-            return None
-        if not cls._forward_intervals(copies, recorder):
-            return None
-        if not all(cls._immutable_save_slots(sid, recorder, trace) for sid in selected):
+        if not cls._can_replay(copies, selected, recorder, trace):
             return None
         replay = cls(manager, recorder.slots, selected)
         replay.save_unpack_counts = getattr(recorder, "save_unpack_counts", None)
@@ -267,8 +266,21 @@ class SavedTensorReplay:
         replay._compile_releases(schedule, recorder)
         return replay
 
+    @classmethod
+    def _can_replay(cls, copies: list, selected: set[int], recorder: SavedTensorRecorder, trace: Any) -> bool:
+        """Require complete immutable forward-save/backward-use transfers."""
+        counts = Counter((action.storage_id, action.kind) for action in copies)
+        if not selected or not recorder.unpacks or selected & trace.retained_sids:
+            return False
+        if any(counts[sid, kind] != 1 for sid in selected for kind in (Action.COPY_D2H, Action.COPY_H2D)):
+            return False
+        return cls._forward_intervals(copies, recorder) and all(
+            cls._immutable_save_slots(sid, recorder, trace) for sid in selected
+        )
+
     @staticmethod
     def _forward_intervals(copies: list, recorder: SavedTensorRecorder) -> bool:
+        """Check that selected transfers fit forward saves and backward reads."""
         first_backward = recorder.unpacks[0][1]
         # Checkpoint recomputation can save additional aliases after backward
         # starts. Each moved storage must still be saved in the forward.
@@ -284,6 +296,7 @@ class SavedTensorReplay:
         return True
 
     def _compile_prefetch(self, copies: list, recorder: SavedTensorRecorder) -> None:
+        """Anchor restores to backward reads without exceeding the resident budget."""
         self.prefetch_at.clear()
         unpack_ops = [op_id for _, op_id in recorder.unpacks]
         # Round prefetch later to the next autograd access. Moving all restores
@@ -297,6 +310,7 @@ class SavedTensorReplay:
         self.unpack_count = len(recorder.unpacks)
 
     def _compile_releases(self, schedule: Any, recorder: SavedTensorRecorder) -> None:
+        """Anchor source releases to saves before the planned restore."""
         save_ops = [slot.op_id for slot in recorder.slots]
         actions = [action for phase in (schedule.pre, schedule.post) for group in phase.values() for action in group]
         for sid in self.selected:
@@ -348,14 +362,12 @@ class SavedTensorReplay:
         if slot is None:
             if self._pending_release and index % 32 == 0:
                 self._retire_sources()
-            if self._native_saved_tensor is not None and type(tensor) is torch.Tensor:
-                return self._native_saved_tensor(tensor, index)
-            return SavedNative(tensor.detach(), tensor._version, index)
+            return SavedNative(tensor.detach(), tensor._version, index)  # pylint: disable=protected-access
         if tensor_metadata(tensor) != slot.metadata:
             raise RuntimeError(f"saved-tensor replay metadata differs at slot={index}")
         sid = slot.storage_id
-        storage_id = tensor.untyped_storage()._cdata
-        version = tensor._version
+        storage_id = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
+        version = tensor._version  # pylint: disable=protected-access
         if sid not in self._bound:
             self._bound[sid] = (storage_id, [])
             self.manager.bind(sid, tensor)
@@ -381,7 +393,7 @@ class SavedTensorReplay:
     def _validate_versions(self, sid: int) -> None:
         for reference, version in self._bound[sid][1]:
             tensor = reference()
-            if tensor is not None and tensor._version != version:
+            if tensor is not None and tensor._version != version:  # pylint: disable=protected-access
                 raise RuntimeError("an offloaded saved tensor was modified in place")
 
     def _prefetch(self, sid: int) -> None:

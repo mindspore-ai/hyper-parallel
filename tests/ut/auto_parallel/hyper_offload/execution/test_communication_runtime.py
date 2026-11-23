@@ -14,6 +14,9 @@
 # ============================================================================
 """Runtime contracts for delayed D2H release and asynchronous H2D prefetch."""
 
+# Runtime tests inspect internal state to verify storage ownership and scheduling.
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 import unittest
@@ -69,6 +72,7 @@ class TestCommunicationRuntime(unittest.TestCase):
         self.events.side_effect = [self.d2h_event, self.h2d_event]
 
     def test_forward_copy_waits_only_at_delayed_release(self):
+        """Test forward copy waits only at delayed release."""
         tensor = torch.tensor([1.0, 2.0, 3.0])
         buffer = self.manager.bind(1, tensor)
         self.manager.copy_d2h(1)
@@ -86,6 +90,7 @@ class TestCommunicationRuntime(unittest.TestCase):
         self.pool.release.assert_not_called()
 
     def test_backward_prefetch_waits_at_consumer_and_fences_host_reuse(self):
+        """Test backward prefetch waits at consumer and fences host reuse."""
         tensor = torch.tensor([2.0, 4.0])
         buffer = self.manager.bind(1, tensor)
         self.manager.copy_d2h(1)
@@ -111,6 +116,7 @@ class TestCommunicationRuntime(unittest.TestCase):
         torch.testing.assert_close(restored, tensor, rtol=0, atol=0)
 
     def test_incomplete_copy_keeps_source_without_blocking_compute(self):
+        """Test incomplete copy keeps source without blocking compute."""
         buffer = self.manager.bind(1, torch.arange(8, dtype=torch.float32))
         self.manager.copy_d2h(1)
         source = buffer.device_buffer
@@ -127,6 +133,7 @@ class TestCommunicationRuntime(unittest.TestCase):
         self.d2h_event.synchronize.assert_not_called()
 
     def test_completed_source_retires_without_wait_and_restores_exactly(self):
+        """Test completed source retires without wait and restores exactly."""
         tensor = torch.arange(8, dtype=torch.float32)
         buffer = self.manager.bind(1, tensor)
         self.manager.copy_d2h(1)
@@ -168,6 +175,7 @@ class TestCommunicationRuntime(unittest.TestCase):
         self.d2h_event.wait.assert_not_called()
 
     def test_pending_host_allocation_is_not_reused_before_h2d_completes(self):
+        """Test pending host allocation is not reused before h2d completes."""
         pool = PinnedMemoryPool(max_host_bytes=2048)
         original_empty = torch.empty
 
@@ -192,6 +200,7 @@ class TestCommunicationRuntime(unittest.TestCase):
             event.synchronize.assert_not_called()
 
     def test_generated_schedule_runs_on_baseline_replay_and_real_buffers(self):
+        """Test generated schedule runs on baseline replay and real buffers."""
         self.events.side_effect = MagicMock
         rows = [
             [(1, AccessKind.WRITE)],

@@ -20,7 +20,7 @@ resolves a view of its :class:`PhysicalBuffer`'s storage on every dispatch.
 
 from __future__ import annotations
 
-from typing import Any, Self
+from typing import Any
 
 import torch
 from torch.utils._pytree import tree_map
@@ -48,7 +48,7 @@ class ShadowTensor(torch.Tensor):
         elem: torch.Tensor,
         buffer: PhysicalBuffer,
         storage_id: int,
-    ) -> Self:
+    ) -> "ShadowTensor":
         """Create a new instance using *elem*'s metadata."""
         return torch.Tensor._make_wrapper_subclass(
             cls,

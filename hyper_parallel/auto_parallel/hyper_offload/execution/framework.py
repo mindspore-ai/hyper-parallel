@@ -46,20 +46,21 @@ def dispatch_framework_read(executor: Any, func: Any, args: tuple, kwargs: dict,
         recorder = getattr(executor, "record_framework_allocation", None)
         if recorder is not None:
             input_storages = {
-                value.untyped_storage()._cdata for value in tree_iter((inputs, options))
+                value.untyped_storage()._cdata  # pylint: disable=protected-access
+                for value in tree_iter((inputs, options))
                 if isinstance(value, torch.Tensor)
             }
             allocated = {
-                value.untyped_storage()._cdata: value.untyped_storage().nbytes()
+                value.untyped_storage()._cdata: value.untyped_storage().nbytes()  # pylint: disable=protected-access
                 for value in tree_iter(output) if isinstance(value, torch.Tensor)
-                and value.untyped_storage()._cdata not in input_storages
+                and value.untyped_storage()._cdata not in input_storages  # pylint: disable=protected-access
             }
             recorder(sum(allocated.values()))
         return ()
 
     framework_read.__name__ = "framework_read:" + func.__name__
     if hasattr(func, "_schema"):
-        framework_read._schema = func._schema
+        framework_read._schema = func._schema  # pylint: disable=protected-access
     executor.dispatch(framework_read, args, kwargs)
     return output
 

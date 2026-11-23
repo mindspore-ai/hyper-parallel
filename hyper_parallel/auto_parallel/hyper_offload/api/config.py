@@ -17,10 +17,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from hyper_parallel.auto_parallel.hyper_offload.planning.base import ResidencyPlanner
+from hyper_parallel.auto_parallel.hyper_offload.planning.base import ResidencyPlanner
 
 
 @dataclass
@@ -41,7 +39,8 @@ class OffloadConfig:
     planner: ResidencyPlanner | None = None
 
 
-@dataclass(kw_only=True)
+# Python 3.10+ dataclass options are absent from the gate checker's older stdlib model.
+@dataclass(kw_only=True)  # pylint: disable=unexpected-keyword-arg
 class HyperOffloadConfig(OffloadConfig):
     """Add an opt-in Trainer switch while reusing the offload budgets."""
 

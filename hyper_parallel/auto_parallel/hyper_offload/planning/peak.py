@@ -70,6 +70,7 @@ def _choose_gap(
     selected: list[EvictionGap],
     weights: ScoreWeights,
 ) -> EvictionGap:
+    """Choose an eviction interval by size, peak coverage and overlap."""
     max_size = max(gap.size_bytes for gap in eligible)
     max_left = max(peak - gap.first for gap in eligible)
     max_right = max(gap.end - peak for gap in eligible)
@@ -91,6 +92,7 @@ def _select_gaps(
     resident: list[int], gaps: list[EvictionGap], limit: int, weights: ScoreWeights,
     preferred: set[tuple[int, int, int]] | None = None,
 ) -> list[EvictionGap]:
+    """Select eviction intervals until reducible peaks fit the budget."""
     remaining, selected = list(gaps), []
     delta = [0] * (len(resident) + 1)
     for gap in gaps:
@@ -125,6 +127,7 @@ def _emit_schedule(
     placements: list[TransferPlacement], last_uses: dict[int, int], retained: set[int],
     checkpoint_ops: set[int],
 ) -> ResidencySchedule:
+    """Translate selected intervals into ordered residency actions."""
     schedule = ResidencySchedule()
     for placement in sorted(
         placements,

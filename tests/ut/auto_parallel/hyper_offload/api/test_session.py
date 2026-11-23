@@ -280,7 +280,7 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
         class Observer(TorchDispatchMode):
             """Observe execution beneath the session."""
 
-            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
                 seen.append(func)
                 return func(*args, **(kwargs or {}))
 

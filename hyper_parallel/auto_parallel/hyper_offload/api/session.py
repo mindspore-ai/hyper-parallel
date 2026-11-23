@@ -44,11 +44,11 @@ _active_session: contextvars.ContextVar[OffloadSession | None] = contextvars.Con
 
 
 def _pack_native(tensor: torch.Tensor) -> SavedNative:
-    return SavedNative(tensor.detach(), tensor._version)
+    return SavedNative(tensor.detach(), tensor._version)  # pylint: disable=protected-access
 
 
 def _unpack_native(packed: SavedNative) -> torch.Tensor:
-    if packed.tensor._version != packed.version:
+    if packed.tensor._version != packed.version:  # pylint: disable=protected-access
         raise RuntimeError("a tensor saved for backward was modified in place")
     return packed.tensor
 

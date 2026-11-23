@@ -14,6 +14,9 @@
 # ============================================================================
 """Native Trainer activation-offload configuration and microstep lifecycle."""
 
+# Runtime tests inspect internal state to verify storage ownership and scheduling.
+# pylint: disable=protected-access
+
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -62,8 +65,9 @@ class TestHyperOffloadConfig(unittest.TestCase):
         for obj, name, value in (
             (config.accelerator, "pp_size", 2),
             (config.compile, "enabled", True),
-            (config, "activation_swap", "attention"),
-            (config.activation_checkpoint, "swap_inputs", True),
+            (config, "activation_checkpoint", SimpleNamespace(
+                mode="selective", selective=SimpleNamespace(swap_regions=[Mock()]),
+            )),
         ):
             original = getattr(obj, name)
             with self.subTest(field=name):
@@ -78,7 +82,9 @@ class TestHyperOffloadConfig(unittest.TestCase):
         trainer = BaseTrainer.__new__(BaseTrainer)
         trainer.config = SimpleNamespace(
             accelerator=SimpleNamespace(loss_parallel=False),
-            hyper_offload=HyperOffloadConfig(enable=True, max_resident_activation_mb=4096, max_offload_activation_mb=8192),
+            hyper_offload=HyperOffloadConfig(
+                enable=True, max_resident_activation_mb=4096, max_offload_activation_mb=8192,
+            ),
         )
         with patch("hyper_parallel.trainer.base.OffloadSession") as session:
             trainer._build_training_context()

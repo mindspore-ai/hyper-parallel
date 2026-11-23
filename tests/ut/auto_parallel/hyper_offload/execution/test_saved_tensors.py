@@ -14,8 +14,12 @@
 # ============================================================================
 """Real byte-copy contracts for autograd saved-activation replay."""
 
+# Runtime tests inspect internal state to verify storage ownership and scheduling.
+# pylint: disable=protected-access
+
 import gc
 import unittest
+from functools import partial
 import weakref
 from types import SimpleNamespace
 from contextlib import ExitStack
@@ -69,7 +73,7 @@ class _Observer(TorchDispatchMode):
         super().__init__()
         self.calls = 0
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
         self.calls += 1
         return func(*args, **(kwargs or {}))
 
@@ -81,6 +85,8 @@ class TestSavedTensorReplay(unittest.TestCase):
         """Replace accelerator queues while preserving real tensor storage copies."""
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        # CPU checkpoint recomputation must not query an installed accelerator's autocast capabilities.
+        self.stack.enter_context(patch("torch.utils.checkpoint.DefaultDeviceType.get_device_type", return_value="cpu"))
         for name in ("torch.accelerator.current_stream", "torch.Event", "torch.Tensor.record_stream"):
             self.stack.enter_context(patch(name))
         self.stack.enter_context(patch(
@@ -90,6 +96,7 @@ class TestSavedTensorReplay(unittest.TestCase):
         self.data = torch.linspace(-2, 2, 16)
 
     def _session(self) -> OffloadSession:
+        """Create a CPU session with deterministic transfer primitives."""
         planner = _CopySavedActivation()
         session = OffloadSession(OffloadConfig(planner=planner))
         manager = session.residency_manager
@@ -400,6 +407,7 @@ class TestSavedTensorReplay(unittest.TestCase):
 
     @staticmethod
     def _recorded_plan() -> tuple:
+        """Record a warmup step and return its compiled replay plan."""
         value = torch.ones(4)
         slots = [SavedSlot(sid, tensor_metadata(value), sid) for sid in range(1, 4)]
         recorder = SimpleNamespace(slots=slots, unpacks=[(2, 10), (1, 20), (0, 30)])
@@ -533,12 +541,14 @@ class TestSavedTensorReplay(unittest.TestCase):
             with self.subTest(implementation=implementation.__module__):
                 calls = []
 
-                def region(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+                def region(left: torch.Tensor, right: torch.Tensor, *, calls: list) -> torch.Tensor:
                     """Save both aliases and count forward and recomputed executions."""
                     calls.append(None)
                     return left.square() + right.cos()
 
-                def compute(value: torch.Tensor) -> torch.Tensor:
+                bound_region = partial(region, calls=calls)
+
+                def compute(value: torch.Tensor, implementation=implementation, region=bound_region) -> torch.Tensor:
                     """Differentiate through a checkpoint with repeated arguments."""
                     activation = value.sin()
                     result = implementation(region, activation, activation, use_reentrant=False)

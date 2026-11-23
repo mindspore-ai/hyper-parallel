@@ -280,6 +280,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
                     PeakResidencyPlanner().build(trace)
 
     def test_forward_delayed_release_and_backward_prefetch(self):
+        """Test forward delayed release and backward prefetch."""
         trace = self.forward_backward_trace()
         schedule = PeakResidencyPlanner().build(trace)
         for sid, produced, consumed in ((1, 0, 8), (2, 1, 9)):
@@ -294,6 +295,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertLessEqual(max(simulate(self, trace, schedule)), 180)
 
     def test_measured_copy_window_checks_before_mandatory_memory_deadline(self):
+        """Test measured copy window checks before mandatory memory deadline."""
         trace = self.forward_backward_trace()
         for op in trace.ops:
             op.duration_ms = 1.0
@@ -309,6 +311,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertLessEqual(max(simulate(self, trace, schedule, complete_copies=True)), 180)
 
     def test_optional_checks_do_not_require_elidable_replay_operators(self):
+        """Test optional checks do not require elidable replay operators."""
         for name in ("detach.default", "framework_read:fsdp"):
             with self.subTest(name=name):
                 trace = self.forward_backward_trace()
@@ -331,6 +334,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertLessEqual(max(simulate(self, trace, schedule)), 180)
 
     def test_memory_fence_uses_prior_native_boundary_without_crossing_last_use(self):
+        """Test memory fence uses prior native boundary without crossing last use."""
         trace = self.forward_backward_trace()
         for index in (3, 4):
             trace.ops[index].name = "detach.default"
@@ -369,6 +373,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
                 self.assertLessEqual(max(simulate(self, trace, schedule)), 180)
 
     def test_mask_toggle_preserves_selection(self):
+        """Test mask toggle preserves selection."""
         trace = self.forward_backward_trace()
         masked = PeakResidencyPlanner().build(trace)
         immediate = PeakResidencyPlanner(enable_communication_masking=False).build(
@@ -398,6 +403,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertEqual(max(simulate(self, trace, schedule)), 150)
 
     def test_unavoidable_peak_does_not_hide_later_reducible_peak(self):
+        """Test unavoidable peak does not hide later reducible peak."""
         trace = make_trace(
             [
                 [(9, AccessKind.WRITE)],
@@ -418,6 +424,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertEqual(positions(schedule, Action.COPY_D2H, 1), [1])
 
     def test_multiple_gaps_refresh_snapshot_after_write(self):
+        """Test multiple gaps refresh snapshot after write."""
         trace = make_trace(
             [
                 [(1, AccessKind.WRITE)],
@@ -440,6 +447,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
                 self.assertEqual(simulate(self, trace, schedule), [8, 0, 8, 0, 8, 0, 8])
 
     def test_read_chain_allows_early_d2h_but_not_early_release(self):
+        """Test read chain allows early d2h but not early release."""
         trace = make_trace(
             [
                 [(1, AccessKind.WRITE)],
@@ -459,6 +467,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertLessEqual(max(simulate(self, trace, schedule)), 16)
 
     def test_retained_storage_counts_through_trace_end_and_is_not_evicted(self):
+        """Test retained storage counts through trace end and is not evicted."""
         trace = make_trace(
             [
                 [(1, AccessKind.WRITE)],
@@ -488,6 +497,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertEqual(simulate(self, trace, schedule), [8, 8, 8])
 
     def test_invalid_input(self):
+        """Test invalid input."""
         for budget in (-1, True, 1.5):
             with self.subTest(budget=budget), self.assertRaises(ValueError):
                 PeakResidencyPlanner().build(make_trace([], {}, budget))
@@ -506,6 +516,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
             PeakResidencyPlanner().build(trace)
 
     def test_default_session_and_explicit_planner(self):
+        """Test default session and explicit planner."""
         class FalseyPlanner(GreedyResidencyPlanner):
             def __bool__(self) -> bool:
                 """Exercise explicit planner selection independently of truthiness."""
@@ -521,6 +532,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
             self.assertIs(OffloadSession(OffloadConfig(planner=custom)).planner, custom)
 
     def test_generated_schedules_preserve_versions_budget_and_input_trace(self):
+        """Test generated schedules preserve versions budget and input trace."""
         rng = random.Random(20261109)
         for case in range(150):
             rows, sizes, retained = [[] for _ in range(24)], {}, set()

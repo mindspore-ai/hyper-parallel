@@ -14,6 +14,9 @@
 # ============================================================================
 """Host dispatch optimizations preserve lifetime and replay contracts."""
 
+# Runtime tests inspect internal state to verify storage ownership and scheduling.
+# pylint: disable=protected-access
+
 import gc
 import unittest
 import weakref

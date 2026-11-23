@@ -26,7 +26,7 @@ Physical state transitions are delegated to
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.utils._pytree import tree_flatten
@@ -148,17 +148,7 @@ class WarmupExecutor(BaseExecutor):
 
         op = TraceOp(name=func.__name__, duration_ms=op_duration_ms)
 
-        # --- Detect mutated (write) input tensors via func._schema ---
-        mutated_tensor_ids: set[int] = set()
-        if hasattr(func, "_schema") and func._schema.is_mutable:  # pylint: disable=protected-access
-            flat_args = iter_tensors((args, {}))
-            for idx, arg_info in enumerate(func._schema.arguments):  # pylint: disable=protected-access
-                if (
-                    arg_info.alias_info is not None
-                    and arg_info.alias_info.is_write
-                    and idx < len(flat_args)
-                ):
-                    mutated_tensor_ids.add(id(flat_args[idx]))
+        mutated_tensor_ids = self._mutated_tensor_ids(func, args)
 
         seen: set[tuple[int, AccessKind]] = set()
 
@@ -206,6 +196,22 @@ class WarmupExecutor(BaseExecutor):
         self._guide.append(guide)
 
         return self.apply_shadows(result, output_bindings, flattened=(leaves, output_spec))
+
+    @staticmethod
+    def _mutated_tensor_ids(func: Callable, args: tuple) -> set[int]:
+        """Identify write inputs from the operator schema."""
+        mutated_tensor_ids: set[int] = set()
+        if hasattr(func, "_schema") and func._schema.is_mutable:  # pylint: disable=protected-access
+            flat_args = iter_tensors((args, {}))
+            for idx, arg_info in enumerate(func._schema.arguments):  # pylint: disable=protected-access
+                if (
+                    arg_info.alias_info is not None
+                    and arg_info.alias_info.is_write
+                    and idx < len(flat_args)
+                ):
+                    mutated_tensor_ids.add(id(flat_args[idx]))
+
+        return mutated_tensor_ids
 
     def record_framework_allocation(self, size_bytes: int) -> None:
         """Remember framework workspace sizes without adopting their storage.

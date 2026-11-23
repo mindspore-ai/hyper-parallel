@@ -14,6 +14,9 @@
 # ============================================================================
 """HyperOffload must interoperate with unchanged framework storage ownership."""
 
+# Runtime tests inspect internal state to verify storage ownership and scheduling.
+# pylint: disable=protected-access
+
 import unittest
 from collections import namedtuple
 from contextlib import ExitStack

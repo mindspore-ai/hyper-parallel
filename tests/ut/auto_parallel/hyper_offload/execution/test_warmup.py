@@ -307,7 +307,6 @@ class TestWarmupExecutor(unittest.TestCase):
         self.executor._tracker._activation_sids.add(sid)  # pylint: disable=protected-access
 
         self.executor.dispatch(lambda x: x + 1, (t,), {})
-        guide = self.executor._guide[0]  # pylint: disable=protected-access
         # The output tensor (x+1) is a new tensor with a different storage,
         # so even though t was tracked, the output won't match._
         # To verify the binding logic, use a mock on get_activation_sid.

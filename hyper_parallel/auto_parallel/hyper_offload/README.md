@@ -103,11 +103,8 @@ HyperOffload preserves externally configured allocator settings, including
 `expandable_segments:True`. Set the backend allocator environment variable before
 starting Python. `session.close()` validates that the session is idle and allows reuse.
 
-The saved-tensor C++ helper is compiled offline by `execution/Makefile` and packaged
-with the wheel through the repository build entry `bash build.sh`. The component
-entry `bash hyper_parallel/auto_parallel/hyper_offload/build.sh` also stages the
-compiled helper independently, following the indexed component convention. Runtime loading does not invoke a compiler; when the optional
-binary is unavailable, HyperOffload falls back to regular detach.
+Saved-tensor replay uses Python autograd hooks and detached saved values with
+version checks. It does not require a HyperOffload C++ extension or compiler.
 
 ### Native autograd replay
 

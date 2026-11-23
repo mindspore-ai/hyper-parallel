@@ -174,7 +174,7 @@ class ResidencyManager:
         Raises:
             KeyError: If the storage identifier is not registered.
         """
-        return self.device_storage(sid)._cdata
+        return self.device_storage(sid)._cdata  # pylint: disable=protected-access
 
     # ------------------------------------------------------------------
     # Stream synchronisation
@@ -206,7 +206,7 @@ class ResidencyManager:
         storage = tensor.untyped_storage()
         current = buffer.device_buffer
         if current is not None and (
-            current.untyped_storage()._cdata == storage._cdata
+            current.untyped_storage()._cdata == storage._cdata  # pylint: disable=protected-access
             and current.numel() == storage.nbytes()
         ):
             # Reuse the full-storage byte view for aliases without changing

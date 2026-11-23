@@ -112,7 +112,9 @@ class TrainerConfig:
         if self.hyper_offload.enable:
             if self.compile.enabled or self.accelerator.pp_size > 1:
                 raise ValueError("hyper_offload requires eager training without pipeline parallelism")
-            if self.activation_swap != "none" or self.activation_checkpoint.swap_inputs:
+            checkpoint = self.activation_checkpoint
+            if (checkpoint is not None and checkpoint.mode in ("selective", "hybrid")
+                    and checkpoint.selective is not None and checkpoint.selective.swap_regions):
                 raise ValueError("hyper_offload cannot be combined with activation swapping")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":

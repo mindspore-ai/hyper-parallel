@@ -14,6 +14,9 @@
 # ============================================================================
 """End-to-end contracts for plan-scoped bindings with real CPU byte copies."""
 
+# Runtime tests inspect internal state to verify storage ownership and scheduling.
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -182,6 +185,7 @@ def test_native_view_created_outside_tracking_keeps_original_input_contract(opaq
 def test_partial_replay_preserves_gradients_aliases_and_retained_native_outputs(
     invalid_managed_input, copy_complete, native_detach,
 ):
+    """Test partial replay preserves gradients aliases and retained native outputs."""
     planner = CopyFirstActivation() if copy_complete is None else CheckFirstActivation()
     session = OffloadSession(OffloadConfig(planner=planner))
     manager = session.residency_manager
