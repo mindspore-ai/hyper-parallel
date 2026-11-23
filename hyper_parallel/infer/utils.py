@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Generation configuration and mask helpers."""
+
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
@@ -29,7 +31,7 @@ class GenerationConfig:
     top_k: int = 50
     top_p: float = 1.0
     do_sample: bool = False
-    eos_token_id: Optional[int] = 2
+    eos_token_id: Optional[int | list[int]] = 2
     pad_token_id: int = 0
     repetition_penalty: float = 1.0
     use_cache: bool = True
@@ -49,6 +51,7 @@ class GenerationConfig:
     mask_dtype: Optional[torch.dtype] = None
     logits_processor: Optional[List[Callable]] = None
     stopping_criteria: Optional[List[Callable]] = None
+    rng: Optional[torch.Generator] = None
 
     def __post_init__(self):
         self._validate_sampling()

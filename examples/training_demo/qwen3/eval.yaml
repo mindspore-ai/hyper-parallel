@@ -1,0 +1,53 @@
+# Standalone token-weighted loss/PPL. No optimizer or training plan is needed.
+run_mode: eval
+
+model:
+  _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /models/Qwen3-0.6B
+  local_files_only: true
+
+model_assets:
+  tokenizer:
+    _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /models/Qwen3-0.6B
+    local_files_only: true
+
+training:
+  backend: hccl
+  seed: 42
+
+checkpoint:
+  restore_from: null
+  save_ckpt: false
+
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: /inputs/evaluation.jsonl
+  data_config:
+    labels_are_shifted: true
+    split: "0, 100, 0"
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 1024
+
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 4
+  num_workers: 0
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: dense
+
+evaluation:
+  split: valid
+  batch_size: 2
+  max_samples: null
+  max_batches: null
+  metrics:
+    - _target_: hyper_parallel.evaluation.metrics.LossMetric
+    - _target_: hyper_parallel.evaluation.metrics.PerplexityMetric

@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Sampling helpers for autoregressive generation."""
+
+from __future__ import annotations
 import torch
 from torch.nn import functional as F
 
@@ -52,20 +54,21 @@ def top_p_sample(
     logits: torch.Tensor,
     top_p: float,
     temperature: float = 1.0,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Sample from the nucleus token set."""
     if logits.ndim != 2:
         raise ValueError("logits must have shape (batch, vocab)")
     if top_p >= 1.0:
         probs = F.softmax(logits / temperature, dim=-1)
-        return torch.multinomial(probs, num_samples=1)
+        return torch.multinomial(probs, num_samples=1, generator=generator)
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
     sorted_probs = F.softmax(sorted_logits / temperature, dim=-1)
     cumulative = sorted_probs.cumsum(dim=-1)
     remove = cumulative - sorted_probs > top_p
     filtered = sorted_logits.masked_fill(remove, float("-inf"))
     probs = F.softmax(filtered / temperature, dim=-1)
-    sampled = torch.multinomial(probs, num_samples=1)
+    sampled = torch.multinomial(probs, num_samples=1, generator=generator)
     return sorted_indices.gather(dim=-1, index=sampled)
 
 
@@ -104,6 +107,6 @@ def sample_next_token(
         return greedy_sample(logits)
     logits = _filter_top_k(logits, config.top_k)
     if config.top_p < 1.0:
-        return top_p_sample(logits, top_p=config.top_p, temperature=config.temperature)
+        return top_p_sample(logits, top_p=config.top_p, temperature=config.temperature, generator=config.rng)
     probs = F.softmax(logits / config.temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
+    return torch.multinomial(probs, num_samples=1, generator=config.rng)
