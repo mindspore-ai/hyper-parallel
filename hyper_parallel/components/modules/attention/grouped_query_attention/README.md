@@ -29,6 +29,18 @@ plan_overrides:
 
 `ulysses_degree` 必须整除 `cp_size`；设为 1 选择纯 Ring，大于 1 时先做 Ulysses 交换再使用 Ring 子组。Ring 接受 dense 输入或带全局累计边界的 batch-one packed 输入，不支持显式 mask、dropout、KV cache 或 sliding window。基础算法、反向和输入布局要求见 [Ring CP 实现](../../../../distributed/context_parallel/ring_attention.py)。
 
+packed 输入可以同时启用文档裁剪和负载均衡：
+
+```yaml
+implementation:
+  _target_: hyper_parallel.components.modules.RingGroupedQueryAttention
+  ulysses_degree: 1
+  load_balance: zigzag
+  prune_documents: true
+```
+
+组合模式先按每篇文档与原始连续 token 分片的交集确定其活跃 CP 子环，再仅在该子环内分配 query 任务。可选择 `none`、`zigzag`、`greedy` 或 `hybrid`；每个 query 任务仍只在所属文档内计算。反向通过逆向任务路由恢复原始 token 顺序。`prune_documents` 要求 batch-one packed TND 元数据，且全局累计边界在所有 rank 一致。当前跨 rank KV 路由按 owner 汇总多文档所需片段，通信轮数取该 owner 最远消费者的上界；多文档场景可能多走少量环跳，后续可再细化为逐文档路由。
+
 ## YAML 配置
 
 下面是 TP1、CP4、U2×AG2 的配置片段，合入已有训练配方并保留其他 replacement：

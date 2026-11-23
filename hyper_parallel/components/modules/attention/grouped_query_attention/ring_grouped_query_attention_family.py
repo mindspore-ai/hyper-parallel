@@ -38,6 +38,7 @@ def _build_ring(
     overlap: bool = False,
     ulysses_degree: int = 1,
     load_balance: str = "none",
+    prune_documents: bool = False,
     balance_block_size: int | None = None,
     zigzag_min_length: int | None = None,
 ) -> nn.Module:
@@ -51,6 +52,7 @@ def _build_ring(
         overlap=overlap,
         ulysses_degree=ulysses_degree,
         load_balance=load_balance,
+        prune_documents=prune_documents,
         balance_block_size=balance_block_size,
         zigzag_min_length=zigzag_min_length,
     )
@@ -68,6 +70,7 @@ def RingGroupedQueryAttention(
     overlap: bool = False,
     ulysses_degree: int = 1,
     load_balance: str = "none",
+    prune_documents: bool = False,
     balance_block_size: int | None = None,
     zigzag_min_length: int | None = None,
 ) -> nn.Module:
@@ -88,6 +91,7 @@ def RingGroupedQueryAttention(
         overlap=overlap,
         ulysses_degree=ulysses_degree,
         load_balance=load_balance,
+        prune_documents=prune_documents,
         balance_block_size=balance_block_size,
         zigzag_min_length=zigzag_min_length,
     )

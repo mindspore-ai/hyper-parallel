@@ -95,6 +95,33 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
         self.assertEqual(ring.call_args.kwargs["input_layout"], "TND")
         self.assertEqual(ring.call_args.kwargs["document_lengths"], (4, 4))
 
+    def test_pruning_and_balance_reach_ring_kernel(self):
+        """Packed module options enable both planners on the Ring kernel."""
+        module = RingGroupedQueryAttention(
+            config=self._config(), context={"cp_size": 4},
+            load_balance="zigzag", prune_documents=True,
+        )
+        module.bind_parallel(SimpleNamespace(cp_context=Mock(size=4, rank=0, mesh=object())))
+        hidden_states = torch.randn(1, 2, 16)
+        with patch(
+            "hyper_parallel.components.modules.attention.grouped_query_attention."
+            "ring_grouped_query_attention.ulysses_ring_attention",
+            side_effect=lambda query, key, value, *args, **kwargs: query,
+        ) as ring:
+            module(hidden_states, actual_seq_len=[4, 8])
+
+        self.assertEqual(ring.call_args.kwargs["load_balance"], "zigzag")
+        self.assertTrue(ring.call_args.kwargs["prune_documents"])
+
+    def test_pruning_requires_packed_document_metadata(self):
+        """Document pruning cannot guess document boundaries from dense input."""
+        module = RingGroupedQueryAttention(
+            config=self._config(), context={"cp_size": 2}, prune_documents=True,
+        )
+        module.bind_parallel(SimpleNamespace(cp_context=Mock(size=2, rank=0, mesh=object())))
+        with self.assertRaisesRegex(ValueError, "requires packed document lengths"):
+            module(torch.randn(1, 2, 16))
+
     def test_global_positions_are_sliced_to_local_cp_tokens(self):
         """Global rotary tables use the source rank's contiguous token slice."""
         module = RingGroupedQueryAttention(config=self._config(), context={"cp_size": 4})

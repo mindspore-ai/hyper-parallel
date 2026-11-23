@@ -41,3 +41,17 @@ def test_ring_gqa_ulysses_ring_npu_4_cards() -> None:
 def test_ring_gqa_packed_npu_2_cards() -> None:
     """Compare packed TND Ring GQA across a document boundary on two ranks."""
     torchrun_case(_WORKER, "test_ring_gqa_packed_tnd_bfloat16", num_proc=2)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_ring_gqa_pruned_zigzag_npu_2_cards() -> None:
+    """Compare document-pruned, zigzag-balanced Ring GQA on two ranks."""
+    torchrun_case(_WORKER, "test_ring_gqa_pruned_zigzag_bfloat16", num_proc=2)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_ring_gqa_pruned_zigzag_npu_4_cards() -> None:
+    """Exercise multi-hop document-subring transport and gradient return."""
+    torchrun_case(_WORKER, "test_ring_gqa_pruned_zigzag_bfloat16", num_proc=4)

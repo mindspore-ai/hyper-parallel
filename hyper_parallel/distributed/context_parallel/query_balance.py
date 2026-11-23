@@ -201,6 +201,105 @@ def query_task_plan(
     return tuple(_merge_tasks(tasks) for tasks in assignments)
 
 
+def _distribute_leading_remainder(assignments, document, workers, remainder):
+    """Spread a document's leading remainder over only its participating ranks."""
+    base, extra = divmod(remainder, len(workers))
+    start = 0
+    for index, worker in enumerate(workers):
+        count = base + (index < extra)
+        if count:
+            assignments[worker].append(QueryTask(document, start, start + count))
+        start += count
+
+
+def _subring_zigzag(assignments, document, length, workers):
+    """Pair causal head/tail chunks across the ranks intersecting one document."""
+    chunk, remainder = divmod(length, 2 * len(workers))
+    _distribute_leading_remainder(assignments, document, workers, remainder)
+    for index, worker in enumerate(workers):
+        for slot in (index, 2 * len(workers) - 1 - index):
+            start = remainder + slot * chunk
+            if chunk:
+                assignments[worker].append(QueryTask(document, start, start + chunk))
+
+
+def _subring_greedy(assignments, document, length, workers, lengths, causal, block_size):
+    """Allocate bounded document blocks by estimated work among active ring ranks."""
+    capacity = (2 * length + len(workers) - 1) // len(workers)
+    block = min(block_size, capacity)
+    tasks = [QueryTask(document, start, min(start + block, length))
+             for start in range(0, length, block)]
+    available = [(0, 0, index) for index in range(len(workers))]
+    heapify(available)
+    for task in sorted(tasks, key=lambda item: (-_task_work(item, 1, lengths, causal), item)):
+        skipped = []
+        while available:
+            cost, count, index = heappop(available)
+            if count + task.length <= capacity:
+                break
+            skipped.append((cost, count, index))
+        else:
+            raise ValueError("document subring has no query worker capacity for a planned block")
+        assignments[workers[index]].append(task)
+        heappush(available, (cost + _task_work(task, 1, lengths, causal), count + task.length, index))
+        for item in skipped:
+            heappush(available, item)
+
+
+@lru_cache(maxsize=128)
+def query_task_plan_in_document_rings(
+        lengths: tuple[int, ...], size: int, mode: str = "none", *, causal: bool = True,
+        block_size: int | None = None, zigzag_min_length: int | None = None,
+) -> tuple[tuple[QueryTask, ...], ...]:
+    """Balance each document only among CP ranks that intersect that document.
+
+    Unlike ``query_task_plan``, this planner preserves the document's contiguous
+    source-owner subring. It is used with document-pruned KV transport, so no
+    query is moved to a rank outside the document's active ring.
+    """
+    if (not isinstance(size, int) or isinstance(size, bool) or size < 1
+            or not lengths or any(not isinstance(length, int) or isinstance(length, bool) or length < 1
+                                  for length in lengths)
+            or sum(lengths) % size):
+        raise ValueError("document subrings require positive lengths and equal contiguous source shards")
+    if mode not in ("none", "zigzag", "greedy", "hybrid") or not isinstance(causal, bool):
+        raise ValueError("load_balance must be none, zigzag, greedy or hybrid; causal must be bool")
+    local = sum(lengths) // size
+    if mode in ("greedy", "hybrid"):
+        block_size = min(2048, local) if block_size is None else block_size
+        if (not isinstance(block_size, int) or isinstance(block_size, bool)
+                or not 1 <= block_size <= local):
+            raise ValueError("balance_block_size must be a positive integer at most the local token count")
+    elif block_size is not None:
+        raise ValueError("balance_block_size requires greedy or hybrid")
+    if mode == "hybrid":
+        if (not isinstance(zigzag_min_length, int) or isinstance(zigzag_min_length, bool)
+                or zigzag_min_length < 1):
+            raise ValueError("hybrid requires an explicit positive zigzag_min_length")
+    elif zigzag_min_length is not None:
+        raise ValueError("zigzag_min_length requires hybrid")
+
+    assignments = [[] for _ in range(size)]
+    boundaries = (0, *accumulate(lengths))
+    for document, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
+        first = begin // local
+        last = (end - 1) // local
+        workers = tuple(range(first, last + 1))
+        length = end - begin
+        if mode == "none":
+            for worker in workers:
+                left = max(begin, worker * local) - begin
+                right = min(end, (worker + 1) * local) - begin
+                assignments[worker].append(QueryTask(document, left, right))
+        elif mode == "zigzag":
+            _subring_zigzag(assignments, document, length, workers)
+        elif mode == "hybrid" and length >= zigzag_min_length and length >= 2 * len(workers):
+            _subring_zigzag(assignments, document, length, workers)
+        else:
+            _subring_greedy(assignments, document, length, workers, lengths, causal, block_size)
+    return tuple(_merge_tasks(tasks) for tasks in assignments)
+
+
 def _send_ranges(tasks: tuple, boundaries: tuple[int, ...], owner: int, local: int) -> tuple:
     """Find only tasks intersecting this owner in each sorted worker assignment."""
     first, last = owner * local, (owner + 1) * local

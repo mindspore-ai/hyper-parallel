@@ -106,6 +106,7 @@ class RingGroupedQueryAttentionModule(GroupedQueryAttentionModule):
         overlap: bool = False,
         ulysses_degree: int = 1,
         load_balance: str = "none",
+        prune_documents: bool = False,
         balance_block_size: int | None = None,
         zigzag_min_length: int | None = None,
     ) -> None:
@@ -120,6 +121,8 @@ class RingGroupedQueryAttentionModule(GroupedQueryAttentionModule):
             raise ValueError("ulysses_degree must be a positive integer")
         if load_balance not in ("none", "zigzag", "greedy", "hybrid"):
             raise ValueError("load_balance must be none, zigzag, greedy or hybrid")
+        if not isinstance(prune_documents, bool):
+            raise ValueError("prune_documents must be bool")
         if balance_block_size is not None and (
             not isinstance(balance_block_size, int)
             or isinstance(balance_block_size, bool)
@@ -137,6 +140,7 @@ class RingGroupedQueryAttentionModule(GroupedQueryAttentionModule):
         self.overlap = overlap
         self.ulysses_degree = ulysses_degree
         self.load_balance = load_balance
+        self.prune_documents = prune_documents
         self.balance_block_size = balance_block_size
         self.zigzag_min_length = zigzag_min_length
         self._parallel_enabled = cp_size > 1
@@ -193,6 +197,8 @@ class RingGroupedQueryAttentionModule(GroupedQueryAttentionModule):
         if resolved is None:
             if any(name in kwargs for name in PACKED_SEQUENCE_ARGUMENTS):
                 raise ValueError("Ring GQA could not resolve packed sequence metadata")
+            if self.prune_documents:
+                raise ValueError("Ring GQA document pruning requires packed document lengths")
             return None
         if batch != 1:
             raise ValueError("Ring GQA packed attention requires batch size one")
@@ -271,6 +277,7 @@ class RingGroupedQueryAttentionModule(GroupedQueryAttentionModule):
             overlap=self.overlap,
             load_balance=self.load_balance,
             document_lengths=inputs.document_lengths,
+            prune_documents=self.prune_documents,
             balance_block_size=self.balance_block_size,
             zigzag_min_length=self.zigzag_min_length,
             trace=inputs.options.get("trace"),

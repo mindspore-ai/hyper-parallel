@@ -25,7 +25,9 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
-from hyper_parallel.distributed.context_parallel.query_balance import query_route, query_task_plan
+from hyper_parallel.distributed.context_parallel.query_balance import (
+    QueryTask, query_route, query_task_plan, query_task_plan_in_document_rings,
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,22 @@ class RingTaskPlan:
     capacity: int
     local_tokens: int
     fast_zigzag: bool
+
+
+@dataclass(frozen=True)
+class PrunedRingPlan:
+    """Bound document-local KV routes for local or subring-balanced queries."""
+
+    spans: tuple[tuple[tuple[int, int], ...], ...]
+    source_spans: tuple[tuple[tuple[int, int], ...], ...]
+    key_tasks: tuple[tuple[QueryTask, ...], ...]
+    counts: tuple[int, ...]
+    capacity: int
+    blocks: tuple[tuple[AttentionBlock, ...], ...]
+    batches: tuple
+    local_blocks: tuple[AttentionBlock, ...]
+    local_batches: tuple
+    hops: tuple[int, ...]
 
 
 @dataclass
@@ -128,12 +146,65 @@ def _document_blocks(query_tasks, key_tasks, causal):
     return tuple(blocks)
 
 
+def _document_blocks_between(query_tasks, key_tasks, causal):
+    """Plan exact blocks when a worker's queries and local keys have different owners."""
+    query_offsets, key_offsets = {}, {}
+    query_cursor = key_cursor = 0
+    for task in query_tasks:
+        query_offsets[task] = query_cursor
+        query_cursor += task.length
+    for task in key_tasks:
+        key_offsets[task] = key_cursor
+        key_cursor += task.length
+
+    keys_by_document = {}
+    for task in key_tasks:
+        keys_by_document.setdefault(task.document, []).append(task)
+
+    blocks = []
+    for query in query_tasks:
+        q_start, q_end = query.start, query.end
+        q_offset = query_offsets[query]
+        for key in keys_by_document.get(query.document, ()):
+            k_start, k_end = key.start, key.end
+            k_offset = key_offsets[key]
+            if not causal:
+                blocks.append(AttentionBlock(q_offset, q_offset + query.length,
+                                             k_offset, k_offset + key.length))
+                continue
+            if k_end <= q_start:
+                blocks.append(AttentionBlock(q_offset, q_offset + query.length,
+                                             k_offset, k_offset + key.length))
+                continue
+            if k_start >= q_end:
+                continue
+
+            diagonal_start, diagonal_end = max(q_start, k_start), min(q_end, k_end)
+            q_diagonal_start = q_offset + diagonal_start - q_start
+            q_diagonal_end = q_offset + diagonal_end - q_start
+            if k_start < diagonal_start:
+                blocks.append(AttentionBlock(q_diagonal_start, q_diagonal_end,
+                                             k_offset, k_offset + diagonal_start - k_start))
+            blocks.append(AttentionBlock(q_diagonal_start, q_diagonal_end,
+                                         k_offset + diagonal_start - k_start,
+                                         k_offset + diagonal_end - k_start, True))
+            if q_end > k_end:
+                q_tail = q_offset + k_end - q_start
+                blocks.append(AttentionBlock(q_tail, q_offset + query.length,
+                                             k_offset, k_offset + key.length))
+    return tuple(blocks)
+
+
 def _block_batches(blocks, capacity):
     """Bound repeated KV prefixes to four transport buffers per fused call."""
     batches, current, rows = [], [], 0
     for block in blocks:
         count = block.key_end - block.key_start
-        if current and (rows + count > 4 * capacity or current[0].causal != block.causal):
+        overlaps_query = any(
+            block.query_start < part.query_end and part.query_start < block.query_end
+            for part in current
+        )
+        if current and (rows + count > 4 * capacity or current[0].causal != block.causal or overlaps_query):
             batches.append(tuple(current))
             current, rows = [], 0
         current.append(block)
@@ -147,6 +218,7 @@ def _block_batches(blocks, capacity):
 def ring_task_plan(
         lengths: tuple[int, ...], size: int, rank: int, mode: str, causal: bool,
         block_size: int | None = None, zigzag_min_length: int | None = None,
+        document_subrings: bool = False,
 ) -> RingTaskPlan:
     """Build exact document-local masks and an equal-capacity transport plan.
 
@@ -154,8 +226,9 @@ def ring_task_plan(
     Other plans decompose valid intersections into full and suffix-causal blocks.
     Padding equalizes transport capacity only and never enters a kernel.
     """
-    assignments = query_task_plan(lengths, size, mode, causal=causal, block_size=block_size,
-                                  zigzag_min_length=zigzag_min_length)
+    planner = query_task_plan_in_document_rings if document_subrings else query_task_plan
+    assignments = planner(lengths, size, mode, causal=causal, block_size=block_size,
+                           zigzag_min_length=zigzag_min_length)
     route = query_route(assignments, lengths, rank)
     local = sum(lengths) // size
     paired = mode == "zigzag" or (mode == "hybrid" and lengths[0] >= zigzag_min_length)
@@ -170,6 +243,76 @@ def ring_task_plan(
     capacity = max(sum(task.length for task in tasks) for tasks in assignments)
     batches = tuple(_block_batches(parts, capacity) for parts in blocks)
     return RingTaskPlan(assignments, route, blocks, batches, capacity, local, fast)
+
+
+@lru_cache(maxsize=128)
+def pruned_ring_plan(lengths: tuple[int, ...], size: int, rank: int, causal: bool,
+                     assignments: tuple | None = None) -> PrunedRingPlan:
+    """Prune KV according to the exact task assignments used by the Ring workers.
+
+    Query and KV tasks share a task owner after reversible QKV redistribution.
+    The packed KV spans are therefore expressed in worker-local task coordinates,
+    while ``spans`` retains the original global token coordinates for inspection.
+    """
+    if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < size:
+        raise ValueError("rank must belong to the CP group")
+    query_assignments = assignments or query_task_plan_in_document_rings(lengths, size, "none", causal=causal)
+    if len(query_assignments) != size:
+        raise ValueError("Ring task assignments must have one entry per CP rank")
+    key_assignments = query_assignments
+    boundaries = (0, *accumulate(lengths))
+    key_tasks_by_owner = []
+    remote_key_tasks = []
+    spans = []
+    source_spans = []
+    for owner, key_tasks in enumerate(key_assignments):
+        key_tasks_by_owner.append(key_tasks)
+        remote_tasks = []
+        owner_spans = []
+        owner_source_spans = []
+        source_offset = 0
+        for key in key_tasks:
+            remote_queries = [
+                task for query_owner, tasks in enumerate(query_assignments) if query_owner != owner
+                for task in tasks if task.document == key.document
+            ]
+            if causal:
+                remote_end = max((task.end for task in remote_queries), default=key.start)
+                key_end = min(key.end, remote_end)
+            else:
+                key_end = key.end if remote_queries else key.start
+            if key_end <= key.start:
+                source_offset += key.length
+                continue
+            remote_tasks.append(QueryTask(key.document, key.start, key_end))
+            owner_spans.append((boundaries[key.document] + key.start, boundaries[key.document] + key_end))
+            owner_source_spans.append((source_offset, source_offset + key_end - key.start))
+            source_offset += key.length
+        remote_key_tasks.append(tuple(remote_tasks))
+        spans.append(tuple(owner_spans))
+        source_spans.append(tuple(owner_source_spans))
+
+    counts = tuple(sum(end - start for start, end in pieces) for pieces in spans)
+    capacity = max(1, *counts)
+    consumers = []
+    for owner, remote_tasks in enumerate(remote_key_tasks):
+        consumers.append(tuple(
+            query_owner for query_owner, tasks in enumerate(query_assignments)
+            if query_owner != owner and _document_blocks_between(tasks, remote_tasks, causal)
+        ))
+    hops = tuple(max(((consumer - owner) % size for consumer in workers), default=0)
+                 for owner, workers in enumerate(consumers))
+    local_blocks = _document_blocks_between(query_assignments[rank], key_tasks_by_owner[rank], causal)
+    blocks = tuple(
+        _document_blocks_between(query_assignments[rank], remote_key_tasks[owner], causal)
+        if owner != rank else ()
+        for owner in range(size)
+    )
+    return PrunedRingPlan(
+        tuple(spans), tuple(source_spans), tuple(remote_key_tasks), counts, capacity, blocks,
+        tuple(_block_batches(parts, capacity) for parts in blocks),
+        local_blocks, _block_batches(local_blocks, capacity), hops,
+    )
 
 
 @lru_cache(maxsize=32)

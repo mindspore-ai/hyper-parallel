@@ -43,7 +43,11 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     _build_hybrid_cp_submeshes, ulysses_head_to_seq, ulysses_seq_to_head,
 )
 from hyper_parallel.distributed.context_parallel.ring_layout import (
-    RingAttentionTrace, redistribute_ring_qkv, redistribute_ring_rows, ring_task_plan,
+    PrunedRingPlan, RingAttentionTrace, pruned_ring_plan, redistribute_ring_qkv, redistribute_ring_rows,
+    ring_task_plan,
+)
+from hyper_parallel.distributed.context_parallel.ring_transport import (
+    _PackedRingExchange, _communication_stream, _pack_ring_kv, _return_ring_gradient,
 )
 
 
@@ -461,6 +465,105 @@ def _planned_backward(saved, grad_output, ring, scale, layout, overlap, plan, tr
     return grad_query.to(query.dtype), grad_key.to(key.dtype), grad_value.to(value.dtype)
 
 
+def _launch_pruned(exchange, packet, overlap, step):
+    if not overlap:
+        exchange.stream.wait_stream(torch.npu.current_stream())
+    received = exchange.launch(packet, step)
+    if not overlap:
+        received.ready()
+    return received
+
+
+def _pruned_forward(query, key, value, ring, scale, overlap, plan, trace):
+    initial = _pack_ring_kv((key, value), plan.source_spans, ring, plan.counts)
+    exchange = _PackedRingExchange(key, plan, ring, _communication_stream(query.device, False))
+    state, packet = _empty_state(query, "TND"), initial
+    for step in range(max(plan.hops) + 1):
+        begin = trace.begin() if trace is not None else None
+        following = exchange.launch(packet, step) if overlap and step < max(plan.hops) else None
+        blocks, batches = (plan.local_blocks, plan.local_batches) if step == 0 else (
+            plan.blocks[packet.owner], plan.batches[packet.owner])
+        if blocks:
+            packet.ready()
+            keys, values = (key, value) if step == 0 else packet.tensors()
+            _forward_blocks(query, keys, values, state, blocks, scale, "TND", batches)
+            packet.consumed_now()
+        if not overlap and step < max(plan.hops):
+            following = _launch_pruned(exchange, packet, False, step)
+        packet = following
+        if step == max(plan.hops):
+            exchange.finish(initial)
+        if trace is not None:
+            trace.end("forward", step, begin)
+    return state[0].to(query.dtype), state[1], state[2]
+
+
+def _pruned_delta(saved, grad_output, grad_query, packet, plan, scale, step):
+    blocks, batches = (plan.local_blocks, plan.local_batches) if step == 0 else (
+        plan.blocks[packet.owner], plan.batches[packet.owner])
+    if not blocks:
+        return None
+    packet.ready()
+    keys, values = saved[1:3] if step == 0 else packet.tensors()
+    delta = _backward_blocks(saved, grad_output, keys, values, grad_query, blocks, scale, "TND", batches)
+    packet.consumed_now()
+    return delta
+
+
+def _pruned_accumulate(gradient, delta, local_gradients, ring, plan, step):
+    if delta is None:
+        return
+    gradient.ready()
+    if step == 0:
+        for target, source in zip(local_gradients, delta):
+            target.add_(source)
+        _pack_ring_kv(local_gradients, plan.source_spans, ring, plan.counts, out=gradient)
+        return
+    for target, source in zip(gradient.tensors(), delta):
+        target.add_(source)
+    gradient.produced_now()
+
+
+def _restore_pruned_gradient(local_gradients, gradient, ring, plan):
+    gradient.ready()
+    for target, source in zip(local_gradients, gradient.tensors()):
+        offset = 0
+        for start, end in plan.source_spans[ring.rank]:
+            length = end - start
+            target[start:end].copy_(source[offset:offset + length])
+            offset += length
+    gradient.consumed_now()
+
+
+def _pruned_backward(saved, grad_output, ring, scale, overlap, plan, trace):
+    query, key, value = saved[:3]
+    grad_query, grad_key, grad_value = (torch.zeros_like(tensor, dtype=torch.float32) for tensor in saved[:3])
+    initial = _pack_ring_kv((key, value), plan.source_spans, ring, plan.counts)
+    grad_initial = _pack_ring_kv((grad_key, grad_value), plan.source_spans, ring, plan.counts)
+    exchange = _PackedRingExchange(key, plan, ring, _communication_stream(query.device, False))
+    grad_exchange = _PackedRingExchange(grad_key, plan, ring, _communication_stream(query.device, True))
+    packet, gradient = initial, grad_initial
+    for step in range(max(plan.hops) + 1):
+        begin = trace.begin() if trace is not None else None
+        following = exchange.launch(packet, step) if overlap and step < max(plan.hops) else None
+        delta = _pruned_delta(saved, grad_output, grad_query, packet, plan, scale, step)
+        _pruned_accumulate(gradient, delta, (grad_key, grad_value), ring, plan, step)
+        if not overlap and step < max(plan.hops):
+            following = _launch_pruned(exchange, packet, False, step)
+        next_gradient = _launch_pruned(grad_exchange, gradient, overlap, step) if step < max(plan.hops) else None
+        if not overlap:
+            grad_exchange.stream.wait_stream(torch.npu.current_stream())
+        _return_ring_gradient(gradient, grad_initial, plan, ring, grad_exchange.stream, step)
+        packet, gradient = following, next_gradient
+        if step == max(plan.hops):
+            _restore_pruned_gradient((grad_key, grad_value), grad_initial, ring, plan)
+            exchange.finish(initial)
+            grad_exchange.finish(grad_initial)
+        if trace is not None:
+            trace.end("backward", step, begin)
+    return tuple(grad.to(tensor.dtype) for grad, tensor in zip((grad_query, grad_key, grad_value), saved[:3]))
+
+
 class _RingAttention(torch.autograd.Function):
     """Pair raw P2P forward transport with an explicit gradient-return ring."""
 
@@ -472,7 +575,9 @@ class _RingAttention(torch.autograd.Function):
     ) -> torch.Tensor:
         """Save only local inputs, the final output and global softmax statistics."""
         query, key, value = (tensor.contiguous() for tensor in (query, key, value))
-        if plan is None:
+        if isinstance(plan, PrunedRingPlan):
+            output, maximum, denominator = _pruned_forward(query, key, value, ring, scale, overlap, plan, trace)
+        elif plan is None:
             output, maximum, denominator = _ring_forward(
                 query, key, value, ring, causal, scale, input_layout, overlap, trace,
             )
@@ -494,7 +599,10 @@ class _RingAttention(torch.autograd.Function):
     @once_differentiable
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
         """Sum local dQ and circulate dKV without a CP-size averaging factor."""
-        if ctx.plan is None:
+        if isinstance(ctx.plan, PrunedRingPlan):
+            gradients = _pruned_backward(ctx.saved_tensors, grad_output.contiguous(), ctx.ring, ctx.scale,
+                                         ctx.overlap, ctx.plan, ctx.trace)
+        elif ctx.plan is None:
             gradients = _ring_backward(
                 ctx.saved_tensors, grad_output.contiguous(), ctx.ring, ctx.causal, ctx.scale, ctx.input_layout,
                 ctx.overlap, ctx.trace,
@@ -541,7 +649,8 @@ def _validate_inputs(query, key, value, causal, scale, input_layout, dropout_p, 
         raise ValueError("ring_attention currently requires all inputs on the same NPU")
 
 
-def _prepare_task_plan(query, layout, size, rank, causal, mode, lengths, block_size, threshold, workers=None):
+def _prepare_task_plan(query, layout, size, rank, causal, mode, lengths, block_size, threshold,
+                       workers=None, document_subrings=False):
     tokens = query.shape[_token_axis(layout)] * size
     if layout == "TND":
         if (not isinstance(lengths, tuple) or not lengths
@@ -551,8 +660,14 @@ def _prepare_task_plan(query, layout, size, rank, causal, mode, lengths, block_s
     elif lengths is not None:
         raise ValueError("document_lengths requires TND layout")
     return ring_task_plan((tokens,) if lengths is None else lengths, size if workers is None else workers,
-                          rank, mode, causal,
-                          block_size, threshold)
+                          rank, mode, causal, block_size, threshold, document_subrings=document_subrings)
+
+
+def _validate_pruning(prune_documents, input_layout):
+    if not isinstance(prune_documents, bool):
+        raise ValueError("prune_documents must be bool")
+    if prune_documents and input_layout != "TND":
+        raise ValueError("prune_documents requires TND input_layout")
 
 
 def ring_attention(
@@ -567,6 +682,7 @@ def ring_attention(
     dropout_p: float = 0.0,
     overlap: bool = False,
     load_balance: str = "none",
+    prune_documents: bool = False,
     document_lengths: tuple[int, ...] | None = None,
     balance_block_size: int | None = None,
     zigzag_min_length: int | None = None,
@@ -585,6 +701,7 @@ def ring_attention(
         dropout_p: Must be zero in this implementation.
         overlap: Prefetch KV and pipeline dKV communication with block computation.
         load_balance: Internal query/KV layout: none, zigzag, greedy or hybrid.
+        prune_documents: Build per-document Ring subplans; can be combined with load_balance.
         document_lengths: Global positive document lengths, required for TND only.
             Supply identical host tuples on all ranks; total equals local tokens times CP.
         balance_block_size: Greedy block size, at most local tokens; default min(2048, local).
@@ -609,6 +726,7 @@ def ring_attention(
         may have atomic reduction roundoff; exact repeatability requires
         torch.use_deterministic_algorithms(True).
     """
+    _validate_pruning(prune_documents, input_layout)
     _validate_inputs(query, key, value, causal, scale, input_layout, dropout_p, overlap)
     ring = _ring_context(cp_mesh)
     # Register optional NPU operators only when the NPU implementation is invoked.
@@ -616,7 +734,23 @@ def ring_attention(
 
     scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
     plan = _prepare_task_plan(query, input_layout, ring.size, ring.rank, causal, load_balance,
-                              document_lengths, balance_block_size, zigzag_min_length)
+                              document_lengths, balance_block_size, zigzag_min_length,
+                              document_subrings=prune_documents)
+    if prune_documents:
+        if load_balance != "none":
+            query, key, value = redistribute_ring_qkv(
+                query, key, value, plan, ring.group, _token_axis(input_layout),
+                2 if input_layout == "BSND" else 1,
+            )
+        pruning_plan = pruned_ring_plan(
+            document_lengths, ring.size, ring.rank, causal, plan.assignments,
+        )
+        output = _RingAttention.apply(
+            query, key, value, ring, causal, scale, "TND", overlap, pruning_plan, trace,
+        )
+        if load_balance != "none":
+            output = redistribute_ring_rows(output, plan, ring.group, _token_axis(input_layout), inverse=True)
+        return output
     if load_balance == "none" and input_layout != "TND":
         if trace is None:
             return _RingAttention.apply(query, key, value, ring, causal, scale, input_layout, overlap)
@@ -667,6 +801,7 @@ def ulysses_ring_attention(
     dropout_p: float = 0.0,
     overlap: bool = False,
     load_balance: str = "none",
+    prune_documents: bool = False,
     document_lengths: tuple[int, ...] | None = None,
     balance_block_size: int | None = None,
     zigzag_min_length: int | None = None,
@@ -688,6 +823,7 @@ def ulysses_ring_attention(
         dropout_p: Must be zero, as in ring_attention.
         overlap: Enable Ring KV/dKV overlap; Ulysses exchanges remain synchronous.
         load_balance: Ring subgroup task layout: none, zigzag, greedy or hybrid.
+        prune_documents: Prune KV routes independently inside each document's Ring subplan.
         document_lengths: Global document lengths for TND, as in ring_attention.
         balance_block_size: Greedy query block size, as in ring_attention.
         zigzag_min_length: Explicit document threshold for hybrid.
@@ -709,6 +845,7 @@ def ulysses_ring_attention(
         even when their upstream gradient is zero. Gradients sum all local losses
         without CP-size averaging. Other limitations are shared with ring_attention.
     """
+    _validate_pruning(prune_documents, input_layout)
     cp_size = _validate_ulysses_degree(cp_mesh, ulysses_degree)
     _validate_inputs(query, key, value, causal, scale, input_layout, dropout_p, overlap)
     sequence_dim, head_dim = _token_axis(input_layout), 2 if input_layout == "BSND" else 1
@@ -718,8 +855,10 @@ def ulysses_ring_attention(
         )
     # Validate metadata before Ulysses creates subgroups or exchanges tensors.
     _prepare_task_plan(query, input_layout, cp_size, 0, causal, load_balance,
-                       document_lengths, balance_block_size, zigzag_min_length, workers=cp_size // ulysses_degree)
-    options = {"load_balance": load_balance, "document_lengths": document_lengths,
+                       document_lengths, balance_block_size, zigzag_min_length,
+                       workers=cp_size // ulysses_degree, document_subrings=prune_documents)
+    options = {"load_balance": load_balance, "prune_documents": prune_documents,
+               "document_lengths": document_lengths,
                "balance_block_size": balance_block_size, "zigzag_min_length": zigzag_min_length, "trace": trace}
     # Validate parent rank order before submesh creation or any tensor exchange.
     _ring_context(cp_mesh)
