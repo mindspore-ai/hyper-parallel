@@ -1,0 +1,286 @@
+# Run from the repository root with 8 Ascend ranks:
+# python -m torch.distributed.run --standalone --nproc_per_node=8 --module examples.training_demo.train_text hyper_parallel/compile/examples/dsv41_graph/train_demo_graph_muon.yaml
+# model.config_path contains a copy of the V4.1 release config.json with
+# text_config.engram_head_dim changed from 256 to 32; the builder crops depth and experts.
+# Generate engram_d8.json from the original release config and matching tokenizer:
+# python -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_assets --model-dir /path/to/original-release --output ./output/dsv41_graph/demo_assets/engram_d8.json --bucket-base 64 --parameter-divisor 8 --table-pad-multiple 2
+# Put the release tokenizer.json and tokenizer_config.json in the configured tokenizer directory.
+# dataset.data_path points to training JSONL with a text field. Weights are randomly initialized.
+model:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: ./output/dsv41_graph/demo_assets/model
+  engram_assets_path: ./output/dsv41_graph/demo_assets/engram_d8.json
+  text_parameter_divisor: 1
+  enable_vision: false
+  num_routed_experts: 16
+  exercise_post_training_indexer: false
+  enable_candidate_pool: true
+  indexer_loss_coeff: 0.001
+  moe_aux_loss_coeff: 0.0001
+  moe_router_bias_update_rate: 0.001
+  torch_dtype: float32
+  validate_placement: false
+  engram_storage_backend: device
+  num_hidden_layers: 4
+  load_base_model: false
+model_init_dtype: float32
+training:
+  train_iters: 30
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+  logging_steps: 1
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 4
+plan_overrides:
+- match: model.layers.*.*_hc
+  region_dispatch: false
+  params:
+    fn:
+      tp: replicate
+    base:
+      tp: replicate
+    scale:
+      tp: replicate
+  in_src:
+    hidden_streams:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_streams:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    pre:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    pre:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+- match: model.layers.*.engram
+  params:
+    q_weight:
+      tp: replicate
+    k_weight:
+      tp: replicate
+    embed.weight:
+      tp: replicate
+    wkv.weight:
+      tp: replicate
+- match: model.layers.*.mlp.forward
+  when: ep
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: true
+      fix_router: false
+- match: model.layers.*.*_hc
+  when: sequence_parallel
+  in_src:
+    hidden_streams:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_streams:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    pre:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    pre:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+- match: model.layers.*.engram
+  when: sequence_parallel
+  in_src:
+    hidden_states:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_states:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    output:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    output:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: full
+activation_swap: none
+compile:
+  enabled: true
+  use_joint_graph: true
+  fsdp_allgather_prefetch: false
+  fsdp_overlap_grad_reduce: false
+  dynamic: true
+  dynamic_arg_dims: {}
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      local_files_only: true
+      pretrained_model_name_or_path: ./output/dsv41_graph/demo_assets/model
+      trust_remote_code: false
+      use_fast: true
+  data_transform:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.text_transform.build_deepseek_v41_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 2304
+    drop_ragged_tail: false
+    sample_alignment_size: 2
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: ./output/datasets/wikitext-train.jsonl
+  data_config:
+    create_attention_mask_in_dataloader: true
+    labels_are_shifted: true
+    cache_dir: ./output/dsv41_graph/demo_muon/data_cache
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 200
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    pad_to_length: 2304
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+      include_position_ids: false
+      include_image_sequence_start: false
+      compress_ratios:
+      - 1
+      - 2
+  sampler_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+  token_budget: 2304
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.Muon
+  fp32_main_params: false
+  muon_config:
+    muon_lr: 0.0001
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./output/dsv41_graph/demo_muon/checkpoint
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: true
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+  restore_dataloader_state: true
+debug:
+  check_nan_inf: false
+  check_dataset: warn
+loss_fn: null
+profiler:
+  enable: false
+  start_step: 3
+  stop_step: 4
+  output_path: ./output/dsv41_graph/demo_muon/profiler
+  memory: false
+  with_stack: false
+  rank_ids:
+  - 0
+memory:
+  enable: false
+  start_step: 0
+  end_step: 1
+  save_path: ./output/dsv41_graph/demo_muon/memory
+  dump_ranks:
+  - 0
+  stacks: all

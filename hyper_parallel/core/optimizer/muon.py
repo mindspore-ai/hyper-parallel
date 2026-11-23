@@ -313,6 +313,8 @@ class Muon(BaseDistributedOptimizer):
             self._build_param_shard_metadata()
         if self.hsdp_replica_count is None:
             self.hsdp_replica_count = self._auto_deduce_replica_count()
+        # Retain the original cache if graph binding has to roll back.
+        self._split_sub_pg_cache = self._split_sub_pg_cache.copy()
         self._split_replicate_groups()
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
