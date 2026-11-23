@@ -23,9 +23,9 @@ from hyper_multicore.modules.mega_gate import MegaGate as SourceMegaGate
 
 from examples.torch.module_family.config import MegaGateConfig
 from hyper_parallel.components.modules import get_family_build_info
-from hyper_parallel.components.modules import gate
+from hyper_parallel.components.modules import gate_family as gate
 from hyper_parallel.components.modules.family import get_module_family
-from hyper_parallel.components.modules.gate import Gate
+from hyper_parallel.components.modules.gate_family import Gate
 from hyper_parallel.distributed.expert_parallel.routing import resolve_moe_router
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest

@@ -226,7 +226,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
             rotate_half,
         )
         # CPU contract tests replace the NPU boundary while preserving the production fused selection.
-        norm_module = importlib.import_module("hyper_parallel.components.modules.rms_norm")
+        norm_module = importlib.import_module("hyper_parallel.components.modules.rms_norm_family")
 
         def norm_kernel(inputs, weight, eps, cast_order):
             del cast_order

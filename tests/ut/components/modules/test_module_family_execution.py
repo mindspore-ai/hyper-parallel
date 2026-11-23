@@ -18,9 +18,9 @@ import unittest
 import torch
 
 from examples.torch.module_family.config import RMSNormConfig, SwiGLUMLPConfig, SharedExpertConfig
-from hyper_parallel.components.modules.rms_norm import RMSNorm, OffsetRMSNorm
-from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
-from hyper_parallel.components.modules.shared_expert import SharedExpert
+from hyper_parallel.components.modules.rms_norm_family import RMSNorm, OffsetRMSNorm
+from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
+from hyper_parallel.components.modules.shared_expert_family import SharedExpert
 
 
 class TestModuleFamilyExecution(unittest.TestCase):

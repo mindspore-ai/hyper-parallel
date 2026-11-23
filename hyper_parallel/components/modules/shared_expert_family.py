@@ -30,7 +30,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.swiglu_mlp import (
+from hyper_parallel.components.modules.swiglu_mlp_family import (
     SwiGLUMLPModule, _validate_mlp_config, local_swiglu, _activation_settings,
 )
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
@@ -369,6 +369,6 @@ def SharedExpert(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="shared_expert", baseline=SharedExpert,
-    variants={"local": "hyper_parallel.components.modules.shared_expert.SharedExpertModule"},
+    variants={"local": "hyper_parallel.components.modules.shared_expert_family.SharedExpertModule"},
     default_variant="local",
 ))

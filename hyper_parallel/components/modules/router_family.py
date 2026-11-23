@@ -23,7 +23,7 @@ from torch import nn
 
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.gate import routing_scores, select_topk_scores
+from hyper_parallel.components.modules.gate_family import routing_scores, select_topk_scores
 
 
 class TokenChoiceTopKRouterModule(nn.Module):
@@ -117,7 +117,7 @@ def TokenChoiceTopKRouter(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="token_choice_topk_router", baseline=TokenChoiceTopKRouter,
-    variants={"local": "hyper_parallel.components.modules.router.TokenChoiceTopKRouterModule"},
+    variants={"local": "hyper_parallel.components.modules.router_family.TokenChoiceTopKRouterModule"},
     default_variant="local",
 ))
 

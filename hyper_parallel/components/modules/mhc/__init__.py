@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Public mHC contracts and legacy class exports."""
-from .mhc import MHCPre, MHCPost, PipelinedMhc, MegaMhc
+from .mhc_family import MHCPre, MHCPost, PipelinedMhc, MegaMhc
 from .mhc_pre import MhcPreModule
 from .mhc_post import MhcPostModule
 from .pipelined_mhc import PipelinedMhcModule, pipelined_mhc_post

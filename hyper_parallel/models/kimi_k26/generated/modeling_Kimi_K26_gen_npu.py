@@ -963,7 +963,7 @@ from transformers.utils.output_capturing import capture_outputs
 
 
 
-from hyper_parallel.components.modules.rms_norm import RMSNorm
+from hyper_parallel.components.modules.rms_norm_family import RMSNorm
 
 
 

@@ -31,7 +31,7 @@ from examples.torch.module_family.config import (
     MegaMhcConfig, RMSNormConfig, SwiGLUMLPConfig, GateConfig, MegaGateConfig,
 )
 from hyper_parallel.components.modules import MegaMhc, RMSNorm, SwiGLUMLP, OffsetRMSNorm, SharedExpert
-from hyper_parallel.components.modules.gate import Gate
+from hyper_parallel.components.modules.gate_family import Gate
 from tests.common.mhc_reference import torch_mega_mhc
 
 

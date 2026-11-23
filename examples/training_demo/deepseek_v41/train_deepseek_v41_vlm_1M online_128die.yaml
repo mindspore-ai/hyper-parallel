@@ -90,7 +90,7 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.components.modules.engram.engram.Engram
+        _target_: hyper_parallel.components.modules.engram.engram_family.Engram
         engram_storage_backend: host
   - match: "model.layers.*.self_attn"
     replace:

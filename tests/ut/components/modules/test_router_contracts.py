@@ -24,10 +24,10 @@ from hyper_multicore.modules.mega_gate import MegaGate as CoreMegaGate
 
 from examples.torch.module_family.config import GateConfig, TokenChoiceTopKRouterConfig, MegaGateConfig
 from hyper_parallel.components.modules import get_family_build_info
-from hyper_parallel.components.modules.router import (
+from hyper_parallel.components.modules.router_family import (
     TokenChoiceTopKRouter, routing_scores, select_topk_scores,
 )
-from hyper_parallel.components.modules.gate import Gate, GateModule, MegaGateModule
+from hyper_parallel.components.modules.gate_family import Gate, GateModule, MegaGateModule
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
 from hyper_parallel.components.modules.family import get_module_family
 

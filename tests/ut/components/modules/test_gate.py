@@ -23,9 +23,9 @@ from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeTopKRouter
 from hyper_multicore.modules.mega_gate import MegaGate as SourceMegaGate
 
 from examples.torch.module_family.config import GateConfig
-from hyper_parallel.components.modules.gate import Gate, GateModule
+from hyper_parallel.components.modules.gate_family import Gate, GateModule
 from hyper_parallel.components.modules.module_family import get_family_build_info
-from hyper_parallel.components.modules.gate import MegaGateModule
+from hyper_parallel.components.modules.gate_family import MegaGateModule
 
 
 class TestGate(unittest.TestCase):
@@ -108,7 +108,7 @@ class TestGate(unittest.TestCase):
         values = torch.randn(2, 3, 8)
         mask = torch.tensor([[True, False, True], [False, True, False]])
         expected = member(values, mask)
-        with patch("hyper_parallel.components.modules.gate._plan_for_device") as plan:
+        with patch("hyper_parallel.components.modules.gate_family._plan_for_device") as plan:
             with patch("hyper_multicore.modules.mega_gate.function.mega_gate", return_value=expected) as native:
                 actual = member._native_forward(values, mask)  # pylint: disable=protected-access
         self.assertIs(actual, expected)

@@ -100,7 +100,7 @@ def _cpu_kernels(monkeypatch):
         return (out,)
 
     # CPU oracles replace the family NPU boundary, including its device precondition.
-    norm_module = importlib.import_module("hyper_parallel.components.modules.rms_norm")
+    norm_module = importlib.import_module("hyper_parallel.components.modules.rms_norm_family")
     monkeypatch.setattr(norm_module, "_npu_rms_norm", rms)
     monkeypatch.setattr(torch_npu, "npu_rotary_mul", rotary)
     monkeypatch.setattr(torch_npu, "npu_fusion_attention", attention)

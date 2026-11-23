@@ -31,7 +31,7 @@ from hyper_parallel.components.modules import (
     MegaMhc, SpatialMergeProjector, RotaryEmbedding, RMSNorm, OffsetRMSNorm,
     SwiGLUMLP, SharedExpert, Engram, get_family_build_info,
 )
-from hyper_parallel.components.modules.router import TokenChoiceTopKRouter, TokenChoiceTopKRouterModule
+from hyper_parallel.components.modules.router_family import TokenChoiceTopKRouter, TokenChoiceTopKRouterModule
 from hyper_parallel.components.modules.mhc.mega_mhc import MegaMhcModule, FusedMegaMhcModule
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionAligner
