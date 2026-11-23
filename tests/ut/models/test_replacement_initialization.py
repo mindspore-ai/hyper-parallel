@@ -31,7 +31,7 @@ from hyper_parallel.components.modules import Engram, SpatialMergeProjector, Tok
 from hyper_parallel.components.modules.engram import EngramModule
 from hyper_parallel.components.modules.linear import Linear
 from hyper_parallel.components.modules.router_family import TokenChoiceTopKRouterModule
-from hyper_parallel.components.modules.spatial_merge_projector_family import SpatialMergeProjectorModule
+from hyper_parallel.components.modules.common.spatial_merge_projector import SpatialMergeProjectorModule
 from hyper_parallel.models._transformers.model_builder import _initialize_model_weights, _materialize_and_load_model
 from hyper_parallel.models.replacement import (
     ModuleReplacementSpec, apply_module_replacements, compile_module_replacements, module_replacement,

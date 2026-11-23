@@ -30,7 +30,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import WeightConvert
 from hyper_parallel.components import functional
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
-from hyper_parallel.components.modules.rms_norm_family import RMSNorm
+from hyper_parallel.components.modules.common.rms_norm import RMSNorm
 
 
 

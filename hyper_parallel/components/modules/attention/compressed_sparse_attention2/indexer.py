@@ -27,7 +27,7 @@ from torch import nn
 from hyper_parallel.components.functional.lightning_indexer import (
     lightning_indexer, sort_key_indices, validate_indexer_tensors,
 )
-from hyper_parallel.components.modules.rms_norm_family import NativeRMSNormModule, RMSNorm
+from hyper_parallel.components.modules.common.rms_norm import NativeRMSNormModule, RMSNorm
 from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper
 
 

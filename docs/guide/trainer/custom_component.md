@@ -52,7 +52,7 @@ YAML parsing produces `list[PlanOverride]`. The Trainer normalizes this into rep
 2. `replace.implementation` points to a replacement factory importable in the training environment. Supply static arguments with a `{_target_: path, ...}` mapping.
 3. Decorate the factory with `@module_replacement`, declare `module`, `module_fqn`, and `context` parameters, and return a `torch.nn.Module`.
 
-See [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm_family.py#L269) for a complete implementation.
+See [`RMSNorm`](../../../hyper_parallel/components/modules/common/rms_norm.py#L269) for a complete implementation.
 
 Model-family adapters are organized by responsibility: module/weight conversion in `adapter/conversion/`; data encoding, processors,
 transforms, and runtime inputs in `adapter/data/`; model forward contracts in `adapter/runtime/`; CP/EP

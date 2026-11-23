@@ -27,7 +27,7 @@ from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.sparse_flash_mla import (
     supports_fused_attention_inputs, sparse_flash_mla,
 )
-from hyper_parallel.components.modules.rms_norm_family import RMSNorm
+from hyper_parallel.components.modules.common.rms_norm import RMSNorm
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from .compressor import CSA2Compressor
 from .document_layout import SharedCompressedPackedSequence

@@ -30,11 +30,11 @@ class TestFamilyImportCompatibility(unittest.TestCase):
     def test_default_member_names_are_local(self):
         """The public ordinary member has one stable name across the migrated families."""
         entries = (
-            ("rms_norm_family", ("RMSNorm", "OffsetRMSNorm")),
+            ("common.rms_norm", ("RMSNorm", "OffsetRMSNorm")),
             ("swiglu_mlp_family", ("SwiGLUMLP",)),
             ("shared_expert_family", ("SharedExpert",)),
-            ("rotary_embedding_family", ("RotaryEmbedding",)),
-            ("spatial_merge_projector_family", ("SpatialMergeProjector",)),
+            ("common.rotary_embedding", ("RotaryEmbedding",)),
+            ("common.spatial_merge_projector", ("SpatialMergeProjector",)),
             ("router_family", ("TokenChoiceTopKRouter",)),
             ("mhc.mhc_family", ("MHCPre", "MHCPost", "PipelinedMhc", "MegaMhc")),
             ("engram.engram_family", ("Engram",)),
@@ -53,7 +53,7 @@ class TestFamilyImportCompatibility(unittest.TestCase):
         """Public exports use the canonical family classes and builders."""
         public = importlib.import_module("hyper_parallel.components.modules")
         for name, cls, factory in (
-            ("rms_norm_family", "RMSNormModule", "RMSNorm"),
+            ("common.rms_norm", "RMSNormModule", "RMSNorm"),
             ("swiglu_mlp_family", "SwiGLUMLPModule", "SwiGLUMLP"),
             ("shared_expert_family", "SharedExpertModule", "SharedExpert"),
         ):

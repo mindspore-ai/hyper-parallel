@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts_family import GroupedExperts
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
-    from hyper_parallel.components.modules.rms_norm_family import OffsetRMSNorm, RMSNorm
+    from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.shared_expert_family import SharedExpert
     from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
 
@@ -56,10 +56,10 @@ _EXPORT_TO_MODULE = {
     "GateModule": "gate_family",
     "MegaMhc": "mhc.mhc_family",
     "MegaMhcModule": "mhc.mega_mhc",
-    "SpatialMergeProjector": "spatial_merge_projector_family",
-    "SpatialMergeProjectorModule": "spatial_merge_projector_family",
-    "RotaryEmbedding": "rotary_embedding_family",
-    "RotaryEmbeddingModule": "rotary_embedding_family",
+    "SpatialMergeProjector": "common.spatial_merge_projector",
+    "SpatialMergeProjectorModule": "common.spatial_merge_projector",
+    "RotaryEmbedding": "common.rotary_embedding",
+    "RotaryEmbeddingModule": "common.rotary_embedding",
     "HostEngramModule": "engram.host_engram",
     "HostEngramTable": "engram.host_engram_table",
     "Engram": "engram",
@@ -71,12 +71,12 @@ _EXPORT_TO_MODULE = {
     "SwiGLUMLP": "swiglu_mlp_family",
     "SharedExpertModule": "shared_expert_family",
     "SharedExpert": "shared_expert_family",
-    "RMSNormModule": "rms_norm_family",
-    "NativeRMSNormModule": "rms_norm_family",
-    "NativeOffsetRMSNormModule": "rms_norm_family",
-    "RMSNorm": "rms_norm_family",
-    "OffsetRMSNormModule": "rms_norm_family",
-    "OffsetRMSNorm": "rms_norm_family",
+    "RMSNormModule": "common.rms_norm",
+    "NativeRMSNormModule": "common.rms_norm",
+    "NativeOffsetRMSNormModule": "common.rms_norm",
+    "RMSNorm": "common.rms_norm",
+    "OffsetRMSNormModule": "common.rms_norm",
+    "OffsetRMSNorm": "common.rms_norm",
     "build_mtp": "mtp",
     "MTPLayer": "mtp",
     "MultiTokenPrediction": "mtp",

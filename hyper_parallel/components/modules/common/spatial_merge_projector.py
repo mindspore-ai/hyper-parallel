@@ -86,6 +86,6 @@ def SpatialMergeProjector(  # pylint: disable=invalid-name
 register_module_family(ModuleFamily(
     name="spatial_merge_projector", baseline=SpatialMergeProjector,
     variants={"local":
-              "hyper_parallel.components.modules.spatial_merge_projector_family.SpatialMergeProjectorModule"},
+              "hyper_parallel.components.modules.common.spatial_merge_projector.SpatialMergeProjectorModule"},
     default_variant="local",
 ))

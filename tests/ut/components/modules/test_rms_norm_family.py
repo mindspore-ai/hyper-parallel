@@ -32,7 +32,7 @@ from hyper_parallel.components.modules.attention.multi_latent_attention.multi_la
     MultiLatentAttentionModule,
 )
 from hyper_parallel.components.modules.family import get_module_family
-from hyper_parallel.components.modules.rms_norm_family import NativeRMSNormModule, NativeOffsetRMSNormModule
+from hyper_parallel.components.modules.common.rms_norm import NativeRMSNormModule, NativeOffsetRMSNormModule
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementSpec
 
