@@ -20,17 +20,146 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.integration.veomni.adapter import (
     _ViTFusionPolicy,
     _build_construction_bindings,
+    _build_forward_method_binding,
+    _build_lora_state_binding,
     _build_parallelize_binding,
     _build_sharding_binding,
+    _build_weight_export_binding,
     _configure_block_prefetch,
 )
 
 
 class TestConstructionBindings(unittest.TestCase):
     """Check copy-in-place restoration without importing optional VeOmni."""
+
+    def setUp(self) -> None:
+        """Provide the optional LoRA surface without importing VeOmni."""
+        self.lora = SimpleNamespace(get_lora_state_dict=MagicMock())
+        self.conversion = SimpleNamespace(export_weights=MagicMock())
+        self.embedding = SimpleNamespace(register_fsdp_forward_method=MagicMock())
+
+    def test_hyper_extra_forward_uses_scheduler_hooks(self) -> None:
+        """Feature: Hyper tied embedding projection.
+
+        Description: Invoke a registered extra forward with transformed arguments.
+        Expectation: Scheduler pre/post hooks surround the original method.
+        """
+        for keep_output in (False, True):
+            with self.subTest(keep_output=keep_output):
+                model = MagicMock(spec=HSDPModule)
+                value, output, transformed = object(), object(), object()
+                method = MagicMock(return_value=output)
+                model.project = method
+                scheduler = SimpleNamespace(
+                    _forward_pre_hook=MagicMock(return_value=((transformed,), {"flag": True})),
+                    _forward_hook=MagicMock(return_value=None if keep_output else transformed),
+                )
+                model.hsdp_scheduler = scheduler
+                with patch("hyper_parallel.integration.veomni.adapter.import_module", return_value=self.embedding):
+                    _, register = _build_forward_method_binding()
+                register(model, "project")
+                self.assertIs(model.project(value), output if keep_output else transformed)
+                scheduler._forward_pre_hook.assert_called_once_with(model, (value,), {})
+                method.assert_called_once_with(transformed, flag=True)
+                scheduler._forward_hook.assert_called_once_with(model, (transformed,), output)
+                self.embedding.register_fsdp_forward_method.assert_not_called()
+
+    def test_native_extra_forward_registration_is_unchanged(self) -> None:
+        """Feature: Native forward registration isolation.
+
+        Description: Register an entry on a plain module with Hyper bindings loaded.
+        Expectation: Delegate unchanged to the native registration API.
+        """
+        model = torch.nn.Linear(2, 2)
+        with patch("hyper_parallel.integration.veomni.adapter.import_module", return_value=self.embedding):
+            _, register = _build_forward_method_binding()
+        register(model, "forward")
+        self.embedding.register_fsdp_forward_method.assert_called_once_with(model, "forward")
+
+    def test_hyper_weight_export_keeps_native_gathering(self) -> None:
+        """Feature: Hyper converter weight export.
+
+        Description: Pass checkpoint views to the native export iterator.
+        Expectation: The original helper sees checkpoint tensors, not live parameters.
+        """
+        model = torch.nn.Linear(2, 2)
+        state = {"weight": torch.ones(2, 2)}
+        self.conversion.export_weights.side_effect = lambda view: iter(view.state_dict().items())
+        with patch("hyper_parallel.integration.veomni.adapter.import_module", return_value=self.conversion):
+            _, export = _build_weight_export_binding()
+        with (
+            patch("hyper_parallel.integration.veomni.adapter.uses_hyper", return_value=True),
+            patch("hyper_parallel.integration.veomni.adapter.get_model_state_dict", return_value=state) as convert,
+        ):
+            actual = dict(export(model))
+        self.assertEqual(set(actual), {"weight"})
+        self.assertIs(actual["weight"], state["weight"])
+        convert.assert_called_once_with(model)
+
+    def test_native_weight_export_is_unchanged(self) -> None:
+        """Feature: Native converter isolation.
+
+        Description: Export a native model with Hyper bindings installed.
+        Expectation: Pass the original model and return its iterator unchanged.
+        """
+        model = torch.nn.Linear(2, 2)
+        expected = iter(model.state_dict().items())
+        self.conversion.export_weights.return_value = expected
+        with patch("hyper_parallel.integration.veomni.adapter.import_module", return_value=self.conversion):
+            _, export = _build_weight_export_binding()
+        with patch("hyper_parallel.integration.veomni.adapter.get_model_state_dict") as convert:
+            self.assertIs(export(model), expected)
+        self.conversion.export_weights.assert_called_once_with(model)
+        convert.assert_not_called()
+
+    def test_lora_hyper_state_uses_checkpoint_views(self) -> None:
+        """Feature: Hyper LoRA adapter export.
+
+        Description: Extract a named adapter and selected bias through checkpoint views.
+        Expectation: Keys follow native policy; values use checkpoint tensors only.
+        """
+        model = torch.nn.Linear(2, 2)
+        config = object()
+        key = "base_model.model.linear.lora_A.weight"
+        bias = "base_model.model.linear.base_layer.bias"
+        self.lora.get_lora_state_dict.return_value = {key: object(), bias: object()}
+        self.lora.strip_adapter_name = lambda name, adapter: name.replace(f".{adapter}.", ".", 1)
+        state = {
+            "base_model.model.linear.lora_A.custom.weight": torch.ones(2, 2),
+            bias: torch.ones(2),
+            "base_model.model.linear.base_layer.weight": torch.zeros(2, 2),
+        }
+        with patch("hyper_parallel.integration.veomni.adapter.import_module", return_value=self.lora):
+            _, extract = _build_lora_state_binding()
+        with (
+            patch("hyper_parallel.integration.veomni.adapter.uses_hyper", return_value=True),
+            patch("hyper_parallel.integration.veomni.adapter.get_model_state_dict", return_value=state) as convert,
+        ):
+            actual = extract(model, adapter_name="custom", config=config)
+        self.assertEqual(set(actual), {key, bias})
+        self.assertIs(actual[key], state["base_model.model.linear.lora_A.custom.weight"])
+        self.assertIs(actual[bias], state[bias])
+        self.lora.get_lora_state_dict.assert_called_once_with(model, adapter_name="custom", config=config)
+        convert.assert_called_once_with(model)
+
+    def test_lora_native_state_is_unchanged(self) -> None:
+        """Feature: Native LoRA isolation.
+
+        Description: Extract a native adapter while Hyper bindings are installed.
+        Expectation: Return the native state unchanged without Hyper conversion.
+        """
+        model = torch.nn.Linear(2, 2)
+        selected = {"lora_A.weight": model.weight}
+        self.lora.get_lora_state_dict.return_value = selected
+        with patch("hyper_parallel.integration.veomni.adapter.import_module", return_value=self.lora):
+            _, extract = _build_lora_state_binding()
+        with patch("hyper_parallel.integration.veomni.adapter.get_model_state_dict") as convert:
+            self.assertIs(extract(model), selected)
+        convert.assert_not_called()
 
     def test_vit_fusion_override_preserves_language_and_root_settings(self):
         """Explicit visual overrides include patch/merger leftovers, not LLM weights."""
@@ -269,6 +398,9 @@ class TestConstructionBindings(unittest.TestCase):
             "veomni.distributed.torch_parallelize": parallel,
             "veomni.optim.optimizer": SimpleNamespace(build_optimizer=build_optimizer),
             "veomni.checkpoint.dcp_checkpointer": checkpoint,
+            "veomni.lora.state_dict": self.lora,
+            "veomni.models.checkpoint.convert": self.conversion,
+            "veomni.distributed.emb_parallel.sharded_embedding": self.embedding,
         }
         config = SimpleNamespace(
             low_precision_reduce_scatter_comm=False,
@@ -335,6 +467,9 @@ class TestConstructionBindings(unittest.TestCase):
                                 build_optimizer=native_optimizer
                             ),
                             "veomni.checkpoint.dcp_checkpointer": checkpoint,
+                            "veomni.lora.state_dict": self.lora,
+                            "veomni.models.checkpoint.convert": self.conversion,
+                            "veomni.distributed.emb_parallel.sharded_embedding": self.embedding,
                         }
                         with patch(
                             "hyper_parallel.integration.veomni.adapter.import_module",
@@ -347,6 +482,9 @@ class TestConstructionBindings(unittest.TestCase):
                         self.assertEqual(
                             checkpoint.get_model_state_dict in bindings, fsdp
                         )
+                        self.assertEqual(self.lora.get_lora_state_dict in bindings, fsdp)
+                        self.assertEqual(self.conversion.export_weights in bindings, fsdp)
+                        self.assertEqual(self.embedding.register_fsdp_forward_method in bindings, fsdp)
                         model = torch.nn.Linear(2, 2)
                         with (
                             patch(
@@ -395,6 +533,9 @@ class TestConstructionBindings(unittest.TestCase):
             "veomni.distributed.torch_parallelize": parallel,
             "veomni.optim.optimizer": SimpleNamespace(build_optimizer=build_optimizer),
             "veomni.checkpoint.dcp_checkpointer": checkpoint,
+            "veomni.lora.state_dict": self.lora,
+            "veomni.models.checkpoint.convert": self.conversion,
+            "veomni.distributed.emb_parallel.sharded_embedding": self.embedding,
         }
         with patch(
             "hyper_parallel.integration.veomni.adapter.import_module",

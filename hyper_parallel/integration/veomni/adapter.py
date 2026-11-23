@@ -24,6 +24,7 @@ from collections.abc import Callable
 from functools import wraps
 from importlib import import_module
 from inspect import signature
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
@@ -113,6 +114,9 @@ def _build_construction_bindings(
     bindings.append(_build_sharding_binding(parallel, options, vit_policy))
     bindings.append((parallel.FSDPModule, (parallel.FSDPModule, HSDPModule)))
     bindings.extend(_build_checkpoint_bindings(checkpoint))
+    bindings.append(_build_lora_state_binding())
+    bindings.append(_build_weight_export_binding())
+    bindings.append(_build_forward_method_binding())
     if options is not None:
         bindings.append(_build_parallelize_binding(parallel, fsdp_config, vit_policy))
     return bindings
@@ -202,6 +206,97 @@ def _build_checkpoint_bindings(checkpoint: Any) -> list:
         return set_model_state_dict(model, model_state_dict=model_state_dict, **kwargs)
 
     return [(old_get, get_model), (old_set, set_model)]
+
+
+def _build_lora_state_binding() -> tuple:
+    """Supply checkpoint views to VeOmni's existing adapter export pipeline."""
+    lora = import_module("veomni.lora.state_dict")
+    original = lora.get_lora_state_dict
+
+    @wraps(original)
+    def get_lora_state(model: torch.nn.Module, adapter_name: str = "default", config: Any = None) -> dict:
+        """Preserve native key selection while translating Hyper tensor storage.
+
+        Args:
+            model: Live LoRA model whose parameters must remain unchanged.
+            adapter_name: Adapter-name infix removed from exported keys.
+            config: Native LoRA configuration, including the bias policy.
+
+        Returns:
+            Native state or detached Hyper checkpoint views under adapter keys.
+        """
+        selected = original(model, adapter_name=adapter_name, config=config)
+        if not uses_hyper(model):
+            return selected
+        # Keep training parameters intact. Torch checkpoint views preserve the
+        # full layout so VeOmni's EP restoration and DCP writer see real shards.
+        return {
+            lora.strip_adapter_name(name, adapter_name): tensor
+            for name, tensor in get_model_state_dict(model).items()
+            if lora.strip_adapter_name(name, adapter_name) in selected
+        }
+
+    return original, get_lora_state
+
+
+def _build_weight_export_binding() -> tuple:
+    """Reuse native expert gathering and converter export on checkpoint views."""
+    conversion = import_module("veomni.models.checkpoint.convert")
+    original = conversion.export_weights
+
+    @wraps(original)
+    def export_weights(model: torch.nn.Module) -> Any:
+        """Export Hyper master shards through the unchanged native export routine.
+
+        Args:
+            model: Live model whose parameters must remain unchanged.
+
+        Returns:
+            Native export iterator containing fully gathered tensors.
+        """
+        if not uses_hyper(model):
+            return original(model)
+        state = get_model_state_dict(model)
+        # The native helper only consumes state_dict. Its existing DTensor
+        # gather, EP broadcast and expert splitting must still run unchanged.
+        return original(SimpleNamespace(state_dict=lambda: state))
+
+    return original, export_weights
+
+
+def _build_forward_method_binding() -> tuple:
+    """Route an embedding's tied projection through its Hyper FSDP hooks."""
+    embedding = import_module("veomni.distributed.emb_parallel.sharded_embedding")
+    original = embedding.register_fsdp_forward_method
+
+    @wraps(original)
+    def register_forward_method(module: torch.nn.Module, method_name: str) -> None:
+        """Register an extra forward entry without changing native modules.
+
+        Args:
+            module: A module that owns its FSDP unit.
+            method_name: Bound method that must run inside the unit's hooks.
+        """
+        if not isinstance(module, HSDPModule):
+            return original(module, method_name)
+        if not hasattr(module, method_name):
+            raise ValueError(f"{type(module)} does not have a method {method_name}")
+        method = getattr(module, method_name)
+
+        @wraps(method)
+        def forward_method(*args: Any, **kwargs: Any) -> Any:
+            """Use the scheduler's ordinary forward and backward registration."""
+            scheduler = module.hsdp_scheduler
+            # Hyper exposes no public extra-forward registration API. Reuse the
+            # same hooks as module.__call__ so both parameter uses reduce once.
+            args, kwargs = scheduler._forward_pre_hook(module, args, kwargs)  # pylint: disable=protected-access
+            output = method(*args, **kwargs)
+            processed = scheduler._forward_hook(module, args, output)  # pylint: disable=protected-access
+            return output if processed is None else processed
+
+        setattr(module, method_name, forward_method)
+
+    return original, register_forward_method
 
 
 def _build_parallelize_binding(

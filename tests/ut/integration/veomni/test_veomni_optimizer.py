@@ -18,6 +18,7 @@ import math
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -39,6 +40,7 @@ from hyper_parallel.integration.veomni.optimizer import (
     build_optimizer_state_binding,
     uses_hyper,
 )
+from tests.common.mark_utils import arg_mark
 
 
 class TestHyperOptimizerAdapter(unittest.TestCase):
@@ -420,6 +422,35 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
             adapter.load_state_dict(state)
         restore.assert_called_once()
 
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_unsupported_hyper_optimizer_reports_selected_and_supported_types(self) -> None:
+        """Feature: Explicit Hyper optimizer capability errors.
+
+        Description: Select AnyPrecision AdamW for a model using Hyper parameters.
+        Expectation: Name the rejected selection and all supported alternatives.
+        """
+        calls = MagicMock()
+
+        def native(
+            model: torch.nn.Module, optimizer_type: str = "adamw", param_groups: Optional[list] = None
+        ) -> object:
+            """Record any unexpected fallback to the native optimizer factory."""
+            return calls(model, optimizer_type, param_groups)
+
+        _, wrapper = build_optimizer_binding(
+            SimpleNamespace(build_optimizer=native), hyper_muon=False
+        )
+        with (
+            patch("hyper_parallel.integration.veomni.optimizer.uses_hyper", return_value=True),
+            self.assertRaisesRegex(
+                NotImplementedError,
+                "Hyper FSDP does not support optimizer.type='anyprecision_adamw'. "
+                "Supported values: 'adamw', 'muon' .* 'hyper_muon'",
+            ),
+        ):
+            wrapper(torch.nn.Linear(2, 2), optimizer_type="anyprecision_adamw")
+        calls.assert_not_called()
 
     def test_optimizer_binding_rejects_missing_or_incompatible_parameters(self):
         """Fail at activation, not with a dictionary KeyError during construction."""

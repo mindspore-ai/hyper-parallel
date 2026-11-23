@@ -28,6 +28,7 @@ from hyper_parallel.integration.veomni import (
     apply_hyper_parallel_patch,
     remove_hyper_parallel_patch,
 )
+from hyper_parallel.integration.veomni.adapter import _build_weight_export_binding
 
 
 class TestVeOmniAdapter(unittest.TestCase):
@@ -131,6 +132,31 @@ class TestVeOmniAdapter(unittest.TestCase):
             self.clipping.clip_grad_norm(model, 1.0, foreach=False), "native-clip"
         )
         self.assertEqual(len(self.native_clip_calls), 1)
+
+    def test_export_binding_restores_converter_aliases(self) -> None:
+        """Feature: Reversible converter export binding.
+
+        Description: Bind an export helper imported by a converter before activation.
+        Expectation: Early and late aliases restore to the original on removal.
+        """
+        conversion = ModuleType("veomni.models.checkpoint.convert")
+        exports, aliases = vars(conversion), vars(self.aliases)
+        exports["export_weights"] = lambda model: iter(model.state_dict().items())
+        original = exports["export_weights"]
+        aliases["export_alias"] = original
+        with patch.dict(sys.modules, {"veomni.models.checkpoint.convert": conversion}):
+            binding = _build_weight_export_binding()
+            with patch(
+                "hyper_parallel.integration.veomni.adapter._build_construction_bindings", return_value=[binding]
+            ):
+                self.adapter.patch()
+            self.assertIs(aliases["export_alias"], exports["export_weights"])
+            self.assertIsNot(exports["export_weights"], original)
+            aliases["late_export_alias"] = exports["export_weights"]
+            self.adapter.unpatch()
+            self.assertIs(exports["export_weights"], original)
+            self.assertIs(aliases["export_alias"], original)
+            self.assertIs(aliases["late_export_alias"], original)
 
     def test_hyper_clip_reuses_native_veomni_function(self):
         """The adapter only translates gradient ownership, not norm arithmetic."""
