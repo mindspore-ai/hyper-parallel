@@ -218,6 +218,29 @@ class TestVeOmniAdapter(unittest.TestCase):
             "native-load",
         )
 
+    def test_chunk_loading_preserves_layout_and_live_parameter(self):
+        """Chunk loading sees a checkpoint view without replacing Hyper storage."""
+        parameter = MagicMock(spec=DTensor)
+        local = torch.zeros(2, 2)
+        checkpoint_view = local.detach()
+        model = torch.nn.Module()
+        model._parameters["weight"] = parameter
+        self.adapter.patch()
+        with patch(
+            "hyper_parallel.integration.veomni.adapter.to_torch_view",
+            return_value=checkpoint_view,
+        ) as convert:
+            view, name = getattr(self.loading, "_find_submodule")(model, "weight")
+        self.assertIsNot(view, model)
+        self.assertIs(view._parameters[name], checkpoint_view)
+        self.assertIs(model._parameters[name], parameter)
+        convert.assert_called_once_with(parameter)
+        view._parameters[name].data.fill_(3)
+        torch.testing.assert_close(local, torch.full_like(local, 3))
+        self.adapter.unpatch()
+        restored, _ = getattr(self.loading, "_find_submodule")(model, "weight")
+        self.assertIs(restored, model)
+
     def test_incompatible_signature_does_not_partially_bind(self):
         """Fail before the first mutation when the framework API differs."""
         self.clipping.clip_grad_norm = lambda unknown: None
