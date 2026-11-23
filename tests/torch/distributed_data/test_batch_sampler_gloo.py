@@ -21,6 +21,18 @@ from tests.common.mark_utils import arg_mark
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_loader_group_cleanup_dp2_tp2_gloo() -> None:
+    """Feature: DataLoader process group lifetime.
+    Description: Rebuild online, metadata and local loaders, including close before first iteration.
+    Expectation: Owned groups are unregistered exactly once and training mesh groups remain usable.
+    """
+    torchrun_case(
+        file_name=str(Path(__file__).with_name("_test_batch_sampler_gloo.py")),
+        case_name="test_loader_group_cleanup_dp2_tp2_gloo", num_proc=4,
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_native_batch_sampler_dp2_tp2_gloo() -> None:
     """Feature: Native HP BatchSampler integration.
     Description: Exercise DP2/TP2 online and metadata loading with both shuffle policies and prefetch.
@@ -62,10 +74,12 @@ def test_host_window_device_queue_dp2_tp2_gloo() -> None:
     Description: Exercise DP2/TP2 loading with independent H2D lookahead and current-batch broadcasts.
     Expectation: Collective ordering, EOF delivery and checkpoint replay remain correct.
     """
-    torchrun_case(
-        file_name=str(Path(__file__).with_name("_test_batch_sampler_gloo.py")),
-        case_name="test_host_window_device_queue_dp2_tp2_gloo", num_proc=4,
-    )
+    # Each mode creates and destroys WORLD, so give it a fresh torchrun rendezvous.
+    for mode in ("process", "in-process"):
+        torchrun_case(
+            file_name=str(Path(__file__).with_name("_test_batch_sampler_gloo.py")),
+            case_name=f"test_host_window_device_queue_dp2_tp2_gloo[{mode}]", num_proc=4,
+        )
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")

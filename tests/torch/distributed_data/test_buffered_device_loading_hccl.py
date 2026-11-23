@@ -31,3 +31,13 @@ def test_buffered_device_loading_hccl() -> None:
         file_name=str(Path(__file__).with_name("_test_buffered_device_loading_hccl.py")),
         case_name="test_buffered_device_loading_hccl", num_proc=4,
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_external_process_hccl() -> None:
+    """Feature: Independent external data processes.
+    Description: Run nested DataLoader workers, child HCCL and parent H2D on DP4.
+    Expectation: Accepted balancing preserves global occurrences and epoch replay.
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_test_buffered_device_loading_hccl.py")),
+                  case_name="test_external_process_hccl", num_proc=4)

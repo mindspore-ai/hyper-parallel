@@ -111,6 +111,15 @@ class PlannedSampleLoader:
             samples_by_key[key] = payload
         return samples_by_key
 
+    def close(self) -> None:
+        """Stop owned persistent workers after the caller has drained sample reads."""
+        # PyTorch exposes no public close API; persistent workers are retained
+        # by the native loader's iterator even after all requested samples arrive.
+        iterator = self._data_loader._iterator
+        if iterator is not None:
+            iterator._shutdown_workers()
+            self._data_loader._iterator = None
+
     def state_dict(self) -> dict[str, Any]:
         """Return the epoch required to seed future plan-aware workers."""
         return {

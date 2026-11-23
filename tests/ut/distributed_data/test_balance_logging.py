@@ -22,12 +22,14 @@ from unittest.mock import Mock, patch
 
 from hyper_parallel.distributed_data.balance_logging import logger
 from hyper_parallel.distributed_data.schema import WorkloadCost
+from tests.common.mark_utils import arg_mark
 from tests.ut.distributed_data.test_accumulation_window import _ids, _loader
 
 
 class TestNativeBalanceLogging(unittest.TestCase):
     """Check reporting boundaries, modeled costs and native source variants."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_prefetch_logs_only_when_window_is_delivered(self) -> None:
         """Feature: Consumption-aligned INFO logs.
         Description: Prefetch two windows with online/offline metadata and either planning mode.
@@ -40,7 +42,7 @@ class TestNativeBalanceLogging(unittest.TestCase):
                         log_balance=True,
                 ) as loader:
                     cost_model = Mock(spec=["__call__"], return_value=WorkloadCost(llm=7))
-                    loader._planner.cost_model = cost_model
+                    loader._source._planner.cost_model = cost_model
                     loader.prefetch()
                     loader.wait_for_prefetch()
                     self.assertEqual(captured.records, [])
@@ -97,28 +99,31 @@ class TestNativeBalanceLogging(unittest.TestCase):
             self.assertIn("[dp-balance] iteration 1 :", captured.records[3].getMessage())
             self.assertIn("epoch=1", captured.records[3].getMessage())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_logs_default_off_even_at_info_level(self) -> None:
         """Feature: Opt-in balancing diagnostics.
         Description: Consume native batches at INFO level without enabling the config switch.
         Expectation: No balancing report is formatted or emitted, and samples are still delivered.
         """
         with self.assertNoLogs(logger.name, level="INFO"), patch(
-                "hyper_parallel.distributed_data.distributed_dataloader.format_balance_stats",
+                "hyper_parallel.distributed_data.native_source.format_balance_stats",
         ) as formatter, _loader(accumulation=3) as loader:
             self.assertEqual([_ids(batch) for batch in loader], [list(range(i, i + 2)) for i in range(0, 44, 2)])
             formatter.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_disabled_info_skips_statistics_formatting(self) -> None:
         """Feature: Standard logging-level control.
         Description: Disable INFO before reading and planning all batches.
         Expectation: Native loading does not format balancing diagnostics.
         """
         with patch.object(logger, "isEnabledFor", return_value=False), patch(
-                "hyper_parallel.distributed_data.distributed_dataloader.format_balance_stats",
+                "hyper_parallel.distributed_data.native_source.format_balance_stats",
         ) as formatter, _loader(accumulation=3, log_balance=True) as loader:
             self.assertTrue(list(loader))
             formatter.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_failed_future_step_does_not_emit_its_planning_logs(self) -> None:
         """Feature: Speculation is not reported as consumption.
         Description: Fail device staging after the successor has already been planned.
@@ -127,15 +132,15 @@ class TestNativeBalanceLogging(unittest.TestCase):
         with self.assertLogs(logger.name, level="INFO") as captured, _loader(
                 accumulation=3, log_balance=True,
         ) as loader:
-            original = loader._stage_batch
+            original = loader._source._prepare_next_batch
 
-            def stage(batch: object) -> object:
+            def stage() -> object:
                 """Fail staging only after the current window is prepared."""
-                if loader._step >= 3:
+                if loader._source._step >= 3:
                     raise ValueError("future staging failed")
-                return original(batch)
+                return original()
 
-            with patch.object(loader, "_stage_batch", side_effect=stage):
+            with patch.object(loader._source, "_prepare_next_batch", side_effect=stage):
                 for _ in range(3):
                     next(loader)
                 with self.assertRaisesRegex(ValueError, "future staging failed"):

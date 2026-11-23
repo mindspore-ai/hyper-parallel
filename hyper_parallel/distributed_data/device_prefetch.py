@@ -164,11 +164,12 @@ class DeviceStepPrefetcher:
             caller does not wait for that event; the consumer stream
             orders itself with ``wait_event`` in ``take_batch``.
         """
-        return self.stage_prepared(self.prepare_host(cpu_batch))
+        self._device_module.set_device(self.device)
+        return self._enqueue(self.prepare_host(cpu_batch))
 
     @staticmethod
     def prepare_host(cpu_batch: Any) -> Any:
-        """Pin a constructed batch on its Host producer before device staging.
+        """Pin a constructed CPU batch before device staging.
 
         Args:
             cpu_batch: Collated batch whose CPU tensor leaves need pinned storage.
@@ -187,10 +188,12 @@ class DeviceStepPrefetcher:
         Returns:
             Device input and its copy event. This prefetcher retains pending Host sources.
         """
+        self._device_module.set_device(self.device)
+        return self._enqueue(staging)
+
+    def _enqueue(self, staging: Any) -> DevicePrefetchedStep:
+        """Copy pinned input on the stream owned by the selected device."""
         device_module = self._device_module
-        # The local loader may create a fresh producer thread each step; device
-        # selection is thread-local even when payload exchange uses only Gloo.
-        device_module.set_device(self.device)
         if self._copy_stream is None:
             self._copy_stream = device_module.Stream(device=self.device)
         self._pending_staging = [(event, batch) for event, batch in self._pending_staging if not event.query()]

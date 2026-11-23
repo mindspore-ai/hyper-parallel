@@ -14,7 +14,11 @@
 # ============================================================================
 """DP2/TP2 native BatchSampler ownership, metadata, and checkpoint coverage."""
 
+import gc
 import logging
+import os
+import tempfile
+import weakref
 import random
 from collections import Counter
 from contextlib import ExitStack, nullcontext
@@ -27,6 +31,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.distributed_c10d import _world
 from torch.utils.data import default_collate
 
 from hyper_parallel.data.batching.build_collate_fn import OmniCollator, TextPackingCollator
@@ -37,6 +42,7 @@ from hyper_parallel.data.parallel import build_dataset_batch_sampler, create_dat
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig, SampleMetadata, TensorFieldSpec, WorkloadCost, build_distributed_dataloader,
     collate_indexed_text_sequences, pack_indexed_text_samples, split_packed_text_sample,
+    build_local_balancing_dataloader,
 )
 from hyper_parallel.distributed_data.balance_logging import logger as balance_logger
 from hyper_parallel.trainer.config.target import Target
@@ -47,7 +53,15 @@ class _Dataset:
 
     def __init__(self) -> None:
         """Initialize the payload read log."""
-        self.reads = []
+        descriptor, self._read_log = tempfile.mkstemp(prefix="hp-reader-test-")
+        os.close(descriptor)
+        weakref.finalize(self, os.unlink, self._read_log)
+
+    @property
+    def reads(self) -> list[int]:
+        """Inspect reads from the independent source process."""
+        with open(self._read_log, encoding="utf-8") as handle:
+            return [int(line) for line in handle]
 
     def __len__(self) -> int:
         """Return a size with an incomplete distributed tail."""
@@ -55,7 +69,8 @@ class _Dataset:
 
     def __getitem__(self, index: int) -> dict:
         """Record a read and return original model fields."""
-        self.reads.append(index)
+        with open(self._read_log, "a", encoding="utf-8") as handle:
+            handle.write(f"{index}\n")
         return {"id": index, "labels": [index + 1], "position_ids": [7], "loss_mask": [1]}
 
 
@@ -94,6 +109,79 @@ def _native_spec(size: int) -> tuple:
                   "labels": TensorFieldSpec((1,), torch.int64),
                   "position_ids": TensorFieldSpec((1,), torch.int64),
                   "loss_mask": TensorFieldSpec((1,), torch.int64)} for _ in range(size))
+
+
+def _assert_groups_released(loader, baseline: set, handles: list) -> None:
+    """A closed loader can stay alive without retaining its registered groups or Gloo resources."""
+    loader.close()
+    gc.collect()
+    assert all(ref() is None for ref in handles), "The closed loader still holds a process group."
+    assert set(_world.pg_map) == baseline, "Closing the loader must preserve the training groups."
+
+
+def test_loader_group_cleanup_dp2_tp2_gloo() -> None:
+    """Close and rebuild native/local loaders without retaining groups or destroying mesh groups."""
+    dist.init_process_group("gloo", timeout=timedelta(seconds=60))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+        baseline = set(_world.pg_map)
+        for invalid_spec in (None, object()):
+            with pytest.raises(ValueError, match="model_batch_spec"):
+                build_distributed_dataloader(
+                    _Dataset() if dist.get_rank() % 2 == 0 else None, mesh,
+                    DistributedDatasetConfig(seq_len=8, local_batch_size=2, communication_backend="gloo"),
+                    batch_sampler=_sampler("single", False), metadata_fn=_metadata,
+                    collate_fn=_native_collate, model_batch_spec=invalid_spec,
+                    device="cpu", cost_model=lambda m: m.cost,
+                )
+            assert set(_world.pg_map) == baseline, "Failed construction retained loader-owned groups."
+        for metadata_mode in (False, True):
+            dataset = _Dataset()
+            metadata_options = (
+                {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
+                if metadata_mode else {"metadata_fn": _metadata}
+            )
+            loader = build_distributed_dataloader(
+                dataset if dist.get_rank() % 2 == 0 else None, mesh,
+                DistributedDatasetConfig(
+                    seq_len=8, local_batch_size=2, communication_backend="gloo", metadata_mode=metadata_mode,
+                ),
+                batch_sampler=_sampler("single", False), **metadata_options,
+                collate_fn=_native_collate, model_batch_spec=_native_spec(2),
+                device="cpu", cost_model=lambda item: item.cost,
+            )
+            try:
+                handles = [weakref.ref(pg) for pg in set(_world.pg_map) - baseline]
+                assert handles, "The loader must create separate communication groups."
+                next(loader)
+            finally:
+                loader.close()
+            _assert_groups_released(loader, baseline, handles)
+            dist.barrier(group=mesh.get_group("dp"))
+            dist.barrier(group=mesh.get_group("tp"))
+
+        local_mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("dp",))
+        baseline = set(_world.pg_map)
+        for consume in (False, True):
+            local = build_local_balancing_dataloader(
+                [[[{"id": dist.get_rank()}]]], local_mesh,
+                DistributedDatasetConfig(seq_len=8, local_batch_size=1, communication_backend="gloo"),
+                metadata_fn=_metadata, pack_fn=lambda samples, _length: tuple(samples), collate_fn=tuple,
+                device="cpu", cost_model=lambda item: item.cost,
+            )
+            try:
+                handles = [weakref.ref(pg) for pg in set(_world.pg_map) - baseline]
+                assert len(handles) == 1, "Temporary startup groups must be released."
+                if consume:
+                    next(local)
+            finally:
+                local.close()
+            _assert_groups_released(local, baseline, handles)
+            with pytest.raises(StopIteration):
+                next(local)
+            dist.barrier(group=local_mesh.get_group())
+    finally:
+        dist.destroy_process_group()
 
 
 def _gather(value: object) -> list:
@@ -144,8 +232,7 @@ def _run_case(
         {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
         if metadata_mode else {"metadata_fn": _metadata}
     )
-    no_a2a = patch.object(dist, "all_to_all_single", side_effect=AssertionError("metadata used A2A"))
-    with (no_a2a if metadata_mode else nullcontext()), ExitStack() as resources:
+    with ExitStack() as resources:
         loader = resources.enter_context(build_distributed_dataloader(
             dataset if rank % 2 == 0 else None, mesh, config, batch_sampler=source_sampler, **metadata_options,
             cost_model=lambda metadata: metadata.cost, collate_fn=_native_collate, model_batch_spec=_native_spec(2),
@@ -287,7 +374,7 @@ def _run_changed_gbs(mesh: object, metadata_mode: bool, sampler_type: str) -> No
 
 def _window_loader(
         mesh: object, *, metadata_mode: bool, repack: bool, broadcast_plan: bool, accumulation: int,
-        device_prefetch_depth: int = 1,
+        device_prefetch_depth: int = 1, use_data_process: bool = True,
 ) -> object:
     """Build a DP2-by-TP2 loader with uneven costs and optional document repacking."""
     records = [
@@ -325,6 +412,7 @@ def _window_loader(
         DistributedDatasetConfig(
             seq_len=4, local_batch_size=1, communication_backend="gloo", balance_window_size=3,
             device_prefetch_depth=device_prefetch_depth,
+            use_data_process=use_data_process,
             metadata_mode=metadata_mode, broadcast_plan=broadcast_plan,
         ),
         batch_sampler=sampler, cost_model=lambda item: item.cost, device="cpu", collate_fn=collate,
@@ -380,8 +468,13 @@ def test_accumulation_window_dp2_tp2_gloo() -> None:
         dist.destroy_process_group()
 
 
-def test_host_window_device_queue_dp2_tp2_gloo() -> None:
-    """Exercise Host preparation and caller device streams with real collectives."""
+@pytest.mark.parametrize("use_data_process", [True, False], ids=["process", "in-process"])
+def test_host_window_device_queue_dp2_tp2_gloo(use_data_process: bool) -> None:
+    """Exercise both Host preparation modes with real data and model collectives.
+
+    Args:
+        use_data_process: Whether to start a separate producer on each data rank.
+    """
     # Inspect internal queues and ownership to verify prefetch lifetime invariants.
     # pylint: disable=protected-access
     dist.init_process_group("gloo", timeout=timedelta(seconds=90))
@@ -390,11 +483,13 @@ def test_host_window_device_queue_dp2_tp2_gloo() -> None:
     accelerator.Event.return_value.query.return_value = True
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
-        _check_early_close_with_uneven_lookahead(mesh, accelerator)
+        if use_data_process:
+            _check_early_close_with_uneven_lookahead(mesh, accelerator)
         for metadata_mode, depth in product((False, True), (0, 1, 2, 24)):
             options = {
                 "metadata_mode": metadata_mode, "repack": False, "broadcast_plan": True, "accumulation": 5,
                 "device_prefetch_depth": depth,
+                "use_data_process": use_data_process,
             }
             with patch.object(torch, "cuda", accelerator), _window_loader(mesh, **options) as loader:
                 # Keep real payload/model traffic on Gloo while exercising device
@@ -414,11 +509,11 @@ def test_host_window_device_queue_dp2_tp2_gloo() -> None:
                     f"Delivered checkpoint differs: state={state}"
                 )
                 _check_window_membership(_gather(outputs), False, 5)
-                worker = loader._prefetch_thread
+                worker = loader._worker
                 loader.set_epoch(1)
                 replay = [_window_output(batch, False) for batch in loader]
                 assert replay == outputs, f"Epoch replay differs: actual={replay}, expected={outputs}"
-                assert loader._prefetch_thread is worker, f"Host worker replaced: {worker}"
+                assert loader._worker is worker, f"Host worker replaced: {worker}"
                 accelerator.Event.return_value.record.assert_called_with(accelerator.current_stream.return_value)
             with patch.object(torch, "cuda", accelerator), _window_loader(mesh, **options) as resumed:
                 resumed._device = torch.device("cuda:0")
@@ -440,15 +535,18 @@ def _check_early_close_with_uneven_lookahead(mesh: object, accelerator: object) 
                 accumulation=1, device_prefetch_depth=1,
         ) as loader:
             loader._device = torch.device("cuda:0")
-            # Delay all optional staging until ranks can deliberately diverge.
+            next(loader)  # Both constructors warm the first successor.
             with patch.object(loader, "_host_batch_ready", return_value=False):
                 next(loader)
-            if dist.get_rank() == 0:
-                loader._prefetch_device_batches(1, blocking=True)
-            queued = _gather(len(loader._device_batches))
-            assert queued == [1, 0, 0, 0], f"Fixture did not create uneven lookahead: {queued}"
-            worker = loader._prefetch_thread
-        assert not worker.is_alive(), "Early close left a Host producer running"
+                if dist.get_rank() == 0:
+                    loader._fill_requested_device_prefetch()
+                queued = _gather(len(loader._device_batches))
+                assert queued == [1, 0, 0, 0], f"Fixture did not create uneven lookahead: {queued}"
+            process = getattr(loader._worker, "_process", None)
+            pid = process.pid if process is not None else None
+        if pid is not None:
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
         dist.barrier()
 
 

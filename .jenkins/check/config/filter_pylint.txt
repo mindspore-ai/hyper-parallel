@@ -217,3 +217,6 @@
 # Gate subclasses and source fixtures intentionally expose different routing/input protocols.
 "hyper-parallel/hyper_parallel/components/modules/gate_family.py" "arguments-renamed"
 "hyper-parallel/tests/ut/components/modules/test_mlp_family.py" "arguments-renamed"
+
+# PyTorch has no public shutdown for a retained persistent DataLoader iterator.
+"hyper-parallel/hyper_parallel/distributed_data/metadata.py"             "protected-access"

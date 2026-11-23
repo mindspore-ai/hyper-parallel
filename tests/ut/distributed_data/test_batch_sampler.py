@@ -17,6 +17,7 @@
 import copy
 import importlib
 import unittest
+from itertools import chain
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -39,6 +40,7 @@ from hyper_parallel.distributed_data.balancing_algorithm import (
 )
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.trainer.config.target import Target
+from tests.common.mark_utils import arg_mark
 
 
 build_dataloader_module = importlib.import_module("hyper_parallel.data.batching.build_dataloader")
@@ -160,6 +162,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                     expected = [sorted(indices) for indices in reference]
                     self.assertEqual([_batch_ids(batch) for batch in loader], expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_duplicate_indices_are_distinct_occurrences(self) -> None:
         """Feature: Independent sampling occurrences.
         Description: Reuse one metadata object for duplicate online or offline sample indices.
@@ -178,7 +181,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                         batch_sampler=_sampler(index_mapping=[3] * 10), **options,
                         device="cpu", cost_model=lambda metadata: metadata.cost,
                 ) as loader:
-                    reader = loader._planning_reader()
+                    reader = loader._source._planning_reader()
                     reader.prepare_next_step(1)
                     first, second = reader.metadata()
                     self.assertIsInstance(first, SampleMetadata)
@@ -303,6 +306,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid metadata callback"):
             next(loader)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_callback_errors_propagate_without_wrapping(self) -> None:
         """Feature: Direct callback error propagation.
         Description: Fail sample metadata extraction with a ValueError.
@@ -315,7 +319,7 @@ class TestNativeBatchSampler(unittest.TestCase):
             batch_sampler=_sampler(), metadata_fn=_metadata,
             device="cpu", cost_model=lambda metadata: metadata.cost,
         )
-        with loader, patch.object(loader._dataset_reader, "_metadata_fn", side_effect=failure):
+        with loader, patch.object(loader._source._dataset_reader, "_metadata_fn", side_effect=failure):
             with self.assertRaises(ValueError) as caught:
                 next(loader)
         self.assertIs(caught.exception, failure)
@@ -417,6 +421,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertEqual(reader.metadata(), ())
         reader.close()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_reader_retains_original_groups_through_split_commit_and_replay(self) -> None:
         """Feature: Original source grouping.
         Description: Read repeated indices with online, offline and split metadata, then commit and restore.
@@ -439,21 +444,17 @@ class TestNativeBatchSampler(unittest.TestCase):
                     saved = reader.state_dict()
                     reader.prepare_next_step(3)
                     planning_input = reader.planning_input()
-                    expected = tuple(tuple(
-                        tuple(SampleKey(0, indices[position], position, sequence)
-                              for sequence in range(indices[position] + 1 if split else 1))
-                        for position in range(start, start + 2)
-                    ) for start in (0, 2, 4))
+                    expected = self._expected_original_groups(indices, split)
                     self.assertEqual(planning_input.original_batches, expected)
                     self.assertEqual(tuple(item.key for item in planning_input.metadata), tuple(
                         key for batch in expected for group in batch for key in group
                     ))
                     self.assertEqual(dataset.reads, [] if metadata_mode else list(indices))
-                    reader.commit({key for group in expected[0] for key in group})
+                    reader.commit(set(chain.from_iterable(expected[0])))
                     self.assertEqual(reader.planning_input().original_batches, expected)
                     self.assertEqual(reader.state_dict()["sampler"]["consumed_samples"], 0)
                     for batch in expected[1:]:
-                        reader.commit({key for group in batch for key in group})
+                        reader.commit(set(chain.from_iterable(batch)))
                     self.assertEqual(reader.planning_input().original_batches, ())
                     self.assertEqual(reader.state_dict()["sampler"]["consumed_samples"], 6)
                     reader.load_state_dict(saved)
@@ -461,6 +462,15 @@ class TestNativeBatchSampler(unittest.TestCase):
                     self.assertEqual(reader.planning_input(), planning_input)
                 finally:
                     reader.close()
+
+    @staticmethod
+    def _expected_original_groups(indices: tuple[int, ...], split: bool) -> tuple:
+        """Bind expected occurrence keys independently of reader execution."""
+        return tuple(tuple(
+            tuple(SampleKey(0, indices[position], position, sequence)
+                  for sequence in range(indices[position] + 1 if split else 1))
+            for position in range(start, start + 2)
+        ) for start in (0, 2, 4))
 
     def test_trainer_builder_reuses_sampler_and_collator(self) -> None:
         """Feature: Trainer balancing enablement.
@@ -483,6 +493,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertIs(build.call_args.kwargs["collate_fn"], collator)
         self.assertEqual(next(iter(build.call_args.kwargs["batch_sampler"])), [3, 3])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_trainer_forwards_balance_logging_switch(self) -> None:
         """Feature: Trainer repacking, balancing gain and log configuration.
         Description: Omit or set load_balance options, then try invalid values and size overrides.
@@ -509,6 +520,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                 {}, {"log_balance": False}, {"log_balance": True},
                 {"repack_sequences": True, "pad_token_id": 151645, "log_balance": True},
                 {"device_prefetch_depth": 0}, {"device_prefetch_depth": 2},
+                {"use_data_process": False, "device_prefetch_depth": 0},
                 {"min_balance_gain": 0.0}, {"min_balance_gain": 0.1}, {"min_balance_gain": 0.99},
             ):
                 with self.subTest(options=options):
@@ -518,11 +530,14 @@ class TestNativeBatchSampler(unittest.TestCase):
                     self.assertIs(config.repack_sequences, options.get("repack_sequences", False))
                     self.assertEqual(config.pad_token_id, options.get("pad_token_id"))
                     self.assertEqual(config.device_prefetch_depth, options.get("device_prefetch_depth", 1))
+                    self.assertIs(config.use_data_process, options.get("use_data_process", True))
                     self.assertEqual(config.min_balance_gain, options.get("min_balance_gain", 0.0))
                     expected_collator = None if config.repack_sequences else tuple
                     self.assertIs(loader_builder.call_args.kwargs["collate_fn"], expected_collator)
             with self.assertRaisesRegex(ValueError, "log_balance must be boolean"):
                 build({"log_balance": "true"})
+            with self.assertRaisesRegex(ValueError, "use_data_process must be boolean"):
+                build({"use_data_process": "false"})
             with self.assertRaisesRegex(ValueError, "device_prefetch_depth must be a non-negative integer"):
                 build({"device_prefetch_depth": -1})
             for gain in (-0.1, 1.0, True):

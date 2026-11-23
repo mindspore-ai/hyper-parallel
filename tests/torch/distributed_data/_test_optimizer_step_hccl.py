@@ -105,7 +105,7 @@ def _run_case(
         for micro, batch in enumerate(loader):
             assert loader._consumer_stream == torch.npu.current_stream(device), "Delivery changed the training stream"
             # WORLD represents model communication; data uses separate groups
-            # concurrently on the Host thread and caller's device streams.
+            # in the data process while the caller submits model work.
             consumed_input = batch[0]["input_ids"].square()
             loss = (inputs @ weights).square().mean()
             loss.backward()
@@ -125,7 +125,7 @@ def _run_case(
             )
             if micro == 0:
                 loader.wait_for_prefetch()
-                ready_batches = loader._future.result().batches
+                ready_batches = loader._host_request.result().batches
                 expected_size = min(3, accumulation - min(3, accumulation) or accumulation)
                 assert len(ready_batches) == expected_size, (
                     f"Next window size differs: actual={len(ready_batches)}, expected={expected_size}"
@@ -150,19 +150,21 @@ def _check_next_epoch(loader: DistributedDataLoader, expected: list[int], device
     """Verify sample replay and producer/stream reuse after an epoch reset."""
     # Inspect internal queues and ownership to verify prefetch lifetime invariants.
     # pylint: disable=protected-access
-    worker = loader._prefetch_thread
+    worker = loader._worker
     copy_stream = loader._device_prefetch._copy_stream if loader._device_prefetch is not None else None
-    assert worker.is_alive(), "Producer exited at epoch exhaustion"
+    if worker is not loader._source:
+        assert worker._process.is_alive(), "Producer exited at epoch exhaustion"
     loader.set_epoch(1)
     actual = []
     for batch in loader:
         _check_batch(batch, device)
         actual.append(batch[0]["id"].item())
     assert actual == expected, f"Epoch reset changed sample order: {actual} vs {expected}"
-    assert loader._prefetch_thread is worker, "Epoch reset replaced the producer"
+    assert loader._worker is worker, "Epoch reset replaced the producer"
     if loader._device_prefetch is not None:
         assert loader._device_prefetch._copy_stream is copy_stream, "Epoch reset replaced the copy stream"
-    assert worker.is_alive(), "Producer did not survive the next epoch"
+    if worker is not loader._source:
+        assert worker._process.is_alive(), "Producer did not survive the next epoch"
 
 
 def _check_legacy_complete_step(device: torch.device, metadata_mode: bool) -> None:
@@ -187,27 +189,26 @@ def _check_legacy_complete_step(device: torch.device, metadata_mode: bool) -> No
     assert actual == expected, f"Legacy complete-step replay differs: {actual} vs {expected}"
 
 
-@pytest.mark.parametrize("accumulation,device_depth", ((1, 1), (3, 0), (3, 1), (3, 2), (5, 2)))
-def test_optimizer_step_loading_hccl(accumulation: int, device_depth: int) -> None:
+@pytest.mark.parametrize("metadata_mode", (False, True), ids=("online", "metadata"))
+def test_optimizer_step_loading_hccl(metadata_mode: bool) -> None:
     """Overlap window data preparation with compute and independent HCCL collectives.
 
     Args:
-        accumulation: Micro-batches prepared per optimizer step.
-        device_depth: Future micro-batches staged on Device.
+        metadata_mode: Whether the sampler reads precomputed metadata.
     """
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     torch.npu.set_device(device)
     dist.init_process_group("hccl", timeout=timedelta(seconds=90))
     try:
-        for backend, metadata_mode, broadcast_plan in (
-                ("hccl", False, True), ("hccl", False, False),
-                ("hccl", True, True), ("gloo", False, True),
-        ):
+        # Cover steps shorter than, equal to and longer than the three-batch host window.
+        if metadata_mode:
+            cases = ((3, 0, "hccl", True), (3, 2, "hccl", True))
+        else:
+            cases = ((1, 1, "gloo", True), (3, 1, "hccl", True), (5, 2, "hccl", False))
+        for accumulation, device_depth, backend, broadcast_plan in cases:
             with torch.npu.stream(torch.npu.Stream(device=device)):
                 _run_case(device, backend, metadata_mode, broadcast_plan, accumulation, device_depth)
-        if accumulation > 1:
-            for metadata_mode in (False, True):
-                _check_legacy_complete_step(device, metadata_mode)
+        _check_legacy_complete_step(device, metadata_mode)
         dist.barrier()
     finally:
         torch.npu.synchronize()
