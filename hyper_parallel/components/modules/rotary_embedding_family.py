@@ -163,6 +163,6 @@ def RotaryEmbedding(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="rotary_embedding", baseline=RotaryEmbedding,
-    variants={"local": "hyper_parallel.components.modules.rotary_embedding.RotaryEmbeddingModule"},
+    variants={"local": "hyper_parallel.components.modules.rotary_embedding_family.RotaryEmbeddingModule"},
     default_variant="local",
 ))

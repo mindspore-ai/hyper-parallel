@@ -46,37 +46,37 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts_family import GroupedExperts
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
-    from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
-    from hyper_parallel.components.modules.shared_expert import SharedExpert
-    from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
+    from hyper_parallel.components.modules.rms_norm_family import OffsetRMSNorm, RMSNorm
+    from hyper_parallel.components.modules.shared_expert_family import SharedExpert
+    from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
-    "Gate": "gate",
-    "GateModule": "gate",
-    "MegaMhc": "mhc.mhc",
+    "Gate": "gate_family",
+    "GateModule": "gate_family",
+    "MegaMhc": "mhc.mhc_family",
     "MegaMhcModule": "mhc.mega_mhc",
-    "SpatialMergeProjector": "spatial_merge_projector",
-    "SpatialMergeProjectorModule": "spatial_merge_projector",
-    "RotaryEmbedding": "rotary_embedding",
-    "RotaryEmbeddingModule": "rotary_embedding",
+    "SpatialMergeProjector": "spatial_merge_projector_family",
+    "SpatialMergeProjectorModule": "spatial_merge_projector_family",
+    "RotaryEmbedding": "rotary_embedding_family",
+    "RotaryEmbeddingModule": "rotary_embedding_family",
     "HostEngramModule": "engram.host_engram",
     "HostEngramTable": "engram.host_engram_table",
     "Engram": "engram",
     "MHCPre": "mhc",
     "MHCPost": "mhc",
     "PipelinedMhc": "mhc",
-    "TokenChoiceTopKRouter": "router",
-    "SwiGLUMLPModule": "swiglu_mlp",
-    "SwiGLUMLP": "swiglu_mlp",
-    "SharedExpertModule": "shared_expert",
-    "SharedExpert": "shared_expert",
-    "RMSNormModule": "rms_norm",
-    "NativeRMSNormModule": "rms_norm",
-    "NativeOffsetRMSNormModule": "rms_norm",
-    "RMSNorm": "rms_norm",
-    "OffsetRMSNormModule": "rms_norm",
-    "OffsetRMSNorm": "rms_norm",
+    "TokenChoiceTopKRouter": "router_family",
+    "SwiGLUMLPModule": "swiglu_mlp_family",
+    "SwiGLUMLP": "swiglu_mlp_family",
+    "SharedExpertModule": "shared_expert_family",
+    "SharedExpert": "shared_expert_family",
+    "RMSNormModule": "rms_norm_family",
+    "NativeRMSNormModule": "rms_norm_family",
+    "NativeOffsetRMSNormModule": "rms_norm_family",
+    "RMSNorm": "rms_norm_family",
+    "OffsetRMSNormModule": "rms_norm_family",
+    "OffsetRMSNorm": "rms_norm_family",
     "TritonGDN": "gdn_triton",
     "build_mtp": "mtp",
     "MTPLayer": "mtp",

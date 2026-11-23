@@ -30,15 +30,15 @@ class TestFamilyImportCompatibility(unittest.TestCase):
     def test_default_member_names_are_local(self):
         """The public ordinary member has one stable name across the migrated families."""
         entries = (
-            ("rms_norm", ("RMSNorm", "OffsetRMSNorm")),
-            ("swiglu_mlp", ("SwiGLUMLP",)),
-            ("shared_expert", ("SharedExpert",)),
-            ("rotary_embedding", ("RotaryEmbedding",)),
-            ("spatial_merge_projector", ("SpatialMergeProjector",)),
-            ("router", ("TokenChoiceTopKRouter",)),
-            ("mhc.mhc", ("MHCPre", "MHCPost", "PipelinedMhc", "MegaMhc")),
-            ("engram.engram", ("Engram",)),
-            ("gate", ("Gate",)),
+            ("rms_norm_family", ("RMSNorm", "OffsetRMSNorm")),
+            ("swiglu_mlp_family", ("SwiGLUMLP",)),
+            ("shared_expert_family", ("SharedExpert",)),
+            ("rotary_embedding_family", ("RotaryEmbedding",)),
+            ("spatial_merge_projector_family", ("SpatialMergeProjector",)),
+            ("router_family", ("TokenChoiceTopKRouter",)),
+            ("mhc.mhc_family", ("MHCPre", "MHCPost", "PipelinedMhc", "MegaMhc")),
+            ("engram.engram_family", ("Engram",)),
+            ("gate_family", ("Gate",)),
         )
         for module_name, factories in entries:
             module = importlib.import_module(f"hyper_parallel.components.modules.{module_name}")
@@ -53,9 +53,9 @@ class TestFamilyImportCompatibility(unittest.TestCase):
         """Public exports use the canonical family classes and builders."""
         public = importlib.import_module("hyper_parallel.components.modules")
         for name, cls, factory in (
-            ("rms_norm", "RMSNormModule", "RMSNorm"),
-            ("swiglu_mlp", "SwiGLUMLPModule", "SwiGLUMLP"),
-            ("shared_expert", "SharedExpertModule", "SharedExpert"),
+            ("rms_norm_family", "RMSNormModule", "RMSNorm"),
+            ("swiglu_mlp_family", "SwiGLUMLPModule", "SwiGLUMLP"),
+            ("shared_expert_family", "SharedExpertModule", "SharedExpert"),
         ):
             with self.subTest(name=name):
                 canonical = importlib.import_module(f"hyper_parallel.components.modules.{name}")
@@ -73,12 +73,12 @@ class TestFamilyImportCompatibility(unittest.TestCase):
             ("mhc", "mhc_pre", "MhcPreModule", "MHCPre"),
             ("mhc", "mhc_post", "MhcPostModule", "MHCPost"),
             ("mhc", "pipelined_mhc", "PipelinedMhcModule", "PipelinedMhc"),
-            ("engram", "base_engram", "EngramModule", "Engram"),
+            ("engram", "engram", "EngramModule", "Engram"),
         ):
             with self.subTest(cls=cls):
                 public = importlib.import_module(f"hyper_parallel.components.modules.{package}")
                 concrete = importlib.import_module(f"hyper_parallel.components.modules.{package}.{implementation}")
-                family = importlib.import_module(f"hyper_parallel.components.modules.{package}.{package}")
+                family = importlib.import_module(f"hyper_parallel.components.modules.{package}.{package}_family")
                 self.assertIs(getattr(public, cls), getattr(concrete, cls))
                 self.assertIs(getattr(public, factory), getattr(family, factory))
                 self.assertTrue(inspect.isfunction(getattr(family, factory)))
@@ -90,7 +90,7 @@ class TestFamilyImportCompatibility(unittest.TestCase):
     def test_public_router_is_the_canonical_family(self):
         """Root imports support config construction and source replacement through the same family."""
         public = importlib.import_module("hyper_parallel.components.modules")
-        canonical = importlib.import_module("hyper_parallel.components.modules.router")
+        canonical = importlib.import_module("hyper_parallel.components.modules.router_family")
         self.assertIs(public.TokenChoiceTopKRouter, canonical.TokenChoiceTopKRouter)
         self.assertEqual(get_module_family(public.TokenChoiceTopKRouter).name, "token_choice_topk_router")
         direct = public.TokenChoiceTopKRouter(config=TokenChoiceTopKRouterConfig(4, 6, 2))

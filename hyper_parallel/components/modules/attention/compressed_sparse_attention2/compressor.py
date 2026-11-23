@@ -23,7 +23,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from hyper_parallel.components.modules.rms_norm import NativeRMSNormModule, RMSNorm
+from hyper_parallel.components.modules.rms_norm_family import NativeRMSNormModule, RMSNorm
 
 
 class CSA2Compressor(nn.Module):

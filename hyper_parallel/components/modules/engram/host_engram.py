@@ -20,7 +20,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .base_engram import EngramModule
+from .engram import EngramModule
 from .host_engram_table import HostEngramTable
 from .parallel_engram import host_sparse_lookup
 

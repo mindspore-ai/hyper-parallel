@@ -294,8 +294,8 @@ def RMSNorm(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="rms_norm", baseline=RMSNorm,
-    variants={"local": "hyper_parallel.components.modules.rms_norm.NativeRMSNormModule",
-              "npu": "hyper_parallel.components.modules.rms_norm.RMSNormModule"},
+    variants={"local": "hyper_parallel.components.modules.rms_norm_family.NativeRMSNormModule",
+              "npu": "hyper_parallel.components.modules.rms_norm_family.RMSNormModule"},
     selector_specs={"use_fused_ops": SelectorSpec(bool, False)},
     variant_rules=(VariantRule({"use_fused_ops": True, "parallel": False}, "npu"),),
     default_variant="local",
@@ -317,8 +317,8 @@ def OffsetRMSNorm(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="offset_rms_norm", baseline=OffsetRMSNorm,
-    variants={"local": "hyper_parallel.components.modules.rms_norm.NativeOffsetRMSNormModule",
-              "npu": "hyper_parallel.components.modules.rms_norm.OffsetRMSNormModule"},
+    variants={"local": "hyper_parallel.components.modules.rms_norm_family.NativeOffsetRMSNormModule",
+              "npu": "hyper_parallel.components.modules.rms_norm_family.OffsetRMSNormModule"},
     selector_specs={"use_fused_ops": SelectorSpec(bool, False)},
     variant_rules=(VariantRule({"use_fused_ops": True, "parallel": False}, "npu"),),
     default_variant="local",

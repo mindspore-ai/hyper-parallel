@@ -296,8 +296,8 @@ def Gate(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="gate", baseline=Gate,
-    variants={"local": "hyper_parallel.components.modules.gate.GateModule",
-              "mega": "hyper_parallel.components.modules.gate.MegaGateModule"},
+    variants={"local": "hyper_parallel.components.modules.gate_family.GateModule",
+              "mega": "hyper_parallel.components.modules.gate_family.MegaGateModule"},
     default_variant="local", selector_specs={"implementation": SelectorSpec(str, "local")},
     variant_rules=(VariantRule({"implementation": "mega", "parallel": False}, "mega"),),
 ))

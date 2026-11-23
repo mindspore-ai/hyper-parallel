@@ -20,7 +20,7 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from examples.torch.module_family.config import EngramConfig
-from hyper_parallel.components.modules.engram.engram import Engram
+from hyper_parallel.components.modules.engram.engram_family import Engram
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
 from hyper_parallel.models.module_build import prepare_model_components

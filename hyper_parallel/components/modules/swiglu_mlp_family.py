@@ -362,8 +362,8 @@ def SwiGLUMLP(  # pylint: disable=invalid-name
 
 register_module_family(ModuleFamily(
     name="swiglu_mlp", baseline=SwiGLUMLP,
-    variants={"local": "hyper_parallel.components.modules.swiglu_mlp.SwiGLUMLPModule",
-              "w1_w2": "hyper_parallel.components.modules.swiglu_mlp.W1W2SwiGLUMLPModule"},
+    variants={"local": "hyper_parallel.components.modules.swiglu_mlp_family.SwiGLUMLPModule",
+              "w1_w2": "hyper_parallel.components.modules.swiglu_mlp_family.W1W2SwiGLUMLPModule"},
     selector_specs={"state_layout": SelectorSpec(str, "linear_fc")},
     variant_rules=(VariantRule({"state_layout": "w1_w2", "parallel": False}, "w1_w2"),),
     default_variant="local",

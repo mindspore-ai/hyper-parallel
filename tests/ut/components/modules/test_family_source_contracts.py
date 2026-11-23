@@ -29,8 +29,8 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4RMSNo
 
 from examples.torch.module_family.config import RMSNormConfig, SharedExpertConfig, SwiGLUMLPConfig
 from hyper_parallel.components.modules import RMSNorm, OffsetRMSNorm, SharedExpert, SwiGLUMLP, get_family_build_info
-from hyper_parallel.components.modules.swiglu_mlp import swiglu_activation, W1W2SwiGLUMLPModule
-from hyper_parallel.components.modules.rms_norm import RMSNormModule
+from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation, W1W2SwiGLUMLPModule
+from hyper_parallel.components.modules.rms_norm_family import RMSNormModule
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower
 from hyper_parallel.models._transformers.model_builder import validate_model_init_dtype
 

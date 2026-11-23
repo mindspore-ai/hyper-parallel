@@ -13,8 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Public Engram contracts and legacy class exports."""
-from .engram import Engram
-from .base_engram import EngramModule
+from .engram_family import Engram
+from .engram import EngramModule
 from .ngram_hash_mapping import NgramHashMapping
 from .parallel_engram import local_token_mask
 

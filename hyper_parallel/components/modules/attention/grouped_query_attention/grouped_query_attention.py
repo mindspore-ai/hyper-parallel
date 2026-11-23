@@ -27,7 +27,7 @@ from torch import nn
 from hyper_parallel.components.checkpoint import InterleaveQKV
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 from hyper_parallel.components.functional import apply_rotary_pos_emb_single, npu_fusion_attention_forward
-from hyper_parallel.components.modules.rms_norm import RMSNorm
+from hyper_parallel.components.modules.rms_norm_family import RMSNorm
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
