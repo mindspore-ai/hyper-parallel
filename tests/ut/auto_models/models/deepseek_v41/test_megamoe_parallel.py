@@ -26,7 +26,7 @@ from torch import nn
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
 
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, SwiGLUParameters
 
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed import ShardingPlanner
@@ -142,8 +142,10 @@ class TestMegaMoeParallel(unittest.TestCase):
         mask = (torch.arange(batch * count * tp).reshape(batch, count * tp) % 3 == 0) if vision else None
         expected_mask = mask[:, tp_rank * count:(tp_rank + 1) * count] if vision else None
         _, weights, indices = gate(hidden, image_mask=expected_mask)
-        expected = _native_reference(experts, hidden, indices, weights,
-                                     expert_weights=(experts.gate_up_proj, experts.down_proj)) + shared(hidden)
+        expected = _native_reference(
+            SimpleNamespace(activation=SwiGLUParameters(clamp_limit=experts.swiglu_limit)),
+            hidden, indices, weights, expert_weights=(experts.gate_up_proj, experts.down_proj),
+        ) + shared(hidden)
         kwargs = {'image_mask': mask} if vision else {}
         if vision:
             handle = gate.register_forward_pre_hook(
