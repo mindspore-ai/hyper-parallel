@@ -150,7 +150,7 @@ class RecoverySession:
         """Bind protected objects and register recovery callbacks.
 
         The caller must have built an eager model with supported offload
-        policies and without external mutable state. Initial
+        policies and adapted external state (currently Host Engram). Initial
         checkpoint loading is permitted only on original workers.
 
         Args:

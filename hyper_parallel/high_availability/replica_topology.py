@@ -44,8 +44,11 @@ def device_replica_ranks(parameter: Any, rank: int) -> set[int]:
 def model_replica_candidates(state: Any, rank: int, world: int) -> tuple[int, ...]:
     """Intersect declared device-shard equivalence across every model parameter."""
     candidates = set(range(world))
-    for parameter in state.parameters.values():
-        peers = device_replica_ranks(parameter, rank)
+    external = getattr(state, "external_state", None)
+    host_names = external.parameters if external is not None else {}
+    host_peers = external.recovery_replica_ranks(rank) if host_names else set()
+    for name, parameter in state.parameters.items():
+        peers = host_peers if name in host_names else device_replica_ranks(parameter, rank)
         candidates.intersection_update(peers)
     return tuple(sorted(candidates))
 

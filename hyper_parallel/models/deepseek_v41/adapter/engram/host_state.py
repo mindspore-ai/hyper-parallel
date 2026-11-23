@@ -22,6 +22,7 @@ import logging
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -118,6 +119,46 @@ class DeepseekV41HostState:
         source_keys = materialize_owner_rows(self.model, self.tables, context)
         self.check_identities()
         return ExternalMaterializationResult(frozenset(self.parameters), source_keys)
+
+    def materialize_for_recovery(self) -> None:
+        """Allocate owner-local CPU receive storage without reading or initializing weights."""
+        for table in self.tables.values():
+            if table.weight.is_meta:
+                rows = torch.empty_like(table.weight, device="cpu")
+                torch.utils.swap_tensors(table.weight, nn.Parameter(rows, requires_grad=table.weight.requires_grad))
+        self.check_identities()
+
+    def recovery_replica_ranks(self, rank: int) -> set[int]:
+        """Derive same-owner replicas from the mesh used to synchronize sparse gradients."""
+        mesh = self.mesh_context
+        if mesh is None or mesh.device_mesh is None:
+            return {rank}
+        moe = mesh.fsdp_moe_mesh
+        if moe is None:
+            return set(mesh.device_mesh.rank_list)
+        ranks = tuple(moe.rank_list)
+        own = np.unravel_index(ranks.index(rank), moe.mesh_shape)
+        return {
+            peer for peer, coordinate in zip(ranks, np.ndindex(moe.mesh_shape))
+            if all(name in ("edp_shard", "edp_replicate") or coordinate[axis] == own[axis]
+                   for axis, name in enumerate(moe.mesh_dim_names))
+        }
+
+    def recovery_schema(self) -> tuple:
+        """Describe CPU table row ownership without copying table or moment values."""
+        return tuple(
+            (fqn, table.global_row_start, table.rows_per_owner, table.logical_rows,
+             table.physical_rows, table.width, table.ep_size)
+            for fqn, table in self.tables.items()
+        )
+
+    def reset_after_recovery(self) -> None:
+        """Discard sparse iteration state after the surviving worker has stopped."""
+        for table in self.tables.values():
+            table.clear_step()
+        if self.optimizer is not None:
+            self.optimizer.state = "ACCUMULATING"
+        self.norm_shard_plan = None
 
     def build_optimizer(self, optimizer_config: Any, *, wrap_dense: Callable[[Any], Any]) -> Any:
         """Build dense optimizer once, then combine it with CPU SparseAdam.

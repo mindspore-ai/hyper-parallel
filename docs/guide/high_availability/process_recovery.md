@@ -27,7 +27,7 @@ When deploying across nodes, the physical placement of replicas determines which
 
 ### Usage Limits
 
-- Use HyperParallel AdamW or Muon. The recovery path currently excludes PP, UCE, AMSGrad, `torch.compile`, Trainer evaluation data state, PEFT, and external model state.
+- Use HyperParallel AdamW or Muon. DeepSeek V4.1 Host Engram additionally supports its CPU SparseAdam through the existing optimizer coordinator. The recovery path currently excludes PP, UCE, AMSGrad, `torch.compile`, Trainer evaluation data state, PEFT, and other external model state.
 - Set `dataloader.use_background_prefetcher` to `false` when recovery is enabled. TextTrainer and VLMTrainer iterate over their data loaders directly in their respective training loops.
 - When rolling back multiprocessing data loading, `FixedBatchDataLoader` shuts down the old iterator's workers before loading the committed snapshot. The original training loop then rebuilds the iterator. The worker count and data configuration must match the original run. Save and restore random augmentation and mutable custom Dataset state through the Dataset's `state_dict()` and `load_state_dict()` so that data worker state is restored alongside the training process's RNG state.
 - `model_integration` supports model onboarding and numerical debugging. Set `model_integration.mode` to `off` when recovery is enabled.
@@ -210,6 +210,22 @@ The data loader and each object in `replica_providers` must implement `state_dic
 | `trainer/runtime/process_recovery.py` | Invokes configuration checks before Trainer construction, registers progress, loaders, and callbacks, and connects the session to training. |
 
 ## Validation and Troubleshooting
+
+### DeepSeek V4.1 Host Engram
+
+Host Engram keeps EP-owner table rows on CPU and updates them with a separate SparseAdam; it does not use HSDP's CPU offload policy. Process recovery requires a surviving replica that holds both the same dense shards and the same Host row intervals and optimizer state. The framework intersects the existing dense/Muon replica domain with the Host table's same-owner mesh domain automatically. A layout without a complete replica is rejected before recovery registration; no additional user configuration is required.
+
+A replacement allocates CPU table storage locally without loading a checkpoint or initializing row values. Repair transfers the donor's current table weights, SparseAdam `exp_avg`, `exp_avg_sq`, scalar steps and parameter-group options. Uninitialized sparse moments remain uninitialized. Transfers stage at most one 4 MiB block at a time through the worker device, rather than moving an entire CPU table or moment tensor to the device. Normal training does not mirror these large tensors each step. The existing optimizer-update transaction covers both dense and sparse updates before MindIO receives the committed step.
+
+During clean, survivors discard pending Host sparse gradients in addition to HSDP iteration state, reset the Host optimizer coordinator to `ACCUMULATING` and discard the cached gradient-norm plan. Replacements already initialize these fields to the same empty state. Rollback does not repeat this reset; subsequent training builds the gradient-norm plan using the restored communication groups. Existing Host model precision and synchronous-checkpoint requirements continue to apply.
+
+The focused CPU tests use native Host lookups, autograd, gradient preparation and SparseAdam, with simulated inter-rank transport:
+
+```bash
+pytest -q tests/ut/high_availability/test_host_engram_recovery.py
+```
+
+They cover owner-domain intersection, missing replicas, mismatched row intervals, replacement allocation, sparse-gradient cleanup, bounded device staging, lazy optimizer slots and repeated repair followed by exact loss/state comparison. These tests do not replace MindIO/HCCL hardware validation of a full DeepSeek V4.1 training job.
 
 ### Validation Tests
 

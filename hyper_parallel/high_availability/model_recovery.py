@@ -24,6 +24,7 @@ from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
 from hyper_parallel.high_availability.validation import validate_recovery_model
+from hyper_parallel.models.external_state import get_model_external_state
 
 
 class ModelRecoveryAdapter:
@@ -37,6 +38,7 @@ class ModelRecoveryAdapter:
     def __init__(self, model: torch.nn.Module, reboot: bool = False) -> None:
         """Check materialized storage and collect optional scheduler cleanup hooks."""
         validate_recovery_model(model)
+        self._external_state = get_model_external_state(model)
         if reboot and any(isinstance(parameter, DTensor) for parameter in model.parameters()):
             if _OP_DISPATCHER._rng_tracker is None:  # pylint: disable=protected-access
                 # Survivors already have a tracker. A replacement must not
@@ -67,6 +69,8 @@ class ModelRecoveryAdapter:
         """Clear retained strategy state after device work abort and main-thread ACK."""
         for scheduler in self._schedulers:
             scheduler.abort_iter_state()
+        if self._external_state is not None:
+            self._external_state.reset_after_recovery()
 
     def reset_after_device_restart(self, synchronize: Callable[[], None]) -> None:
         """Drop swap and CP state after the device becomes usable.

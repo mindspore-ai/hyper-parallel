@@ -27,7 +27,7 @@ HyperParallel 进程级快恢用于在分布式训练的部分 worker 退出后�
 
 ### 使用限制
 
-- 优化器使用 HyperParallel AdamW 或 Muon。PP、UCE、AMSGrad 和 `torch.compile` 暂未接入。Trainer 的评估数据状态、PEFT 和外部模型状态也在当前恢复范围之外。
+- 优化器使用 HyperParallel AdamW 或 Muon。DeepSeek V4.1 Host Engram 额外支持通过现有优化器协调器管理的 CPU SparseAdam。PP、UCE、AMSGrad 和 `torch.compile` 暂未接入。Trainer 的评估数据状态、PEFT 和其他外部模型状态也在当前恢复范围之外。
 - 开启快恢时，`dataloader.use_background_prefetcher` 必须为 `false`。TextTrainer 和 VLMTrainer 使用各自的训练循环直接迭代 DataLoader。
 - 多进程取数回滚时，FixedBatchDataLoader 先关闭旧迭代器的 worker，再加载已提交快照；原训练循环重建迭代器。worker 数和数据配置须与原训练一致。随机数据增强和自定义 Dataset 的可变状态须由 Dataset 的 state_dict/load_state_dict 保存和恢复，训练主进程的 RNG 快照不能替代子进程的随机状态。
 - 快恢通过 `TrainState` 保存显式 Generator；固定 batching 取 DataLoader 的 generator，动态 batching 取内层 `source_dataloader.generator`。rollback 先恢复数据游标和公共 provider，仅暂存 RNG。主线程执行开始/epoch 回调并构造原生 iterator 后，`@recovery_epoch_initialized` 在原生初始化方法返回时调用 `TrainState.restore_pending_rng()`，一次性应用 Python、NumPy、Torch CPU/NPU 和显式 Generator 状态。没有待恢复状态时不改随机源；DataLoader 不增加专用快照字段，也不覆盖其原生 `_get_iterator()`。
@@ -213,6 +213,22 @@ PRELOCK 约束优化器推进。若存活 worker 已在第 9 步等待设备计�
 | `trainer/runtime/process_recovery.py` | 构造 Trainer 前调用配置校验，登记训练进度、loader 和回调，并将会话接入原训练流程。 |
 
 ## 验证与排查
+
+### DeepSeek V4.1 Host Engram
+
+Host Engram 按 EP owner 将表的行保存在 CPU，由独立的 SparseAdam 更新，不使用 HSDP 的 CPU offload policy。快恢要求存在一个存活副本，同时持有相同的 dense 分片、Host 表行区间及优化器状态。框架自动将已有 dense/Muon 副本域与 Host 表的同 owner mesh 域取交集；没有完整副本时，在注册恢复关系前报错，不增加用户配置。
+
+替代进程在本地分配 CPU 表存储，不加载 checkpoint，也不随机初始化行内容。repair 传输供体当前的表权重、SparseAdam 的 `exp_avg`、`exp_avg_sq`、标量步数和参数组设置；尚未初始化的矩状态保持未初始化。传输时每次最多通过 worker device 暂存一个 4 MiB 块，不把整张 CPU 表或矩状态搬到设备。正常训练不增加这些大张量的每步镜像；已有优化器更新事务涵盖 dense 与 sparse 两部分更新，全部完成后才向 MindIO 提交步数。
+
+clean 阶段，存活进程在清理 HSDP 迭代状态的同时，丢弃 Host 表中尚未提交的稀疏梯度，将 Host 优化器协调器重置为 `ACCUMULATING`，并丢弃梯度范数计划缓存。替代进程在初始化时已经具有这些空状态，rollback 不再重复重置；后续训练使用恢复后的通信组重新构造范数计划。Host 模型原有的精度组合与同步 checkpoint 要求继续适用。
+
+专项 CPU 用例使用真实的 Host 查询、autograd、梯度准备及 SparseAdam，仅模拟跨 rank 传输：
+
+```bash
+pytest -q tests/ut/high_availability/test_host_engram_recovery.py
+```
+
+覆盖副本域交集、缺少完整副本、行区间不匹配、替代节点分配、稀疏梯度清理、设备暂存上限、优化器惰性状态，以及连续修复后的 loss 和状态精确对齐。这些用例不代替完整 DeepSeek V4.1 训练作业的 MindIO/HCCL 硬件验证。
 
 ### 验证用例
 
