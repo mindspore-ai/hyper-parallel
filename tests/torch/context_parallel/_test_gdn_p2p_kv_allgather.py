@@ -15,13 +15,15 @@
 """Distributed mixed-CP forward/backward oracle; supports CPU/Gloo and NPU/HCCL.
 
 Run with torchrun --nproc-per-node=8 this_file.py --backend hccl --gdn-backend triton.
-CPU smoke: torchrun --nproc-per-node=2 this_file.py --backend gloo.
+State CP uses Triton on NPU; the complete-sequence eager path is the numerical reference.
 """
 
 import argparse
 import copy
 import os
 from datetime import timedelta
+
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -30,8 +32,9 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel import init_device_mesh
-from hyper_parallel.distributed.context_parallel.gated_delta_net import GatedDeltaNetP2PCP
+from hyper_parallel.components.modules import GatedDeltaNet
 from hyper_parallel.distributed.context_parallel.wrappers import sdpa_hf_cp_wrapper
+from tests.torch.context_parallel._test_linear_tnd import _bind_family
 
 
 class _GatedNorm(nn.Module):
@@ -41,7 +44,13 @@ class _GatedNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, hidden_states, gate):
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Normalize and gate the source output.
+
+        Args:
+            hidden_states: Local dense or flat hidden activations.
+            gate: Raw gate logits or output-gate values for this stage.
+        """
         normalized = hidden_states.float() * torch.rsqrt(hidden_states.float().square().mean(-1, keepdim=True) + 1e-6)
         return (normalized * self.weight.float() * F.silu(gate.float())).to(hidden_states.dtype)
 
@@ -79,7 +88,12 @@ class _Attention(nn.Module):
         self.v_proj = nn.Linear(16, 8, bias=False)
         self.out_proj = nn.Linear(16, 16, bias=False)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the local full-attention control.
+
+        Args:
+            hidden_states: Local dense or flat hidden activations.
+        """
         batch, length, _ = hidden_states.shape
         query = self.q_proj(hidden_states).view(batch, length, 2, 8).transpose(1, 2)
         key = self.k_proj(hidden_states).view(batch, length, 1, 8).transpose(1, 2)
@@ -88,29 +102,24 @@ class _Attention(nn.Module):
         return self.out_proj(output.transpose(1, 2).reshape(batch, length, 16))
 
 
-class _SingletonMesh:
-    """CP=1 metadata for the independent full-sequence eager reference."""
-
-    ndim = 1
-
-    @staticmethod
-    def size():
-        return 1
-
-    @staticmethod
-    def get_local_rank():
-        return 0
 
 
-def run_case(mesh, device, backend, recompute):
-    """Compare mixed-CP outputs, input gradients and every parameter gradient."""
+def run_case(mesh: Any, device: torch.device, backend: str, recompute: bool) -> None:
+    """Compare mixed-CP outputs, input gradients and every parameter gradient.
+
+    Args:
+        mesh: Precreated chronological CP mesh.
+        device: Device on which the distributed case runs.
+        backend: Explicit attention backend for the case.
+        recompute: Whether to checkpoint the complete mixed graph.
+    """
     torch.manual_seed(123)
     dtype = torch.bfloat16 if backend == "triton" else torch.float32
     gdn = _GDN(128 if backend == "triton" else 8).to(device=device, dtype=dtype)
     attention = _Attention().to(device=device, dtype=dtype)
     reference_gdn, reference_attention = copy.deepcopy(gdn), copy.deepcopy(attention)
-    local_gdn = GatedDeltaNetP2PCP(gdn, mesh, backend=backend)
-    full_gdn = GatedDeltaNetP2PCP(reference_gdn, _SingletonMesh(), backend="eager")
+    local_gdn = _bind_family(GatedDeltaNet, mesh, module=gdn, backend=backend)
+    full_gdn = GatedDeltaNet(module=reference_gdn, backend="eager")
     attention.forward = sdpa_hf_cp_wrapper(attention, None, None, mesh, None)
     full_input = torch.randn(1, 64 * mesh.size(), 16, device=device, dtype=dtype, requires_grad=True)
     local_input = full_input.detach().chunk(mesh.size(), dim=1)[mesh.get_local_rank()].clone().requires_grad_()
@@ -131,7 +140,7 @@ def run_case(mesh, device, backend, recompute):
     torch.testing.assert_close(
         local_input.grad, full_input.grad.chunk(mesh.size(), dim=1)[mesh.get_local_rank()], **tolerance,
     )
-    for local_module, reference_module in ((gdn, reference_gdn), (attention, reference_attention)):
+    for local_module, reference_module in ((local_gdn, full_gdn), (attention, reference_attention)):
         for (name, parameter), (_, reference_parameter) in zip(
             local_module.named_parameters(), reference_module.named_parameters(),
         ):
@@ -144,8 +153,13 @@ def run_case(mesh, device, backend, recompute):
         print(f"PASS mixed CP={mesh.size()} backend={backend} recompute={recompute}", flush=True)
 
 
-def run_distributed(communication_backend, gdn_backend):
-    """Initialize workers and run ordinary and activation-checkpointed graphs."""
+def run_distributed(communication_backend: str, gdn_backend: str) -> None:
+    """Initialize workers and run ordinary and activation-checkpointed graphs.
+
+    Args:
+        communication_backend: Distributed communication backend for the workers.
+        gdn_backend: Explicit local GDN implementation.
+    """
     torch.set_num_threads(1)
     if communication_backend == "hccl":
         import torch_npu  # pylint: disable=import-outside-toplevel,unused-import
@@ -168,11 +182,11 @@ def test_mixed_cp_triton():
     run_distributed("hccl", "triton")
 
 
-def main():
+def main() -> None:
     """Select the hardware/backend for standalone torchrun validation."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("gloo", "hccl"), default="gloo")
-    parser.add_argument("--gdn-backend", choices=("eager", "triton"), default="eager")
+    parser.add_argument("--backend", choices=("hccl",), default="hccl")
+    parser.add_argument("--gdn-backend", choices=("triton",), default="triton")
     args = parser.parse_args()
     run_distributed(args.backend, args.gdn_backend)
 

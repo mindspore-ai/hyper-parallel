@@ -24,12 +24,18 @@ from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import get_fsdp
 from hyper_parallel.models.registry import register_model_adapter
 
 
+def _load_replacements():
+    """Publish the complete linear-attention family through the model adapter."""
+    from hyper_parallel.components.modules.attention import gated_delta_net  # pylint: disable=C0415
+    return gated_delta_net
+
+
 def _load_context_parallel():
-    """Return the Qwen3.5 CP wrapper module through a lazy provider."""
-    from hyper_parallel.models.qwen3_5.adapter.distributed import (  # pylint: disable=C0415
-        context_parallel,
+    """Return the model-owned packed decoder call adapter."""
+    from hyper_parallel.models.qwen3_5.adapter import (  # pylint: disable=C0415
+        linear_attention_decoder,
     )
-    return context_parallel
+    return linear_attention_decoder
 
 
 def _load_loss():
@@ -59,6 +65,7 @@ QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
     loss=_load_vlm_loss,
     encoder_parallel=_load_encoder_parallel,
     fsdp_execution_order=get_fsdp_execution_order,
+    replacements=_load_replacements,
     context_parallel=_load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
 )
@@ -69,6 +76,7 @@ QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
     loss=_load_loss,
+    replacements=_load_replacements,
     context_parallel=_load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
 )

@@ -16,16 +16,22 @@
 import copy
 from datetime import timedelta
 import os
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from hyper_parallel.distributed.context_parallel.cp_context import CPContext
+from hyper_parallel.components.modules import GatedDeltaNet
+from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.distributed._builder.planner import ShardingPlanner
+from hyper_parallel.distributed.apply import apply_sharding_plan
 import hyper_parallel as hp
-from hyper_parallel.components.modules.kimi_delta_attention import KimiDeltaAttention, KimiRMSNormGated
-from hyper_parallel.distributed.context_parallel.gated_delta_net import GatedDeltaNetP2PCP, GatedDeltaNetUlyssesCP
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention import KimiDeltaAttentionLayerCP
+from hyper_parallel.components.modules.attention.kimi_delta_attention import KimiDeltaAttention
+from hyper_parallel.components.modules.attention.kimi_delta_attention.kimi_delta_attention import KimiRMSNormGated
 
 
 class _GDN(nn.Module):
@@ -62,23 +68,39 @@ def _model(kind, npu):
     return model
 
 
+def _bind_family(factory, mesh, **options):
+    """Use the factory's topology request, then borrow the existing CP context."""
+    layer = factory(context={"cp_size": mesh.size()}, **options)
+    if mesh.size() > 1:
+        layer.bind_parallel(SimpleNamespace(cp_context=CPContext(mesh)))
+    return layer
+
+
 def _wrapper(model, kind, mesh, npu, degree=1, method="p2p"):
     options = {"backend": "triton" if npu else "eager", "chunk_size": 64 if npu else 4}
     if kind == "kda":
-        return KimiDeltaAttentionLayerCP(
-            model, mesh, ulysses_degree=degree, state_cp_method=method,
+        return _bind_family(KimiDeltaAttention, mesh,
+            module=model, ulysses_degree=degree, state_cp_method=method,
             allgather_group_size=2 if method == "grouped_allgather_p2p" else 1, **options)
-    cls = GatedDeltaNetUlyssesCP if degree > 1 else GatedDeltaNetP2PCP
-    return cls(model, mesh, **options)
+    return _bind_family(GatedDeltaNet, mesh, module=model, ulysses_degree=None if degree > 1 else 1, **options)
 
 
 def _execute(model, wrapper, inputs, gradients, boundaries, *, live=False):
     """Use FP32 master parameters and identical backward order for all schedules."""
     model.zero_grad(set_to_none=True)
+    wrapper.zero_grad(set_to_none=True)
     values = [tensor.detach().clone().requires_grad_() for tensor in inputs]
 
     def call(value: torch.Tensor, offsets: tuple[int, ...]) -> torch.Tensor:
-        """Execute with differentiable BF16 views of FP32 master weights."""
+        """Execute with differentiable BF16 views of FP32 master weights.
+
+        Args:
+            value: Local hidden activations.
+            offsets: Global packed-document boundaries.
+
+        Returns:
+            Local attention output with the same token layout.
+        """
         parameters = {name: param if name.endswith(("A_log", "dt_bias")) else param.to(value.dtype)
                       for name, param in wrapper.named_parameters()}
         return torch.func.functional_call(wrapper, parameters, (value,), {"cu_seq_lens": offsets})
@@ -93,7 +115,7 @@ def _execute(model, wrapper, inputs, gradients, boundaries, *, live=False):
         outputs[index].backward(gradients[index])
     result = {f"output_{index}": tensor.detach().cpu() for index, tensor in enumerate(outputs)}
     result.update({f"hidden_{index}": tensor.grad.cpu() for index, tensor in enumerate(values)})
-    for name, parameter in model.named_parameters():
+    for name, parameter in wrapper.named_parameters():
         assert parameter.grad is not None and parameter.grad.dtype == torch.float32, name
         grad = parameter.grad.detach().clone()
         dist.all_reduce(grad)
@@ -146,6 +168,8 @@ def _isolation(wrapper, inputs, grad, offsets, rank, length):
 
 def _protocol_options(kind, npu, size):
     """Select the existing backend-qualified combinations for this worker."""
+    if not npu:
+        return [(size, "p2p")]
     options = [(1, "p2p"), (size, "p2p")]
     if kind == "kda":
         options.insert(1, (2, "p2p"))
@@ -227,3 +251,86 @@ def test_linear_tnd_gloo():
 def test_linear_tnd_npu():
     """Check true resets, existing protocols, nonzero checkpoint and live-call ownership."""
     _run(True)
+
+
+def _tp_family_model(kind, cp, tp, flat):
+    """Use native whole-head parameters so the test does not manually shard weights."""
+    options = {"context": {"cp_size": cp, "tp_size": tp}, "chunk_size": 4, "ulysses_degree": None,
+               "input_layout": "TH" if flat else "BSH"}
+    if kind == "kda":
+        attention = KimiDeltaAttention(hidden_size=16, num_heads=4, num_v_heads=4,
+                                      head_k_dim=4, head_v_dim=4, use_full_rank_gate=False, **options)
+    else:
+        # Exercise a non-power-of-two GVA ratio, as used by Qwen3.5-27B.
+        config = SimpleNamespace(hidden_size=16, linear_num_key_heads=4, linear_num_value_heads=12,
+                                 linear_key_head_dim=4, linear_value_head_dim=4)
+        attention = GatedDeltaNet(config=config, **options)
+    return nn.ModuleDict({"attention": attention}).npu()
+
+
+def _tp_family_case(mesh, kind, sp):
+    """Check common TP/SP collectives against a complete unpartitioned eager layer."""
+    torch.manual_seed(291)
+    reference = _tp_family_model(kind, 1, 1, sp)
+    parallel = _tp_family_model(kind, 2, 2, sp)
+    parallel.load_state_dict(reference.state_dict())
+    member = get_family_build_info(parallel.attention).resolved
+    context = FamilyShardingContext(("cp", "tp"), {"cp": 2, "tp": 2}, {}, sequence_parallel=sp)
+    spec = member.family.sharding(module=parallel.attention, module_fqn="attention", member=member, context=context)
+    plan = ShardingPlanner(derive=False).plan(parallel, mesh, cp_size=2, tp_size=2, sequence_parallel=sp)
+    parallel, _ = apply_sharding_plan(parallel, plan, mesh)
+    cp_rank, tp_rank = mesh["cp"].get_local_rank(), mesh["tp"].get_local_rank()
+    axis = 0 if sp else 1
+
+    def local_part(value: torch.Tensor) -> torch.Tensor:
+        """Select the CP interval and optional TP sequence shard.
+
+        Args:
+            value: Complete unpartitioned tensor from the serial reference.
+        """
+        local = value.chunk(2, axis)[cp_rank]
+        return local.chunk(2, axis)[tp_rank] if sp else local
+
+    inputs = (torch.randn((64, 16) if sp else (1, 64, 16), device="npu") * .1).requires_grad_()
+    copied = local_part(inputs.detach()).contiguous().clone().requires_grad_()
+    options = {"cu_seqlens": (0, 11, 47, 64)} if sp else {}
+    expected = reference.attention(inputs, **options)
+    actual = parallel.attention(copied, **options)
+    torch.testing.assert_close(actual, local_part(expected), rtol=4e-5, atol=3e-6)
+    gradient = torch.randn_like(inputs)
+    expected.backward(gradient)
+    # Without FSDP, replicated TP losses use the common SUM-adjoint convention.
+    actual.backward(local_part(gradient) / (1 if sp else 2))
+    if not sp:
+        dist.all_reduce(copied.grad, group=mesh["tp"].get_group())
+    torch.testing.assert_close(copied.grad, local_part(inputs.grad), rtol=6e-5, atol=5e-6)
+    for name, parameter in parallel.attention.named_parameters():
+        dist.all_reduce(parameter.grad, group=mesh["cp"].get_group())
+        target = reference.attention.get_parameter(name).grad
+        placement = spec.params[name]["tp"]
+        if isinstance(placement, Shard):
+            target = target.chunk(2, placement.dim)[tp_rank]
+        else:
+            dist.all_reduce(parameter.grad, group=mesh["tp"].get_group())
+        torch.testing.assert_close(parameter.grad, target, rtol=8e-5, atol=8e-6,
+                                   msg=lambda message, field=name: f"{kind}/{field}: {message}")
+
+
+def test_linear_attention_tp_sp_npu():
+    """Feature: Linear-attention TP/SP. Description: Public TP2 CP2 layout, dense/flat KDA and GDN GVA3.
+    Expectation: Outputs, input gradients and every parameter gradient match complete eager layers.
+    """
+    import torch_npu  # pylint: disable=import-outside-toplevel,unused-import
+    # Optional backend: CPU TND workers must remain importable without torch-npu.
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    torch.npu.matmul.allow_hf32 = False
+    torch.npu.config.allow_internal_format = False
+    torch.set_num_threads(1)
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        mesh = hp.init_device_mesh("npu", (2, 2), mesh_dim_names=("cp", "tp"))
+        for kind in ("kda", "gdn"):
+            for sp in (False, True):
+                _tp_family_case(mesh, kind, sp)
+    finally:
+        dist.destroy_process_group()

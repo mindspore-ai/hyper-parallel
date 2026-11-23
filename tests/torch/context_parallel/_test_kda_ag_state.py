@@ -13,19 +13,17 @@
 # limitations under the License.
 # ============================================================================
 """Real collective checks for KDA local-M state exchange and DP submeshes."""
-import copy
 from datetime import timedelta
 import os
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 
 import hyper_parallel as hp
-from hyper_parallel.components.modules import KimiDeltaAttention
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention import KimiDeltaAttentionLayerCP
-from hyper_parallel.distributed.context_parallel import kimi_delta_attention_state as state_cp
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention_state import (
+from hyper_parallel.components.modules.attention.kimi_delta_attention.cp_kimi_delta_attention import (
     build_kda_state_cp,
     split_kda_mesh,
 )
@@ -116,35 +114,8 @@ def test_kda_ag_state_npu():
 
 def test_kda_ag_state_gloo():
     """Qualify root-preserving subgroup order with real CPU communication."""
-    with patch.object(state_cp, "merge_affine_summaries", _cpu_merge), \
-            patch.object(state_cp, "_scan_maps", _cpu_scan):
+    arithmetic = SimpleNamespace(merge_affine_summaries=_cpu_merge, scan_kda_affine_maps=_cpu_scan)
+    with patch.dict(sys.modules, {
+        "hyper_parallel.components.functional.kimi_delta_attention_triton": arithmetic,
+    }):
         _run("cpu")
-
-
-def test_kda_hybrid_layout() -> None:
-    """Match the serial layer, including halo and replicated parameter gradients."""
-    torch.set_num_threads(1)
-    dist.init_process_group("gloo", timeout=timedelta(seconds=120))
-    rank, size = dist.get_rank(), dist.get_world_size()
-    mesh = hp.init_device_mesh("cpu", (size,), mesh_dim_names=("cp",))
-    torch.manual_seed(412)
-    reference = KimiDeltaAttention(hidden_size=8, num_heads=4, num_v_heads=4,
-                                   head_k_dim=4, head_v_dim=4, conv_kernel_size=3,
-                                   chunk_size=4).float().train()
-    model = copy.deepcopy(reference)
-    executor = KimiDeltaAttentionLayerCP(model, mesh, ulysses_degree=2,
-                                               chunk_size=4, backend="eager")
-    torch.manual_seed(523)
-    full = torch.randn(1, 32, 8, requires_grad=True)
-    grad_output = torch.randn_like(full)
-    local = full.detach().chunk(size, dim=1)[rank].contiguous().requires_grad_()
-    expected = reference(full)
-    actual = executor(local)
-    actual.backward(grad_output.chunk(size, dim=1)[rank].contiguous())
-    expected.backward(grad_output)
-    torch.testing.assert_close(actual, expected.detach().chunk(size, dim=1)[rank], atol=2e-6, rtol=2e-5)
-    torch.testing.assert_close(local.grad, full.grad.chunk(size, dim=1)[rank], atol=2e-6, rtol=2e-5)
-    for (_, parameter), (_, ref) in zip(model.named_parameters(), reference.named_parameters()):
-        dist.all_reduce(parameter.grad)
-        torch.testing.assert_close(parameter.grad, ref.grad, atol=2e-6, rtol=2e-5)
-    dist.destroy_process_group()

@@ -3,6 +3,9 @@
 本目录按注意力算法分目录组织：本地实现负责计算，上下文并行实现补充通信，
 family 提供统一的公共入口。各算法的使用参数见对应文档。
 
+`linear_attention_utils/` 提供 KDA、GDN 共用的序列、模块适配、并行布局和卷积通信辅助功能，
+不注册独立的注意力模块族。具体算法实现仍位于各自的算法目录中。
+
 | 算法 | 说明 |
 | --- | --- |
 | [Grouped Query Attention](grouped_query_attention/README.md) | 分组查询注意力 |

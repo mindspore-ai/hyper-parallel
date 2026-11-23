@@ -16,6 +16,7 @@
 import copy
 from datetime import timedelta
 import os
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -23,14 +24,13 @@ import torch_npu
 from torch.utils.checkpoint import checkpoint
 
 import hyper_parallel as hp
-from hyper_parallel.components.functional.kimi_delta_attention_fla_adapter import get_fla_kda_staged_ops
-from hyper_parallel.components.functional.kimi_delta_attention_state_summary import (
+from hyper_parallel.distributed.context_parallel.cp_context import CPContext
+from hyper_parallel.components.functional.kimi_delta_attention_triton import get_fla_kda_staged_ops
+from hyper_parallel.components.functional.kimi_delta_attention_triton import (
     kda_state_gradient_summary_from_prepared,
     kda_state_summary_forward_from_prepared,
 )
 from hyper_parallel.components.modules import KimiDeltaAttention
-from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
-from hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel import kimi_delta_attention_cp_wrapper
 
 
 def _model():
@@ -61,7 +61,7 @@ def _saved_transfers(outputs):
         if node is None or node in seen:
             continue
         seen.add(node)
-        if type(node).__name__ == "_KDAStateP2PFunctionBackward" and node.state_cp is not None:
+        if type(node).__name__ == "_KDAStateCPFunctionBackward" and node.state_cp is not None:
             matrix = node.saved_tensors[12]
             size = matrix.numel() * matrix.element_size()
             if matrix.ndim != 4 or matrix.untyped_storage().nbytes() != size:
@@ -166,11 +166,10 @@ def test_kda_ag_layer() -> None:
         cases.append(("grouped_allgather_p2p", 2, 2))
     controls = {}
     for protocol, ulysses, width in cases:
-        model = copy.deepcopy(base).npu()
-        request = kimi_delta_attention_cp_wrapper(
-            model, None, None, root, None, state_cp_method=protocol,
-            ulysses_degree=ulysses, allgather_group_size=width, backend="triton")
-        _commit_forward_rewrite(request)
+        model = KimiDeltaAttention(module=copy.deepcopy(base).npu(), context={"cp_size": size},
+                                   state_cp_method=protocol, ulysses_degree=ulysses,
+                                   allgather_group_size=width, backend="triton")
+        model.bind_parallel(SimpleNamespace(cp_context=CPContext(root)))
         gather = protocol != "p2p" and size // ulysses > 1
         result = _execute(model, [local], [local_do], root.get_group(), gather=gather)
         if protocol == "p2p":
@@ -184,5 +183,5 @@ def test_kda_ag_layer() -> None:
             _assert_same(repeated, result, lifetime=True)
             del repeated
         print(f"PASS KDA {protocol}/U{ulysses}/g{width} gradients and local-M cache", flush=True)
-        del result, model, request
+        del result, model
     dist.destroy_process_group()

@@ -15,11 +15,16 @@
 """Register the Kimi K3 adapter capabilities."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
-from hyper_parallel.models.kimi_k3.adapter import load_context_parallel
 from hyper_parallel.models.kimi_k3.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
 from hyper_parallel.models.registry import register_model_adapter
+
+
+def _load_replacements():
+    """Publish the complete linear-attention family through the model adapter."""
+    from hyper_parallel.components.modules.attention import kimi_delta_attention  # pylint: disable=C0415
+    return kimi_delta_attention
 
 
 def _load_codegen():
@@ -32,7 +37,7 @@ def _load_codegen():
 KIMI_K3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="KimiK3ForConditionalGeneration",
     model_type="kimi_k3",
-    context_parallel=load_context_parallel,
+    replacements=_load_replacements,
     sharding_rules=build_parameter_sharding_rules,
     codegen=_load_codegen,
 )

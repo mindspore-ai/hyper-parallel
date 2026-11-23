@@ -12,16 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed adapters for Kimi K3."""
+"""GatedDeltaNet family and its complete local algorithm."""
+from .gated_delta_net_family import GatedDeltaNet
+from .gated_delta_net import GatedDeltaNetModule
 
-from hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel import (
-    kimi_delta_attention_cp_wrapper,
-    kimi_delta_attention_p2p_cp_wrapper,
-    kimi_delta_attention_ulysses_cp_wrapper,
-)
-
-__all__ = [
-    "kimi_delta_attention_cp_wrapper",
-    "kimi_delta_attention_p2p_cp_wrapper",
-    "kimi_delta_attention_ulysses_cp_wrapper",
-]
+__all__ = ["GatedDeltaNet", "GatedDeltaNetModule"]

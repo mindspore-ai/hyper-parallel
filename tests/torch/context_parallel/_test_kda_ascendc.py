@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Native dense/TND Ulysses must preserve resets, gradients and saved calls."""
+from __future__ import annotations
 from datetime import timedelta
 import os
 
@@ -24,14 +25,39 @@ import torch_npu
 
 import hyper_parallel as hp
 from hyper_parallel.components.functional.kimi_delta_attention_ascendc import ascendc_chunk_kda
-from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
-from hyper_parallel.components.modules.kimi_delta_attention import KimiDeltaAttention
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (
-    KimiDeltaAttentionCoreCP, KimiDeltaAttentionLayerCP, KimiDeltaAttentionUlyssesCP,
+from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import (
+    PackedSequenceInfo,
 )
+from hyper_parallel.components.modules.attention.kimi_delta_attention import KimiDeltaAttention
 from tests.torch.context_parallel._test_linear_tnd import (
-    _assert_protocol_compatible, _assert_same, _execute, _isolation,
+    _assert_protocol_compatible, _assert_same, _bind_family, _execute, _isolation,
 )
+
+
+def _projected_core(mesh, *, heads=8, **options):
+    """Exercise the bound family core stage without paying for projections in this operator test."""
+    layer = _bind_family(KimiDeltaAttention, mesh, hidden_size=32, num_heads=heads, **options)
+
+    def call(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+             gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor, dt_bias: torch.Tensor,
+             sequence_info: PackedSequenceInfo | None) -> torch.Tensor:
+        """Preserve flat input rank while invoking the real projected stage.
+
+        Args:
+            query: Head-major raw queries.
+            key: Head-major raw keys.
+            value: Head-major values.
+            gate: Raw gate logits or output-gate values for this stage.
+            beta: Activated delta-rule update weights.
+        """
+        flat = query.ndim == 3
+        inputs = (query, key, value, gate, beta)
+        if flat:
+            inputs = tuple(tensor.unsqueeze(0) for tensor in inputs)
+        output = layer.run_state_core(inputs, sequence_info, a_log, dt_bias)
+        return output.squeeze(0) if flat else output
+
+    return call
 
 
 def _local_core_inputs(full, rank, offsets):
@@ -56,8 +82,7 @@ def _check_core(mesh, offsets):
     expected = ascendc_chunk_kda(*full[:5], a_log=full[5], dt_bias=full[6], cu_seqlens=offsets)
     expected_grads = torch.autograd.grad(expected, full, grad_output)
     local, info = _local_core_inputs(full, rank, offsets)
-    executors = (KimiDeltaAttentionUlyssesCP(mesh, backend="ascendc"),
-                 KimiDeltaAttentionCoreCP(mesh, ulysses_degree=size, backend="ascendc"))
+    executor = _projected_core(mesh, heads=4, ulysses_degree=size, backend="ascendc")
 
     def run(*values: torch.Tensor) -> torch.Tensor:
         """Preserve packed metadata through non-reentrant checkpoint replay."""
@@ -66,7 +91,7 @@ def _check_core(mesh, offsets):
     seed = grad_output[:, rank * 4096:(rank + 1) * 4096].contiguous()
     if info is not None:
         seed = seed.squeeze(0)
-    for executor, checkpointed in zip(executors, (False, True)):
+    for checkpointed in (False, True):
         actual = checkpoint(run, *local, use_reentrant=False) if checkpointed else run(*local)
         grads = torch.autograd.grad(actual, local, seed)
         reference_output = expected[:, rank * 4096:(rank + 1) * 4096]
@@ -86,7 +111,7 @@ def _check_layer(mesh):
     size, rank = dist.get_world_size(), dist.get_rank()
     torch.manual_seed(83)
     model = KimiDeltaAttention(hidden_size=32, num_heads=4, conv_kernel_size=4).float().npu()
-    wrapper = KimiDeltaAttentionLayerCP(model, mesh, backend="ascendc", ulysses_degree=size)
+    wrapper = _bind_family(KimiDeltaAttention, mesh, module=model, backend="ascendc", ulysses_degree=size)
     local = (torch.randn(4096, 32)*.05).bfloat16().npu()
     do = torch.randn_like(local)*.01
     offsets = (0, 4097, 4096*size-1, 4096*size)
@@ -113,6 +138,20 @@ def test_kda_ascendc_ulysses() -> None:
         _check_layer(mesh)
     finally:
         dist.destroy_process_group()
+
+
+def _check_dense_halo_layer(mesh):
+    """A CP cut must preserve dense ShortConv history and its backward gradients."""
+    torch.manual_seed(83)
+    model = KimiDeltaAttention(hidden_size=32, num_heads=4, conv_kernel_size=4).float().npu()
+    local = (torch.randn(1, 4096, 32) * .05).bfloat16().npu()
+    do = torch.randn_like(local) * .01
+    offsets = (0, 4096 * mesh.size())
+    for method in ("p2p", "allgather", "recursive_doubling"):
+        wrapper = _bind_family(KimiDeltaAttention, mesh, module=model, backend="ascendc", state_cp_method=method)
+        expected = _execute(model, wrapper, [local], [do], [offsets])
+        actual = _execute(model, wrapper, [local], [do], [None])
+        _assert_same(actual, expected, exact=False)
 
 
 def test_kda_ascendc_state() -> None:
@@ -152,12 +191,12 @@ def test_kda_ascendc_state() -> None:
 
         for metadata in (None, info):
             for degree in (1, 2):
-                reference = run(KimiDeltaAttentionCoreCP(
+                reference = run(_projected_core(
                     mesh, backend="ascendc", ulysses_degree=degree, state_cp_method="allgather"))
                 methods = ("p2p", "grouped_allgather_p2p", "recursive_doubling") if degree == 1 else (
                     "p2p", "recursive_doubling")
                 for method in methods:
-                    executor = KimiDeltaAttentionCoreCP(
+                    executor = _projected_core(
                         mesh, backend="ascendc", ulysses_degree=degree, state_cp_method=method,
                         allgather_group_size=2 if method == "grouped_allgather_p2p" else 1)
                     actual = run(executor)
@@ -165,5 +204,6 @@ def test_kda_ascendc_state() -> None:
                         _assert_protocol_compatible(actual, reference)
                     else:
                         _assert_same(actual, reference, exact=False)
+        _check_dense_halo_layer(mesh)
     finally:
         dist.destroy_process_group()

@@ -16,9 +16,9 @@
 import pytest
 import torch
 
-from hyper_parallel.components.modules.kimi_delta_attention import (
-    KimiDeltaAttention,
-    chunk_kda,
+from hyper_parallel.components.modules import KimiDeltaAttention
+from hyper_parallel.components.functional.kimi_delta_attention import chunk_kda
+from hyper_parallel.components.functional.kimi_delta_attention import (
     torch_apply_kda_state_summary,
     torch_chunk_kda,
     torch_compose_kda_state_summaries,
@@ -26,10 +26,17 @@ from hyper_parallel.components.modules.kimi_delta_attention import (
     torch_kda_state_summary,
     torch_recurrent_kda,
 )
+from tests.common.mark_utils import arg_mark
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_kimi_delta_attention_layer_runs_eager_training_forward_backward():
-    """The standalone training layer owns parameters and remains Triton-free."""
+    """Feature: Standalone eager KDA layer.
+
+    Description: Run the parameter-owning layer through forward and backward.
+    Expectation: The layer produces the expected shapes and trainable parameter gradients.
+    """
     torch.manual_seed(7)
     layer = KimiDeltaAttention(
         hidden_size=32,
@@ -117,8 +124,14 @@ def _run_and_grad(function, tensors):
     return output, final_state, dict(zip(names, grads))
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_kda_eager_dispatch_matches_torch_reference():
-    """The public eager backend preserves the differentiable Torch contract."""
+    """Feature: KDA eager dispatch.
+
+    Description: Compare the public eager backend with the Torch implementation.
+    Expectation: The dispatched output and recurrent state match the reference.
+    """
     inputs = _make_inputs(sequence_length=9)
     kwargs = {
         "a_log": inputs["a_log"],
@@ -142,8 +155,14 @@ def test_kda_eager_dispatch_matches_torch_reference():
     torch.testing.assert_close(actual_state, expected_state)
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_kimi_gate_is_lower_bounded_and_differentiable():
-    """The K3 decay mapping stays in ``(lower_bound, 0)`` and has gradients."""
+    """Feature: Kimi gate transform.
+
+    Description: Evaluate the gate and backpropagate through its parameters.
+    Expectation: Gate values remain in the configured interval and gradients are available.
+    """
     gate_logits = torch.linspace(-20, 20, 48).reshape(1, 3, 4, 4).requires_grad_()
     a_log = torch.zeros(4, requires_grad=True)
     dt_bias = torch.zeros(4, 4, requires_grad=True)
@@ -163,6 +182,8 @@ def test_kimi_gate_is_lower_bounded_and_differentiable():
     assert dt_bias.grad is not None
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize(
     "seed,num_k_heads,num_v_heads",
     ((0, 2, 2), (11, 2, 4), (29, 1, 4)),
@@ -172,7 +193,11 @@ def test_chunk_kda_matches_recurrent_output_state_and_all_gradients(
     num_k_heads,
     num_v_heads,
 ):
-    """Chunkwise KDA matches the token recurrence, including random ``dht``."""
+    """Feature: Chunked KDA recurrence.
+
+    Description: Compare chunk and token recurrences with a nonzero final-state gradient.
+    Expectation: Outputs, final state and all input gradients agree.
+    """
     recurrent_inputs = _make_inputs(seed, num_k_heads, num_v_heads)
     chunk_inputs = {
         name: tensor.detach().clone().requires_grad_(True)
@@ -200,8 +225,14 @@ def test_chunk_kda_matches_recurrent_output_state_and_all_gradients(
         )
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_kda_rejects_incompatible_grouped_value_heads():
-    """Grouped-value KDA requires value heads to be divisible by Q/K heads."""
+    """Feature: KDA grouped-value contract.
+
+    Description: Pass a value-head count not divisible by the query-head count.
+    Expectation: The eager implementation rejects the incompatible shape.
+    """
     query = torch.randn(1, 4, 3, 8)
     key = torch.randn_like(query)
     value = torch.randn(1, 4, 4, 8)
@@ -267,8 +298,14 @@ def _run_cp4_state_summary(summary_inputs, common_kwargs):
     return torch.cat(output_shards, dim=1), state, composed_state
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_kda_state_summary_cp4_matches_output_state_and_gradients():
-    """Four affine local summaries reproduce full-sequence KDA training."""
+    """Feature: KDA affine state composition.
+
+    Description: Compose four local summaries and compare with the full-sequence recurrence.
+    Expectation: Output, final state and gradients match the full-sequence reference.
+    """
     reference_inputs = _make_inputs(sequence_length=64)
     summary_inputs = {
         name: tensor.detach().clone().requires_grad_(True)
@@ -342,8 +379,14 @@ def test_kda_state_summary_cp4_matches_output_state_and_gradients():
             )
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_kda_state_summary_keeps_fp32_state_under_autocast():
-    """Affine summary state must not inherit the BF16 compute dtype."""
+    """Feature: KDA state precision under autocast.
+
+    Description: Build and compose summaries inside a BF16 autocast region.
+    Expectation: Summary and recurrent state tensors retain FP32 precision.
+    """
     inputs = _make_inputs(sequence_length=16)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         state_ext, transition = torch_kda_state_summary(

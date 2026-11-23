@@ -67,6 +67,7 @@ from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.framework_spec import cp_dispatch_shell_body
 from hyper_parallel.codegen.inline.observations import collect_source_observations
+from tests.common.mark_utils import arg_mark
 
 SOURCE_TEXT = '''\
 import torch
@@ -131,27 +132,6 @@ def test_inline_meta_normalization_does_not_mutate_native_observation():
     assert meta.boundary_classes == {"model.block": "Block"}
 
 
-@pytest.mark.parametrize(
-    ("factory", "helper"),
-    (
-        (
-            "hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel."
-            "kimi_delta_attention_ulysses_cp_wrapper",
-            "kimi_delta_attention_cp_forward",
-        ),
-        (
-            "hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel."
-            "qwen3_5_gdn_ulysses_cp_wrapper",
-            "qwen3_5_gdn_cp_forward",
-        ),
-    ),
-)
-def test_delegating_cp_wrapper_exposes_source_visible_helper(factory, helper):
-    """Delegating wrappers retain a module-level helper for code generation."""
-    target = inner_wrapper_target(factory)
-
-    assert target is not None
-    assert target.helper_name == helper
 
 
 def test_framework_inner_wrapper_resolves_without_model_adapter_path():
@@ -676,11 +656,18 @@ def test_replacement_verifier_requires_constructor_call():
     }]
 
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_bound_method_local_compute_satisfies_verification():
-    """A model-owned MethodType wrapper is a visible local-compute patch."""
+    """Feature: Bound-method source export.
+
+    Description: Render a local compute method within the observed replacement.
+    Expectation: Exported construction and forward ownership satisfy replacement verification.
+    """
     module_type = type("ImportedMoe", (), {})
 
-    def source_forward(self, hidden_states):
+    def source_forward(self: Any, hidden_states: Any) -> Any:
+        """Return the generic fixture input unchanged."""
         del self
         return hidden_states
 
