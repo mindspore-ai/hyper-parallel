@@ -5,6 +5,29 @@
 - Q 与 KV 使用各自的头数，默认融合 QKV 投影，也支持独立投影表示。
 - 支持 Ulysses、KV AllGather、混合 CP，以及已就绪输入的通算重叠。
 - 支持 packed 文档和非 packed 的 padding mask；带输出 gate 的变体见 [gated GQA](../gated_grouped_query_attention/README.md)。
+- 显式选择 `RingGroupedQueryAttention` 可使用 Ring / Ulysses+Ring；它与默认 GQA family 分开，不更改已有配方的 CP 算法。
+
+## Ring CP
+
+在现有 Qwen3-MoE 配方的 attention replacement 中，将 `_target_` 改为 `RingGroupedQueryAttention`，并按设备数设置 CP：
+
+```yaml
+accelerator:
+  cp_size: 4
+
+plan_overrides:
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+      implementation:
+        _target_: hyper_parallel.components.modules.RingGroupedQueryAttention
+        ulysses_degree: 1
+        overlap: false
+        load_balance: none
+```
+
+`ulysses_degree` 必须整除 `cp_size`；设为 1 选择纯 Ring，大于 1 时先做 Ulysses 交换再使用 Ring 子组。Ring 接受 dense 输入或带全局累计边界的 batch-one packed 输入，不支持显式 mask、dropout、KV cache 或 sliding window。基础算法、反向和输入布局要求见 [Ring CP 实现](../../../../distributed/context_parallel/ring_attention.py)。
 
 ## YAML 配置
 
@@ -63,6 +86,8 @@ GQA 的反向使用已有可微通信接口；这里主要优化输入前向调�
 | [grouped_query_attention.py](grouped_query_attention.py) | 参数构造与转换、投影/Norm/RoPE、FA 和共享 forward |
 | [grouped_query_attention_family.py](grouped_query_attention_family.py) | 选择 local/CP 成员，声明布局并校验配置 |
 | [cp_grouped_query_attention.py](cp_grouped_query_attention.py) | CP 输入通信、文档与 mask 映射、输出恢复 |
+| [ring_grouped_query_attention.py](ring_grouped_query_attention.py) | Ring / Ulysses+Ring attention 阶段和 packed 长度转换 |
+| [ring_grouped_query_attention_family.py](ring_grouped_query_attention_family.py) | 独立 Ring family 入口，保持默认 GQA family 行为 |
 
 ## 执行流程
 
