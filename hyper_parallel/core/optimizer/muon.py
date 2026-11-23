@@ -16,11 +16,13 @@
 """Muon optimizer with HSDP shard-group-aware communication."""
 
 import math
-from collections.abc import Callable, Iterable
-from collections import defaultdict
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from functools import partial
+from itertools import chain, groupby
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -75,6 +77,44 @@ class MuonPostUpdateContext:
     step: int
 
 
+@dataclass(frozen=True)
+class _ShardBatch:
+    """One batch and its original assignment boundary."""
+
+    group_idx: int
+    assignment: HSDPGroupAssignment
+    params: List[torch.nn.Parameter]
+    last_in_assignment: bool
+
+
+@dataclass
+class _GatheredShardBatch:
+    """Gather results owned by the communication stream."""
+
+    batch: _ShardBatch
+    inputs: Dict[torch.nn.Parameter, torch.Tensor]
+    compute_coords: Dict[torch.nn.Parameter, Tuple[int, ...]]
+    ready: Any
+
+
+_PackedShardUpdates = Dict[
+    Tuple[int, ...], Tuple[torch.Tensor, List[Tuple[torch.nn.Parameter, int, int]]]
+]
+_AssignmentEntry = Tuple[int, HSDPGroupAssignment]
+_LocalQueueKey = Tuple[int, torch.device]
+_LocalBatches = Deque[List[torch.nn.Parameter]]
+
+
+@dataclass
+class _BroadcastShardBatch:
+    """Retain cross-stream tensors until the broadcast and apply have finished."""
+
+    gathered: _GatheredShardBatch
+    updates: Dict[torch.nn.Parameter, torch.Tensor]
+    packed: _PackedShardUpdates
+    works: List[dist.Work]
+
+
 _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "ns_coefficients": None,
     "ns_epsilon": 1e-10,
@@ -85,6 +125,7 @@ _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "post_update_fn": None,
     "zero_rms_scale_mode": "zero",
     "apply_lr_in_update": False,
+    "fsdp_overlap": False,
 }
 
 
@@ -101,6 +142,7 @@ class _MuonAdvancedOptions:
     post_update_fn: Optional[Callable[..., None]]
     zero_rms_scale_mode: str
     apply_lr_in_update: bool
+    fsdp_overlap: bool
 
 
 def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOptions:
@@ -250,6 +292,10 @@ class Muon(BaseDistributedOptimizer):
             reshape_fn: Optional logical-matrix reshape function.
             ns_transform_fn: Optional Newton-Schulz input transformation.
             post_update_fn: Optional callback applied after a parameter update.
+            fsdp_overlap: Overlap computation and communication on a single
+                CUDA or NPU shard axis. Independent local batches can fill
+                additional communication windows. Set consistently on all ranks. Custom
+                momentum and post-update callbacks use the serial schedule.
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
@@ -257,6 +303,8 @@ class Muon(BaseDistributedOptimizer):
                 Both modes support distinct update and buffer coefficients.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        if not isinstance(advanced.fsdp_overlap, bool):
+            raise TypeError("fsdp_overlap must be a bool")
         if momentum_mode not in ("legacy", "vanilla"):
             raise ValueError(
                 f"momentum_mode must be 'legacy' or 'vanilla', got {momentum_mode!r}"
@@ -299,6 +347,8 @@ class Muon(BaseDistributedOptimizer):
         self._update_muon_momentum_mode = momentum_mode
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
+        self.fsdp_overlap = advanced.fsdp_overlap
+        self._shard_pipeline_streams: Dict[torch.device, Tuple[Any, Any]] = {}
         self.reset_optimizer_parameters()
 
     def reset_optimizer_parameters(self) -> None:
@@ -374,78 +424,232 @@ class Muon(BaseDistributedOptimizer):
                 loss = closure()
         broadcaster = AsyncReplicateBroadcaster(self)
 
-        num_groups = len(self.param_groups)
-
         for group in self.param_groups:
             group['step'] = (group.get('step') or 0) + 1
 
-        # Compute momentum only for no-comm params upfront.
-        no_comm_ns: Dict[int, Dict] = {}
-        for group_idx in range(num_groups):
-            info = self._hsdp_assignment_batches.get(group_idx)
-            if not info:
-                # No HSDP info — all params are no_comm.
-                unshard_params = self.unshard_params_by_group.get(group_idx, [])
-                no_comm_ns[group_idx] = self._update_muon_momentum(
-                    self.param_groups[group_idx], unshard_params
-                )
+        self._run_step_assignments(broadcaster)
+        broadcaster.wait_all()
+        return loss
+
+    def _run_step_assignments(self, broadcaster: AsyncReplicateBroadcaster) -> None:
+        """Submit shard and independent local batches in one schedule."""
+        assignments: Iterable[_AssignmentEntry] = self._step_assignments()
+        local_batches: Dict[_LocalQueueKey, _LocalBatches] = {}
+        if self.fsdp_overlap and all(callback is None for callback in (
+                self.momentum_update_fn, self.post_update_fn, self.reshape_fn, self.ns_transform_fn,
+        )):
+            assignments, local_batches = self._plan_overlap_batches(assignments)
+        self._process_no_comm_params(local_batches)
+
+        for key, run in groupby(assignments, self._shard_pipeline_key):
+            if key is None:
+                for group_idx, assignment in run:
+                    self._process_serial_assignment(group_idx, assignment, broadcaster)
             else:
-                no_comm_params = info.get("no_comm", [])
-                if no_comm_params:
-                    no_comm_ns[group_idx] = self._update_muon_momentum(
-                        self.param_groups[group_idx], no_comm_params
-                    )
-                else:
-                    no_comm_ns[group_idx] = {}
+                device, _, _ = key
+                self._process_shard_pipeline(self._iter_shard_batches(run), device, broadcaster, local_batches)
+        for (group_idx, _), queue in local_batches.items():
+            while queue:
+                self._run_local_batch(group_idx, queue)
 
-        # Process no-comm params.
-        for group_idx in range(num_groups):
-            if no_comm_ns[group_idx]:
-                group = self.param_groups[group_idx]
-                self._process_unshard_params(group, no_comm_ns[group_idx])
-                if self.post_update_fn is not None:
-                    self._run_post_update_fn(group, no_comm_ns[group_idx].keys())
+    def _plan_overlap_batches(
+            self, assignments: Iterable[_AssignmentEntry],
+    ) -> Tuple[List[_AssignmentEntry], Dict[_LocalQueueKey, _LocalBatches]]:
+        """Extract updates that need neither shard collectives nor replica synchronization."""
+        entries = list(assignments)
+        queues: Dict[_LocalQueueKey, _LocalBatches] = {}
+        for entry in entries:
+            pipeline_key = self._shard_pipeline_key(entry)
+            if pipeline_key is not None:
+                queues.setdefault((entry[0], pipeline_key[0]), deque())
 
-        # Flatten nested batch into a linear schedule.
-        group_linear_batches: Dict[int, List[HSDPGroupAssignment]] = {}
-        max_num_batches = 0
-        for group_idx in range(num_groups):
-            info = self._hsdp_assignment_batches.get(group_idx)
-            linear_batches = []
-            if info:
-                for bg in info.get("batch_groups", []):
-                    linear_batches.extend(bg.get("sub_batches", []))
-            group_linear_batches[group_idx] = linear_batches
-            max_num_batches = max(max_num_batches, len(linear_batches))
-
-        # Process batches: compute momentum per-batch for owned params only (HSDP de-duplication).
-        for batch_idx in range(max_num_batches):
-            for group_idx in range(num_groups):
-                linear_batches = group_linear_batches[group_idx]
-                if batch_idx >= len(linear_batches):
+        remaining = []
+        for group_idx, assignment in entries:
+            if not assignment.is_shard and not assignment.is_replicated and assignment.owned_records:
+                params = assignment.owned_params
+                device = to_local_if_dtensor(params[0]).device
+                queue = queues.get((group_idx, device))
+                if queue is not None:
+                    self._queue_local_batches(params, queue)
                     continue
+            remaining.append((group_idx, assignment))
+        return remaining, queues
 
-                hsdp_assign = linear_batches[batch_idx]
-                group = self.param_groups[group_idx]
+    def _queue_local_batches(self, params: List[torch.nn.Parameter], queue: _LocalBatches) -> None:
+        """Plan local work while keeping pending entries free of temporary tensors."""
+        for shape_group in self._group_by_shape([param for param in params if param.grad is not None]).values():
+            queue.extend(self._split_into_memory_safe_batches(shape_group, shard_size=1))
 
-                # Compute momentum for this assignment's owned params only.
-                ns_inputs = self._update_muon_momentum(group, hsdp_assign.owned_params)
-                if not hsdp_assign.is_shard:
-                    if ns_inputs:
-                        self._process_unshard_params(group, ns_inputs)
-                else:
-                    self._process_shard_params(
-                        group, ns_inputs, [hsdp_assign], group_idx,
-                        buffer_cache={},
-                    )
+    def _process_no_comm_params(self, local_batches: Dict[_LocalQueueKey, _LocalBatches]) -> None:
+        """Use the same local queue for parameters outside HSDP assignments."""
+        no_comm_inputs = []
+        for group_idx, group in enumerate(self.param_groups):
+            info = self._hsdp_assignment_batches.get(group_idx)
+            params = info.get("no_comm", []) if info else self.unshard_params_by_group.get(group_idx, [])
+            if local_batches and params:
+                eligible = defaultdict(list)
+                eager = []
+                for param in params:
+                    device = to_local_if_dtensor(param).device
+                    if (group_idx, device) in local_batches:
+                        eligible[device].append(param)
+                    else:
+                        eager.append(param)
+                for device, device_params in eligible.items():
+                    self._queue_local_batches(device_params, local_batches[(group_idx, device)])
+                params = eager
+            no_comm_inputs.append(self._update_muon_momentum(group, params) if params else {})
+
+        for group, ns_inputs in zip(self.param_groups, no_comm_inputs):
+            if ns_inputs:
+                self._process_unshard_params(group, ns_inputs)
                 if self.post_update_fn is not None:
                     self._run_post_update_fn(group, ns_inputs.keys())
 
-                # Flush broadcasts after each assignment.
-                broadcaster.flush_group(hsdp_assign)
+    def _run_local_batch(self, group_idx: int, queue: Optional[_LocalBatches]) -> None:
+        """Submit one local batch on the caller's compute stream."""
+        if queue:
+            with torch.profiler.record_function("muon.pipeline.local_ns"):
+                group = self.param_groups[group_idx]
+                self._process_unshard_params(group, self._update_muon_momentum(group, queue.popleft()))
 
-        broadcaster.wait_all()
-        return loss
+    def _step_assignments(self) -> Iterator[_AssignmentEntry]:
+        """Yield assignments in the original round-robin optimizer group order."""
+        by_group = []
+        for group_idx in range(len(self.param_groups)):
+            batch_groups = self._hsdp_assignment_batches.get(group_idx, {}).get("batch_groups", [])
+            by_group.append(list(chain.from_iterable(batch_group["sub_batches"] for batch_group in batch_groups)))
+        for batch_idx in range(max(map(len, by_group), default=0)):
+            for group_idx, assignments in enumerate(by_group):
+                if batch_idx < len(assignments):
+                    yield group_idx, assignments[batch_idx]
+
+    def _process_serial_assignment(
+            self, group_idx: int, assignment: HSDPGroupAssignment, broadcaster: AsyncReplicateBroadcaster,
+            overlap_work: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Keep whole-assignment callback inputs and the serial shard path."""
+        group = self.param_groups[group_idx]
+        ns_inputs = self._update_muon_momentum(group, assignment.owned_params)
+        if assignment.is_shard:
+            self._process_shard_params(
+                group, ns_inputs, [assignment], group_idx, buffer_cache={}, overlap_work=overlap_work,
+            )
+        elif ns_inputs:
+            self._process_unshard_params(group, ns_inputs)
+        if self.post_update_fn is not None:
+            self._run_post_update_fn(group, ns_inputs.keys())
+        broadcaster.flush_group(assignment)
+
+    def _shard_pipeline_key(
+            self, entry: Tuple[int, HSDPGroupAssignment],
+    ) -> Optional[Tuple[torch.device, Tuple[dist.ProcessGroup, ...], Tuple[dist.ProcessGroup, ...]]]:
+        """Only look ahead across consecutive assignments with the same communication groups."""
+        _, assignment = entry
+        if not self.fsdp_overlap or self.momentum_update_fn is not None or self.post_update_fn is not None:
+            return None
+        if not assignment.is_shard or len(assignment.shard_pgs) != 1 or not assignment.owned_records:
+            return None
+        pg = assignment.shard_pgs[0]
+        if pg is None or dist.get_world_size(pg) <= 1:
+            return None
+        device = to_local_if_dtensor(assignment.owned_records[0].param).device
+        if device.type not in ("cuda", "npu"):
+            return None
+        return device, assignment.shard_pgs, assignment.replicate_pgs
+
+    def _iter_shard_batches(self, assignments: Iterable[Tuple[int, HSDPGroupAssignment]]) -> Iterator[_ShardBatch]:
+        """Keep the serial shard batch membership and replica flush boundaries."""
+        for group_idx, assignment in assignments:
+            shard_size = dist.get_world_size(assignment.shard_pgs[0])
+            batches = self._split_into_memory_safe_batches(assignment.owned_params, shard_size, shard_size)
+            for batch_idx, params in enumerate(batches):
+                yield _ShardBatch(group_idx, assignment, params, batch_idx == len(batches) - 1)
+
+    def _prepare_shard_batch(self, batch: _ShardBatch, backend: Any, stream: Any) -> _GatheredShardBatch:
+        """Produce this batch's momentum and gathered inputs on the communication stream."""
+        with backend.stream(stream), torch.profiler.record_function("muon.pipeline.gather"):
+            ns_inputs = self._update_muon_momentum(self.param_groups[batch.group_idx], batch.params)
+            gathered, coords = self._gather_shard_inputs(
+                batch.params, ns_inputs, batch.assignment, self._shard_compute_coord[batch.group_idx],
+                buffer_cache=None, fallback_dtype=torch.bfloat16,
+            )
+            ready = backend.Event()
+            ready.record(stream)
+        return _GatheredShardBatch(batch, gathered, coords, ready)
+
+    def _process_shard_pipeline(
+            self, batches: Iterator[_ShardBatch], device: torch.device, broadcaster: AsyncReplicateBroadcaster,
+            local_batches: Dict[_LocalQueueKey, _LocalBatches],
+    ) -> None:
+        """Overlap each batch's NS with its neighbors' collectives using two in-flight batches."""
+        first = next(batches)
+        second = next(batches, None)
+        if second is None:
+            queue = local_batches.get((first.group_idx, device))
+            overlap_work = partial(self._run_local_batch, first.group_idx, queue) if queue else None
+            self._process_serial_assignment(first.group_idx, first.assignment, broadcaster, overlap_work)
+            return
+
+        backend = getattr(torch, device.type)
+        compute_stream = backend.current_stream(device)
+        if device not in self._shard_pipeline_streams:
+            self._shard_pipeline_streams[device] = backend.Stream(device=device), backend.Stream(device=device)
+        comm_stream, apply_stream = self._shard_pipeline_streams[device]
+        comm_stream.wait_stream(compute_stream)
+        apply_stream.wait_stream(compute_stream)
+        current = self._prepare_shard_batch(first, backend, comm_stream)
+        self._run_local_batch(first.group_idx, local_batches.get((first.group_idx, device)))
+        previous = None
+        for following in chain((second,), batches, (None,)):
+            with torch.profiler.record_function("muon.pipeline.ns"):
+                compute_stream.wait_event(current.ready)
+                batch = current.batch
+                shard_size = dist.get_world_size(batch.assignment.shard_pgs[0])
+                group = self.param_groups[batch.group_idx]
+                updates = self._compute_shard_updates(current.inputs, group, shard_size)
+                ns_done = backend.Event()
+                ns_done.record(compute_stream)
+
+            if previous is not None:
+                local_group = previous.gathered.batch.group_idx
+                # The next shard NS is already queued on the compute stream.
+                # Independent local work can cover the rest of the older broadcast.
+                self._run_local_batch(local_group, local_batches.get((local_group, device)))
+                self._retire_shard_batch(previous, backend, apply_stream, broadcaster)
+                previous = None
+
+            # Put the next gather ahead of this broadcast on the communication
+            # stream so the next NS can run while this broadcast is in flight.
+            prefetched = self._prepare_shard_batch(following, backend, comm_stream) if following else None
+            with backend.stream(comm_stream), torch.profiler.record_function("muon.pipeline.broadcast"):
+                comm_stream.wait_event(ns_done)
+                pg = batch.assignment.shard_pgs[0]
+                packed = self._pack_shard_updates(batch.params, updates, current.compute_coords, (dist.get_rank(pg),))
+                works = self._launch_shard_axis_broadcasts(packed, pg, 0, ())
+            previous = _BroadcastShardBatch(current, updates, packed, works)
+            del packed, works
+            current = prefetched
+
+        self._run_local_batch(batch.group_idx, local_batches.get((batch.group_idx, device)))
+        self._retire_shard_batch(previous, backend, apply_stream, broadcaster)
+
+    def _retire_shard_batch(
+            self,
+            pending: _BroadcastShardBatch,
+            backend: Any,
+            stream: Any,
+            broadcaster: AsyncReplicateBroadcaster,
+    ) -> None:
+        """Bound the memory window while keeping apply independent of the next NS."""
+        batch = pending.gathered.batch
+        with backend.stream(stream), torch.profiler.record_function("muon.pipeline.apply"):
+            for work in pending.works:
+                work.wait()
+            self._apply_shard_updates(pending.packed, self.param_groups[batch.group_idx], batch.assignment)
+        stream.synchronize()
+        if batch.last_in_assignment:
+            broadcaster.flush_group(batch.assignment)
 
     def _run_post_update_fn(
             self,
@@ -636,6 +840,7 @@ class Muon(BaseDistributedOptimizer):
             shard_compute_coord: Dict[int, Tuple[int, ...]],
             group: Dict[str, Any],
             buffer_cache: Optional[Dict],
+            overlap_work: Optional[Callable[[], None]] = None,
     ) -> Tuple[
         Dict[torch.nn.Parameter, torch.Tensor],
         Dict[torch.nn.Parameter, Tuple[int, ...]],
@@ -645,59 +850,68 @@ class Muon(BaseDistributedOptimizer):
         Returns:
             (my_updates, param_compute_coord) for this HSDP assignment.
         """
-        shard_sizes, local_coords, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
-        param_to_index = {record.param: record.index for record in hsdp_assign.owned_records}
+        gathered_inputs, compute_coords = self._gather_shard_inputs(
+            valid_params, param_to_ns_input, hsdp_assign, shard_compute_coord, buffer_cache,
+            overlap_work=overlap_work,
+        )
+        shard_size = self._get_shard_info(hsdp_assign)[-1]
+        return self._compute_shard_updates(gathered_inputs, group, shard_size), compute_coords
 
-        my_params: List[torch.nn.Parameter] = []
-        my_param_ids: set = set()
+    def _gather_shard_inputs(
+            self,
+            params: List[torch.nn.Parameter],
+            param_to_ns_input: Dict[torch.nn.Parameter, torch.Tensor],
+            hsdp_assign: HSDPGroupAssignment,
+            shard_compute_coord: Dict[int, Tuple[int, ...]],
+            buffer_cache: Optional[Dict],
+            fallback_dtype: Optional[torch.dtype] = None,
+            overlap_work: Optional[Callable[[], None]] = None,
+    ) -> Tuple[Dict[torch.nn.Parameter, torch.Tensor], Dict[torch.nn.Parameter, Tuple[int, ...]]]:
+        """Gather a fused buffer and retain only locally assigned NS inputs."""
+        shard_sizes, local_coords, shard_pgs, _ = self._get_shard_info(hsdp_assign)
+        param_to_index = {record.param: record.index for record in hsdp_assign.owned_records}
         param_compute_coord: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
         my_indices: set = set()
 
-        for idx, p in enumerate(valid_params):
+        for idx, p in enumerate(params):
             p_index = param_to_index[p]
             compute_coord = shard_compute_coord.get(p_index, (0,) * len(shard_sizes))
             param_compute_coord[p] = compute_coord
             if compute_coord == local_coords:
-                my_params.append(p)
-                my_param_ids.add(id(p))
                 my_indices.add(idx)
 
-        # Fused all-gather full NS inputs; keep only tensors computed locally.
-        gathered_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
         local_inputs = build_pad_ns_inputs(
-            valid_params,
+            params,
             param_to_ns_input,
             self._param_shard_metadata,
+            fallback_dtype=fallback_dtype,
         )
-        param_shard_metadata = [self._param_shard_metadata.get(p) for p in valid_params]
+        param_shard_metadata = [self._param_shard_metadata.get(p) for p in params]
         gathered_list = fused_allgather_dtensor_params(
             local_inputs, shard_pgs, hsdp_assign.layout_spec,
             param_shard_metadata=param_shard_metadata,
             buffer_cache=buffer_cache,
             keep_indices=my_indices,
+            while_gathering=overlap_work,
         )
-        for p, full_inp in zip(valid_params, gathered_list):
-            if id(p) in my_param_ids:
-                gathered_inputs[p] = full_inp
-        local_inputs.clear()
-        gathered_list.clear()
+        return {p: full_input for p, full_input in zip(params, gathered_list)
+                if full_input is not None}, param_compute_coord
 
-        # Compute NS updates in shape groups and memory-safe batches.
+    def _compute_shard_updates(
+            self,
+            gathered_inputs: Dict[torch.nn.Parameter, torch.Tensor],
+            group: Dict[str, Any],
+            shard_size: int,
+    ) -> Dict[torch.nn.Parameter, torch.Tensor]:
+        """Use the same NS shape groups for serial and overlapping shard batches."""
         my_updates: Dict[torch.nn.Parameter, torch.Tensor] = {}
-        if my_params:
-            shape_groups = self._group_by_shape(my_params)
-            for _, p_list in shape_groups.items():
-                safe_batches = self._split_into_memory_safe_batches(p_list, shard_size=total_shard_size)
-                for sub_batch in safe_batches:
-                    updates_dict = self._compute_batched_ns_updates(
-                        sub_batch, gathered_inputs, group
-                    )
-                    for p in sub_batch:
-                        my_updates[p] = updates_dict[p].contiguous()
-                    del updates_dict
-            gathered_inputs.clear()
-
-        return my_updates, param_compute_coord
+        for params in self._group_by_shape(list(gathered_inputs)).values():
+            for batch in self._split_into_memory_safe_batches(params, shard_size=shard_size):
+                updates = self._compute_batched_ns_updates(batch, gathered_inputs, group)
+                for param in batch:
+                    my_updates[param] = updates[param].contiguous()
+                del updates
+        return my_updates
 
     def _process_shard_params(
             self,
@@ -706,6 +920,7 @@ class Muon(BaseDistributedOptimizer):
             hsdp_assignments: List[HSDPGroupAssignment],
             group_idx: int,
             buffer_cache: Optional[Dict] = None,
+            overlap_work: Optional[Callable[[], None]] = None,
     ) -> None:
         """Process sharded params with greedy shard-group compute assignment."""
         shard_compute_coord = self._shard_compute_coord.get(group_idx, {})
@@ -729,7 +944,7 @@ class Muon(BaseDistributedOptimizer):
                     logger.debug_rank0(
                         "[hyper-optimizer uneven-shard] p %s placement %s device_mesh %s "
                         "local_shape %s global_shape %s pg_rank %s shard_sizes %s",
-                        p.model_name,
+                        getattr(p, "model_name", None),
                         p.placements,
                         p.device_mesh,
                         p.to_local().shape,
@@ -745,12 +960,12 @@ class Muon(BaseDistributedOptimizer):
                 for sub_batch in safe_batches:
                     my_updates, param_compute_coord = self._gather_and_compute_shard_updates(
                         sub_batch, param_to_ns_input, hsdp_assign,
-                        shard_compute_coord, group, buffer_cache,
+                        shard_compute_coord, group, buffer_cache, overlap_work,
                     )
 
                     self._fused_broadcast_and_apply(
                         sub_batch, my_updates, param_compute_coord,
-                        group, hsdp_assign,
+                        group, hsdp_assign, overlap_work,
                     )
 
     def _group_by_shape(
@@ -1111,66 +1326,63 @@ class Muon(BaseDistributedOptimizer):
             param_compute_coord: Dict[torch.nn.Parameter, Tuple[int, ...]],
             group: Dict[str, Any],
             hsdp_assign: HSDPGroupAssignment,
+            overlap_work: Optional[Callable[[], None]] = None,
     ) -> None:
         """Fused broadcast and apply for shard-group updates."""
-        lr = group["lr"]
-        weight_decay = group["weight_decay"]
         shard_sizes, local_coords, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
-        device = to_local_if_dtensor(valid_params[0].data).device
+        packed = self._pack_shard_updates(valid_params, my_updates, param_compute_coord, local_coords)
+        if total_shard_size > 1:
+            self._batched_relay_broadcast(packed, shard_pgs, shard_sizes, local_coords, overlap_work)
+        self._apply_shard_updates(packed, group, hsdp_assign)
 
+    @staticmethod
+    def _pack_shard_updates(
+            params: List[torch.nn.Parameter],
+            my_updates: Dict[torch.nn.Parameter, torch.Tensor],
+            param_compute_coord: Dict[torch.nn.Parameter, Tuple[int, ...]],
+            local_coords: Tuple[int, ...],
+    ) -> _PackedShardUpdates:
+        """Pack BF16 updates into one aligned buffer per compute owner."""
+        device = to_local_if_dtensor(params[0].data).device
         coord_groups: Dict[Tuple[int, ...], List[torch.nn.Parameter]] = defaultdict(list)
-        for p in valid_params:
+        for p in params:
             coord_groups[param_compute_coord[p]].append(p)
 
-        all_local_params: List[torch.Tensor] = []
-        all_update_shards: List[torch.Tensor] = []
-
-        alignment_bytes = 512
-        element_size = torch.empty(0, dtype=torch.bfloat16, device=device).element_size()
-        alignment_elements = max(1, alignment_bytes // element_size)
-
-        pack_buffers: Dict[Tuple[int, ...], torch.Tensor] = {}
-        coord_param_offsets: Dict[Tuple[int, ...], List[Tuple[int, int, int]]] = {}
-
+        alignment_elements = 256  # 512 bytes in BF16
+        packed: _PackedShardUpdates = {}
         for coord, coord_params in coord_groups.items():
-            is_compute_rank = coord == local_coords
-            param_offsets: List[Tuple[int, int, int]] = []
+            param_offsets = []
             total_padded_numel = 0
-
             for p in coord_params:
                 actual_numel = p.numel()
                 padded_numel = ((actual_numel + alignment_elements - 1) // alignment_elements) * alignment_elements
-                param_offsets.append((total_padded_numel, actual_numel, padded_numel))
+                param_offsets.append((p, total_padded_numel, actual_numel, padded_numel))
                 total_padded_numel += padded_numel
 
-            coord_param_offsets[coord] = param_offsets
             pack_buffer = torch.empty(total_padded_numel, dtype=torch.bfloat16, device=device)
-
-            if is_compute_rank:
-                for p, (offset, actual_numel, padded_numel) in zip(coord_params, param_offsets):
-                    update = my_updates[p]
-                    pack_buffer[offset:offset + actual_numel].copy_(update.reshape(-1))
+            if coord == local_coords:
+                for p, offset, actual_numel, padded_numel in param_offsets:
+                    pack_buffer[offset:offset + actual_numel].copy_(my_updates[p].reshape(-1))
                     if padded_numel > actual_numel:
                         pack_buffer[offset + actual_numel:offset + padded_numel].zero_()
+            packed[coord] = pack_buffer, [(p, offset, count) for p, offset, count, _ in param_offsets]
+        return packed
 
-            pack_buffers[coord] = pack_buffer
-
-        if total_shard_size > 1:
-            self._batched_relay_broadcast(
-                pack_buffers, shard_pgs, shard_sizes, local_coords
-            )
-
-        layout_spec = hsdp_assign.layout_spec
-        for coord, coord_params in coord_groups.items():
-            pack_buffer = pack_buffers[coord]
-            param_offsets = coord_param_offsets[coord]
-
-            for p, (offset, actual_numel, _) in zip(coord_params, param_offsets):
+    def _apply_shard_updates(
+            self, packed: _PackedShardUpdates, group: Dict[str, Any], hsdp_assign: HSDPGroupAssignment,
+    ) -> None:
+        """Apply the local shard of each update after its broadcast completes."""
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
+        all_local_params: List[torch.Tensor] = []
+        all_update_shards: List[torch.Tensor] = []
+        for pack_buffer, param_offsets in packed.values():
+            for p, offset, actual_numel in param_offsets:
                 full_update = pack_buffer[offset:offset + actual_numel].view(tuple(p.shape))
                 update_to_apply = chunk_update_by_layout(
                     full_update,
                     p,
-                    layout_spec,
+                    hsdp_assign.layout_spec,
                     self._param_shard_metadata.get(p),
                 )
 
@@ -1231,12 +1443,14 @@ class Muon(BaseDistributedOptimizer):
 
         return shard_sizes, local_coords, shard_pgs, total_shard_size
 
-    @staticmethod
+    @classmethod
     def _batched_relay_broadcast(
-            tensor_dict: Dict[Tuple[int, ...], torch.Tensor],
+            cls,
+            packed: _PackedShardUpdates,
             shard_pgs: Tuple[dist.ProcessGroup, ...],
             shard_sizes: Tuple[int, ...],
             local_coords: Tuple[int, ...],
+            overlap_work: Optional[Callable[[], None]] = None,
     ) -> None:
         """
         Batched asynchronous multi-dimensional relay broadcast.
@@ -1247,22 +1461,28 @@ class Muon(BaseDistributedOptimizer):
             if pg is None or shard_sizes[dim_idx] <= 1:
                 continue
 
-            work_handles = []
+            works = cls._launch_shard_axis_broadcasts(packed, pg, dim_idx, local_coords[dim_idx + 1:])
+            try:
+                if works and overlap_work is not None:
+                    overlap_work()
+            finally:
+                for work in works:
+                    work.wait()
 
-            for coord, tensor in tensor_dict.items():
-                aligned = all(
-                    local_coords[sub_dim] == coord[sub_dim]
-                    for sub_dim in range(dim_idx + 1, len(shard_pgs))
-                )
-                if not aligned:
-                    continue
-
-                src_rank_in_pg = coord[dim_idx]
-                global_src_rank = dist.get_global_rank(pg, src_rank_in_pg)
-
-                work = dist.broadcast(tensor, src=global_src_rank, group=pg, async_op=True)
-                if work is not None:
-                    work_handles.append(work)
-
-            for work in work_handles:
-                work.wait()
+    @staticmethod
+    def _launch_shard_axis_broadcasts(
+            packed: _PackedShardUpdates,
+            pg: dist.ProcessGroup,
+            dim_idx: int,
+            downstream_coords: Tuple[int, ...],
+    ) -> List[dist.Work]:
+        """Submit the buffers whose source is present on this relay axis."""
+        works = []
+        for coord, (tensor, _) in packed.items():
+            if coord[dim_idx + 1:] != downstream_coords:
+                continue
+            src = dist.get_global_rank(pg, coord[dim_idx])
+            work = dist.broadcast(tensor, src=src, group=pg, async_op=True)
+            if work is not None:
+                works.append(work)
+        return works

@@ -25,6 +25,7 @@ __all__ = [
 import math
 import logging
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -207,13 +208,17 @@ def build_pad_ns_inputs(
         comm_params: List[torch.Tensor],
         param_to_ns_input: Dict[torch.Tensor, torch.Tensor],
         param_shard_metadata: Optional[Dict[torch.Tensor, ParamShardMeta]] = None,
+        *,
+        fallback_dtype: Optional[torch.dtype] = None,
 ) -> List[torch.Tensor]:
     """Build aligned local NS inputs for all communication params."""
     if not comm_params:
         return []
 
     ref_tensor = next(iter(param_to_ns_input.values()), None)
-    default_dtype = ref_tensor.dtype if ref_tensor is not None else to_local_if_dtensor(comm_params[0].data).dtype
+    default_dtype = ref_tensor.dtype if ref_tensor is not None else fallback_dtype
+    if default_dtype is None:
+        default_dtype = to_local_if_dtensor(comm_params[0].data).dtype
     local_inputs: List[torch.Tensor] = []
 
     for param in comm_params:
@@ -379,6 +384,7 @@ def _pack_and_allgather(
         shard_pg: dist.ProcessGroup,
         shard_size: int,
         buffer_cache: Optional[Dict],
+        while_gathering: Optional[Callable[[], None]],
 ) -> torch.Tensor:
     """Pack local shards into one buffer, all-gather, return gathered view."""
     pack_buffer = _get_or_alloc_buffer(
@@ -397,7 +403,14 @@ def _pack_and_allgather(
         dtype, device,
     )[:total_padded_numel * shard_size]
 
-    dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
+    if while_gathering is None:
+        dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
+    else:
+        work = dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg, async_op=True)
+        try:
+            while_gathering()
+        finally:
+            work.wait()
     return gathered_buffer.view(shard_size, total_padded_numel)
 
 
@@ -453,6 +466,8 @@ def fused_allgather_dtensor_params(
         param_shard_metadata: Optional[List[Optional[ParamShardMeta]]] = None,
         buffer_cache: Optional[Dict] = None,
         keep_indices: Optional[set] = None,
+        *,
+        while_gathering: Optional[Callable[[], None]] = None,
 ) -> List[Optional[torch.Tensor]]:
     """Fuse many parameter shards into one all-gather per shard axis."""
     if not shard_pgs or not local_tensors:
@@ -496,7 +511,7 @@ def fused_allgather_dtensor_params(
 
         gathered_view = _pack_and_allgather(
             gather_inputs, param_meta, total_padded_numel,
-            axis_idx, dtype, device, shard_pg, shard_size, buffer_cache,
+            axis_idx, dtype, device, shard_pg, shard_size, buffer_cache, while_gathering,
         )
 
         new_tensors = _unpack_gathered_results(
