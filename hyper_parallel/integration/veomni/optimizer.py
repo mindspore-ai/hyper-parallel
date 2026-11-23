@@ -232,7 +232,9 @@ def build_optimizer_binding(native_module: Any, *, hyper_muon: bool) -> tuple:
                 return original_optimizer(*args, **kwargs)
             if arguments["optimizer_type"] != "adamw":
                 raise NotImplementedError(
-                    "The adapter currently supports AdamW and Hyper Muon."
+                    f"Hyper FSDP does not support optimizer.type={arguments['optimizer_type']!r}. "
+                    "Supported values: 'adamw', 'muon' (VeOmni), "
+                    "'hyper_muon' (HyperParallel)."
                 )
             config = arguments.get("optimizer_config")
             if getattr(config, "state_offload", "none") == "cpu":
