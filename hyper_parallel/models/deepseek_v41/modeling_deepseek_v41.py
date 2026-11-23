@@ -44,7 +44,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.modules.shared_expert_family import SharedExpertModule
-from hyper_parallel.components.modules.rms_norm_family import RMSNormModule
+from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
 from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation
 from hyper_parallel.components.modules.router_family import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps

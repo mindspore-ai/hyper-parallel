@@ -132,7 +132,7 @@
 +
 +
 +
-+from hyper_parallel.components.modules.rms_norm_family import RMSNorm
++from hyper_parallel.components.modules.common.rms_norm import RMSNorm
 +
 +
 +
