@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public CSA2 factory and its complete local/CP implementation allowlist."""
+"""Public CSA2 factory and its complete local, CP, and low-precision allowlist."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import partial
 from typing import Any
 
 from torch import nn
 
+from hyper_parallel.components.modules.family import resolve_module_family_target
+from hyper_parallel.components.modules.linear import Linear
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, SelectorSpec, VariantRule, build_family, register_module_family,
 )
@@ -34,6 +37,12 @@ from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.replacement import module_replacement
 from .compressed_sparse_attention2 import CompressedSparseAttention2Module
 from .cp_compressed_sparse_attention2 import CPCompressedSparseAttention2, _TPCompressedSparseAttention2
+from .low_precision_compressed_sparse_attention2 import (
+    DEFAULT_LINEAR_ALLOWLIST,
+    LowPrecisionCompressedSparseAttention2Module,
+    active_low_precision_config,
+    normalize_linear_allowlist,
+)
 
 
 def _sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
@@ -98,9 +107,42 @@ def _parallel_spec(*, module: nn.Module, member: Any) -> ParallelModuleSpec:
     return ParallelModuleSpec("attention.csa2.local", validate=_validate_layout)
 
 
+def _validate_low_precision_options(*, context: Any, member: Any) -> None:
+    """Validate precision selector, allowlisted Linear scheme, and single-card topology."""
+    arguments = member.arguments
+    scheme_name = arguments.get("linear_dtype_scheme")
+    if scheme_name is not None and (not isinstance(scheme_name, str) or not scheme_name):
+        raise ValueError("linear_dtype_scheme must be None or a non-empty scheme name")
+    allowlist = normalize_linear_allowlist(arguments.get("linear_allowlist", DEFAULT_LINEAR_ALLOWLIST))
+    if member.selectors["precision"] == "inherit":
+        if scheme_name is not None or allowlist != DEFAULT_LINEAR_ALLOWLIST:
+            raise ValueError("linear_dtype_scheme and custom linear_allowlist require precision='low_precision'")
+        return
+    if any(member.axis_sizes.get(axis, 1) > 1 for axis in ("tp", "cp", "pp")):
+        raise NotImplementedError("CSA2 low-precision variants currently require TP=CP=PP=1")
+    direct_config = active_low_precision_config(context)
+    if direct_config is None:
+        raise ValueError("CSA2 precision='low_precision' requires an enabled LowPrecisionConfig")
+    if not direct_config.active_direct_formats() and scheme_name is None:
+        raise ValueError(
+            "CSA2 precision='low_precision' requires at least one CSA2 format "
+            "(indexer_qk, main_kv, swa_kv) or linear_dtype_scheme"
+        )
+    if scheme_name is not None:
+        scheme = direct_config.resolve_dtype_scheme(scheme_name)
+        resolve_module_family_target(
+            Linear,
+            {
+                "weight_format": scheme.weight_format,
+                "act_format": scheme.act_format,
+                "is_fake_quantize": scheme.is_fake_quantize,
+                "fused": False,
+            },
+        )
+
+
 def _validate(*, config: Any, module: nn.Module | None, context: Any, member: Any) -> None:
-    """Validate the source contract and supported fusion, balance and communication options."""
-    del context
+    """Validate the source contract and supported fusion, balance, communication and precision options."""
     if module is not None and not isinstance(module, CompressedSparseAttention2Module):
         raise TypeError("CSA2 source conversion requires the shared V4.1 attention parameter contract")
     if module is None:
@@ -115,35 +157,83 @@ def _validate(*, config: Any, module: nn.Module | None, context: Any, member: An
         raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
     if member.axis_sizes["tp"] > 1 and (member.selectors["use_fused_ops"] or mode != "none"):
         raise NotImplementedError("CSA2 fusion and Indexer load balancing currently require TP=1")
+    _validate_low_precision_options(context=context, member=member)
 
 
 def _build_local(*, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
                  module_fqn: str = "", context: Any = None, use_fused_ops: bool = False,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
                  indexer_balance_block_size: int | None = None,
-                 indexer_zigzag_min_length: int | None = None) -> nn.Module:
-    """Retain CP options in family provenance without adding them to local math."""
+                 indexer_zigzag_min_length: int | None = None,
+                 linear_dtype_scheme: str | None = None,
+                 linear_allowlist: Sequence[str] = DEFAULT_LINEAR_ALLOWLIST) -> nn.Module:
+    """Retain CP and low-precision options in family provenance without adding them to baseline math."""
     del module_fqn, indexer_load_balance, main_kv_comm, indexer_balance_block_size, indexer_zigzag_min_length
+    del linear_dtype_scheme, linear_allowlist
     implementation = (_TPCompressedSparseAttention2 if context is not None and context.get("tp_size", 1) > 1
                       else CompressedSparseAttention2Module)
     return implementation(module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops)
 
 
+def _build_cp(*, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
+              use_fused_ops: bool = False, indexer_load_balance: str = "none",
+              main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
+              indexer_zigzag_min_length: int | None = None,
+              linear_dtype_scheme: str | None = None,
+              linear_allowlist: Sequence[str] = DEFAULT_LINEAR_ALLOWLIST) -> nn.Module:
+    """Construct the CP CSA2 member while accepting shared family arguments."""
+    del linear_dtype_scheme, linear_allowlist
+    return CPCompressedSparseAttention2(
+        module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops,
+        indexer_load_balance=indexer_load_balance, main_kv_comm=main_kv_comm,
+        indexer_balance_block_size=indexer_balance_block_size,
+        indexer_zigzag_min_length=indexer_zigzag_min_length,
+    )
+
+
+def _build_low_precision_local(
+    *, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
+    module_fqn: str = "", context: Any = None, use_fused_ops: bool = False,
+    indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
+    indexer_balance_block_size: int | None = None,
+    indexer_zigzag_min_length: int | None = None,
+    linear_dtype_scheme: str | None = None,
+    linear_allowlist: Sequence[str] = DEFAULT_LINEAR_ALLOWLIST,
+) -> nn.Module:
+    """Construct the dedicated single-card low-precision CSA2 member."""
+    del indexer_load_balance, main_kv_comm, indexer_balance_block_size, indexer_zigzag_min_length
+    return LowPrecisionCompressedSparseAttention2Module(
+        module,
+        config=config,
+        layer_idx=layer_idx,
+        module_fqn=module_fqn,
+        context=context,
+        use_fused_ops=use_fused_ops,
+        linear_dtype_scheme=linear_dtype_scheme,
+        linear_allowlist=linear_allowlist,
+    )
+
+
 _reference = partial(_build_local, use_fused_ops=False)
 _fused = partial(_build_local, use_fused_ops=True)
-_cp_reference = partial(CPCompressedSparseAttention2, use_fused_ops=False)
-_cp_fused = partial(CPCompressedSparseAttention2, use_fused_ops=True)
+_cp_reference = partial(_build_cp, use_fused_ops=False)
+_cp_fused = partial(_build_cp, use_fused_ops=True)
+_low_precision_reference = partial(_build_low_precision_local, use_fused_ops=False)
+_low_precision_fused = partial(_build_low_precision_local, use_fused_ops=True)
 
 
 @module_replacement
 def CompressedSparseAttention2(  # pylint: disable=invalid-name
         *, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
         module_fqn: str = "", context: Any = None, mesh: Any = None,
-        use_fused_ops: bool = False, indexer_load_balance: str = "none",
-        main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
+        use_fused_ops: bool = False, precision: str = "inherit",
+        indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
+        indexer_balance_block_size: int | None = None,
         indexer_zigzag_min_length: int | None = None,
+        linear_dtype_scheme: str | None = None,
+        linear_allowlist: Sequence[str] = DEFAULT_LINEAR_ALLOWLIST,
 ) -> nn.Module:
-    """Build complete CSA2, choosing CP automatically from the job's existing mesh.
+    """Build complete CSA2, selecting local, CP, or low-precision members via the Family allowlist.
 
     Args:
         config: V4.1 architecture config for direct parameter construction.
@@ -153,30 +243,54 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
         context: Job topology and construction facts.
         mesh: Optional prebuilt mesh for direct construction and layout binding.
         use_fused_ops: Select all three native entries; unsupported calls raise explicitly.
+        precision: 'inherit' (baseline floating math) or 'low_precision' (CSA2 cache/Linear QAT).
         indexer_load_balance: none, zigzag, greedy or hybrid; only selection tasks move.
         main_kv_comm: all_gather or document-prefix all_to_all_v.
         indexer_balance_block_size: Greedy/hybrid task size, defaulting to 2048.
         indexer_zigzag_min_length: Hybrid-only long-document threshold in raw tokens.
+        linear_dtype_scheme: Optional catalog name for allowlisted internal Dense Linear replacement.
+        linear_allowlist: Allowlisted relative child Linear paths replaced when linear_dtype_scheme is set.
     """
     return build_family(
         CompressedSparseAttention2, config=config, module=module, layer_idx=layer_idx,
         module_fqn=module_fqn, context=context, mesh=mesh, use_fused_ops=use_fused_ops,
-        indexer_load_balance=indexer_load_balance, main_kv_comm=main_kv_comm,
+        precision=precision, indexer_load_balance=indexer_load_balance, main_kv_comm=main_kv_comm,
         indexer_balance_block_size=indexer_balance_block_size,
         indexer_zigzag_min_length=indexer_zigzag_min_length,
+        linear_dtype_scheme=linear_dtype_scheme,
+        linear_allowlist=linear_allowlist,
     )
 
+
+CompressedSparseAttention2.low_precision_formats = frozenset({"indexer_qk", "main_kv", "swa_kv"})
 
 _PATH = __name__
 register_module_family(ModuleFamily(
     name="compressed_sparse_attention2", baseline=CompressedSparseAttention2,
-    variants={"reference": f"{_PATH}._reference", "fused": f"{_PATH}._fused",
-              "cp_reference": f"{_PATH}._cp_reference", "cp_fused": f"{_PATH}._cp_fused"},
-    selector_specs={"use_fused_ops": SelectorSpec(bool, False)},
+    variants={
+        "reference": f"{_PATH}._reference",
+        "fused": f"{_PATH}._fused",
+        "cp_reference": f"{_PATH}._cp_reference",
+        "cp_fused": f"{_PATH}._cp_fused",
+        "low_precision_reference": f"{_PATH}._low_precision_reference",
+        "low_precision_fused": f"{_PATH}._low_precision_fused",
+    },
+    selector_specs={
+        "use_fused_ops": SelectorSpec(bool, False),
+        "precision": SelectorSpec(str, "inherit"),
+    },
     variant_rules=(
-        VariantRule({"use_fused_ops": True, "parallel": False}, "fused"),
-        VariantRule({"use_fused_ops": False, "parallel": True}, "cp_reference"),
-        VariantRule({"use_fused_ops": True, "parallel": True}, "cp_fused"),
+        VariantRule({"use_fused_ops": True, "precision": "inherit", "parallel": False}, "fused"),
+        VariantRule({"use_fused_ops": False, "precision": "inherit", "parallel": True}, "cp_reference"),
+        VariantRule({"use_fused_ops": True, "precision": "inherit", "parallel": True}, "cp_fused"),
+        VariantRule(
+            {"use_fused_ops": False, "precision": "low_precision", "parallel": False},
+            "low_precision_reference",
+        ),
+        VariantRule(
+            {"use_fused_ops": True, "precision": "low_precision", "parallel": False},
+            "low_precision_fused",
+        ),
     ),
     default_variant="reference", parallel_axis="cp", sharding=_sharding, validate=_validate,
     parallel_spec=_parallel_spec,

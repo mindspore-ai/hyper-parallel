@@ -52,6 +52,9 @@ if TYPE_CHECKING:
 
 _EXPORT_TO_MODULE = {
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
+    "LowPrecisionCompressedSparseAttention2Module": (
+        "attention.compressed_sparse_attention2.low_precision_compressed_sparse_attention2"
+    ),
     "Gate": "moe.router",
     "GateModule": "moe.router",
     "MegaMhc": "mhc.mhc_family",

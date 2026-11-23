@@ -15,9 +15,19 @@
 """Public shared compressed sparse attention family (CSA2)."""
 
 from .compressed_sparse_attention2_family import CompressedSparseAttention2
-from .compressed_sparse_attention2 import CompressedSparseAttention2Module
+from .compressed_sparse_attention2 import CompressedSparseAttention2Module, SharedCompressedAttentionState
 from .document_layout import GraphPackedSequence, SharedCompressedPackedSequence
-from .compressed_sparse_attention2 import SharedCompressedAttentionState
+from .low_precision_compressed_sparse_attention2 import (
+    DEFAULT_LINEAR_ALLOWLIST,
+    LowPrecisionCompressedSparseAttention2Module,
+)
 
-__all__ = ["CompressedSparseAttention2", "CompressedSparseAttention2Module",
-           "SharedCompressedAttentionState", "SharedCompressedPackedSequence", "GraphPackedSequence"]
+__all__ = [
+    "CompressedSparseAttention2",
+    "CompressedSparseAttention2Module",
+    "LowPrecisionCompressedSparseAttention2Module",
+    "DEFAULT_LINEAR_ALLOWLIST",
+    "SharedCompressedAttentionState",
+    "SharedCompressedPackedSequence",
+    "GraphPackedSequence",
+]

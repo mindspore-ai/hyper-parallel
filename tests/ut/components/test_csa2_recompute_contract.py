@@ -28,16 +28,22 @@ The tests exercise the shared-state and context-parallel contracts on CPU:
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import torch
 from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
-from hyper_parallel.components.modules import CompressedSparseAttention2
+from hyper_parallel.components.modules import CompressedSparseAttention2, LowPrecisionCompressedSparseAttention2Module
 from hyper_parallel.components.modules.module_family import get_family_build_info
+from hyper_parallel.components.quantization.config import LowPrecisionConfig
+from hyper_parallel.components.quantization.functional.indexer_qk import MXFP4FakeQuantPolicy
+from hyper_parallel.components.quantization.functional.main_kv_cache_qat import MainKVCacheQATStrategy
+from hyper_parallel.components.quantization.functional.swa_kv_qat import SWAKVQATStrategy
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention
@@ -350,10 +356,98 @@ def test_checkpointed_kv_source_matches_plain_and_writes_state_once():
         _assert_recompute_matches_plain(_kv_source_layer, use_cp=use_cp)
 
 
+def test_checkpointed_packed_kv_source_matches_plain_without_cp():
+    """Single-card packed Main/SWA reads retain gradients during recompute."""
+    config = LowPrecisionConfig(enabled=True, dtype_schemes={
+        "main_kv": {"act_format": "fp4_e2m1", "scale_format": "e4m3"},
+        "swa_kv": {"act_format": "fp8_e4m3"},
+    })
+
+    def _builder(use_cp, state):
+        """Bind both physical cache policies to the dedicated low-precision CSA2 member."""
+        source_layer, inputs, gather = _kv_source_layer(use_cp, state)
+        layer = LowPrecisionCompressedSparseAttention2Module(
+            source_layer, replace_indexer=False, use_fused_ops=False,
+        )
+        layer.set_kv_qat_strategy(MainKVCacheQATStrategy(config.main_kv))
+        layer.set_swa_kv_qat_strategy(SWAKVQATStrategy(config.swa_kv))
+        return layer, inputs, gather
+
+    def _pack(value, *_args):
+        """Encode a deterministic CPU byte stand-in for checkpoint ownership."""
+        return (value.detach() + 8).round().clamp(0, 255).to(torch.uint8)
+
+    def _unpack(packed, width, dtype, *_args):
+        """Restore the stand-in value at its original logical width."""
+        if packed.shape[-1] != width:
+            raise ValueError("stand-in cache width changed")
+        return packed.to(dtype) - 8
+
+    def _unpack_swa(packed, width, *_args):
+        """SWA's production decoder returns the local bank in its floating dtype."""
+        return _unpack(packed, width, torch.float32)
+
+    cache_module = "hyper_parallel.components.quantization.tensor.csa2_cache_tensor"
+    with ExitStack() as stack:
+        for name, implementation in (
+            ("pack_main_kv", _pack), ("unpack_main_kv", _unpack),
+            ("pack_swa_kv", _pack), ("unpack_swa_kv", _unpack_swa),
+        ):
+            stack.enter_context(mock.patch(f"{cache_module}.{name}", side_effect=implementation))
+        _assert_recompute_matches_plain(_builder, use_cp=False)
+
+
 def test_checkpointed_index_source_matches_plain_and_writes_state_once():
     """A protected Reindex source matches eager execution and publishes once."""
     for use_cp in (False, True):
         _assert_recompute_matches_plain(_index_source_layer, use_cp=use_cp)
+
+
+def test_attention_replacement_binds_independent_kv_formats():
+    """Only configured KV/Indexer strategies are installed on the low-precision CSA2 member."""
+    config = LowPrecisionConfig(
+        enabled=True,
+        dtype_schemes={"main_kv": {"act_format": "fp4_e2m1", "scale_format": "e4m3"}},
+    )
+    layer = CompressedSparseAttention2(
+        module=CompressedSparseAttention2Module(_Source()),
+        context={"low_precision": config},
+        precision="low_precision",
+    )
+    assert isinstance(layer, LowPrecisionCompressedSparseAttention2Module)
+    assert layer._kv_qat_strategy.format_config is config.main_kv  # pylint: disable=protected-access
+    assert layer._swa_kv_qat_strategy is None  # pylint: disable=protected-access
+
+    swa_only = LowPrecisionConfig(enabled=True, dtype_schemes={"swa_kv": {"act_format": "fp8_e4m3"}})
+    layer = CompressedSparseAttention2(
+        module=CompressedSparseAttention2Module(_Source()),
+        context={"low_precision": swa_only},
+        precision="low_precision",
+    )
+    assert isinstance(layer, LowPrecisionCompressedSparseAttention2Module)
+    assert layer._kv_qat_strategy is None  # pylint: disable=protected-access
+    assert layer._swa_kv_qat_strategy.format_config is swa_only.swa_kv  # pylint: disable=protected-access
+
+    qk_only = LowPrecisionConfig(enabled=True, dtype_schemes={"indexer_qk": {"act_format": "mxfp4"}})
+    source = _IndexSource()
+    source.indexer = _IndexerSource()
+    layer = CompressedSparseAttention2(
+        module=CompressedSparseAttention2Module(source),
+        context={"low_precision": qk_only},
+        precision="low_precision",
+    )
+    assert isinstance(layer, LowPrecisionCompressedSparseAttention2Module)
+    assert isinstance(layer.indexer._qk_policy, MXFP4FakeQuantPolicy)  # pylint: disable=protected-access
+    assert layer._kv_qat_strategy is None  # pylint: disable=protected-access
+    assert layer._swa_kv_qat_strategy is None  # pylint: disable=protected-access
+
+    inherit_layer = CompressedSparseAttention2(
+        module=CompressedSparseAttention2Module(source),
+        context={"low_precision": qk_only},
+        precision="inherit",
+    )
+    assert type(inherit_layer) is CompressedSparseAttention2Module  # pylint: disable=unidiomatic-typecheck
+    assert inherit_layer.indexer._qk_policy is None  # pylint: disable=protected-access
 
 
 class _RecordingIndexer(nn.Module):

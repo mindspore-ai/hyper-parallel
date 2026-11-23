@@ -82,6 +82,7 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
 
         def _backward(query, grad, *_args, **kwargs):
             del query
+            self.assertIsNotNone(kwargs["metadata"])
             return (grad, torch.zeros_like(kwargs["ori_kv"]), torch.zeros_like(kwargs["cmp_kv"]),
                     torch.zeros_like(kwargs["sinks"]), None, None)
 
@@ -158,6 +159,45 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
                         query, raw, main, indices, torch.zeros(8), 512**-.5, 2, 128, 128, document_segments,
                     )
         self.assertEqual(widths, [4, 4, 64, 64, 512, 512])
+
+    def test_swa_only_attention_disables_compressed_mask(self):
+        """BSND and packed TND must pass the native no-Main-KV mask contract."""
+        metadata_modes = []
+        forward_modes = []
+        backward_modes = []
+
+        def _metadata(*_args, **kwargs):
+            metadata_modes.append(kwargs["cmp_mask_mode"])
+            return torch.zeros(1, dtype=torch.int32)
+
+        def _forward(query, **kwargs):
+            forward_modes.append(kwargs["cmp_mask_mode"])
+            self.assertIsNone(kwargs["cmp_kv"])
+            return query.clone(), torch.zeros(query.shape[:-1])
+
+        def _backward(query, grad, *_args, **kwargs):
+            del query
+            backward_modes.append(kwargs["cmp_mask_mode"])
+            self.assertIsNone(kwargs["cmp_kv"])
+            self.assertIsNotNone(kwargs["metadata"])
+            return grad, torch.zeros_like(kwargs["ori_kv"]), None, torch.zeros_like(kwargs["sinks"]), None, None
+
+        for cached in (_attention_metadata, attention_ops._tnd_attention_metadata):
+            cached.cache_clear()
+            self.addCleanup(cached.cache_clear)
+        query = torch.ones(1, 8, 4, 512, dtype=torch.bfloat16, requires_grad=True)
+        raw = torch.ones(1, 1, 4, 512, dtype=torch.bfloat16)
+        sinks = torch.zeros(8)
+        segments = (((0, 4, 0, 0, 0),), ((0, 2, 0, 0, 0), (2, 4, 0, 0, 0)))
+        with patch.object(attention_ops, "_load_attention_ops", return_value=(_forward, _backward, _metadata)):
+            for document_segments in segments:
+                output = attention_ops.sparse_flash_mla(
+                    query, raw, None, None, sinks, 512**-.5, 0, 128, 0, document_segments,
+                )
+                output.sum().backward()
+        self.assertEqual(metadata_modes, [0, 0])
+        self.assertEqual(forward_modes, [0, 0])
+        self.assertEqual(backward_modes, [0, 0])
 
     def test_underflow_recovery_ignores_invalid_slots_and_empty_rows(self):
         """Only valid zero probabilities need stable recomputation."""

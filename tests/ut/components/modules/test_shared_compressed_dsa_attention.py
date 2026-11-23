@@ -24,7 +24,8 @@ from hyper_parallel.core.dtensor.placement_types import Shard
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
-from hyper_parallel.components.modules import CompressedSparseAttention2
+from hyper_parallel.components.modules import CompressedSparseAttention2, LowPrecisionCompressedSparseAttention2Module
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import DEFAULT_LINEAR_ALLOWLIST
 from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
 from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding, validate_parallel_module
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer as attention
@@ -43,7 +44,15 @@ from hyper_parallel.components.modules.attention.compressed_sparse_attention2.co
 )
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
+from hyper_parallel.components.quantization.config import LowPrecisionConfig, LowPrecisionDtypeScheme
+from hyper_parallel.components.quantization.functional.hifloat8_linear_func import HiFloat8LinearStrategy
+from hyper_parallel.components.quantization.functional.indexer_qk import MXFP4FakeQuantPolicy
+from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
+from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.quantization.tensor import csa2_cache_tensor as cache_ops
+from hyper_parallel.components.quantization.tensor.csa2_cache_tensor import CSA2CacheTensor, pack_csa2_cache
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
+from tests.ut.components.quantization.csa2_cpu_reference import install_cache_standins
 
 
 def _source(index_source=False):
@@ -500,3 +509,342 @@ class TestCSA2Family(unittest.TestCase):
         cp = CompressedSparseAttention2(module=source, context={"cp_size": 2})
         with self.assertRaisesRegex(RuntimeError, "must be bound"):
             cp.query_partition(2, torch.arange(2).unsqueeze(0))
+
+
+def _full_linear_source() -> attention_impl.CompressedSparseAttention2Module:
+    """Build a Full-layer CSA2 source module with all projection subtrees."""
+    module = nn.Module()
+    values = {
+        "config": SimpleNamespace(o_groups=2, qk_rope_head_dim=0),
+        "layer_idx": 0, "num_heads": 2, "num_key_value_groups": 1, "compress_ratio": 2,
+        "is_kv_source": True, "is_index_source": True, "kv_source_layer_idx": 0,
+        "index_source_layer_idx": 0, "candidate_source_layer_idx": None, "head_dim": 64,
+        "sliding_window": 4, "scaling": 64**-.5,
+    }
+    for name, value in values.items():
+        setattr(module, name, value)
+    module.q_a_proj = nn.Linear(64, 64, bias=False)
+    module.q_a_norm = nn.LayerNorm(64, bias=False)
+    module.q_b_proj = nn.Linear(64, 128, bias=False)
+    module.kv_proj = nn.Linear(64, 64, bias=False)
+    module.kv_norm = nn.LayerNorm(64, bias=False)
+    module.o_a_proj = nn.Linear(16, 64, bias=False)
+    module.o_b_proj = nn.Linear(64, 64, bias=False)
+    module.sinks = nn.Parameter(torch.zeros(2))
+    compressor = nn.Module()
+    compressor.wkv = nn.Linear(64, 64, bias=False)
+    compressor.wgate = nn.Linear(64, 64, bias=False)
+    compressor.norm = nn.LayerNorm(64, bias=False)
+    module.compressor = compressor
+    indexer = nn.Module()
+    indexer.q_b_proj = nn.Linear(64, 128, bias=False)
+    indexer.wk = nn.Linear(64, 64, bias=False)
+    indexer.k_norm = nn.LayerNorm(64, bias=False)
+    indexer.weights_proj = nn.Linear(64, 4, bias=False)
+    idx_values = {
+        "compress_ratio": 2, "num_heads": 2, "head_dim": 64, "index_topk": 4, "owns_key": True,
+        "is_candidate_source": False, "uses_candidates": False, "candidate_topk_blocks": 1,
+        "candidate_block_size": 1, "loss_coeff": .001,
+    }
+    for name, value in idx_values.items():
+        setattr(indexer, name, value)
+    module.indexer = indexer
+    return attention_impl.CompressedSparseAttention2Module(module=module)
+
+
+class TestPackedCacheAttentionRouting(unittest.TestCase):
+    """Packed KV changes the bank values while retaining each attention implementation."""
+
+    def setUp(self) -> None:
+        """Install CPU codecs only for routing and STE tests."""
+        install_cache_standins(self)
+        source = _source()
+        source.num_heads = 2
+        source.head_dim = 32
+        source.sinks = nn.Parameter(torch.tensor([-.2, .3], dtype=torch.bfloat16))
+        source.sliding_window = 3
+        source.scaling = .2
+        self.source = source
+
+    def test_shared_state_read_keeps_main_kv_packed_until_consumer(self):
+        """Reuse the existing read API without eagerly decoding the Main cache."""
+        state = attention_impl.SharedCompressedAttentionState()
+        main = torch.randn(1, 3, 32, dtype=torch.bfloat16)
+        packed = pack_csa2_cache(main, "main_kv")
+        state.publish_compressed_kv(0, packed)
+        with patch.object(CSA2CacheTensor, "dequantize", side_effect=AssertionError("eager decode")):
+            self.assertIs(state.require_compressed_kv(0, 1), packed)
+
+        state.publish_compressed_kv(2, main)
+        self.assertIs(state.require_compressed_kv(2, 3), main)
+
+    def test_unfused_uses_reference_for_packed_multibatch_and_preserves_gradients(self):
+        """Both KV producers and the sink receive the original reference gradient."""
+        torch.manual_seed(37)
+        module = CompressedSparseAttention2(module=self.source, use_fused_ops=False)
+        query = torch.randn(2, 2, 3, 32, dtype=torch.bfloat16, requires_grad=True)
+        raw = torch.randn(2, 1, 5, 32, dtype=torch.bfloat16, requires_grad=True)
+        main = torch.randn(2, 3, 32, dtype=torch.bfloat16, requires_grad=True)
+        raw_cache = pack_csa2_cache(raw, "swa_kv")
+        main_cache = pack_csa2_cache(main, "main_kv")
+        topk = torch.tensor([[[0, 1], [1, 2], [2, -1]], [[0, -1], [1, 1], [2, 0]]])
+        with patch.object(attention_impl, "reference_sparse_attention", wraps=reference_sparse_attention) as reference:
+            output = module._run_sparse_attention(  # pylint: disable=protected-access
+                query, raw_cache, main_cache, topk, 2, 5, None, ((0, 3, 0, 3, 0),),
+            )
+        reference.assert_called_once()
+        self.assertIs(type(reference.call_args.args[1]), torch.Tensor)
+        gradients = torch.autograd.grad(output.float().square().sum(), (query, raw, main, module.sinks))
+
+        query_ref = query.detach().requires_grad_()
+        raw_ref = raw_cache.dequantize().detach().requires_grad_()
+        main_ref = main_cache.dequantize().detach().requires_grad_()
+        sinks_ref = module.sinks.detach().requires_grad_()
+        bank, indices = module._build_sparse_indices(  # pylint: disable=protected-access
+            raw_ref, main_ref, topk, 3, 2, 5, None,
+        )
+        expected = reference_sparse_attention(query_ref, bank, indices, sinks_ref, .2)
+        expected_gradients = torch.autograd.grad(
+            expected.float().square().sum(), (query_ref, raw_ref, main_ref, sinks_ref),
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        for observed, target in zip(gradients, expected_gradients):
+            torch.testing.assert_close(observed, target, rtol=0, atol=0)
+
+    def test_fused_decodes_packed_banks_before_original_smla_and_keeps_ste(self):
+        """The fused call receives BF16 banks and its gradient reaches both producers."""
+        self.source.compress_ratio = 2
+        module = CompressedSparseAttention2(module=self.source, use_fused_ops=True)
+        query = torch.ones(1, 2, 2, 32, dtype=torch.bfloat16, requires_grad=True)
+        raw = torch.ones(1, 1, 3, 32, dtype=torch.bfloat16, requires_grad=True)
+        main = torch.ones(1, 2, 32, dtype=torch.bfloat16, requires_grad=True)
+        topk = torch.zeros(1, 2, 2, dtype=torch.int32)
+
+        def fused_stub(q, raw_bank, main_bank, indices, sinks, *args):
+            """Use a differentiable stand-in for SMLA's Q/KV/sink outputs."""
+            del indices, args
+            return (q.transpose(1, 2) + raw_bank.mean(dim=2).unsqueeze(1)
+                    + main_bank.mean(dim=1).view(1, 1, 1, 32) + sinks.view(1, 1, 2, 1))
+
+        with patch.object(attention_impl, "supports_fused_attention_inputs", return_value=True):
+            with patch.object(attention_impl, "sparse_flash_mla", side_effect=fused_stub) as fused:
+                output = module._run_sparse_attention(  # pylint: disable=protected-access
+                    query, pack_csa2_cache(raw, "swa_kv"), pack_csa2_cache(main, "main_kv"),
+                    topk, 0, 4, None, ((0, 2, 0, 2, 0),),
+                )
+        fused.assert_called_once()
+        self.assertIs(type(fused.call_args.args[1]), torch.Tensor)
+        self.assertIs(type(fused.call_args.args[2]), torch.Tensor)
+        output.sum().backward()
+        for value in (query, raw, main, module.sinks):
+            self.assertIsNotNone(value.grad)
+            self.assertTrue(torch.count_nonzero(value.grad))
+
+
+class TestPackedCacheIndexerKL(unittest.TestCase):
+    """KL reads the Main teacher at the granularity required by its implementation."""
+
+    def setUp(self) -> None:
+        """Use CPU codecs while exercising the real KL and cache boundaries."""
+        install_cache_standins(self)
+
+    def test_reference_kl_decodes_only_selected_main_rows_and_matches_dense_gradients(self):
+        """Sparse teacher reads preserve loss and student gradients across batches and empty rows."""
+        torch.manual_seed(41)
+        query = torch.randn(2, 3, 2, 16, requires_grad=True)
+        key = torch.randn(2, 5, 16, requires_grad=True)
+        weights = torch.randn(2, 3, 2, requires_grad=True)
+        dense_inputs = tuple(value.detach().clone().requires_grad_() for value in (query, key, weights))
+        main = torch.randn(2, 5, 16, requires_grad=True)
+        cache = pack_csa2_cache(main, "main_kv")
+        dense_main = cache.dequantize().detach()
+        teacher_query = torch.randn(2, 2, 3, 16, requires_grad=True)
+        sinks = torch.tensor([.1, -.2], requires_grad=True)
+        indices = torch.tensor([[[0, 2, 2], [-1, -1, -1], [4, 1, -1]],
+                                [[3, 0, -1], [1, 4, 2], [-1, -1, -1]]])
+        options = {"attention_scale": .25, "loss_coeff": .7, "query_chunk_size": 2}
+
+        dense_loss = loss_impl.shared_compressed_indexer_kl_loss(
+            *dense_inputs, teacher_query, dense_main, indices, sinks, **options,
+        )
+        with patch.object(CSA2CacheTensor, "dequantize", side_effect=AssertionError("dense KL read")):
+            with patch.object(cache_ops, "unpack_main_kv", wraps=cache_ops.unpack_main_kv) as unpack:
+                packed_loss = loss_impl.shared_compressed_indexer_kl_loss(
+                    query, key, weights, teacher_query, cache, indices, sinks, **options,
+                )
+        self.assertEqual(unpack.call_count, 2)
+        self.assertEqual([call.args[0].shape for call in unpack.call_args_list],
+                         [torch.Size((2, 2, 3, 9)), torch.Size((2, 1, 3, 9))])
+        torch.testing.assert_close(packed_loss, dense_loss, rtol=0, atol=0)
+        packed_gradients = torch.autograd.grad(packed_loss, (query, key, weights))
+        dense_gradients = torch.autograd.grad(dense_loss, dense_inputs)
+        for observed, expected in zip(packed_gradients, dense_gradients):
+            torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+        self.assertIsNone(main.grad)
+        self.assertIsNone(teacher_query.grad)
+        self.assertIsNone(sinks.grad)
+
+    def test_fused_kl_decodes_full_main_once_and_detaches_teacher(self):
+        """The existing fused interface receives a floating, detached Main bank."""
+        query = torch.randn(1, 2, 2, 16, requires_grad=True)
+        key = torch.randn(1, 5, 16, requires_grad=True)
+        weights = torch.randn(1, 2, 2, requires_grad=True)
+        teacher_query = torch.randn(1, 2, 2, 16, requires_grad=True)
+        main = torch.randn(1, 5, 16, requires_grad=True)
+        cache = pack_csa2_cache(main, "main_kv")
+        indices = torch.tensor([[[0, 2], [1, 4]]], dtype=torch.int32)
+        sinks = torch.zeros(2, requires_grad=True)
+        with patch.object(loss_impl, "validate_fused_kl_inputs") as validate:
+            with patch.object(loss_impl, "sparse_lightning_indexer_kl_loss", return_value=query.sum()) as fused:
+                with patch.object(cache_ops, "unpack_main_kv", wraps=cache_ops.unpack_main_kv) as unpack:
+                    result = loss_impl.shared_compressed_indexer_kl_loss(
+                        query, key, weights, teacher_query, cache, indices, sinks,
+                        attention_scale=.25, loss_coeff=.7, query_segments=((0, 2, 0, 5, 0),), use_fused=True,
+                    )
+        validate.assert_called_once()
+        fused.assert_called_once()
+        self.assertIs(result, fused.return_value)
+        self.assertEqual(unpack.call_count, 1)
+        self.assertEqual(unpack.call_args.args[0].shape, torch.Size((1, 5, 9)))
+        self.assertIs(type(fused.call_args.args[4]), torch.Tensor)
+        self.assertEqual(fused.call_args.args[4].shape, main.shape)
+        self.assertFalse(fused.call_args.args[3].requires_grad)
+        self.assertFalse(fused.call_args.args[4].requires_grad)
+        self.assertFalse(fused.call_args.args[6].requires_grad)
+
+
+class TestCSA2FamilyLowPrecision(unittest.TestCase):
+    """Verify LowPrecisionCompressedSparseAttention2Module, Family allowlist, and child Linear allowlist."""
+
+    @staticmethod
+    def _catalog() -> LowPrecisionConfig:
+        """Create a complete catalog with CSA2 formats plus MXFP8 and HiFloat8 Dense schemes."""
+        return LowPrecisionConfig(
+            enabled=True,
+            dtype_schemes={
+                "mxfp8": LowPrecisionDtypeScheme(weight_format="mxfp8", act_format="mxfp8"),
+                "hif8": LowPrecisionDtypeScheme(weight_format="hif8", act_format="hif8"),
+                "swa_kv": {"act_format": "fp8_e4m3"},
+                "main_kv": {"act_format": "fp4_e2m1", "scale_format": "e4m3"},
+                "indexer_qk": {"act_format": "mxfp4"},
+            },
+        )
+
+    @patch("hyper_parallel.components.modules.low_precision_linear.validate_npu_runtime")
+    @patch("hyper_parallel.components.modules.low_precision_linear.validate_hifloat8_runtime")
+    def test_low_precision_member_and_default_linear_allowlist(self, hif8_probe, mxfp8_probe):
+        """precision='low_precision' selects LowPrecisionCompressedSparseAttention2Module and allowlisted Linears."""
+        expected_excluded = ("o_a_proj", "indexer.weights_proj")
+        for fused in (False, True):
+            for scheme_name, strategy_cls in (("mxfp8", MXFP8LinearStrategy), ("hif8", HiFloat8LinearStrategy)):
+                with self.subTest(fused=fused, scheme=scheme_name):
+                    source = _full_linear_source()
+                    original_params = dict(source.named_parameters())
+                    built = CompressedSparseAttention2(
+                        module=source,
+                        module_fqn="model.layers.0.self_attn",
+                        context={"low_precision": self._catalog(), "ep_size": 2},
+                        use_fused_ops=fused,
+                        precision="low_precision",
+                        linear_dtype_scheme=scheme_name,
+                    )
+                    self.assertIs(type(built), LowPrecisionCompressedSparseAttention2Module)
+                    expected_variant = "low_precision_fused" if fused else "low_precision_reference"
+                    self.assertEqual(get_family_build_info(built).resolved.variant, expected_variant)
+                    for path in DEFAULT_LINEAR_ALLOWLIST:
+                        child = built.get_submodule(path)
+                        self.assertIs(type(child), LowPrecisionLinear)
+                        self.assertIs(type(child.strategy), strategy_cls)
+                    for path in expected_excluded:
+                        self.assertIs(type(built.get_submodule(path)), nn.Linear)
+                    for name, param in original_params.items():
+                        self.assertIs(built.get_parameter(name), param)
+                    self.assertIsInstance(built.indexer._qk_policy, MXFP4FakeQuantPolicy)  # pylint: disable=W0212
+                    self.assertIsNotNone(built._kv_qat_strategy)  # pylint: disable=W0212
+                    self.assertIsNotNone(built._swa_kv_qat_strategy)  # pylint: disable=W0212
+                    sharding_ctx = FamilyShardingContext(("tp", "cp"), {"tp": 1, "cp": 1}, {})
+                    layout = family._sharding(  # pylint: disable=W0212
+                        module=built, module_fqn="", member=None, context=sharding_ctx,
+                    )
+                    self.assertEqual(set(layout.params), set(original_params))
+        self.assertGreater(mxfp8_probe.call_count, 0)
+        self.assertGreater(hif8_probe.call_count, 0)
+
+    @patch("hyper_parallel.components.modules.low_precision_linear.validate_npu_runtime")
+    def test_custom_linear_allowlist_subset_and_plan_override(self, _probe):
+        """A subset linear_allowlist quantizes only listed Linears; non-allowlisted targets fail fast."""
+        subset = ["q_a_proj", "q_b_proj", "kv_proj", "o_b_proj", "compressor.wkv"]
+        entry = PlanOverride(
+            match="self_attn",
+            when="low_precision",
+            replace=ReplaceAction(
+                kind="module",
+                implementation=Target(
+                    CompressedSparseAttention2,
+                    target_path="hyper_parallel.components.modules.CompressedSparseAttention2",
+                    precision="low_precision",
+                    linear_dtype_scheme="mxfp8",
+                    linear_allowlist=subset,
+                ),
+            ),
+        )
+        catalog = self._catalog()
+        rules = entries_to_module_replacements([entry], low_precision_enabled=True, low_precision_config=catalog)
+        self.assertEqual(len(rules), 1)
+        built = rules[0].factory(
+            module=_full_linear_source(), module_fqn="self_attn", context={"low_precision": catalog},
+        )
+        self.assertIs(type(built), LowPrecisionCompressedSparseAttention2Module)
+        self.assertIs(type(built.q_a_proj), LowPrecisionLinear)
+        self.assertIs(type(built.compressor.wkv), LowPrecisionLinear)
+        self.assertIs(type(built.compressor.wgate), nn.Linear)
+        self.assertIs(type(built.indexer.q_b_proj), nn.Linear)
+        self.assertIs(type(built.indexer.wk), nn.Linear)
+        self.assertEqual(
+            entries_to_module_replacements([entry], low_precision_enabled=False, low_precision_config=catalog),
+            (),
+        )
+        for forbidden in ("o_a_proj", "indexer.weights_proj", "unknown_proj"):
+            with self.subTest(forbidden=forbidden):
+                with self.assertRaisesRegex(ValueError, "Unsupported CSA2 Linear target"):
+                    CompressedSparseAttention2(
+                        module=_full_linear_source(),
+                        context={"low_precision": catalog},
+                        precision="low_precision",
+                        linear_dtype_scheme="mxfp8",
+                        linear_allowlist=[forbidden],
+                    )
+
+    def test_family_allowlist_and_topology_guards(self):
+        """Enforce Family selector allowlist, CP/TP/PP restrictions, and enabled config contract."""
+        catalog = self._catalog()
+        with self.assertRaisesRegex(ValueError, "unsupported selector combination"):
+            CompressedSparseAttention2(module=_full_linear_source(), precision="fp8")
+        with self.assertRaisesRegex(ValueError, "unsupported selector combination"):
+            CompressedSparseAttention2(
+                module=_full_linear_source(),
+                context={"low_precision": catalog, "cp_size": 2},
+                precision="low_precision",
+            )
+        for axis in ("tp_size", "pp_size"):
+            with self.subTest(axis=axis):
+                with self.assertRaisesRegex(NotImplementedError, "TP=CP=PP=1"):
+                    CompressedSparseAttention2(
+                        module=_full_linear_source(),
+                        context={"low_precision": catalog, axis: 2},
+                        precision="low_precision",
+                    )
+        with self.assertRaisesRegex(ValueError, "require precision='low_precision'"):
+            CompressedSparseAttention2(
+                module=_full_linear_source(),
+                context={"low_precision": catalog},
+                precision="inherit",
+                linear_dtype_scheme="mxfp8",
+            )
+        disabled = LowPrecisionConfig(enabled=False, dtype_schemes=catalog.dtype_schemes)
+        with self.assertRaisesRegex(ValueError, "enabled LowPrecisionConfig"):
+            CompressedSparseAttention2(
+                module=_full_linear_source(),
+                context={"low_precision": disabled},
+                precision="low_precision",
+            )

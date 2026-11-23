@@ -142,6 +142,16 @@ def _load_attention_ops() -> tuple[Callable[..., Any], Callable[..., Any], Calla
     return sparse_flash_mla_op, sparse_flash_mla_grad, sparse_flash_mla_metadata
 
 
+@lru_cache(maxsize=1)
+def _load_attention_grad_metadata_op() -> Callable[..., Any]:
+    """Resolve the Ascend 950 backward planner's dedicated metadata operator."""
+    try:
+        from cann_ops_transformer import sparse_flash_mla_grad_metadata  # pylint: disable=import-outside-toplevel
+    except ImportError as err:
+        raise RuntimeError("SMLA backward requires cann_ops_transformer.sparse_flash_mla_grad_metadata") from err
+    return sparse_flash_mla_grad_metadata
+
+
 def supports_fused_attention_inputs(query: torch.Tensor, ratio: int, window: int, topk: int = 512) -> bool:
     """Check the validated attention input contract without importing operators.
 
@@ -178,13 +188,18 @@ def _attention_metadata(
     # the forward interface instead omits that optional input at ratio one.
     residue = torch.full((batch,), residual, dtype=torch.int32, device=device) if main_length else None
     _, _, metadata_op = _load_attention_ops()
-    metadata = metadata_op(
-        heads, 1, dim, cmp_residual_kv=residue if ratio > 1 else None, batch_size=batch, max_seqlen_q=length,
-        max_seqlen_ori_kv=raw_length, max_seqlen_cmp_kv=main_length, ori_topk=0, cmp_topk=topk,
-        cmp_ratio=ratio, ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=window-1, ori_win_right=0,
-        layout_q="BSND", layout_kv="BSND", has_ori_kv=True, has_cmp_kv=bool(main_length),
-    )
-    return residue, metadata
+    metadata_args = (heads, 1, dim)
+    metadata_kwargs = {
+        "cmp_residual_kv": residue if ratio > 1 else None, "batch_size": batch, "max_seqlen_q": length,
+        "max_seqlen_ori_kv": raw_length, "max_seqlen_cmp_kv": main_length, "ori_topk": 0, "cmp_topk": topk,
+        "cmp_ratio": ratio, "ori_mask_mode": 4, "cmp_mask_mode": 3 if main_length else 0,
+        "ori_win_left": window-1, "ori_win_right": 0,
+        "layout_q": "BSND", "layout_kv": "BSND", "has_ori_kv": True, "has_cmp_kv": bool(main_length),
+    }
+    metadata = metadata_op(*metadata_args, **metadata_kwargs)
+    grad_metadata = (_load_attention_grad_metadata_op()(*metadata_args, **metadata_kwargs)
+                     if device.type == "npu" else metadata)
+    return residue, metadata, grad_metadata
 
 
 class _SparseFlashMla(torch.autograd.Function):
@@ -198,29 +213,31 @@ class _SparseFlashMla(torch.autograd.Function):
     ) -> torch.Tensor:
         """Save the native output and LSE required by the training backward."""
         batch, length, heads, dim = query.shape
-        residue, metadata = _attention_metadata(
+        residue, metadata, grad_metadata = _attention_metadata(
             query.device, batch, length, heads, dim, raw.shape[1], 0 if main is None else main.shape[1],
             0 if indices is None else indices.shape[-1], ratio, residual, window,
         )
-        options = {"softmax_scale": scale, "cmp_ratio": ratio, "ori_mask_mode": 4, "cmp_mask_mode": 3,
+        options = {"softmax_scale": scale, "cmp_ratio": ratio, "ori_mask_mode": 4,
+                   "cmp_mask_mode": 3 if main is not None else 0,
                    "ori_win_left": window-1, "ori_win_right": 0, "layout_q": "BSND", "layout_kv": "BSND"}
         attention, _, _ = _load_attention_ops()
         output, lse = attention(
             query, ori_kv=raw, cmp_kv=main, cmp_sparse_indices=indices, sinks=sinks,
             cmp_residual_kv=residue if ratio > 1 else None, metadata=metadata, return_softmax_lse=True, **options,
         )
-        ctx.save_for_backward(query, raw, main, indices, sinks, residue, output, lse)
+        ctx.save_for_backward(query, raw, main, indices, sinks, residue, output, lse, grad_metadata)
         ctx.options = options
         return output
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
         """Return main-branch gradients without substituting the KL teacher."""
-        query, raw, main, indices, sinks, residue, output, lse = ctx.saved_tensors
+        query, raw, main, indices, sinks, residue, output, lse, grad_metadata = ctx.saved_tensors
         _, attention_grad, _ = _load_attention_ops()
         grad_query, grad_raw, grad_main, grad_sinks, _, _ = attention_grad(
             query, grad_output.contiguous(), output, lse, ori_kv=raw, cmp_kv=main,
-            cmp_sparse_indices=indices, sinks=sinks, cmp_residual_kv=residue, **ctx.options,
+            cmp_sparse_indices=indices, sinks=sinks, cmp_residual_kv=residue,
+            metadata=grad_metadata, **ctx.options,
         )
         return grad_query, grad_raw, grad_main if main is not None else None, None, grad_sinks, None, None, None, None
 
@@ -287,16 +304,20 @@ def _tnd_attention_metadata(plan, device, heads, dim, raw_ranges, ratio, window,
     cu_raw = torch.tensor((0, *accumulate(raw_lengths)), device=device, dtype=torch.int32)
     _, _, metadata_op = _load_attention_ops()
     options = {"layout_q": "TND", "layout_kv": "TND", "cmp_ratio": ratio, "ori_mask_mode": 4,
-               "cmp_mask_mode": 3, "ori_win_left": window-1, "ori_win_right": 0}
-    metadata = metadata_op(
-        heads, 1, dim, cu_seqlens_q=cu_q, cu_seqlens_ori_kv=cu_raw,
-        cu_seqlens_cmp_kv=cu_k if has_keys else None,
-        cmp_residual_kv=residuals if has_keys and ratio > 1 else None,
-        batch_size=len(plan.segments), max_seqlen_q=max(plan.q_lengths),
-        max_seqlen_ori_kv=max(raw_lengths), max_seqlen_cmp_kv=max(plan.k_lengths) if has_keys else 0,
-        ori_topk=0, cmp_topk=topk, has_ori_kv=True, has_cmp_kv=has_keys, **options,
-    )
-    return cu_q, cu_raw, cu_k if has_keys else None, residuals if has_keys else None, metadata
+               "cmp_mask_mode": 3 if has_keys else 0, "ori_win_left": window-1, "ori_win_right": 0}
+    metadata_args = (heads, 1, dim)
+    metadata_kwargs = {
+        "cu_seqlens_q": cu_q, "cu_seqlens_ori_kv": cu_raw,
+        "cu_seqlens_cmp_kv": cu_k if has_keys else None,
+        "cmp_residual_kv": residuals if has_keys and ratio > 1 else None,
+        "batch_size": len(plan.segments), "max_seqlen_q": max(plan.q_lengths),
+        "max_seqlen_ori_kv": max(raw_lengths), "max_seqlen_cmp_kv": max(plan.k_lengths) if has_keys else 0,
+        "ori_topk": 0, "cmp_topk": topk, "has_ori_kv": True, "has_cmp_kv": has_keys, **options,
+    }
+    metadata = metadata_op(*metadata_args, **metadata_kwargs)
+    grad_metadata = (_load_attention_grad_metadata_op()(*metadata_args, **metadata_kwargs)
+                     if device.type == "npu" else metadata)
+    return cu_q, cu_raw, cu_k if has_keys else None, residuals if has_keys else None, metadata, grad_metadata
 
 
 class _SparseFlashMlaTND(torch.autograd.Function):
@@ -309,12 +330,13 @@ class _SparseFlashMlaTND(torch.autograd.Function):
             plan: CSATNDPlan, raw_ranges: tuple,
     ) -> torch.Tensor:
         """Save native output/LSE and independent raw/compressed cumulative lengths."""
-        cu_q, cu_raw, cu_k, residuals, metadata = _tnd_attention_metadata(
+        cu_q, cu_raw, cu_k, residuals, metadata, grad_metadata = _tnd_attention_metadata(
             plan, query.device, query.shape[1], query.shape[2], raw_ranges, ratio, window, main is not None,
             0 if indices is None else indices.shape[-1],
         )
         options = {"layout_q": "TND", "layout_kv": "TND", "softmax_scale": scale, "cmp_ratio": ratio,
-                   "ori_mask_mode": 4, "cmp_mask_mode": 3, "ori_win_left": window-1, "ori_win_right": 0}
+                   "ori_mask_mode": 4, "cmp_mask_mode": 3 if main is not None else 0,
+                   "ori_win_left": window-1, "ori_win_right": 0}
         forward, _, _ = _load_attention_ops()
         output, lse = forward(
             query, ori_kv=raw, cmp_kv=main, cmp_sparse_indices=indices, sinks=sinks,
@@ -322,19 +344,20 @@ class _SparseFlashMlaTND(torch.autograd.Function):
             cmp_residual_kv=residuals if ratio > 1 else None, metadata=metadata,
             return_softmax_lse=True, **options,
         )
-        ctx.save_for_backward(query, raw, main, indices, sinks, output, lse, cu_q, cu_raw, cu_k, residuals)
+        ctx.save_for_backward(query, raw, main, indices, sinks, output, lse, cu_q, cu_raw, cu_k, residuals,
+                              grad_metadata)
         ctx.options = options
         return output
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
         """Return each physical bank's gradient to its autograd communication owner."""
-        query, raw, main, indices, sinks, output, lse, cu_q, cu_raw, cu_k, residuals = ctx.saved_tensors
+        query, raw, main, indices, sinks, output, lse, cu_q, cu_raw, cu_k, residuals, grad_metadata = ctx.saved_tensors
         _, backward, _ = _load_attention_ops()
         dq, dr, dm, ds, _, _ = backward(
             query, grad_output.contiguous(), output, lse, ori_kv=raw, cmp_kv=main,
             cmp_sparse_indices=indices, sinks=sinks, cu_seqlens_q=cu_q, cu_seqlens_ori_kv=cu_raw,
-            cu_seqlens_cmp_kv=cu_k, cmp_residual_kv=residuals, **ctx.options,
+            cu_seqlens_cmp_kv=cu_k, cmp_residual_kv=residuals, metadata=grad_metadata, **ctx.options,
         )
         return dq, dr, dm if main is not None else None, None, ds, None, None, None, None, None
 

@@ -28,6 +28,7 @@ from hyper_parallel.components.functional.lightning_indexer import (
     lightning_indexer, sort_key_indices, validate_indexer_tensors,
 )
 from hyper_parallel.components.modules.common.rms_norm import NativeRMSNormModule, RMSNorm
+from hyper_parallel.components.quantization.functional.indexer_qk import IndexerQKPrecisionPolicy
 from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper
 
 
@@ -40,6 +41,7 @@ class CSA2IndexerOutput:
     candidate_blocks: torch.Tensor | None
     index_query: torch.Tensor
     merge_weight: torch.Tensor
+    index_key_cache: torch.Tensor | None = None
 
 
 def _run_lightning_indexer(
@@ -532,8 +534,13 @@ class CSA2Indexer(nn.Module):
         self.candidate_block_size = module.candidate_block_size
         self.loss_coeff = module.loss_coeff
         self.query_chunk_size = int(getattr(module, "query_chunk_size", 256))
+        self._qk_policy: IndexerQKPrecisionPolicy | None = getattr(module, "_qk_policy", None)
         # Children are adopted by identity; preserve their individual training modes.
         self.training = module.training
+
+    def set_qk_policy(self, policy: IndexerQKPrecisionPolicy) -> None:
+        """Bind the Query QDQ and shared Key packing policy."""
+        self._qk_policy = policy
 
     def _project_index_query(
             self, query_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -547,8 +554,10 @@ class CSA2Indexer(nn.Module):
             )
         query = query.view(*query_residual.shape[:2], -1, self.head_dim)
         if sequence_major:
-            return self.apply_rope(query, cos, sin, unsqueeze_dim=2)
-        return self.apply_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
+            query = self.apply_rope(query, cos, sin, unsqueeze_dim=2)
+        else:
+            query = self.apply_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
+        return self._qk_policy.apply_query(query) if self._qk_policy is not None else query
 
     @torch.no_grad()
     def _project_worker_index_query(
@@ -650,11 +659,14 @@ class CSA2Indexer(nn.Module):
             raise ValueError("Indexer query and merge weights must have matching head counts")
         weights = weights * (self.head_dim**-0.5 * self.global_num_heads**-0.5)
         key = self.exchange_key(prepared_key)
+        key_cache = None
+        if self.owns_key and self._qk_policy is not None:
+            key, key_cache = self._qk_policy.encode_owned_key(key)
         selected, candidates = self._run_selection(
             query, key, weights, candidate_blocks, query_offset, reduce_sum,
             minimum_key_indices, query_segments, causal_upper,
         )
-        return CSA2IndexerOutput(selected, key, candidates, query, weights)
+        return CSA2IndexerOutput(selected, key, candidates, query, weights, key_cache)
 
     def enable_selection_exclude(self) -> None:
         """Reuse the discrete selection during activation recomputation."""

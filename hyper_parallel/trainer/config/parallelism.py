@@ -997,6 +997,44 @@ def entries_to_module_replacement_requests(
     return tuple(result)
 
 
+def _resolve_entry_low_precision_policy(
+    entry: PlanOverride,
+    *,
+    low_precision_config: Optional[LowPrecisionConfig],
+    effective_config: Optional[LowPrecisionConfig],
+    direct_formats: frozenset[str],
+) -> Optional[LowPrecisionDtypeScheme]:
+    """Resolve the optional W/A dtype scheme for one module replacement entry."""
+    target = entry.replace.implementation
+    callable_target = target.requested_target if isinstance(target, ReplacementTarget) else target.callable
+    supported_formats = getattr(callable_target, "low_precision_formats", ())
+    consumes_direct_format = bool(direct_formats.intersection(supported_formats))
+    scheme_name = getattr(target, "low_precision_dtype_scheme", None)
+    if consumes_direct_format and (entry.low_precision_dtype_scheme is not None or scheme_name is not None):
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} cannot select a W/A dtype scheme "
+            "and CSA2 formats on the same replacement"
+        )
+    if scheme_name is not None:
+        if entry.low_precision_dtype_scheme is not None:
+            raise ValueError(
+                f"plan_overrides match={entry.match!r}: specify dtype scheme only inside replace.implementation"
+            )
+        if low_precision_config is None:
+            raise ValueError(f"plan_overrides match={entry.match!r}: dtype scheme requires training.low_precision")
+        return low_precision_config.resolve_dtype_scheme(scheme_name)
+    uses_family_precision = (
+        isinstance(target, ReplacementTarget)
+        and target.selectors.get("precision", "inherit") != "inherit"
+        and entry.low_precision_dtype_scheme is None
+    )
+    if entry.when == "low_precision" and effective_config is not None and not (
+        consumes_direct_format or uses_family_precision
+    ):
+        return effective_config.resolve_dtype_scheme(entry.low_precision_dtype_scheme)
+    return None
+
+
 def entries_to_module_replacements(
     entries: List[PlanOverride],
     *,
@@ -1012,6 +1050,11 @@ def entries_to_module_replacements(
     """
 
     effective_config = low_precision_config if low_precision_enabled else None
+    direct_formats = (
+        effective_config.active_direct_formats()
+        if isinstance(effective_config, LowPrecisionConfig)
+        else frozenset()
+    )
     rules = []
     for entry_index, entry in enumerate(entries):
         if entry.replace is None or entry.replace.kind != "module":
@@ -1020,17 +1063,12 @@ def entries_to_module_replacements(
             continue
         _validate_replacement_entry(entry, effective_config)
         patterns = (entry.match,) if isinstance(entry.match, str) else tuple(entry.match)
-        policy = None
-        scheme_name = getattr(entry.replace.implementation, "low_precision_dtype_scheme", None)
-        if scheme_name is not None:
-            if entry.low_precision_dtype_scheme is not None:
-                raise ValueError(
-                    f"plan_overrides match={entry.match!r}: specify dtype scheme only inside replace.implementation")
-            if low_precision_config is None:
-                raise ValueError(f"plan_overrides match={entry.match!r}: dtype scheme requires training.low_precision")
-            policy = low_precision_config.resolve_dtype_scheme(scheme_name)
-        elif entry.when == "low_precision" and effective_config is not None:
-            policy = effective_config.resolve_dtype_scheme(entry.low_precision_dtype_scheme)
+        policy = _resolve_entry_low_precision_policy(
+            entry,
+            low_precision_config=low_precision_config,
+            effective_config=effective_config,
+            direct_formats=direct_formats,
+        )
         serialized_target = entry.replace.implementation.to_dict()
         rules.append(
             ModuleReplacementSpec(

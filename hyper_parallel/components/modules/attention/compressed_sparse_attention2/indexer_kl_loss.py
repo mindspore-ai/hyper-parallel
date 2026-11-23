@@ -24,6 +24,7 @@ import torch
 from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad import (
     gather_selected_keys, sparse_lightning_indexer_kl_loss, validate_fused_kl_inputs,
 )
+from hyper_parallel.components.quantization.tensor.csa2_cache_tensor import CSA2CacheTensor
 
 
 class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
@@ -75,7 +76,10 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                     index_scores = reduce_sum(index_scores)
                 index_scores.masked_fill_(~valid, -1.0e9)
 
-                selected_attention_key = gather_selected_keys(compressed_key, safe_indices).float()
+                if isinstance(compressed_key, CSA2CacheTensor):
+                    selected_attention_key = compressed_key.dequantize_selected(safe_indices).float()
+                else:
+                    selected_attention_key = gather_selected_keys(compressed_key, safe_indices).float()
                 attention_scores = torch.einsum(
                     "bhcd,bckd->bhck",
                     attention_query[:, :, start:end].float(),
@@ -189,8 +193,9 @@ def shared_compressed_indexer_kl_loss(
         if query_segments is None:
             raise ValueError("Fused KL requires document-local causal query_segments")
         validate_fused_kl_inputs(index_query, index_key, merge_weight, topk_indices)
+        teacher_key = compressed_key.dequantize() if isinstance(compressed_key, CSA2CacheTensor) else compressed_key
         return sparse_lightning_indexer_kl_loss(
-            index_query, index_key, merge_weight, attention_query.detach(), compressed_key.detach(),
+            index_query, index_key, merge_weight, attention_query.detach(), teacher_key.detach(),
             topk_indices, sinks.detach(), attention_scale, loss_coeff, query_chunk_size,
             compress_ratio, query_segments,
         )
