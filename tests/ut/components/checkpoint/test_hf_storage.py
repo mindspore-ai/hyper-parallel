@@ -76,10 +76,10 @@ def _raw_safetensors(header: Any, data: bytes = b"") -> bytes:
     return struct.pack("<Q", len(encoded)) + encoded + data
 
 
-def _save_index(checkpoint_dir: Path, weight_map: dict[str, str]) -> None:
-    """Write the index of a sharded Hugging Face checkpoint."""
+def _save_index(checkpoint_dir: Path, weight_map: dict[str, str], weights_name: str = "model") -> None:
+    """Write the index of a sharded Hugging Face checkpoint under the given weights stem."""
     index = {"metadata": {"total_size": 0}, "weight_map": weight_map}
-    index_path = checkpoint_dir / f"model{SAFETENSORS_INDEX_SUFFIX}"
+    index_path = checkpoint_dir / f"{weights_name}{SAFETENSORS_INDEX_SUFFIX}"
     index_path.write_text(json.dumps(index), encoding="utf-8")
 
 
@@ -198,6 +198,45 @@ class TestHuggingFaceStorageReader(unittest.TestCase):
         files = _stored_files(HuggingFaceStorageReader(checkpoint_dir).load_metadata())
 
         expected = {"norm.weight": "model.safetensors"}
+        self.assertEqual(files, expected, f"files mismatch: expected={expected}, got={files}")
+
+    def test_diffusers_index_names_the_files_read(self):
+        """
+        Feature: HuggingFaceStorageReader.load_metadata with a diffusion_pytorch_model index.
+        Description: Write a Diffusers component directory: two shards named
+            diffusion_pytorch_model-0000X-of-00002.safetensors and an index of the same stem.
+        Expectation: The indexed files are described under their tensor names, like a
+            model.safetensors.index.json checkpoint of the same layout.
+        """
+        checkpoint_dir = _temporary_directory(self)
+        _save(checkpoint_dir / "diffusion_pytorch_model-00001-of-00002.safetensors",
+              {"blocks.0.attn.to_q.weight": torch.zeros(4, 3)})
+        _save(checkpoint_dir / "diffusion_pytorch_model-00002-of-00002.safetensors",
+              {"scale_shift_table": torch.zeros(6)})
+        weight_map = {
+            "blocks.0.attn.to_q.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+            "scale_shift_table": "diffusion_pytorch_model-00002-of-00002.safetensors",
+        }
+        _save_index(checkpoint_dir, weight_map, weights_name="diffusion_pytorch_model")
+
+        files = _stored_files(HuggingFaceStorageReader(checkpoint_dir).load_metadata())
+
+        self.assertEqual(files, weight_map, f"files mismatch: expected={weight_map}, got={files}")
+
+    def test_diffusers_single_file_without_index_is_read(self):
+        """
+        Feature: HuggingFaceStorageReader.load_metadata without an index, Diffusers naming.
+        Description: Write one diffusion_pytorch_model.safetensors holding a tensor, beside a
+            stray file of another name.
+        Expectation: The Diffusers weights file is described, and the stray file is never opened.
+        """
+        checkpoint_dir = _temporary_directory(self)
+        _save(checkpoint_dir / "diffusion_pytorch_model.safetensors", {"scale_shift_table": torch.zeros(6)})
+        _save(checkpoint_dir / "consolidated.safetensors", {"scale_shift_table": torch.ones(6)})
+
+        files = _stored_files(HuggingFaceStorageReader(checkpoint_dir).load_metadata())
+
+        expected = {"scale_shift_table": "diffusion_pytorch_model.safetensors"}
         self.assertEqual(files, expected, f"files mismatch: expected={expected}, got={files}")
 
     def test_tensor_in_two_indexed_files_is_rejected(self):

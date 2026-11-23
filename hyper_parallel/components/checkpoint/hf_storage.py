@@ -19,7 +19,8 @@ kind valid makes one of the other kind wrong:
 
 * :class:`HuggingFaceStorageReader` reads a Hugging Face checkpoint, as ``save_pretrained`` writes
   one: whole tensors, each in exactly one file, which is ``model.safetensors`` or one of the files a
-  ``model.safetensors.index.json`` names.
+  ``model.safetensors.index.json`` names; a Diffusers component directory is read the same way under
+  its ``diffusion_pytorch_model`` stem.
 * :class:`TorchShardedSafetensorsReader` reads what torch's ``HuggingFaceStorageWriter`` writes with
   ``save_distributed=True`` before consolidating it: every rank's shard of a tensor in a file of its
   own, where the shard sits in the whole tensor recorded in the file's header, and no index.
@@ -61,6 +62,11 @@ SAVED_OFFSETS_KEY = "saved_offsets"
 
 _SAFE_WEIGHTS_NAME = "model.safetensors"
 _SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+# A Diffusers component directory names its weights after the pipeline component instead, with the
+# same index layout; both stems are accepted, as resolve_checkpoint_index accepts both on the
+# whole-tensor load path.
+_DIFFUSERS_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
+_DIFFUSERS_WEIGHTS_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
 _HEADER_METADATA_KEY = "__metadata__"
 _HEADER_LENGTH_BYTES = 8
 
@@ -336,7 +342,8 @@ class HuggingFaceStorageReader(FileSystemReader):
         load(model.state_dict(), storage_reader=HuggingFaceStorageReader("/models/Qwen3-8B"))
 
     The files read are the ones ``model.safetensors.index.json`` names, or ``model.safetensors``
-    alone when there is no index. Nothing else in the directory is read, such as a second copy of
+    alone when there is no index; a Diffusers component directory is read the same way under its
+    ``diffusion_pytorch_model`` stem. Nothing else in the directory is read, such as a second copy of
     the weights in a file of another name. A file whose header records offsets the way torch's
     HuggingFaceStorageWriter does is read as long as every offset is zero: anything else is a shard
     of a larger tensor, and a directory of those is for :class:`TorchShardedSafetensorsReader`.
@@ -366,8 +373,8 @@ class HuggingFaceStorageReader(FileSystemReader):
             Metadata: Size, dtype and file of every tensor.
 
         Raises:
-            FileNotFoundError: If the directory holds neither the index nor the single weights
-                file, or a file the index names is not there.
+            FileNotFoundError: If the directory holds none of the known index or weights files,
+                or a file the index names is not there.
             ValueError: If the index or a header is malformed, a dtype has no torch counterpart, a
                 tensor is a shard of a larger one, or two files hold the same tensor.
         """
@@ -377,27 +384,35 @@ class HuggingFaceStorageReader(FileSystemReader):
         """
         Name the files that make up the checkpoint.
 
+        A Transformers checkpoint names its weights ``model.safetensors``, a Diffusers component
+        directory ``diffusion_pytorch_model.safetensors``, each with an index of the same stem. Both
+        stems are accepted, and an index of either stem names the files read.
+
         Returns:
             list[str]: File names relative to the checkpoint directory, sorted.
 
         Raises:
-            FileNotFoundError: If the directory holds neither the index nor the single weights file.
+            FileNotFoundError: If the directory holds none of the known index or weights files.
             ValueError: If the index does not map tensor names to file names.
         """
-        index_path = self.checkpoint_dir / _SAFE_WEIGHTS_INDEX_NAME
-        if index_path.is_file():
+        for index_name in (_SAFE_WEIGHTS_INDEX_NAME, _DIFFUSERS_WEIGHTS_INDEX_NAME):
+            index_path = self.checkpoint_dir / index_name
+            if not index_path.is_file():
+                continue
             index = _loads(index_path.read_bytes(), str(index_path))
             weight_map = index.get("weight_map") if isinstance(index, dict) else None
             if (not isinstance(weight_map, dict) or not weight_map
                     or not all(isinstance(file_name, str) for file_name in weight_map.values())):
                 raise ValueError(f"{index_path} has no weight_map mapping tensor names to file names.")
             return sorted(set(weight_map.values()))
-        if not (self.checkpoint_dir / _SAFE_WEIGHTS_NAME).is_file():
-            raise FileNotFoundError(
-                f"Neither {_SAFE_WEIGHTS_INDEX_NAME} nor {_SAFE_WEIGHTS_NAME} found in {self.checkpoint_dir}. "
-                f"A directory of shards written by torch is read with TorchShardedSafetensorsReader."
-            )
-        return [_SAFE_WEIGHTS_NAME]
+        for weights_name in (_SAFE_WEIGHTS_NAME, _DIFFUSERS_WEIGHTS_NAME):
+            if (self.checkpoint_dir / weights_name).is_file():
+                return [weights_name]
+        raise FileNotFoundError(
+            f"None of {_SAFE_WEIGHTS_INDEX_NAME}, {_DIFFUSERS_WEIGHTS_INDEX_NAME}, {_SAFE_WEIGHTS_NAME} or "
+            f"{_DIFFUSERS_WEIGHTS_NAME} found in {self.checkpoint_dir}. A directory of shards written by "
+            f"torch is read with TorchShardedSafetensorsReader."
+        )
 
 
 class TorchShardedSafetensorsReader(FileSystemReader):

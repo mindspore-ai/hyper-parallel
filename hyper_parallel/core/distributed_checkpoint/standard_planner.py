@@ -864,7 +864,8 @@ class _DcpMergeLoadPlanner(StandardLoadPlanner):
 
         Args:
             state_dict (dict[str, Any]): Must be empty; filled in place with a full-size tensor
-                per entry of the metadata.
+                per entry of the metadata, restored to the entry's save-time position (nested
+                when the save flattened a nested payload).
             metadata (Metadata): Metadata of the checkpoint being merged.
             **kwargs (Any): Additional keyword arguments (e.g. is_coordinator).
         """
@@ -885,9 +886,15 @@ class _DcpMergeLoadPlanner(StandardLoadPlanner):
                     dtype=str_to_dtype(v.properties.dtype),
                 )
 
-            state_dict[k] = v
+            # Planner-data paths carry the save-time nesting: restore the entry at its
+            # original position only. Writing the flat key as well would leave both
+            # spellings in one dict, and the re-flatten below then rejects the
+            # duplicate FQN, so nested payloads (trainer ``{"model": ...}``) failed
+            # to merge at all. Entries without a planner-data path stay flat.
             if metadata.planner_data is not None and k in metadata.planner_data:
                 set_element(state_dict, metadata.planner_data[k], v)
+            else:
+                state_dict[k] = v
 
         super().configure_planner(
             state_dict,
