@@ -140,7 +140,7 @@ class ParamShardSpec:
     axis_spec: ParamLayoutSpec
 
 
-@dataclass(frozen=True)
+@dataclass
 class ParamRecord:
     """A lightweight parameter record."""
 

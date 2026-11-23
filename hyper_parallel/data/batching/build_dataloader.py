@@ -478,6 +478,12 @@ class FixedBatchDataLoader(StatefulDataLoader):
         Args:
             state_dict: State saved by the ordinary or balanced native loader.
         """
+        # The training frame may still retain the old iterator during rollback.
+        # Stop its producers before torchdata drops the loader's iterator reference.
+        iterator = self._iterator
+        if self.num_workers > 0 and iterator is not None:
+            # torchdata exposes worker shutdown only through its iterator's private API.
+            iterator._shutdown_workers()  # pylint: disable=protected-access
         sampler = get_sampler_checkpoint_state(state_dict)
         snapshot = state_dict.get("_snapshot", {}).get("_main_snapshot", {})
         native_sampler = sampler if sampler is not None else snapshot.get("_index_sampler_state")

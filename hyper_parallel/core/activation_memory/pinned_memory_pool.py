@@ -245,6 +245,20 @@ class PinnedMemoryPool:
                 self._available[block.capacity].append(block)
             raise
 
+    def reset_after_device_restart(self) -> None:
+        """Recycle pending buffers after the caller has quiesced all device transfers.
+
+        Old device events must not be queried after recovery. Checked-out buffers
+        remain owned by their callers; only already-released blocks are recycled.
+        """
+        with self._lock:
+            for blocks in self._pending.values():
+                for block in blocks:
+                    block.event = None
+                    block.state = _AVAILABLE
+                    self._available[block.capacity].append(block)
+            self._pending.clear()
+
     def release(self, tensor: Any, event: Optional[Any] = None) -> None:
         """Return an acquired view to the pool, optionally after an async event."""
         key = _storage_key(tensor)

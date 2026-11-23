@@ -29,6 +29,7 @@ import torch.distributed as dist
 from hyper_parallel.core.distributed_checkpoint.async_persist import (
     AsyncSaveResponse,
     FileType,
+    assemble_file_path,
     build_staged_state_dict,
     execute_async_persist_with_gloo,
     execute_async_persist,
@@ -245,6 +246,8 @@ def _create_persist_process(
     Depending on the caller, the child either runs the plan and write result collectives on a
     dedicated gloo group it reinitialises itself, or exchanges those results through the
     storage, or runs without any cross-rank interaction at all.
+    Storage coordination clears old exchange files and synchronizes the callers
+    before constructing the child process.
 
     Args:
         result_queue (mp.Queue): IPC queue the child returns its status and metadata on.
@@ -268,6 +271,7 @@ def _create_persist_process(
         use_storage_comm = need_comm and not use_gloo
         if use_storage_comm:
             logger.info("use storage communication for dcp async save.")
+            _cleanup_stale_communication_files(checkpoint_id, storage_writer)
         return mp.Process(
             target=execute_async_persist,
             args=(
@@ -309,6 +313,25 @@ def _create_persist_process(
         name=f"AsyncCheckpointPersistGloo_{save_index}",
     )
     return proc
+
+
+def _cleanup_stale_communication_files(
+    checkpoint_id: Optional[Union[Path, str]],
+    storage_writer: Optional[StorageWriter],
+) -> None:
+    """Remove possible stale communication files before any new persist child starts."""
+    directory = checkpoint_id if checkpoint_id is not None else getattr(storage_writer, "checkpoint_dir", None)
+    if directory is None:
+        raise ValueError("Storage-coordinated async save requires checkpoint_id or storage_writer.checkpoint_dir")
+    rank = dist.get_rank()
+    for file_type in FileType:
+        try:
+            os.remove(assemble_file_path(directory, file_type, rank))
+        except FileNotFoundError:
+            pass
+    # Complete files from a previous attempt are indistinguishable from new
+    # results until every rank has removed its own files. Admit writers together.
+    dist.barrier()
 
 
 @dcp_timer_decorator
@@ -387,15 +410,17 @@ def async_save(
     # Deliberately not a daemon: it has to outlive the training loop long enough to resolve
     # persist_completion and run callback, and killing it early would not let the process exit
     # any sooner because the persist child is joined at interpreter exit regardless.
+    response = AsyncSaveResponse(persist_completion, process=proc, result_queue=result_queue)
     join_thread = threading.Thread(
         target=resolve_async_persist_result,
-        args=(proc, result_queue, persist_completion, async_callback),
+        args=(proc, result_queue, response, async_callback),
         name="AsyncCheckpointPersistJoin",
     )
+    response.join_thread = join_thread
     proc.start()
     join_thread.start()
-    ret = AsyncSaveResponse(persist_completion=persist_completion)
-    return ret
+    dist.barrier()
+    return response
 
 
 def _open_checkpoint(

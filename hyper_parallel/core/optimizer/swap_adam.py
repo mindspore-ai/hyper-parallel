@@ -292,15 +292,17 @@ class AdamSwapAdapter(StateSwapAdapter):
             maximize=group["maximize"],
         )
 
+    def step_state_device(self, param: Any, group: Dict[str, Any]) -> Any:
+        """Use a host step tensor for packed, non-fused Adam updates."""
+        if group.get("fused", False) or not self.runtime.packed_enabled:
+            return param.device
+        return "cpu"
+
     def _init_param_state(self, param: Any, group: Dict[str, Any]) -> None:
         """Initialize missing Adam state and swap slots for one parameter."""
         state = self.optimizer.state[param]
         if not self.is_new_adamw and len(state) == 0:
-            step_device = (
-                param.device
-                if group.get("fused", False)
-                else ("cpu" if self.runtime.packed_enabled else param.device)
-            )
+            step_device = self.step_state_device(param, group)
             state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
         state_keys = ["exp_avg", "exp_avg_sq"]
         if group.get("amsgrad", False):

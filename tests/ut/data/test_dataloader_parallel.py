@@ -20,11 +20,107 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.data.batching.build_dataloader import FixedBatchDataLoader
+from hyper_parallel.high_availability.recovery_state import TrainState
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch, TextParallelBatch
 from hyper_parallel.data.parallel import (
     DataLoaderParallelContext, TPBatchBroadcaster, build_dataset_for_dataloader,
     create_dataloader_parallel_context,
 )
+
+
+class _RandomRecoveryDataset(torch.utils.data.Dataset):
+    """Keep data-side random state inside the native worker snapshot."""
+
+    def __init__(self) -> None:
+        """Start a private random stream for the Dataset."""
+        self.generator = torch.Generator().manual_seed(19)
+
+    def __len__(self) -> int:
+        """Return enough samples to leave prefetched batches pending."""
+        return 48
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        """Pair a sample index with a stateful random value."""
+        return torch.tensor([index, torch.rand((), generator=self.generator).item()])
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """Capture the worker-local random stream."""
+        return {"rng": self.generator.get_state()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """Restore the worker-local random stream."""
+        self.generator.set_state(state["rng"])
+
+
+class TestDataLoaderWorkerRecovery(unittest.TestCase):
+    """Replay consumed data while old training frames still retain their iterators."""
+
+    def test_next_epoch_worker_seed_matches_after_restore(self):
+        """Keep the next epoch's worker seed unchanged by mid-epoch reconstruction."""
+        loader = FixedBatchDataLoader(torch.arange(12), batch_size=2, num_workers=1)
+        restored = FixedBatchDataLoader(torch.arange(12), batch_size=2, num_workers=1)
+        source_state = TrainState(loader, {}, generators={"data_loader": loader.generator})
+        target_state = TrainState(restored, {}, generators={"data_loader": restored.generator})
+        try:
+            iterator = iter(loader)
+            next(iterator)
+            snapshot = source_state.capture()
+            list(iterator)
+            expected = iter(loader)
+            target_state.restore(snapshot)
+            iterator = iter(restored)
+            target_state.restore_pending_rng()
+            list(iterator)
+            actual = iter(restored)
+            self.assertEqual(actual._base_seed, expected._base_seed)
+            torch.testing.assert_close(restored.generator.get_state(), loader.generator.get_state(), rtol=0, atol=0)
+        finally:
+            for active in (loader, restored):
+                if active._iterator is not None:
+                    active._iterator._shutdown_workers()
+
+    def test_worker_snapshots_replay_on_survivor_and_replacement(self):
+        """Restore prefetched data across repeated rollback and fresh-loader startup."""
+        for workers in (1, 4):
+            with self.subTest(workers=workers):
+                options = {
+                    "batch_size": 2,
+                    "num_workers": workers,
+                    "prefetch_factor": 2,
+                }
+                options["dataset"] = _RandomRecoveryDataset()
+                loader = FixedBatchDataLoader(**options)
+                iterator = iter(loader)
+                options["dataset"] = _RandomRecoveryDataset()
+                replacement = FixedBatchDataLoader(**options)
+                state_codec = TrainState(loader, {}, generators={"data_loader": loader.generator})
+                replacement_codec = TrainState(replacement, {}, generators={"data_loader": replacement.generator})
+                try:
+                    for _ in range(3):
+                        next(iterator)
+                    state = state_codec.capture()
+                    generator_state = loader.generator.get_state()
+                    expected = [next(iterator) for _ in range(3)]
+                    for _ in range(2):
+                        old_iterator = iterator
+                        state_codec.restore(state)
+                        self.assertTrue(all(not worker.is_alive() for worker in old_iterator._workers))
+                        iterator = iter(loader)
+                        state_codec.restore_pending_rng()
+                        torch.testing.assert_close(loader.generator.get_state(), generator_state, rtol=0, atol=0)
+                        for batch in expected:
+                            torch.testing.assert_close(next(iterator), batch)
+                    replacement_codec.restore(state)
+                    restored = iter(replacement)
+                    replacement_codec.restore_pending_rng()
+                    torch.testing.assert_close(replacement.generator.get_state(), generator_state, rtol=0, atol=0)
+                    for batch in expected:
+                        torch.testing.assert_close(next(restored), batch)
+                finally:
+                    for active in (loader, replacement):
+                        if active._iterator is not None:
+                            active._iterator._shutdown_workers()
 
 
 class TestDataLoaderParallelContext(unittest.TestCase):

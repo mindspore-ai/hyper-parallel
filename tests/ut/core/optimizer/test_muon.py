@@ -29,7 +29,9 @@ from hyper_parallel.core.optimizer.muon import (
     _NS_LEGACY_COEFFS,
     zeropower_via_newtonschulz5,
 )
+from hyper_parallel.core.optimizer.muon_shard import build_param_shard_metadata_for_group
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
+from hyper_parallel.core.optimizer.sharding_category import CommDomainKey, HSDPCommGroup, ParamLayoutSpec, ParamRecord
 
 
 def _plain_ns_group(**overrides):
@@ -46,6 +48,25 @@ def _plain_ns_group(**overrides):
     }
     group.update(overrides)
     return group
+
+
+def test_build_shard_metadata_updates_existing_record():
+    """Refresh shard metadata without invalidating a batch's parameter record."""
+    parameter = torch.nn.Parameter(torch.ones(3, 4))
+    record = ParamRecord(0, parameter)
+    domain = CommDomainKey((1,), (0,), (), (0,))
+    layout = ParamLayoutSpec(2, ((0, 0),), ())
+    records = [record]
+    group = HSDPCommGroup(domain, layout, shard_pgs=(None,), records=records)
+
+    first_meta = build_param_shard_metadata_for_group(group)[parameter]
+    latest_meta = build_param_shard_metadata_for_group(group)[parameter]
+
+    assert group.records is records
+    assert group.records[0] is record
+    assert record.shard_meta is latest_meta
+    assert first_meta is not latest_meta
+    assert latest_meta.stage_metas[0].split_sizes == (3,)
 
 
 def test_compute_batched_ns_updates_accepts_plain_parameter_without_sharding():
