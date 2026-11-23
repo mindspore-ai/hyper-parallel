@@ -27,7 +27,7 @@ from torch.nn import functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4SparseMoeBlock
 
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, SwiGLUParameters
 
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
 from hyper_parallel.models.replacement import (
@@ -133,15 +133,16 @@ def _source(limit=10.0):
 def _native_reference(module, inputs, indices, weights, *, expert_weights=None):
     """Differentiate the routed expert math independently of the native executor."""
     gate_up, down_weight = expert_weights or (module.gate_up_weight, module.down_weight)
+    clamp_limit = module.activation.clamp_limit
     original_shape = inputs.shape
     inputs = inputs.reshape(-1, inputs.shape[-1])
     result = torch.zeros_like(inputs)
     for slot in range(indices.shape[1]):
         up = torch.bmm(inputs.unsqueeze(1), gate_up[indices[:, slot]]).squeeze(1)
         gate, value = up.chunk(2, dim=-1)
-        if module.swiglu_limit is not None:
-            gate = gate.clamp(max=module.swiglu_limit)
-            value = value.clamp(-module.swiglu_limit, module.swiglu_limit)
+        if clamp_limit is not None:
+            gate = gate.clamp(max=clamp_limit)
+            value = value.clamp(-clamp_limit, clamp_limit)
         act = F.silu(gate) * value
         down = torch.bmm(act.unsqueeze(1), down_weight[indices[:, slot]]).squeeze(1)
         result = result + down * weights[:, slot, None]
@@ -231,7 +232,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 reference = SimpleNamespace(
                     gate_up_weight=source.gate_up_proj.transpose(1, 2).contiguous(),
                     down_weight=source.down_proj.transpose(1, 2).contiguous(),
-                    swiglu_limit=10.0,
+                    activation=SwiGLUParameters(clamp_limit=10.0),
                 )
                 expected = _native_reference(reference, inputs, ids, weights)
                 with patch.object(MegaMoeExperts, "forward", _native_reference):
@@ -466,8 +467,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 settings = executor._resource_group.specification
                 self.assertEqual((settings["dispatch_mode"], settings["initial_capacity_factor"],
                                   settings["capacity_growth_factor"]), expected)
-                self.assertEqual(executor.swiglu_limit, 10.0)
-                self.assertFalse(executor.clamp_after_silu)
+                self.assertEqual(executor.activation, SwiGLUParameters(clamp_limit=10.0))
                 self.assertFalse(executor.apply_probs_before_fc2)
                 self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
         for option in ("initial_capacity_factor", "capacity_growth_factor"):

@@ -108,14 +108,14 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         if self._executor is not None:
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
         # Multicore is optional for the default native-EP replacement provider.
-        from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions  # pylint: disable=C0415
+        from hyper_multicore import MegaMoeExperts, SwiGLUParameters  # pylint: disable=C0415
         from hyper_multicore.experimental import MegaMoeTuningOptions  # pylint: disable=C0415
 
         self._executor = MegaMoeExperts(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group,
-            numerics_options=MegaMoeNumericsOptions(swiglu_limit=self.swiglu_limit),
+            activation=SwiGLUParameters(clamp_limit=self.swiglu_limit),
             tuning_options=MegaMoeTuningOptions(
                 dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
                 capacity_growth_factor=self.capacity_growth_factor,

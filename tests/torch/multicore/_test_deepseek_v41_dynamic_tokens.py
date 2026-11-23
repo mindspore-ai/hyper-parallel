@@ -27,7 +27,7 @@ import torch_npu  # pylint: disable=unused-import
 from torch import nn
 from torch.nn import functional
 
-from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore import MegaMoeExperts, SwiGLUParameters
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
@@ -106,7 +106,7 @@ def test_deepseek_v41_dynamic_tokens() -> None:
     dynamic.configure(dist.group.WORLD, 6)
     fixed = MegaMoeExperts(hidden_size=512, intermediate_size=128,
                            num_experts=48, top_k=6, ep_group=dist.group.WORLD,
-                           numerics_options=MegaMoeNumericsOptions(swiglu_limit=10.0),
+                           activation=SwiGLUParameters(clamp_limit=10.0),
                            tuning_options=MegaMoeTuningOptions(dispatch_mode=dispatch_mode))
     fixed_weights = tuple(nn.Parameter(weight[experts].clone().npu()) for weight in weights)
     reports = []
