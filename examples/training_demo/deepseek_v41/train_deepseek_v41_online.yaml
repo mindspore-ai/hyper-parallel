@@ -22,9 +22,11 @@ model:
   enable_candidate_pool: false
   indexer_loss_coeff: 0.001
   # Sequence auxiliary loss; 0 disables it.
-  router_aux_loss_coeff: 0.0001
+  moe_aux_loss_coeff: 0.0001
   # Modality load statistics and bias updates; 0 disables them.
-  router_bias_update_rate: 0.001
+  moe_router_bias_update_rate: 0.001
+  # Benchmark-only balanced destinations when using the new Gate family.
+  moe_router_force_load_balancing: false
   # Generic HyperAutoModel build options accepted by the builder.
   torch_dtype: bfloat16
   validate_placement: false
@@ -140,7 +142,6 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
-        fix_router: false  # Benchmark-only balanced destinations; use false for normal training.
   # MegaMoe supports CP and TP+SP with EP>1 and PP=1; pair it with the compute target above.
   - match: "model.layers.*.mlp.experts"
     replace:

@@ -25,7 +25,10 @@ single submodule (e.g. ``functional.npu_grouped_swiglu``).
 # pylint: disable=invalid-name,undefined-all-variable
 
 import importlib
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.functional.swiglu import swiglu
 
 _EXPORT_TO_MODULE = {
     "aggregate_hidden": "aggregate_hidden",

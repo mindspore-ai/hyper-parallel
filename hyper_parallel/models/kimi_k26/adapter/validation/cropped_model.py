@@ -91,6 +91,9 @@ def build_cropped_kimi_vlm(
         swap_inputs: bool = False,
         freeze_patterns: list[str] | None = None,
         load_pretrained: bool = False,
+        moe_router_force_load_balancing: bool = False,
+        moe_aux_loss_coeff: float = 0.0,
+        moe_router_bias_update_rate: float = 0.0,
 ) -> PreTrainedModel:
     """Create a Kimi-K2.5/K2.6 VLM with a cropped text tower.
 
@@ -98,15 +101,9 @@ def build_cropped_kimi_vlm(
     geometry); pass ``load_pretrained=True`` together with a checkpoint path to
     load the real weights instead.
 
-    Reads the top-level ``Kimi_K25Config`` natively (never the repo's
-    remote-code classes), crops only the nested text tower, keeps the 27-layer
-    vision tower and the multimodal projector untouched, and parallelizes the
-    whole ``KimiK25ForConditionalGeneration`` through the HyperParallel model
-    stack. The family's TP layout (MLA down-projections and the vision path
-    replicated, up-projections colwise) is provided by
-    ``hyper_parallel/models/kimi_k26/adapter/registration.py`` and resolved
-    through the shared adapter registry, so this builder carries no layout
-    knowledge of its own.
+    Read the native ``Kimi_K25Config`` and crop its text tower while preserving the
+    27-layer vision tower and projector. The adapter registry supplies the TP layout
+    for the full ``KimiK25ForConditionalGeneration``.
 
     Args:
         config_path: Local Hugging Face Kimi-K2.5/K2.6 model directory (config
@@ -134,6 +131,9 @@ def build_cropped_kimi_vlm(
             host memory during the forward pass. Independent of
             ``activation_swap``; requires ``activation_checkpoint`` to be
             ``"full"`` or ``"selective"``.
+        moe_router_force_load_balancing: Enable deterministic destinations in the new Gate family.
+        moe_aux_loss_coeff: New Gate's sequence balancing coefficient; zero disables it.
+        moe_router_bias_update_rate: New Gate's correction-bias update rate; zero disables it.
         load_pretrained: Load the Hugging Face weights from ``model_dir`` instead
             of keeping the random initialization. ``config_path`` still selects
             the configuration, so a cropped geometry with full weights would be a
@@ -164,6 +164,9 @@ def build_cropped_kimi_vlm(
     model_dir = _resolve_cropped_model_dir(config_path, pretrained_model_name_or_path)
     config = _load_cropped_kimi_config(
         model_dir, local_files_only, num_hidden_layers, n_routed_experts, attn_implementation)
+    config.text_config.moe_router_force_load_balancing = moe_router_force_load_balancing
+    config.text_config.moe_aux_loss_coeff = moe_aux_loss_coeff
+    config.text_config.moe_router_bias_update_rate = moe_router_bias_update_rate
     model = _build_cropped_kimi_model(
         config, attn_implementation, distributed_setup, peft_config, torch_dtype, validate_placement,
         compile_config, activation_checkpoint, activation_swap, swap_inputs, freeze_patterns)

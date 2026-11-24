@@ -23,16 +23,20 @@ from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeTopKRouter
 from hyper_multicore.modules.mega_gate import MegaGate as SourceMegaGate
 
 from examples.torch.module_family.config import GateConfig
-from hyper_parallel.components.modules.gate_family import Gate, GateModule
+from hyper_parallel.components.modules.moe.router import Gate, GateModule, MegaGateModule
 from hyper_parallel.components.modules.module_family import get_family_build_info
-from hyper_parallel.components.modules.gate_family import MegaGateModule
 
+from tests.common.mark_utils import arg_mark
 
 class TestGate(unittest.TestCase):
     """Exercise a shared base without swallowing model auxiliary state."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_local_hf_fp32_outputs_and_gradients(self):
-        """HF softmax gate agrees with the declared FP32 local gate contract."""
+        """Feature: Gate.
+        Description: HF softmax gate agrees with the declared FP32 local gate contract.
+        Expectation: Local hf fp32 outputs and gradients.
+        """
         config = GateConfig(8, 6, 2, scoring_func="softmax", sorted_indices=True)
         member = Gate(config=config)
         source = Qwen2MoeTopKRouter(SimpleNamespace(
@@ -50,8 +54,12 @@ class TestGate(unittest.TestCase):
         self.assertIs(member.__class__, GateModule)
         self.assertEqual(get_family_build_info(member).resolved.variant, "local")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mega_uses_base_and_same_local_math(self):
-        """MegaGate is a Gate variant, preserving the base output protocol and scoring."""
+        """Feature: Gate.
+        Description: MegaGate is a Gate variant, preserving the base output protocol and scoring.
+        Expectation: Mega uses base and same local math.
+        """
         config = GateConfig(8, 6, 2, scoring_func="sigmoid")
         local = Gate(config=config)
         mega = Gate(config=config, implementation="mega")
@@ -67,8 +75,12 @@ class TestGate(unittest.TestCase):
         with self.assertRaises(ValueError):
             Gate(config=replace(config, normalize_topk=False), implementation="mega")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_base_owns_projection_state_and_initialization(self):
-        """The standalone Gate base constructs and resets the common state used by both variants."""
+        """Feature: Gate.
+        Description: The standalone Gate base constructs and resets the common state used by both variants.
+        Expectation: Base owns projection state and initialization.
+        """
         config = GateConfig(8, 6, 2, scoring_func="sigmoid")
         torch.manual_seed(12)
         base = GateModule(config=config)
@@ -86,8 +98,12 @@ class TestGate(unittest.TestCase):
         for actual, expected in zip(mega(values), base(values)):
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mega_preserves_fp32_bias_values_and_gradients(self):
-        """Dtype conversion changes the projection while retaining full-precision correction state."""
+        """Feature: Gate.
+        Description: Dtype conversion changes the projection while retaining full-precision correction state.
+        Expectation: Mega preserves fp32 bias values and gradients.
+        """
         member = MegaGateModule(config=GateConfig(8, 6, 2, vision_enabled=True))
         with torch.no_grad():
             member.bias.copy_(torch.linspace(-0.12345, 0.98765, 6))
@@ -102,13 +118,17 @@ class TestGate(unittest.TestCase):
             torch.testing.assert_close(member.get_parameter(name), value, atol=0, rtol=0)
         torch.testing.assert_close(member.bias.grad, gradient, atol=0, rtol=0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_bridge_receives_gate_owned_state(self):
-        """The optional fused function receives the same Parameters without a nested router module."""
+        """Feature: MoE module compatibility.
+        Description: The optional fused function receives the same Parameters without a nested router module.
+        Expectation: Existing routing state and synchronization behavior are preserved.
+        """
         member = MegaGateModule(config=GateConfig(8, 6, 2, vision_enabled=True))
         values = torch.randn(2, 3, 8)
         mask = torch.tensor([[True, False, True], [False, True, False]])
         expected = member(values, mask)
-        with patch("hyper_parallel.components.modules.gate_family._plan_for_device") as plan:
+        with patch("hyper_parallel.components.modules.moe.router._plan_for_device") as plan:
             with patch("hyper_multicore.modules.mega_gate.function.mega_gate", return_value=expected) as native:
                 actual = member._native_forward(values, mask)  # pylint: disable=protected-access
         self.assertIs(actual, expected)
@@ -123,8 +143,12 @@ class TestGate(unittest.TestCase):
         self.assertEqual(options["routed_scaling_factor"], member.routed_scaling_factor)
         self.assertEqual(tuple(member.children()), ())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mega_rejects_invalid_visual_mask(self):
-        """Visual correction requires the declared modality state and a matching boolean mask."""
+        """Feature: Gate.
+        Description: Visual correction requires the declared modality state and a matching boolean mask.
+        Expectation: Mega rejects invalid visual mask.
+        """
         values = torch.randn(2, 3, 8)
         plain = MegaGateModule(config=GateConfig(8, 6, 2))
         with self.assertRaises(ValueError):

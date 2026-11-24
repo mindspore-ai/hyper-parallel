@@ -25,26 +25,31 @@ from torch.nn import functional as F
 
 from examples.torch.module_family.config import (
     MegaMhcConfig, SpatialMergeProjectorConfig, RotaryEmbeddingConfig, RMSNormConfig,
-    SwiGLUMLPConfig, SharedExpertConfig, TokenChoiceTopKRouterConfig, EngramConfig,
+    SwiGLUMLPConfig, SharedExpertConfig, GateConfig, EngramConfig,
 )
 from hyper_parallel.components.modules import (
     MegaMhc, SpatialMergeProjector, RotaryEmbedding, RMSNorm, OffsetRMSNorm,
-    SwiGLUMLP, SharedExpert, Engram, get_family_build_info,
+    SwiGLUMLP, SharedExpert, Gate, Engram, get_family_build_info,
 )
-from hyper_parallel.components.modules.router_family import TokenChoiceTopKRouter, TokenChoiceTopKRouterModule
+from hyper_parallel.components.modules.moe.router import GateModule
 from hyper_parallel.components.modules.mhc.mega_mhc import MegaMhcModule, FusedMegaMhcModule
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionAligner
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementSpec
 from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
+from tests.common.mark_utils import arg_mark
 
 
 class TestAdditionalFamilies(unittest.TestCase):
     """Compare independent formulas, source state and family replacement boundaries."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_spatial_source_padding_grad_and_restore(self):
-        """Odd grids preserve channel/row/column ordering, loaded state and gradients."""
+        """Feature: Additional families.
+        Description: Odd grids preserve channel/row/column ordering, loaded state and gradients.
+        Expectation: Spatial source padding grad and restore.
+        """
         source = DeepseekV41VisionAligner(SimpleNamespace(
             v41_vision_downsample_ratio=2, v41_vision_hidden_size=3, hidden_size=5))
         source.eval()
@@ -74,8 +79,12 @@ class TestAdditionalFamilies(unittest.TestCase):
                 child.reset_parameters()
         self.assertTrue(torch.isfinite(meta(inputs, 3, 5)).all())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rotary_scaling_axes_and_stateless_dynamic(self):
-        """Frequency equations and sectioned positions agree without request-history state."""
+        """Feature: Additional families.
+        Description: Frequency equations and sectioned positions agree without request-history state.
+        Expectation: Rotary scaling axes and stateless dynamic.
+        """
         x = torch.empty(1, 4, 8)
         positions = torch.tensor([[0, 1, 3, 7]])
         for rope_type in ("default", "linear", "dynamic"):
@@ -115,8 +124,12 @@ class TestAdditionalFamilies(unittest.TestCase):
         rebuild_materialized_state(meta, MaterializationContext("random_init", torch.device("cpu")))
         torch.testing.assert_close(meta(x, positions)[0], source(x, positions)[0])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mhc_reference_grad_state_and_source(self):
-        """Shifted pre/post mapping orientation and all parameter gradients match a separate reference."""
+        """Feature: Additional families.
+        Description: Shifted pre/post mapping orientation and all parameter gradients match a separate reference.
+        Expectation: Mhc reference grad state and source.
+        """
         member = MegaMhc(config=MegaMhcConfig(8, num_iters=3))
         reference = MegaMhcModule(config=MegaMhcConfig(8, num_iters=3))
         reference.load_state_dict(member.state_dict())
@@ -162,8 +175,12 @@ class TestAdditionalFamilies(unittest.TestCase):
         member.bfloat16()
         self.assertEqual(member.phi.dtype, torch.float32)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_eager_norm_and_clamped_mlp_shared(self):
-        """Ordinary norm and clamped activation retain dtype and gradient contracts."""
+        """Feature: Additional families.
+        Description: Ordinary norm and clamped activation retain dtype and gradient contracts.
+        Expectation: Eager norm and clamped mlp shared.
+        """
         for factory in (RMSNorm, OffsetRMSNorm):
             member = factory(config=RMSNormConfig(8))
             x = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
@@ -186,24 +203,32 @@ class TestAdditionalFamilies(unittest.TestCase):
                 self.assertIs(adopted.linear_fc1.weight, member.linear_fc1.weight)
                 self.assertEqual(adopted.make_transforms(), [])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_router_replacement_and_metadata(self):
-        """Only public factories declare replacement; model bias is supplied at each call."""
-        source = TokenChoiceTopKRouterModule(config=TokenChoiceTopKRouterConfig(4, 6, top_k=2))
+        """Feature: Additional families.
+        Description: Only public factories declare replacement; model bias is supplied at each call.
+        Expectation: Router replacement and metadata.
+        """
+        source = GateModule(config=GateConfig(4, 6, top_k=2))
         model = nn.Sequential(source)
         model, _ = prepare_model_components(model, {"module_replacements": (
-            ModuleReplacementSpec(("0",), TokenChoiceTopKRouter),)})
-        self.assertIs(model[0].gate.weight, source.gate.weight)
+            ModuleReplacementSpec(("0",), Gate),)})
+        self.assertIs(model[0].weight, source.weight)
         x, bias = torch.randn(3, 4), torch.rand(6)
         for actual, expected in zip(model[0](x, bias), source(x, bias)):
             torch.testing.assert_close(actual, expected)
-        direct = TokenChoiceTopKRouter(config=TokenChoiceTopKRouterConfig(4, 6, top_k=2))
+        direct = Gate(config=GateConfig(4, 6, top_k=2))
         self.assertIsNotNone(get_family_build_info(direct))
         for concrete in (MegaMhcModule, FusedMegaMhcModule, type(model[0])):
             self.assertFalse(getattr(concrete, "_hp_module_replacement", False))
-        self.assertTrue(getattr(TokenChoiceTopKRouter, "_hp_module_replacement", False))
+        self.assertTrue(getattr(Gate, "_hp_module_replacement", False))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_host_table_sparse_step_and_restore(self):
-        """Host lookup coalesces repeated rows and resumes an optimizer step from saved state."""
+        """Feature: Additional families.
+        Description: Host lookup coalesces repeated rows and resumes an optimizer step from saved state.
+        Expectation: Host table sparse step and restore.
+        """
         initial = torch.randn(12, 3)
         table = HostEngramTable(source_weight=nn.Parameter(torch.empty(12, 3, device="meta")), logical_rows=11)
         table.bind_planned_shard(ep_rank=0, ep_size=1)
@@ -235,8 +260,12 @@ class TestAdditionalFamilies(unittest.TestCase):
             opt.step()
         torch.testing.assert_close(table.weight, restored.weight)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_host_family_direct_and_source(self):
-        """Direct Host construction defers the full table and preserves dense fusion state."""
+        """Feature: Additional families.
+        Description: Direct Host construction defers the full table and preserves dense fusion state.
+        Expectation: Host family direct and source.
+        """
         assets = {"layer_ids": [0], "max_ngram_size": 2, "num_heads": 2,
                   "token_map": list(range(6)), "pad_token_id": 0,
                   "primes": [[[5, 7]]], "multipliers": [[1, 3]]}
@@ -256,8 +285,12 @@ class TestAdditionalFamilies(unittest.TestCase):
         parallel = host.parallel_forward(hidden, ids, ep_group=None, ep_rank=0, ep_size=1)
         torch.testing.assert_close(parallel, actual)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_packed_mlp_source_and_clamp(self):
-        """Packed model weights retain identity and reversible checkpoint names."""
+        """Feature: Additional families.
+        Description: Packed model weights retain identity and reversible checkpoint names.
+        Expectation: Packed mlp source and clamp.
+        """
         source = nn.Module()
         source.w1, source.w2 = nn.Linear(4, 12), nn.Linear(6, 4)
         source.swiglu_limit = 0.3

@@ -20,14 +20,19 @@ import torch
 from examples.torch.module_family.config import RMSNormConfig, SwiGLUMLPConfig, SharedExpertConfig
 from hyper_parallel.components.modules.common.rms_norm import RMSNorm, OffsetRMSNorm
 from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
-from hyper_parallel.components.modules.shared_expert_family import SharedExpert
+from hyper_parallel.components.modules.moe.shared_expert import SharedExpert
+from tests.common.mark_utils import arg_mark
 
 
 class TestModuleFamilyExecution(unittest.TestCase):
     """Exercise independently usable public components with CPU autograd."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_components_forward_and_backward(self):
-        """Direct construction executes and differentiates without a global operator runtime."""
+        """Feature: Module family execution.
+        Description: Direct construction executes and differentiates without a global operator runtime.
+        Expectation: Native components forward and backward.
+        """
         modules = (
             RMSNorm(config=RMSNormConfig(8), use_fused_ops=False),
             OffsetRMSNorm(config=RMSNormConfig(8), use_fused_ops=False),

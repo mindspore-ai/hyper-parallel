@@ -29,12 +29,11 @@ from unittest.mock import MagicMock, call, patch
 import torch  # pylint: disable=C0413
 
 from hyper_parallel.core.activation_memory.api import checkpoint_wrapper, checkpoint_exclude_wrapper, swap_wrapper
-from hyper_parallel.components.modules.moe_utils import (  # pylint: disable=C0413
-    MoEMonitorCallback,
-    sync_and_update_expert_bias,
-)
+from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
+from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo  # pylint: disable=C0413
 
+from tests.common.mark_utils import arg_mark
 
 class TestSyncAndUpdateExpertBias(unittest.TestCase):
     """Test sync_and_update_expert_bias function."""
@@ -48,61 +47,81 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe.update_expert_bias = MagicMock()
         return moe
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_no_sync_single_device(self):
-        """No group provided: should call moe.update_expert_bias directly."""
+        """Feature: Moe utils.
+        Description: No group provided: should call moe.update_expert_bias directly.
+        Expectation: No sync single device.
+        """
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
 
         sync_and_update_expert_bias(moe, lr=1e-3)
 
         moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_dp_group_sync_with_group_info(self):
-        """DP group provided as GroupInfo: should sync then update."""
+        """Feature: MoE module compatibility.
+        Description: DP group provided as GroupInfo: should sync then update.
+        Expectation: Existing routing state and synchronization behavior are preserved.
+        """
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         dp_group = GroupInfo("dp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, dp_group=dp_group)
 
             mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=dp_group.group)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_dp_group_sync_with_process_group(self):
-        """DP group provided as ProcessGroup: should sync with the raw group."""
+        """Feature: MoE module compatibility.
+        Description: DP group provided as ProcessGroup: should sync with the raw group.
+        Expectation: Existing routing state and synchronization behavior are preserved.
+        """
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         mock_pg = MagicMock(spec=torch.distributed.ProcessGroup)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, dp_group=mock_pg)
 
             mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=mock_pg)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_group_wrapper_sync_updates_counts_before_bias(self):
-        """A duck-typed group wrapper passes its raw group and updates stats in place."""
+        """Feature: MoE module compatibility.
+        Description: A duck-typed group wrapper passes its raw group and updates stats in place.
+        Expectation: Existing routing state and synchronization behavior are preserved.
+        """
         moe = self._make_moe_mock([1.0, 2.0, 3.0, 4.0])
         group = SimpleNamespace(group=object())
         moe.update_expert_bias.side_effect = lambda **_kwargs: torch.testing.assert_close(
             moe.tokens_per_expert, torch.tensor([2.0, 4.0, 6.0, 8.0]),
         )
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
             mock_all_reduce.side_effect = lambda tensor, **_kwargs: tensor.mul_(2)
             sync_and_update_expert_bias(moe, dp_group=group)
 
         mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=group.group)
         moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_tp_cp_dp_sync_all_groups(self):
-        """All three groups provided: should sync in order TP, CP, DP."""
+        """Feature: MoE module compatibility.
+        Description: All three groups provided: should sync in order TP, CP, DP.
+        Expectation: Existing routing state and synchronization behavior are preserved.
+        """
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         tp_group = GroupInfo("tp_group", MagicMock(), 2)
         cp_group = GroupInfo("cp_group", MagicMock(), 2)
         dp_group = GroupInfo("dp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(
                 moe, lr=1e-3, tp_group=tp_group, cp_group=cp_group, dp_group=dp_group,
@@ -116,32 +135,44 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
             ])
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_num_recomputations_passed(self):
-        """num_recomputations should be forwarded to moe.update_expert_bias."""
+        """Feature: Moe utils.
+        Description: num_recomputations should be forwarded to moe.update_expert_bias.
+        Expectation: Num recomputations passed.
+        """
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
 
         sync_and_update_expert_bias(moe, lr=1e-3, num_recomputations=2)
 
         moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_tp_only_sync(self):
-        """TP group only: should sync once then update (TP+SP scenario)."""
+        """Feature: MoE module compatibility.
+        Description: TP group only: should sync once then update (TP+SP scenario).
+        Expectation: Existing routing state and synchronization behavior are preserved.
+        """
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         tp_group = GroupInfo("tp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, tp_group=tp_group)
 
             mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=tp_group.group)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_only_sync(self):
-        """CP group only: should sync once then update."""
+        """Feature: MoE module compatibility.
+        Description: CP group only: should sync once then update.
+        Expectation: Existing routing state and synchronization behavior are preserved.
+        """
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         cp_group = GroupInfo("cp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.components.modules.moe_utils.dist.all_reduce") as mock_all_reduce:
+        with patch("hyper_parallel.components.modules.moe.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, cp_group=cp_group)
 
@@ -152,9 +183,13 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
 class TestMoEMonitorCallback(unittest.TestCase):
     """Unit tests for MoEMonitorCallback (Layer 1+2 of the three-layer architecture)."""
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_wrapped_router_is_counted_once(self, mock_sync):
-        """Checkpointing leaves logical layer weights and bias-update count unchanged."""
+        """Feature: Moe utils.
+        Description: Checkpointing leaves logical layer weights and bias-update count unchanged.
+        Expectation: Wrapped router is counted once.
+        """
         for wrap in (checkpoint_wrapper, checkpoint_exclude_wrapper, swap_wrapper):
             for wrap_parent in (False, True):
                 with self.subTest(wrapper=wrap.__name__, wrap_parent=wrap_parent):
@@ -173,8 +208,12 @@ class TestMoEMonitorCallback(unittest.TestCase):
                     monitor.on_step_end()
                     self.assertEqual([call.args[0] for call in mock_sync.call_args_list], routers)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_buffer_and_property_metrics_are_observable(self):
-        """Router metrics need not be stored in the module's instance dictionary."""
+        """Feature: Moe utils.
+        Description: Router metrics need not be stored in the module's instance dictionary.
+        Expectation: Buffer and property metrics are observable.
+        """
         class PropertyRouter(torch.nn.Identity):
             """Expose a buffer through the router metric protocol."""
 
@@ -223,9 +262,13 @@ class TestMoEMonitorCallback(unittest.TestCase):
         model.modules.return_value = list(moe_layers)
         return model, moe_layers
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm01_iterates_moe_layers(self, mock_sync):
-        """LB-M01: on_step_end iterates all MoE layers and calls sync per layer."""
+        """Feature: Moe utils.
+        Description: LB-M01: on_step_end iterates all MoE layers and calls sync per layer.
+        Expectation: Iterates moe layers.
+        """
         model, moe_layers = self._make_model_with_moe_layers(num_layers=3)
         callback = MoEMonitorCallback(model, lr=1e-3)
 
@@ -242,9 +285,13 @@ class TestMoEMonitorCallback(unittest.TestCase):
                 num_recomputations=1,
             )
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm02_skip_disabled_layers(self, mock_sync):
-        """LB-M02: Layers with enable_expert_bias=False are skipped."""
+        """Feature: Moe utils.
+        Description: LB-M02: Layers with enable_expert_bias=False are skipped.
+        Expectation: Skip disabled layers.
+        """
         model, _ = self._make_model_with_moe_layers(
             num_layers=3,
             enable_expert_bias_list=[True, False, True],
@@ -260,8 +307,12 @@ class TestMoEMonitorCallback(unittest.TestCase):
              f"expected=2, got={mock_sync.call_count}"),
         )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm04_register_optimizer_hook(self):
-        """LB-M04: register() attaches optimizer post-hook, remove() detaches it."""
+        """Feature: Moe utils.
+        Description: LB-M04: register() attaches optimizer post-hook, remove() detaches it.
+        Expectation: Register optimizer hook.
+        """
         model, _ = self._make_model_with_moe_layers(num_layers=1)
         callback = MoEMonitorCallback(model, lr=1e-3)
 
@@ -283,8 +334,12 @@ class TestMoEMonitorCallback(unittest.TestCase):
         callback.remove()
         mock_handle.remove.assert_called_once()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm04b_register_raises_on_unsupported_optimizer(self):
-        """LB-M04b: register() raises RuntimeError if optimizer lacks post-hook."""
+        """Feature: Moe utils.
+        Description: LB-M04b: register() raises RuntimeError if optimizer lacks post-hook.
+        Expectation: Register raises on unsupported optimizer.
+        """
         model, _ = self._make_model_with_moe_layers(num_layers=1)
         callback = MoEMonitorCallback(model, lr=1e-3)
 
@@ -293,8 +348,12 @@ class TestMoEMonitorCallback(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             callback.register(optimizer)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm04c_reregister_replaces_existing_hook(self):
-        """LB-M04c: register() removes the previous hook before replacing it."""
+        """Feature: Moe utils.
+        Description: LB-M04c: register() removes the previous hook before replacing it.
+        Expectation: Reregister replaces existing hook.
+        """
         model, _ = self._make_model_with_moe_layers(num_layers=1)
         callback = MoEMonitorCallback(model, lr=1e-3)
         first_optimizer = MagicMock()
@@ -313,8 +372,12 @@ class TestMoEMonitorCallback(unittest.TestCase):
         first_handle.remove.assert_called_once()
         second_handle.remove.assert_called_once()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm04d_reregister_runs_callback_once_per_step(self):
-        """LB-M04d: repeated registration triggers one callback per optimizer step."""
+        """Feature: Moe utils.
+        Description: LB-M04d: repeated registration triggers one callback per optimizer step.
+        Expectation: Reregister runs callback once per step.
+        """
         model, _ = self._make_model_with_moe_layers(num_layers=1)
         callback = MoEMonitorCallback(model, lr=1e-3)
         callback.on_step_end = MagicMock()
@@ -330,9 +393,13 @@ class TestMoEMonitorCallback(unittest.TestCase):
         callback.on_step_end.assert_called_once_with()
         callback.remove()
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm05_stores_mean_aux_loss(self, mock_sync):  # pylint: disable=W0613
-        """LB-M05: the monitor exposes the mean of the latest layer aux losses."""
+        """Feature: Moe utils.
+        Description: LB-M05: the monitor exposes the mean of the latest layer aux losses.
+        Expectation: Stores mean aux loss.
+        """
         model, moe_layers = self._make_model_with_moe_layers(num_layers=2)
         moe_layers[0].last_aux_loss = torch.tensor(0.1)
         moe_layers[1].last_aux_loss = torch.tensor(0.3)
@@ -343,9 +410,13 @@ class TestMoEMonitorCallback(unittest.TestCase):
         self.assertIsInstance(callback.last_mean_aux_loss, torch.Tensor)
         torch.testing.assert_close(callback.last_mean_aux_loss, torch.tensor(0.2))
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm05b_no_aux_loss_stores_none(self, mock_sync):  # pylint: disable=W0613
-        """LB-M05b: last_mean_aux_loss is None when all layers have no aux_loss."""
+        """Feature: Moe utils.
+        Description: LB-M05b: last_mean_aux_loss is None when all layers have no aux_loss.
+        Expectation: No aux loss stores none.
+        """
         model, _ = self._make_model_with_moe_layers(num_layers=2)
         callback = MoEMonitorCallback(model, lr=1e-3)
 
@@ -353,7 +424,8 @@ class TestMoEMonitorCallback(unittest.TestCase):
 
         self.assertIsNone(callback.last_mean_aux_loss)
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_aux_loss_available_with_bias_updates_disabled(self, mock_sync):
         """
         Feature: Auxiliary-loss logging.
@@ -368,7 +440,8 @@ class TestMoEMonitorCallback(unittest.TestCase):
         mock_sync.assert_not_called()
         self.assertEqual(callback.last_mean_aux_loss, 1.25)
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_aux_loss_passes_source_tensor_through_until_logging(self, mock_sync):
         """
         Feature: Unified eager and graph auxiliary-loss access.
@@ -391,9 +464,13 @@ class TestMoEMonitorCallback(unittest.TestCase):
         layers[0].last_aux_loss = None
         self.assertIsNone(callback.last_mean_aux_loss)
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm06_multi_layer_different_num_experts(self, mock_sync):
-        """LB-M06: Multi-layer with different num_experts, each synced correctly."""
+        """Feature: Moe utils.
+        Description: LB-M06: Multi-layer with different num_experts, each synced correctly.
+        Expectation: Multi layer different num experts.
+        """
         model, moe_layers = self._make_model_with_moe_layers(
             num_layers=2,
             num_experts_list=[4, 8],
@@ -413,9 +490,13 @@ class TestMoEMonitorCallback(unittest.TestCase):
         self.assertIs(call_moe_args[0], moe_layers[0])
         self.assertIs(call_moe_args[1], moe_layers[1])
 
-    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    @patch("hyper_parallel.trainer.callbacks.moe_monitor_callback.sync_and_update_expert_bias")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_lbm07_no_moe_layers_no_error(self, mock_sync):
-        """LB-M07: Model with no MoE layers does not trigger sync or error."""
+        """Feature: Moe utils.
+        Description: LB-M07: Model with no MoE layers does not trigger sync or error.
+        Expectation: No moe layers no error.
+        """
         model = MagicMock()
         model.modules.return_value = []
         callback = MoEMonitorCallback(model, lr=1e-3)

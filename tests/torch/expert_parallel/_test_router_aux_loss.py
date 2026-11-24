@@ -27,7 +27,7 @@ from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.components.modules.moe_utils import sync_and_update_expert_bias
+from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
 
 

@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from hyper_parallel.components.modules.moe_utils import sync_and_update_expert_bias
+from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from tests.torch.utils import init_dist_gloo
 
@@ -55,7 +55,12 @@ class _RouterWithLoad(nn.Module):
         self.register_buffer("bias", torch.zeros(counts.shape))
 
     def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
-        """Apply the requested bias step to experts above or below the mean load."""
+        """Apply the requested bias step to experts above or below the mean load.
+
+        Args:
+            lr: Bias update step size.
+            num_recomputations: Number of counted forwards per microbatch.
+        """
         counts = self.tokens_per_expert.float() / num_recomputations
         self.bias.add_((counts.mean() - counts).sign(), alpha=lr)
         self.tokens_per_expert.zero_()

@@ -14,8 +14,8 @@
 # ============================================================================
 """CPU contracts for the routed grouped-expert family."""
 
+from itertools import product
 from types import SimpleNamespace
-from typing import Optional
 import unittest
 from unittest.mock import patch
 
@@ -38,36 +38,10 @@ from hyper_parallel.models.replacement import (
 )
 from hyper_parallel.trainer.config.parallelism import entries_to_module_replacements
 from hyper_parallel.trainer.config.resolver import resolve_config
+from tests.common.grouped_experts_family import (
+    cpu_grouped_matmul, cpu_swiglu, cpu_token_permute, cpu_token_unpermute,
+)
 from tests.common.mark_utils import arg_mark
-
-
-def _cpu_permute(tokens: torch.Tensor, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Emulate the NPU token permutation and its source-to-permuted map."""
-    flat_indices = indices.reshape(-1).to(torch.int64)
-    order = flat_indices.argsort(stable=True)
-    inverse = torch.empty_like(order, dtype=torch.int32)
-    inverse.scatter_(0, order, torch.arange(order.numel(), dtype=torch.int32))
-    return tokens.index_select(0, order // indices.shape[1]), inverse
-
-
-def _cpu_unpermute(
-    values: torch.Tensor, inverse: torch.Tensor, probabilities: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Emulate the fused inverse permutation, optional weighting and top-k sum."""
-    source_slots = values.index_select(0, inverse.to(torch.int64))
-    if probabilities is None:
-        return source_slots
-    source_slots = source_slots.reshape(*probabilities.shape, values.shape[-1])
-    return (source_slots * probabilities.unsqueeze(-1)).sum(dim=1)
-
-
-def _cpu_grouped_matmul(
-    inputs: torch.Tensor, weights: torch.Tensor, *, group_list: torch.Tensor,
-) -> torch.Tensor:
-    """Apply the same expert row selection as grouped GEMM using CPU batched matmul."""
-    counts = torch.diff(group_list, prepend=group_list.new_zeros(1))
-    expert_ids = torch.arange(counts.numel(), device=counts.device).repeat_interleave(counts)
-    return torch.bmm(inputs.unsqueeze(1), weights.index_select(0, expert_ids)).squeeze(1)
 
 
 def _reference_forward(
@@ -195,9 +169,15 @@ class TestRoutedGroupedExperts(unittest.TestCase):
         Expectation: Outputs and all differentiable inputs and parameters agree.
         """
         expert_ids = torch.tensor([[3, 0], [1, 3], [0, 2]], dtype=torch.int64)
-        for mode in ("output", "before_fc2"):
-            with self.subTest(mode=mode):
-                config = GroupedExpertsConfig(4, 6, 5, routing_weight_mode=mode, num_layers=1)
+        for mode, limit in product(("output", "before_fc2"), (None, 0.0, -1.0)):
+            with self.subTest(mode=mode, limit=limit):
+                if limit is None:
+                    config = GroupedExpertsConfig(4, 6, 5, routing_weight_mode=mode, num_layers=1)
+                else:
+                    with self.assertWarnsRegex(UserWarning, "disables clamping"):
+                        config = GroupedExpertsConfig(
+                            4, 6, 5, routing_weight_mode=mode, num_layers=1, swiglu_limit=limit,
+                        )
                 candidate = GroupedExpertsModule(config=config).to(torch.float64)
                 hidden = torch.randn(3, 6, dtype=torch.float64, requires_grad=True)
                 probabilities = torch.randn(3, 2, dtype=torch.float64).softmax(-1).requires_grad_()
@@ -208,15 +188,19 @@ class TestRoutedGroupedExperts(unittest.TestCase):
 
                 with patch(
                     "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.moe_token_permute",
-                    side_effect=_cpu_permute,
+                    side_effect=cpu_token_permute,
                 ) as permute, patch(
                     "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.moe_token_unpermute",
-                    side_effect=_cpu_unpermute,
+                    side_effect=cpu_token_unpermute,
                 ), patch(
                     "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.grouped_matmul",
-                    side_effect=_cpu_grouped_matmul,
-                ):
+                    side_effect=cpu_grouped_matmul,
+                ), patch(
+                    "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.npu_swiglu",
+                    side_effect=cpu_swiglu,
+                ) as activation:
                     actual = candidate(hidden, expert_ids, probabilities)
+                activation.assert_called_once()
                 expected = _reference_forward(
                     reference_hidden,
                     expert_ids,
@@ -421,7 +405,7 @@ class TestRoutedGroupedExperts(unittest.TestCase):
     )
     def test_family_selects_only_implemented_local_and_ep_members(self) -> None:
         """Feature: Family selector matrix.
-        Description: Select local and EP implementations and reject reserved execution modes.
+        Description: Select local, EP and MoonEP implementations with EP=1 fallback.
         Expectation: The topology chooses the concrete member before runtime resources are bound.
         """
         config = GroupedExpertsConfig(4, 6, 5, num_layers=1)
@@ -430,9 +414,13 @@ class TestRoutedGroupedExperts(unittest.TestCase):
         self.assertIs(type(local), GroupedExpertsModule)
         self.assertIs(type(parallel), EPGroupedExperts)
         self.assertEqual(parallel.parallel_module_spec().binding_kind, "ep")
-        for selectors in ({"megakernel": True}, {"moonep": True, "context": {"ep_size": 2}}):
-            with self.subTest(selectors=selectors), self.assertRaises(NotImplementedError):
-                GroupedExperts(config=config, **selectors)
+        with self.assertRaisesRegex(ValueError, "top_k"):
+            GroupedExperts(config=config, megakernel=True, context={"ep_size": 2})
+        moon = GroupedExperts(config=config, moonep=True, moonep_replica_capacity=3, context={"ep_size": 2})
+        self.assertEqual(type(moon).__name__, "MoonEPGroupedExperts")
+        self.assertEqual(moon.parallel_module_spec().options["moonep_replica_capacity"], 3)
+        with self.assertWarnsRegex(UserWarning, "EP=1"):
+            self.assertIs(type(GroupedExperts(config=config, moonep=True)), GroupedExpertsModule)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",

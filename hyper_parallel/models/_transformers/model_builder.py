@@ -31,6 +31,7 @@ from torch import nn
 from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
 from hyper_parallel.high_availability.group_registry import is_recovery_bootstrapping
+from hyper_parallel.components.modules.megakernel_utils import prepare_module_runtimes
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
     HuggingFaceCheckpointer,
 )
@@ -687,6 +688,17 @@ def _apply_fsdp2_with_external(
     return model
 
 
+def _finalize_materialized_model(model: nn.Module, model_init_dtype: Optional[str], external: Any) -> None:
+    """Prepare materialized modules and their runtimes before compilation."""
+    # Final dtype conversion belongs to the atomic build (05 stage-5 item
+    # 5): the Trainer never patches model dtype after construction.
+    apply_model_init_dtype(model, model_init_dtype)
+    validate_materialized_modules(model)
+    prepare_module_runtimes(model)
+    if external is not None:
+        external.check_identities()
+
+
 def apply_model_infrastructure(
     model: nn.Module,
     mesh: Optional[MeshContext] = None,
@@ -790,12 +802,7 @@ def apply_model_infrastructure(
         load_base_model=load_base_model, pretrained_path=pretrained_path, weights_mapping=weights_mapping,
     )
 
-    # Final dtype conversion belongs to the atomic build (05 stage-5 item
-    # 5): the Trainer never patches model dtype after construction.
-    apply_model_init_dtype(model, model_init_dtype)
-    validate_materialized_modules(model)
-    if external is not None:
-        external.check_identities()
+    _finalize_materialized_model(model, model_init_dtype, external)
 
     if compile_for_execution:
         model = apply_compile(model, compile_config)

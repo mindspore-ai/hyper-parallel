@@ -139,7 +139,13 @@ def _load_pretrained_config(
     config_kwargs = {name: value for name, value in kwargs.items()
                      if name not in {"model_factory", "model_spec"}}
     config_kwargs.update(config_overrides or {})
-    return get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+    config = get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+    # HF applies kwargs only to attributes it already knows. Explicit adapter
+    # metadata must survive too, without replacing converted nested HF configs.
+    for name, value in (config_overrides or {}).items():
+        if not hasattr(config, name):
+            setattr(config, name, value)
+    return config
 
 
 def _validate_weight_check_options(verify_hf_weights: Optional[str], load_base_model: bool) -> None:
@@ -336,6 +342,29 @@ class _BaseHyperAutoModelClass:
 
         No checkpoint is loaded, so the from-config random initialization path
         is preserved.
+
+        Args:
+            config: Resolved HF model configuration.
+            *model_args: Positional arguments for the native model constructor.
+            distributed_setup: Resolved job parallel setup.
+            device_mesh: Optional existing device mesh.
+            peft_config: Optional adapter configuration.
+            torch_dtype: Model parameter dtype.
+            attn_implementation: Native attention backend selection.
+            validate_placement: Enable placement validation.
+            qat_config: Optional quantization-aware training configuration.
+            fp8_config: Optional FP8 configuration.
+            compile_config: Optional compilation settings.
+            freeze_config: Optional parameter-freezing rules.
+            activation_checkpoint: Activation checkpointing policy.
+            swap_inputs: Enable input swapping.
+            allow_cache_entry_mutation: Permit cache-entry mutation during replay.
+            activation_swap: Activation swapping policy.
+            model_init_dtype: Random initialization dtype before mixed precision.
+            **kwargs: Additional model or infrastructure construction arguments.
+
+        Returns:
+            Materialized model with the requested infrastructure applied.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()

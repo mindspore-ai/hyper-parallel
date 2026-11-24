@@ -23,19 +23,24 @@ from hyper_multicore.modules.mega_gate import MegaGate as SourceMegaGate
 
 from examples.torch.module_family.config import MegaGateConfig
 from hyper_parallel.components.modules import get_family_build_info
-from hyper_parallel.components.modules import gate_family as gate
 from hyper_parallel.components.modules.family import get_module_family
-from hyper_parallel.components.modules.gate_family import Gate
+from hyper_parallel.components.modules.moe import router
+from hyper_parallel.components.modules.moe.router import Gate
 from hyper_parallel.distributed.expert_parallel.routing import resolve_moe_router
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest
+from tests.common.mark_utils import arg_mark
 
 
 class TestGateFamily(unittest.TestCase):
     """Preserve public router state and reuse the existing adapter implementations."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_original_mega_gate_outputs_and_gradients(self):
-        """Match original scoring, TopK, modality and precision contracts with nonzero correction biases."""
+        """Feature: Gate family.
+        Description: Match original scoring, TopK, modality and precision contracts with nonzero correction biases.
+        Expectation: Original mega gate outputs and gradients.
+        """
         modes = ("fp32", "bf16", "autocast")
         for scoring, top_k, modality, precision in product(
                 ("sqrtsoftplus", "softmax", "sigmoid"), (1, 2), ("text", "visual", "mixed"), modes):
@@ -78,14 +83,26 @@ class TestGateFamily(unittest.TestCase):
                     else:
                         torch.testing.assert_close(parameter.grad, reference.grad, atol=0, rtol=0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_only_gate_family_is_registered(self):
-        """Both members share one family; the removed MegaGate entry cannot register a second family."""
-        self.assertFalse(hasattr(gate, "MegaGate"))
+        """Feature: Gate family.
+        Description: Ordinary and fused routing share one Gate registration and initialization owner.
+        Expectation: Only gate family is registered.
+        """
+        self.assertFalse(hasattr(router, "MegaGate"))
+        self.assertFalse(hasattr(router, "TokenChoiceTopKRouter"))
+        self.assertFalse(hasattr(router, "TokenChoiceTopKRouterModule"))
+        self.assertFalse(hasattr(router, "RouterTrainingMixin"))
+        self.assertEqual(router.GateModule.__bases__, (torch.nn.Module,))
         self.assertEqual(get_module_family(Gate).name, "gate")
         self.assertEqual(set(get_module_family(Gate).variants), {"local", "mega"})
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_original_initialization_reset_and_empty_input(self):
-        """The original and migrated member initialize identically and accept empty token batches."""
+        """Feature: Gate family.
+        Description: The original and migrated member initialize identically and accept empty token batches.
+        Expectation: Original initialization reset and empty input.
+        """
         for vision in (False, True):
             with self.subTest(vision=vision):
                 torch.manual_seed(71)
@@ -108,8 +125,12 @@ class TestGateFamily(unittest.TestCase):
                 for actual, expected in zip(member(values, mask), original(values, mask)):
                     torch.testing.assert_close(actual, expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_source_replacement_and_gradients(self):
-        """Actual replacement preserves source values, parameter identities and mode."""
+        """Feature: Gate family.
+        Description: Actual replacement preserves source values, parameter identities and mode.
+        Expectation: Source replacement and gradients.
+        """
         for vision in (False, True):
             with self.subTest(vision=vision):
                 source = SourceMegaGate(hidden_size=4, num_experts=4, top_k=2,
@@ -142,8 +163,12 @@ class TestGateFamily(unittest.TestCase):
                 torch.testing.assert_close(x.grad, other.grad)
                 torch.testing.assert_close(member.weight.grad, reference.weight.grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_direct_meta_and_scope(self):
-        """Caller-owned configs construct/reset routers; other router classes are rejected."""
+        """Feature: Gate family.
+        Description: Caller-owned configs construct/reset routers; other router classes are rejected.
+        Expectation: Direct meta and scope.
+        """
         config = MegaGateConfig(4, 4, 2)
         with torch.device("meta"):
             member = Gate(config=config, implementation="mega")
@@ -161,8 +186,12 @@ class TestGateFamily(unittest.TestCase):
         with self.assertRaises(ValueError):
             Gate(config=config, module=member, implementation="mega")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_public_adapter_reuse(self):
-        """Resolved adapters preserve numerical routing contracts for public Gate members."""
+        """Feature: Gate family.
+        Description: Resolved adapters preserve numerical routing contracts for public Gate members.
+        Expectation: Public adapter reuse.
+        """
         source = Gate(config=MegaGateConfig(4, 4, 2, scoring_func="sigmoid"), implementation="mega")
         x = torch.randn(2, 3, 4)
         _, weights, indices = source(x)
@@ -173,8 +202,12 @@ class TestGateFamily(unittest.TestCase):
         with self.assertRaises(KeyError):
             resolve_moe_router("unknown_router")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_softmax_and_group_adapters_against_explicit_scores(self):
-        """Adapter resolution executes softmax normalization and group-limited sigmoid selection."""
+        """Feature: Gate family.
+        Description: Adapter resolution executes softmax normalization and group-limited sigmoid selection.
+        Expectation: Softmax and group adapters against explicit scores.
+        """
         logits = torch.tensor([[4., 3., 0., -1.], [-2., -1., 2., 1.]])
         projection = torch.nn.Linear(4, 4, bias=False)
         with torch.no_grad():

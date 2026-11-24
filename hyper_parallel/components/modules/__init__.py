@@ -47,13 +47,13 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
     from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm
-    from hyper_parallel.components.modules.shared_expert_family import SharedExpert
+    from hyper_parallel.components.modules.moe.shared_expert import SharedExpert
     from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
-    "Gate": "gate_family",
-    "GateModule": "gate_family",
+    "Gate": "moe.router",
+    "GateModule": "moe.router",
     "MegaMhc": "mhc.mhc_family",
     "MegaMhcModule": "mhc.mega_mhc",
     "SpatialMergeProjector": "common.spatial_merge_projector",
@@ -66,11 +66,10 @@ _EXPORT_TO_MODULE = {
     "MHCPre": "mhc",
     "MHCPost": "mhc",
     "PipelinedMhc": "mhc",
-    "TokenChoiceTopKRouter": "router_family",
     "SwiGLUMLPModule": "swiglu_mlp_family",
     "SwiGLUMLP": "swiglu_mlp_family",
-    "SharedExpertModule": "shared_expert_family",
-    "SharedExpert": "shared_expert_family",
+    "SharedExpertModule": "moe.shared_expert",
+    "SharedExpert": "moe.shared_expert",
     "RMSNormModule": "common.rms_norm",
     "NativeRMSNormModule": "common.rms_norm",
     "NativeOffsetRMSNormModule": "common.rms_norm",

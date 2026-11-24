@@ -388,8 +388,9 @@ def build_deepseek_v41_validation_config(
         exercise_post_training_indexer: bool = True,
         enable_candidate_pool: bool = False,
         indexer_loss_coeff: float = 1.0e-3,
-        router_aux_loss_coeff: float = 1.0e-4,
-        router_bias_update_rate: float = 1.0e-3,
+        moe_aux_loss_coeff: float = 0.0,
+        moe_router_bias_update_rate: float = 0.0,
+        moe_router_force_load_balancing: bool = False,
         dspark_depth: int = 0,
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
@@ -412,15 +413,13 @@ def build_deepseek_v41_validation_config(
         vision_num_hidden_layers: Optional visual-tower crop depth, valid only when ``enable_vision`` is true.
         vision_parameter_divisor: Uniform divisor for vision hidden, MLP, and attention-head dimensions.
         num_routed_experts: Routed-expert count for the crop; routing top-k and every MoE layer are retained.
-        exercise_post_training_indexer: Bound the candidate pool so a 4K smoke
-            exercises candidate selection before the released Reindex layers.
-            Only applies when enable_candidate_pool is True.
-        enable_candidate_pool: Retain hierarchical candidates when True. Defaults to False, which
-            disables candidate-specific crop remapping and preserves the
-            retained released Full/Reindex/Reuse roles with full-range causal indexing.
+        exercise_post_training_indexer: Bound the candidate pool for 4K smoke tests when it is enabled.
+        enable_candidate_pool: Retain hierarchical candidates. False preserves the released layer roles
+            with full-range causal indexing.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
-        router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
-        router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
+        moe_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
+        moe_router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
+        moe_router_force_load_balancing: Enable deterministic destinations when using the new Gate family.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
         dspark_target_layer_ids: Backbone layers feeding the drafter; defaults to the released last-three layout.
         dspark_loss_coeff: Drafter objective weight.
@@ -448,8 +447,12 @@ def build_deepseek_v41_validation_config(
     if not enable_candidate_pool:
         config.v41_candidate_source_layer_id = -1
         config.v41_candidate_topk_blocks = 0
-    config.router_aux_loss_coef = float(router_aux_loss_coeff)
-    config.router_bias_update_rate = float(router_bias_update_rate)
+    config.moe_aux_loss_coeff = float(moe_aux_loss_coeff)
+    config.moe_router_bias_update_rate = float(moe_router_bias_update_rate)
+    config.moe_router_force_load_balancing = moe_router_force_load_balancing
+    # The native HF model still consumes these fields before module replacement.
+    config.router_aux_loss_coef = config.moe_aux_loss_coeff
+    config.router_bias_update_rate = config.moe_router_bias_update_rate
     _apply_v41_vision_fields(
         config, source, enable_vision, vision_num_hidden_layers, vision_parameter_divisor
     )
@@ -486,8 +489,9 @@ def build_cropped_deepseek_v41(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
-        router_aux_loss_coeff: float = 1.0e-4,
-        router_bias_update_rate: float = 1.0e-3,
+        moe_aux_loss_coeff: float = 0.0,
+        moe_router_bias_update_rate: float = 0.0,
+        moe_router_force_load_balancing: bool = False,
         dspark_depth: int = 0,
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
@@ -517,13 +521,12 @@ def build_cropped_deepseek_v41(
         config_path: Local DeepSeek-V4.1 repository.
         engram_assets_path: Prepared scaled-Engram JSON file.
         num_routed_experts: Routed-expert count for the parameter crop.
-        exercise_post_training_indexer: Bound candidates and remap shallow crops for Reindex testing.
-            Only applies when enable_candidate_pool is True.
-        enable_candidate_pool: Enable hierarchical candidates. Defaults to False, which disables
-            candidate-specific remapping and preserves the retained released layer roles.
+        exercise_post_training_indexer: Bound and remap candidates in shallow crops when the pool is enabled.
+        enable_candidate_pool: Retain the released Full/Reindex candidate pool.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
-        router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
-        router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
+        moe_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
+        moe_router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
+        moe_router_force_load_balancing: Enable deterministic destinations when using the new Gate family.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
         dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
             to the last three.
@@ -542,7 +545,6 @@ def build_cropped_deepseek_v41(
         codegen: Select the codegen ``gen`` backend for this build.
         codegen_config: Optional codegen backend configuration.
         load_base_model: Load local HF weights from config_path.
-        enable_candidate_pool: Retain the released Full/Reindex candidate pool.
         verify_hf_weights: Optional report directory for checking loaded weights
             against the HF checkpoint before the first forward or optimizer update.
     """
@@ -553,7 +555,8 @@ def build_cropped_deepseek_v41(
         vision_parameter_divisor=vision_parameter_divisor, num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         enable_candidate_pool=enable_candidate_pool, indexer_loss_coeff=indexer_loss_coeff,
-        router_aux_loss_coeff=router_aux_loss_coeff, router_bias_update_rate=router_bias_update_rate,
+        moe_aux_loss_coeff=moe_aux_loss_coeff, moe_router_bias_update_rate=moe_router_bias_update_rate,
+        moe_router_force_load_balancing=moe_router_force_load_balancing,
         dspark_depth=dspark_depth, dspark_target_layer_ids=dspark_target_layer_ids,
         dspark_loss_coeff=dspark_loss_coeff, dspark_confidence_coeff=dspark_confidence_coeff,
         engram_storage_backend=engram_storage_backend, engram_max_pending_entries=engram_max_pending_entries,

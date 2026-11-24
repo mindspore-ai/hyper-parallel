@@ -75,7 +75,7 @@ from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
-from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
+from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.models.external_state import get_model_external_state
@@ -1013,6 +1013,11 @@ class BaseTrainer(Stateful, ABC):
 
         External providers expose their owned parameters through ``parameters``
         and normalize those gradients in ``prepare_optimizer_step`` instead.
+
+        Args:
+            loss: Summed step objective before token normalization.
+            loss_dict: Step loss metrics, normalized in place.
+            denominator: Optional precomputed valid-token count.
         """
         if denominator is None:
             denominator = self._loss_denominator()
@@ -1034,7 +1039,12 @@ class BaseTrainer(Stateful, ABC):
         return loss / denominator
 
     def prepare_optimizer_step(self, loss: float, loss_dict: Dict[str, float]) -> tuple[float, Any]:
-        """Normalize the step objective before clipping and optimizer preparation."""
+        """Normalize the step objective before clipping and optimizer preparation.
+
+        Args:
+            loss: Summed step objective before token normalization.
+            loss_dict: Step loss metrics, normalized in place.
+        """
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)

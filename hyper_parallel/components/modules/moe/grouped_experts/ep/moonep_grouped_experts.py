@@ -12,45 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Reserved MoonEP execution member; default expert mathematics stays shared."""
+"""MoonEP member sharing the ordinary expert algorithm and FSDP parameter lifecycle."""
 
 from __future__ import annotations
+
+from typing import Any
 
 from torch import Tensor, nn
 
 from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts import validate_ep_layout
 from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (
-    GroupedExpertsConfig, GroupedExpertsModule,
+    GroupedExpertsConfig, GroupedExpertsModule, match_grouped_experts_inputs,
 )
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.distributed.expert_parallel.moonep_context import MoonEPContext
 from hyper_parallel.distributed.module_binding import ParallelBinding, ParallelModuleSpec
 
 
 class MoonEPGroupedExperts(GroupedExpertsModule):
-    """Reserve dynamic execution replicas while keeping the canonical home Parameters.
-
-    Future execution plans/prefetches/dispatches through MoonEPContext, calls
-    inherited compute_experts with explicit compute weights, and combines once.
-    Replica gradients must return to home before FSDP/optimizer consume them.
-    """
+    """Balance execution with temporary replicas while retaining home Shard(0) Parameters."""
 
     def __init__(
         self, *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
+        module_fqn: str = "", context: Any = None, moonep_replica_capacity: int | None = None,
+        overlap_shared_expert: bool = True,
     ) -> None:
-        """Construct home parameters without acquiring MoonEP runtime resources.
+        """Construct the shared algorithm without acquiring runtime resources.
 
         Args:
-            config: Canonical global algorithm configuration, exclusive with module.
-            module: Canonical source whose parameters and training state are retained.
+            config: Canonical expert algorithm configuration, exclusive with module.
+            module: Packed source whose parameters and training state are retained.
+            module_fqn: Source expert boundary for replacement metadata.
+            context: Builder-provided model configuration and initialization facts.
+            moonep_replica_capacity: Remote expert slots per rank; None means E/EP.
+            overlap_shared_expert: Enable context-owned shared FC1/FC2 scheduling.
         """
-        super().__init__(config=config, module=module)
+        super().__init__(config=config, module=module, module_fqn=module_fqn, context=context)
+        self.moonep_replica_capacity = moonep_replica_capacity
+        self.overlap_shared_expert = overlap_shared_expert
         self.ep_context: MoonEPContext | None = None
 
     def bind_parallel(self, binding: ParallelBinding) -> None:
         """Borrow the job-owned MoonEP context with matching home ownership.
 
         Args:
-            binding: Existing expert mesh and MoonEP context; no new process group.
+            binding: Existing expert mesh and MoonEP runtime context.
         """
         context = binding.ep_context
         if not isinstance(context, MoonEPContext) or context.num_experts != self.config.num_experts:
@@ -61,27 +67,43 @@ class MoonEPGroupedExperts(GroupedExpertsModule):
 
     def forward(
         self, hidden_states: Tensor, topk_ids: Tensor | None = None, topk_weights: Tensor | None = None,
-        **kwargs: Tensor,
+        **kwargs: Any,
     ) -> Tensor:
-        """Reserve the full request-level MoonEP execution and autograd lifecycle.
+        """Run the inherited permute/compute/unpermute with a per-call MoonEP plan.
 
         Args:
-            hidden_states: Original source tokens [...,H], before ordinary permute.
-            topk_ids: Global model-selected expert IDs [T,K].
-            topk_weights: Final differentiable routing weights [T,K].
-            **kwargs: Source aliases accepted by the family interface.
+            hidden_states: Source tokens [...,H].
+            topk_ids: Logical expert IDs [T,K], unchanged by physical balancing.
+            topk_weights: Differentiable route probabilities [T,K].
+            **kwargs: Recognized source routing aliases.
 
-        Note:
-            The runtime must use the same invocation plan for weight prefetch,
-            dispatch, shared compute, combine, replica-gradient return and recompute.
-            It must not compose ordinary slot restore around token-level combine.
+        Returns:
+            Routed token outputs [...,H]; routing weights are applied exactly once.
         """
-        raise NotImplementedError("MoonEP execution, replica autograd and invocation lifecycle are not implemented")
+        if self.ep_context is None:
+            raise ValueError("MoonEP experts must be bound before forward")
+        topk_ids, topk_weights = match_grouped_experts_inputs(topk_ids, topk_weights, kwargs)
+        output_shape = tuple(hidden_states.shape)
+        hidden_states = self.validate_and_flatten_inputs(hidden_states, topk_ids, topk_weights)
+        hidden, ids, _, weights, source_inverse = self.permute(hidden_states, topk_ids, topk_weights)
+        plan = self.ep_context.plan(ids)
+        gate, down = self.gate_up_proj, self.down_proj
+        gate = gate.to_local() if isinstance(gate, DTensor) else gate
+        down = down.to_local() if isinstance(down, DTensor) else down
+        gate, down = self.ep_context.expert_weights(gate, down, plan)
+        hidden, counts, weights, receive_inverse = self.ep_context.dispatch(
+            hidden, weights, plan=plan,
+        )
+        values = self.compute_experts(hidden, counts, gate, down, weights)
+        values = self.ep_context.combine(values, plan, receive_inverse)
+        return self.unpermute(values, source_inverse, topk_weights, output_shape)
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
-        """Declare home Shard(0) ownership and a distinct request-level EP protocol."""
+        """Declare fixed home ownership and the collective MoonEP protocol."""
         return ParallelModuleSpec(
             "grouped_experts.forward.moonep", "ep", {"forward": ("hidden_states", "topk_ids", "topk_weights")},
             validate=validate_ep_layout,
-            options={"num_experts": self.config.num_experts, "moonep": True},
+            options={"num_experts": self.config.num_experts, "moonep": True,
+                     "moonep_replica_capacity": self.moonep_replica_capacity,
+                     "overlap_shared_expert": self.overlap_shared_expert},
         )
