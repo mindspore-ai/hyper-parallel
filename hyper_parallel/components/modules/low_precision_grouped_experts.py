@@ -49,6 +49,8 @@ def _swiglu(projected: Tensor, *, limit: float | None = None) -> Tensor:
 class LowPrecisionGroupedExperts(GroupedExperts):
     """Preserve high-performance expert layout/routing and bind one existing QAT strategy."""
 
+    requires_ep_grouped_gemm = True
+
     def __init__(self, *, module: nn.Module, strategy: GroupedLinear, module_fqn: str = "",
                  context: Mapping[str, Any]) -> None:
         """Build local expert computation from the already resolved dtype scheme.
@@ -60,8 +62,12 @@ class LowPrecisionGroupedExperts(GroupedExperts):
             context: Existing replacement context containing the resolved low_precision policy.
         """
         prefix = f"{module_fqn or '<root>'}: LowPrecisionGroupedExperts"
-        if any(context.get(axis) for axis in ("tp", "cp", "ep", "pp")) or context.get("ep_size", 1) != 1:
-            raise NotImplementedError(f"{prefix} requires TP=CP=EP=PP=1")
+        is_mxfp8 = isinstance(strategy, MXFP8GroupedLinear)
+        blocked_axes = ("tp", "cp", "pp") if is_mxfp8 else ("tp", "cp", "ep", "pp")
+        if any(context.get(axis) for axis in blocked_axes) or (
+                not is_mxfp8 and context.get("ep_size", 1) != 1):
+            requirement = "TP=CP=PP=1" if is_mxfp8 else "TP=CP=EP=PP=1"
+            raise NotImplementedError(f"{prefix} requires {requirement}")
         super().__init__(module=module, module_fqn=module_fqn, context=context)
         if (not self.has_gate or self.add_bias or self.use_2d_experts
                 or not self.router_gating_in_fp32):

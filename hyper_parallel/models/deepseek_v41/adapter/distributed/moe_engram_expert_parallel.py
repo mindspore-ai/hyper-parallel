@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.modules.engram import local_token_mask
+from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
@@ -279,14 +280,17 @@ def deepseek_v41_ep_compute_fn(
     ep_size = ep_mesh["ep"].size()
     tp_size = 1 if tp_mesh is None else tp_mesh.size()
     tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
-    apply_gate = (
-        module.experts._apply_gate  # pylint: disable=protected-access
-        if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
-    )
-    if use_grouped_gemm:
-        module.experts.forward_expert_major = MethodType(
-            _deepseek_v41_grouped_expert_forward, module.experts,
+    if isinstance(module.experts, GroupedExperts):
+        apply_gate = None
+    else:
+        apply_gate = (
+            module.experts._apply_gate  # pylint: disable=protected-access
+            if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
         )
+        if use_grouped_gemm:
+            module.experts.forward_expert_major = MethodType(
+                _deepseek_v41_grouped_expert_forward, module.experts,
+            )
     bind_local_expert_forward(
         module, ep_size, use_grouped_gemm=use_grouped_gemm,
         apply_gate=None if use_grouped_gemm else apply_gate,

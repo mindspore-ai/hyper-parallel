@@ -702,15 +702,15 @@ def _apply_module_replacement_actions(
     if weights_mapping is None:
         weights_mapping = get_model_conversion_mapping(model)
     context = context or {}
-    active_model_parallel_axes = [
+    active_unsupported_axes = [
         axis.upper()
-        for axis in ("tp", "cp", "ep", "pp")
+        for axis in ("tp", "cp", "pp")
         if context.get(axis)
     ]
-    if context.get("low_precision") is not None and active_model_parallel_axes:
+    if context.get("low_precision") is not None and active_unsupported_axes:
         raise NotImplementedError(
-            "Low-precision online training currently requires TP=CP=EP=PP=1; "
-            f"active axes: {active_model_parallel_axes}."
+            "Low-precision online training currently requires TP=CP=PP=1; "
+            f"active axes: {active_unsupported_axes}."
         )
     plan = (replacement_rules if isinstance(replacement_rules, ModuleReplacementPlan)
             else compile_module_replacements(model, tuple(replacement_rules or ())))
