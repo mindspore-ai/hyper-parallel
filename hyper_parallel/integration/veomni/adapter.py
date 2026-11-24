@@ -21,6 +21,7 @@ remove them after training; concurrent patch changes are unsupported.
 
 import sys
 from collections.abc import Callable
+from copy import copy
 from functools import wraps
 from importlib import import_module
 from inspect import signature
@@ -37,6 +38,7 @@ from hyper_parallel.integration.torch import (
     get_model_state_dict,
     set_model_state_dict,
 )
+from hyper_parallel.integration.torch.dtensor import to_torch_view
 from hyper_parallel.integration.veomni.extra_parallel import (
     bind_gradient_divisor,
     native_clipping_view,
@@ -55,6 +57,30 @@ def _loaded_veomni_modules() -> list:
         for name, module in tuple(sys.modules.items())
         if (name == "veomni" or name.startswith("veomni.")) and module is not None
     ]
+
+
+def _build_chunk_loading_binding() -> tuple:
+    """Keep layout metadata when the native chunk loader reads parameter.data."""
+    loading = import_module("veomni.models.checkpoint.weights")
+    # The native chunk loader has no separate parameter-view hook.
+    original_find = loading._find_submodule  # pylint: disable=protected-access
+
+    @wraps(original_find)
+    def find_submodule(module: torch.nn.Module, name: str) -> tuple:
+        """Expose a storage-sharing checkpoint view only to loader lookups."""
+        module, local_name = original_find(module, name)
+        parameter = module._parameters.get(local_name)  # pylint: disable=protected-access
+        if not isinstance(parameter, DTensor):
+            return module, local_name
+        view = copy(module)
+        # The real module and its parameter identity stay owned by Hyper FSDP.
+        view._parameters = {  # pylint: disable=protected-access
+            **module._parameters,  # pylint: disable=protected-access
+            local_name: to_torch_view(parameter),
+        }
+        return view, local_name
+
+    return original_find, find_submodule
 
 
 @torch.no_grad()
@@ -405,7 +431,7 @@ class VeOmniAdapter:
         if not (self.fsdp or self.muon):
             return self
         replacements = (
-            [self._build_loading_binding(), self._build_clipping_binding()]
+            [self._build_loading_binding(), _build_chunk_loading_binding(), self._build_clipping_binding()]
             if self.fsdp
             else []
         )
@@ -431,6 +457,7 @@ class VeOmniAdapter:
         # pylint: disable=protected-access
         loading = import_module("veomni.models.checkpoint.weights")
         original_load = loading._dispatch_parameter
+        original_find = loading._find_submodule
         load_signature = signature(original_load)
         if not {"module", "name", "tensor"}.issubset(load_signature.parameters):
             raise RuntimeError("Unsupported VeOmni parameter dispatcher signature.")
@@ -442,9 +469,7 @@ class VeOmniAdapter:
             bound = load_signature.bind(*args, **kwargs)
             bound.apply_defaults()
             arguments = bound.arguments
-            module, local_name = loading._find_submodule(
-                arguments["module"], arguments["name"]
-            )
+            module, local_name = original_find(arguments["module"], arguments["name"])
             parameter = module._parameters[local_name]
             if not isinstance(parameter, DTensor):
                 return original_load(*args, **kwargs)
