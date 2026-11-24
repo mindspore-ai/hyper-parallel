@@ -28,9 +28,7 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # pylint: disable=wrong-import-position
 
-from hyper_parallel.models.kimi_k26.adapter.distributed import (  # pylint: disable=wrong-import-position
-    ep_compute,
-)
+from hyper_parallel.distributed.expert_parallel import recipes as ep_compute  # pylint: disable=wrong-import-position
 
 
 # These stub modules never run a forward pass; they only expose the attributes
@@ -59,6 +57,7 @@ class TestFactorySwitch(unittest.TestCase):
     """``fix_router`` reaches the framework resolver through the archetype."""
 
     @staticmethod
+
     def _capture(**kwargs):
         """Build the archetype with ``build_ep_compute`` stubbed out, return its kwargs."""
         captured = {}
@@ -74,7 +73,7 @@ class TestFactorySwitch(unittest.TestCase):
 
         ep_compute.build_ep_compute = _stub
         try:
-            ep_compute.kimi_k26_ep_compute_fn(
+            ep_compute.deepseekv3_ep_compute_fn(
                 module=_FakeMoE(2, 8), mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None,
                 **kwargs)
         finally:
@@ -107,6 +106,7 @@ class TestOverlapAndCapacitySwitches(unittest.TestCase):
     """
 
     @staticmethod
+
     def _capture(**kwargs):
         """Build the archetype with ``build_ep_compute`` stubbed out, return its kwargs."""
         captured = {}
@@ -122,7 +122,7 @@ class TestOverlapAndCapacitySwitches(unittest.TestCase):
 
         ep_compute.build_ep_compute = _stub
         try:
-            ep_compute.kimi_k26_ep_compute_fn(
+            ep_compute.deepseekv3_ep_compute_fn(
                 module=_FakeMoE(2, 8), mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None,
                 **kwargs)
         finally:

@@ -14,19 +14,23 @@
 # ============================================================================
 """qwen3_moe: Qwen3-MoE model family package (HF model example).
 
-The stable entry exposes the adapter-spec query only; replacements,
-attention contract and model-specific TP/CP/EP rules live in ``adapter/``
-and are filled in by changesets M2/M3 (adjust doc §7.1). Importing this
-package must not read YAML, hit the network, build models or initialize
-distributed.
+The root specification declares public module families and architecture policies.
+Native modeling composes the public terminal head and router loss. Package import
+performs no model construction, network access or distributed initialization.
 """
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+
 
 __all__ = [
     "get_adapter_spec",
 ]
 
 
-def get_adapter_spec():
+def get_adapter_spec() -> "ModelAdapterSpec":
     """Return this family's ModelAdapterSpec via the shared registry."""
     # Lazy import: keeps the package import free of registry/provider work.
     from hyper_parallel.models.registry import (  # pylint: disable=C0415

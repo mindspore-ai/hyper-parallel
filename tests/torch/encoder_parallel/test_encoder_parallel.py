@@ -14,11 +14,12 @@
 # ============================================================================
 """Lightweight launchers for CPU/Gloo Encoder Parallel system tests."""
 
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
-
 
 _HERE = Path(__file__).resolve().parent
 
@@ -71,3 +72,29 @@ def test_parent_nosp():
     Expectation: Each CP owner receives a full record on every TP rank.
     """
     torchrun_case(str(_HERE / "_test_exchange.py"), "test_parent_nosp", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_cross_decoder_domain_precision():
+    """Feature: Cross-parent encoder precision.
+
+    Description: Train a real visual tower/projector for ten Muon updates with Encoder-CP4 and decoder CP2.
+    Expectation: Initial tensor parity and ten-step loss/norm pass; tensor update probes remain visible.
+    """
+    with patch.dict(os.environ, {"HP_ENCODER_BACKEND": "gloo", "HP_ENCODER_LLM_CP": "2",
+                                 "HP_ENCODER_LLM_TP": "1", "HP_ENCODER_CP": "4",
+                                 "HP_ENCODER_DOMAIN": "auto", "HP_ENCODER_FAMILY": "deepseek"}):
+        torchrun_case(str(_HERE / "_test_encoder_domains.py"), "test_encoder_domain_precision", num_proc=4)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_global_encoder_domain_precision():
+    """Feature: Explicit pooling despite a locally divisible encoder degree.
+
+    Description: Train the HF axial visual source with global pooling, decoder CP1/TP2 and Encoder-CP2.
+    Expectation: Initial parity and ten-step loss/norm pass; strict update probes are reported separately.
+    """
+    with patch.dict(os.environ, {"HP_ENCODER_BACKEND": "gloo", "HP_ENCODER_LLM_CP": "1",
+                                 "HP_ENCODER_LLM_TP": "2", "HP_ENCODER_CP": "2",
+                                 "HP_ENCODER_DOMAIN": "global", "HP_ENCODER_FAMILY": "qwen"}):
+        torchrun_case(str(_HERE / "_test_encoder_domains.py"), "test_encoder_domain_precision", num_proc=4)

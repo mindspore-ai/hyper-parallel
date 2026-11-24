@@ -244,7 +244,18 @@ class ShardingPlanner:
         for boundary_fqn, group in boundary_groups.items():
             boundary_type = (boundary_types or {}).get(boundary_fqn) or self._infer_boundary_type(boundary_fqn, group)
             if self._templates.get(boundary_type) is None:
-                logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
+                # Model-owned bare state has no attention/MLP template. Only an
+                # explicit REPLICATED role authorizes this parameter-only layout;
+                # unknown roles still fail the normal coverage check.
+                prefix = boundary_fqn + "." if boundary_fqn else ""
+                replicated = {name[len(prefix):]: {axis: Replicate() for axis in mesh_dim_names}
+                              for name, role in group if role == ParamRole.REPLICATED}
+                if replicated:
+                    plan.modules[boundary_fqn] = ModuleShardingSpec(
+                        params=replicated, in_src={}, in_dst={}, out_src={}, out_dst={}, is_boundary=False,
+                    )
+                if len(replicated) != len(group):
+                    logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue
             spec = _build_spec_from_template(
                 self._templates,
@@ -285,18 +296,23 @@ class ShardingPlanner:
         self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
 
     @staticmethod
+
     def _log_explanation(plan: ShardingPlan, enabled: bool) -> None:
         """Log the plan explanation when requested."""
         if enabled:
             logger.info("ShardingPlan explain:\n%s", plan.explain())
 
     @staticmethod
+
     def _resolve_isolated_roots(model: Any, arch: str) -> tuple[str, ...]:
         """Find subtrees whose activation layout is owned by a separate runtime."""
         from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
 
-        adapter = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
-                   else get_model_adapter(arch))
+        adapter = (
+            model._hp_model_adapter_spec
+            if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+            else get_model_adapter(arch)
+        )
         if adapter is None or adapter.encoder_parallel is None:
             return ()
         spec = adapter.encoder_parallel()
@@ -304,6 +320,7 @@ class ShardingPlanner:
         return tuple(root for root in spec.isolated_subtrees if root in names)
 
     @staticmethod
+
     def _manages_expert_transport(spec, protocol) -> bool:
         """Recognize complete matrices and stage-owned transport from existing declarations."""
         if spec.is_boundary or any((spec.in_src, spec.in_dst, spec.out_src, spec.out_dst)):
@@ -573,11 +590,13 @@ class ShardingPlanner:
     # ── Architecture detection ──────────────────────────────────────────
 
     @staticmethod
+
     def _get_architecture(model) -> str:
         """Compatibility wrapper for the module-level architecture helper."""
         return _get_architecture(model)
 
     @staticmethod
+
     def _validate_dtensor_axes(
         mesh, tp_size: int, cp_size: int, ep_size: int,
     ) -> None:
@@ -695,6 +714,7 @@ class ShardingPlanner:
     # ── Phase 1 ─────────────────────────────────────────────────────────
 
     @staticmethod
+
     def _warn_uncovered_function_modules(model, plan) -> None:
         """DX guard: a FunctionModule without a boundary spec gets NO
         redistribution communication (it is invisible to the planner's
@@ -717,8 +737,11 @@ class ShardingPlanner:
         from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
             get_model_adapter,
         )
-        spec = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
-                else get_model_adapter(arch))
+        spec = (
+            model._hp_model_adapter_spec
+            if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+            else get_model_adapter(arch)
+        )
         rules = []
         if spec is not None and spec.sharding_rules is not None:
             rules = list(spec.sharding_rules())
@@ -794,6 +817,7 @@ class ShardingPlanner:
     # ── Phase 3 ─────────────────────────────────────────────────────────
 
     @staticmethod
+
     def _explicit_boundary_type(fqn_lower: str, segment: str) -> Optional[str]:
         """Return an explicit FQN-based boundary type when one matches."""
         if _match_any(
@@ -810,6 +834,7 @@ class ShardingPlanner:
         return None
 
     @staticmethod
+
     def _moe_boundary_type(fqn: str, roles: set[ParamRole]) -> Optional[str]:
         """Return the boundary type implied by MoE-specific parameter roles."""
         if ParamRole.MOE_EXPERT in roles:
@@ -821,6 +846,7 @@ class ShardingPlanner:
         return None
 
     @staticmethod
+
     def _dense_boundary_type(fqn_lower: str, group: List[Tuple[str, ParamRole]]) -> str:
         """Infer an attention or MLP boundary from dense parameter roles."""
         has_colwise = any(
@@ -876,6 +902,7 @@ class ShardingPlanner:
     # ── Phase 4 post-processing: MoE EP marking (D-09/D-10, 05 §6.4.7/§6.4.8) ──
 
     @staticmethod
+
     def _validate_ep_domain(ep_extend, mesh) -> None:
         """Validate that virtual EP evenly partitions the dense rank domain.
 
@@ -900,6 +927,7 @@ class ShardingPlanner:
             )
 
     @classmethod
+
     def _validate_ep_extend(cls, ep_extend, mesh, model) -> None:
         """Validate virtual EP plus the routed-expert count constraint."""
         cls._validate_ep_domain(ep_extend, mesh)
@@ -911,6 +939,7 @@ class ShardingPlanner:
             )
 
     @classmethod
+
     def _mark_virtual_ep_parameters(
         cls,
         plan: ShardingPlan,
@@ -996,6 +1025,7 @@ class ShardingPlanner:
         return expert_params, stacks, batched
 
     @staticmethod
+
     def _mark_old_style_experts(
         spec: ModuleShardingSpec,
         stacks: Dict[str, List[Tuple[int, str]]],
@@ -1015,6 +1045,7 @@ class ShardingPlanner:
             spec._ep_stack[stacked] = sources  # pylint: disable=protected-access  # planner owns the spec DSL internals
 
     @staticmethod
+
     def _mark_extended_expert_params(
         spec: ModuleShardingSpec,
         expert_params: List[str],
@@ -1052,6 +1083,7 @@ class ShardingPlanner:
             )
 
     @staticmethod
+
     def _set_extended_ep_contract(spec: ModuleShardingSpec, ep_extend: int) -> None:
         """Set the identity boundary contract used by TP-extended EP."""
         identity = copy.deepcopy(spec.in_src)
@@ -1119,8 +1151,8 @@ class ShardingPlanner:
         )
         self._set_extended_ep_contract(spec, ep_extend)
 
-
     @staticmethod
+
     def _finalize_fused_expert_tp_guard(plan: ShardingPlan, *, tp_size: int) -> None:
         """Fail fast on fused expert weights TP-sharded without D-10 EP.
 
@@ -1220,6 +1252,7 @@ class ShardingPlanner:
             "override needed.")
 
     @staticmethod
+
     def _should_defer_rowwise_bias(
         module_fqn: str,
         module: nn.Module,
@@ -1260,6 +1293,7 @@ class ShardingPlanner:
         return False
 
     @staticmethod
+
     def _validate_colwise_bias(
         module_fqn: str,
         weight_path: str,
@@ -1284,6 +1318,7 @@ class ShardingPlanner:
         )
 
     @staticmethod
+
     def _bias_owner_path(param_name: str) -> Optional[str]:
         """Return a bias owner's module path, or ``None`` for other params."""
         if param_name == "bias":
@@ -1293,6 +1328,7 @@ class ShardingPlanner:
         return None
 
     @staticmethod
+
     def _collect_deferred_biases(module_fqn: str, spec: ModuleShardingSpec, module: nn.Module) -> List[str]:
         """Validate one boundary's biases and collect rowwise deferred names."""
         named_params = dict(module.named_parameters())
@@ -1328,6 +1364,7 @@ class ShardingPlanner:
         return deferred
 
     @staticmethod
+
     def _finalize_deferred_biases(
         plan: ShardingPlan, model, mesh_dim_names: Tuple[str, ...],
     ) -> None:
@@ -1382,6 +1419,7 @@ class ShardingPlanner:
                     module_fqn, list(deferred))
 
     @staticmethod
+
     def _check_param_uniqueness(plan: ShardingPlan) -> None:
         """D-14 invariant 1 (05 §13.3): every parameter is sharded by exactly
         one boundary. spec.params keys are resolved to full parameter FQNs
@@ -1404,6 +1442,7 @@ class ShardingPlanner:
                 seen[full] = fqn
 
     @staticmethod
+
     def _check_full_declaration(plan: ShardingPlan) -> None:
         """D-14 (05 §13.2): chain fill is removed — every boundary spec must
         fully declare its I/O contract. A non-empty in_dst with an empty
@@ -1419,6 +1458,7 @@ class ShardingPlanner:
     # ── F4 plan-time lints (accuracy_fix_plan.md §2) ─────────────────────
 
     @staticmethod
+
     def _check_param_shard_divisibility(
         fqn: str,
         prefix: str,
@@ -1469,6 +1509,7 @@ class ShardingPlanner:
                 )
 
     @staticmethod
+
     def _check_shard_divisibility(
         plan: ShardingPlan,
         param_shapes: Dict[str, Tuple[int, ...]],
@@ -1506,6 +1547,7 @@ class ShardingPlanner:
                 )
 
     @staticmethod
+
     def _declared_parameter_names(plan: ShardingPlan) -> set[str]:
         """Collect full names covered by placements and special handlers."""
         covered = set()
@@ -1588,6 +1630,7 @@ class ShardingPlanner:
         return plan
 
     @staticmethod
+
     def _topological_sort_by_forward_order(fqns: List[str], model) -> List[str]:
         """Sort by named_modules registration order; unmatched FQNs are
         appended at the end with a warning."""
@@ -1611,6 +1654,7 @@ class ShardingPlanner:
     # ── tied weights ────────────────────────────────────────────────────
 
     @staticmethod
+
     def _detect_tied_pairs(model) -> List[Tuple[str, str]]:
         """Detect the embed_tokens.weight <-> lm_head.weight tied pair.
 

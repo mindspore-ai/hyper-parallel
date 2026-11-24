@@ -17,6 +17,8 @@
 import math
 from typing import Any
 
+import torch.distributed as dist
+
 
 def derive_reshaped_submesh(root_mesh: Any, *, source_dims: tuple[str, ...],
                            target_sizes: tuple[int, ...], target_names: tuple[str, ...]) -> Any:
@@ -53,3 +55,51 @@ def decoder_coordinates(parent_rank: int, decoder_tp_size: int) -> tuple[int, in
         decoder_tp_size: Number of decoder TP ranks per CP rank.
     """
     return divmod(parent_rank, decoder_tp_size)
+
+
+def select_encoder_domain_size(*, decoder_size: int, job_size: int,
+                               encoder_cp_size: int, resource_domain: str) -> int:
+    """Select the smallest legal whole-decoder domain, or an explicitly requested domain.
+
+    Resource selection does not change the task or execution protocol. Contiguous
+    complete decoder parents preserve sample identity and enable small-group transport.
+    """
+    if resource_domain not in ("auto", "decoder", "global"):
+        raise ValueError("encoder resource_domain must be auto, decoder or global")
+    size = {"auto": math.lcm(decoder_size, encoder_cp_size),
+            "decoder": decoder_size, "global": job_size}[resource_domain]
+    if size % decoder_size or size % encoder_cp_size or job_size % size:
+        raise ValueError("encoder resource domain must contain whole decoder parents, "
+                         "divide the job size and be divisible by encoder_cp_size")
+    return size
+
+
+def collect_decoder_metadata(value: Any, *, decoder_size: int, parent_mesh: Any,
+                             device: Any = None) -> tuple[Any, ...]:
+    """Collect one small envelope per decoder leader using the existing resource group.
+
+    A local domain already has identical metadata on its CP/TP replicas. Shared
+    domains broadcast leader envelopes instead of gathering empty contributions
+    from every replica, retaining backend-portable object transport.
+
+    Args:
+        value: Local envelope; only each decoder leader's value is consumed.
+        decoder_size: Number of ranks per complete decoder parent.
+        parent_mesh: Selected encoder resource domain.
+        device: Collective staging device, separate from the CPU metadata.
+
+    Returns:
+        Decoder envelopes in resource-domain leader order.
+    """
+    if parent_mesh.size() == decoder_size:
+        return (value,)
+    if not dist.is_initialized():
+        raise RuntimeError("Independent encoder domains require initialized process groups")
+    group = parent_mesh.get_group()
+    members = dist.get_process_group_ranks(group)
+    envelopes = []
+    for source in range(0, parent_mesh.size(), decoder_size):
+        envelope = [value if parent_mesh.get_local_rank() == source else None]
+        dist.broadcast_object_list(envelope, src=members[source], group=group, device=device)
+        envelopes.append(envelope[0])
+    return tuple(envelopes)

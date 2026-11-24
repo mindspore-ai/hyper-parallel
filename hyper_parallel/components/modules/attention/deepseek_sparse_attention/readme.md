@@ -29,11 +29,11 @@ CP 的三个配置参数写在 `replace.implementation` 下：
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `kv_cp_size` | `1` | 上下文并行大小，与 `accelerator.cp_size` 保持一致；1 表示不开启 CP。 |
+| `kv_cp_size` | `None` | 默认跟随作业 CP 大小；显式提供时必须与 `accelerator.cp_size` 一致。 |
 | `kv_cp_strategy` | `allgather` | KV 通信策略，当前仅支持 `allgather`。 |
 | `cp_comm_overlap` | `false` | 是否启用异步 KV 收集。 |
 
-TP 度和总 CP 度仍写在 `accelerator` 中，改 `accelerator.cp_size` 时须同步改 `kv_cp_size`。
+TP 度和总 CP 度写在 `accelerator` 中。省略 `kv_cp_size` 时，模块族在绑定阶段自动使用作业 CP 大小。
 `*.self_attn` 匹配完整的注意力模块，框架自动选择本地或上下文并行实现；
 通用规则见 [Attention YAML 配置通用规则](../readme.md#yaml-配置通用规则)。
 

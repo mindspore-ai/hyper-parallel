@@ -27,7 +27,8 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules.module_family import (
-    FamilyBoundary, FamilyBuildInfo, _build_family_member, _context_from_mesh, collect_family_modules, resolve_family,
+    FamilyBoundary, FamilyBuildInfo, FamilyRequest, _build_family_member, _context_from_mesh,
+    collect_family_modules, get_family_build_info, resolve_family,
     validate_family_context,
 )
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
@@ -108,6 +109,7 @@ def build_module_context(
     result["loss_parallel"] = bool(getattr(mesh, "loss_parallel", False))
     result["mesh_dim_names"] = tuple(getattr(getattr(mesh, "device_mesh", None), "mesh_dim_names", ()) or ())
     result["mesh"] = mesh
+    result["eager_pipeline"] = getattr(distributed_setup, "pipeline_config", None) is not None and result["pp"]
     result["model_spec"] = model_spec
     result["module_replacement_requests"] = getattr(distributed_setup, "module_replacement_requests", None)
     result["module_replacements"] = getattr(distributed_setup, "module_replacements", None)
@@ -204,6 +206,22 @@ def _prepare_family_member(
                                          module_fqn=boundary.fqns[0], context=context)
     _adopt_family_state(source, candidate, boundary.fqns[0])
     return candidate, replace(info, resolved=member)
+
+
+def _reconfigure_direct_family(
+    source: nn.Module, request: FamilyRequest, *, module_fqn: str, context: Mapping[str, Any],
+) -> nn.Module:
+    """Select a native member from its saved config while retaining all logical tensors."""
+    info = get_family_build_info(source)
+    if info is None or info.origin != "direct" or info.request.target is not request.target:
+        raise ValueError("native family overrides must retain the original public family")
+    _validate_family_lifetime(source)
+    member = resolve_family(request, context=context)
+    with torch.device("meta"):
+        candidate = _build_family_member(request, member, config=info.config_snapshot,
+                                         module_fqn=module_fqn, context=context)
+    _adopt_family_state(source, candidate, module_fqn)
+    return candidate
 
 
 def _finalize_family_modules(model: nn.Module, context: Mapping[str, Any]) -> nn.Module:

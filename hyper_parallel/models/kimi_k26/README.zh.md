@@ -1,117 +1,45 @@
-# Kimi-K2.6 模型族适配
+# Kimi-K2.6 模型集成
 
 [English](README.md) | **简体中文**
 
-Kimi-K2.6 是 Moonshot 的多模态（图文）MoE 模型，其文本塔是 DeepSeek-V3 风格的 MLA + MoE 结构，
-视觉塔与 projector 独立。本目录是 HyperParallel 对该族的适配层：模块替换工厂、CP/分片规则、
-损失适配、数据变换入口与训练 recipe 都收敛在这里。
+Kimi-K2.6 沿用 Transformers 的 `kimi_k25` 配置和源实现，模型目录身份为 `kimi_k26`。
+使用原生 Transformers 配置与 processor，设置 `trust_remote_code: false`。官方发布资产中遗留的
+remote-code `auto_map` 不代表需要执行远端建模代码。
 
-## 注册身份
-
-| 项目 | 值 |
-|---|---|
-| HyperParallel 族名（`models/<family>/` 目录名、注册身份） | `kimi_k26` |
-| HF `config.model_type`（K2.6 checkpoint 实际值） | `kimi_k25` |
-| HF `architectures` | `KimiK25ForConditionalGeneration` |
-| 实现来源 | transformers 原生实现（`transformers.models.kimi_k25`），`trust_remote_code: false` |
-
-K2.6 checkpoint 沿用 K2.5 的原生实现与配置命名，因此目录名与注册身份取 `kimi_k26` 以对应用户
-可见的产品版本，而 HF 侧的 `kimi_k25` 拼写由 `hyper_parallel/models/registry.py` 的
-`_FAMILY_DIR_ALIASES`（`kimik25 → kimi_k26`）映射到本族，`get_model_adapter()` 对
-`kimi_k26` / `kimi_k25` / `KimiK25ForConditionalGeneration` 三种拼写都能解析。
-
-## 目录结构
+## 目录与职责
 
 ```text
 models/kimi_k26/
-├── __init__.py                      # get_adapter_spec() 入口
-├── adapter/
-│   ├── __init__.py                  # KIMI_MODEL_TYPES：运行时守卫接受的 model_type 拼写
-│   ├── chunk_loss.py                # 训练用 Chunk Loss 前向替换（绑定到 model.forward）
-│   ├── distributed/
-│   │   └── context_parallel.py      # CP 输入切分：inputs_embeds 切窗 + 全局 position_ids + 偏移 mask
-│   ├── data/
-│   │   └── transform_fn.py          # Omni 数据变换（原生 image_grid_thw 协议：eager + packing）
-│   ├── validation/
-│   │   └── cropped_model.py         # 模型构建入口 build_cropped_kimi_vlm（recipe 的 model._target_）
-│   └── registration.py              # ModelAdapterSpec：sharding_rules + loss
+├── __init__.py                         # 轻量模型包入口
+├── kimi_k26_spec.py                    # 模型身份、公共族替换、FSDP 边界、有限旧 YAML 目标
+├── modeling_kimi_k26.py                # 模型原生组合；decoder 类拥有输入 CP 切窗与 chunked loss
+├── dataset_adapter.py                 # 保留完整媒体输入，分发全局移位后的局部 CP 目标
+├── dataset_preprocessing/
+│   ├── __init__.py                     # 数据预处理包入口
+│   └── transform_fn.py                 # processor 输出到 Omni eager/packing 样本的转换
+├── validation/
+│   ├── __init__.py                     # 验证辅助包入口
+│   └── cropped_model.py                # 显式验证裁剪与冻结入口，不承载公共算法
+├── generated/                         # 可选 codegen 产物
 └── recipes/
-    ├── train.yaml                   # 4 超节点 / 512 卡 GroupedExperts 训练配方
-    ├── run_kimi_k26_4sn.sh          # 多机启动脚本（默认 64 节点 × 8 卡）
-    └── prepare_kimi_vlm_data.py     # 生成演示图文数据（离线自测用）
+    ├── train.yaml                     # 既有发布模型训练配置
+    ├── run_kimi_k26_4sn.sh             # 既有多节点启动脚本
+    └── prepare_kimi_vlm_data.py        # 演示图文数据构造工具
 ```
 
-数据侧变换也在本族目录内：`adapter/data/transform_fn.py`（`KimiVLMChatTransform` /
-`KimiOmniTransform` / `KimiPackingOmniTransform` + 两个 builder），与
-`models/deepseek_v41/adapter/data/` 的放置方式一致，由 recipe 的
-`dataset.data_transform._target_` 直接引用（`ModelAdapterSpec` 不注册数据适配，无需改注册）。
+## 模块族与模型组合
 
-## 适配内容
-
-- **分片规则**（`adapter/registration.py`）：嵌套文本塔是 MLA，但低秩下投影
-  （`q_a_proj` / `kv_a_proj_with_mqa`）保持复制（LoRA rank 维不切分），上投影
-  （`q_b_proj` / `kv_b_proj`）沿 head 维列切；视觉塔与 `mm_projector` 全复制——其原生注意力
-  在完整 hidden 维上重排 head，TP 切分不可组合。因此本族不能套用 DeepSeek-V3 的 MLA 命名规则。
-- **Chunk Loss**（`adapter/chunk_loss.py`）：以原子前向替换的方式把分块交叉熵绑定到
-  `model.forward`，避免全序列 logits 驻留；只在 `chunk_loss_targets` 在场时生效。
-  目前要求 `tp_size=1`：词表分片（TP）下的 chunk loss 由核心 `ChunkedCausalLMLoss`
-  在 `bind_model` 时直接拒绝；配方对应地只使用预移位目标（Omni batch 的
-  `labels_are_shifted` 默认为 `True`，其发布的 `shift_labels` 即 chunk loss 所需目标）。
-- **CP 输入切分**（`adapter/distributed/context_parallel.py`）：dataloader 按 `dp_rank` 切样本，
-  同一 DP 组内 CP 各 rank 拿到同一样本并各自跑视觉塔；文本塔前把 `inputs_embeds` 切成
-  `[cp_rank*L, (cp_rank+1)*L)` 窗口，RoPE `position_ids` 用全局窗口重建，并下发 4D 偏移
-  causal+padding mask。`cp_size <= 1` 时是 no-op，可无条件调用。
-- **模型构建**（`adapter/validation/cropped_model.py`）：校验 `config.model_type` 属于
-  `KIMI_MODEL_TYPES`，截断文本塔层数 / 专家数后经 HyperParallel 模型构建入口并行化，并支持
-  `freeze_patterns` 在 plan/FSDP 推导前冻结模块（视觉塔冻结可一并去掉其反向与激活）。
-- **GroupedExperts**：主线配方保留原生 router 和共享专家，并替换文本塔的路由专家。
-- **旧版 benchmark EP 计算工厂**（`adapter/distributed/ep_compute.py`）：家族自组合的
-  `deepseekv3_sigmoid_group_shared` 原型（与 `models/qwen3_moe/adapter/distributed/` 同放置），
-  经框架公开的 `build_ep_compute` 组合，因此框架层不需要任何改动。`fix_router: true` 切到
-  框架的**均衡路由**（`routing.make_balanced_router`，由骨架统一解析）：真实路由的 token
-  倾斜实测会把最忙的 rank 堆到均值的 6.3 倍（也是显存被打爆的主因），均衡路由让每个
-  destination rank 拿到完全相同的 slot 数，使同口径对比能在 2–3 步内收敛。
-  ⚠️ 该模式是 **benchmark-only**：忽略 gate 分数，`loss`/`grad_norm`/专家命中分布无意义，
-  正确性与收敛性验证必须置 `false`（此时回落框架的 sigmoid-group 真实路由）。
-- **数据变换**（`adapter/data/transform_fn.py`）：走原生 processor 的
-  `image_grid_thw` 协议，支持 eager（pad 到 `max_seq_len`）与 token-budget packing 两种形态。
-
-## 实机验证时的已知边界（2SN 实测，2026-09-24）
-
-- **`activation_checkpoint.swap_inputs=true` 与 chunk loss 前向替换不兼容**：实测在首个
-  backward 的激活重计算阶段抛 `RuntimeError: SwapGroup 'swap_group_0' wait_offload() called
-  before launch_offload()`（`core/activation_memory/swap.py` 的 forward hook 与家族改写后的
-  前向时序冲突）。配方交付默认是 `swap_inputs: false`，不受影响；需要在 2SN 等小 edp 档位
-  省显存时，请改用序列长度 / GBS 等其它旋钮。
-- **2SN（edp=2）有硬性显存墙，必须有 optimizer 状态 swap**：`ep=128` 时 2SN 每卡
-  参数+梯度+优化器态约为 4SN（edp=4）的 2 倍；同族此前在该形状上实测过——**无 swap 需 56.59 GB**
-  （贴近 61.3 GB 上限，步时会在 24.9–41.0 s 之间抖动并偶发 OOM），**optimizer 状态 swap 后为
-  41.49 GB / 21.06–22.84 s**，因此在该档位上是硬要求而非可交易余量。本 PR 不含该接线（核心原语
-  `core/optimizer/swap_optimizer.py` 已在基线内，缺的是 trainer 侧 YAML 配置），故实测在
-  2SN / ep128 / seq8192 / GBS4096 上于 backward 阶段 ~55.4 GiB OOM；`fsdp_config.enable_offload`
-  与 `activation_checkpoint.swap_inputs`（后者与 chunk loss 前向不兼容）都无法替代它。
-  **主线配方按 4SN 定尺寸**，4SN 上无 swap 即为该族实测最优档位。
-- **多模态 batch 只带 raw `labels`**：框架 `ChunkedCausalLMLoss` 要求预移位的 `shift_labels`，
-  因此 `loss_fn` 必须用家族子类 `adapter/loss.py::KimiChunkedCausalLMLoss`（本配方已如此配置）。
-
-## 依赖与资产前提
-
-- **模型结构由 transformers 原生实现提供，本族不自带建模代码**：构建时用
-  `AutoConfig(trust_remote_code=False)` 读 checkpoint 的 `config.json`，类由**配置类**解析——
-  顶层是 transformers 的 `Kimi_K25ForConditionalGeneration`，嵌套文本塔是 `DeepseekV3ForCausalLM`
-  （`text_config.architectures` 是 checkpoint 自己的声明，本族不改写）。
-  要求 transformers 提供原生 `kimi_k25` / `deepseek_v3`（验证版本 **5.13.0**）；缺失时 builder 会
-  直接给出"需要哪个版本"的报错，而不会退回 checkpoint 目录里的 remote code。
-- checkpoint 目录里虽然带 `modeling_kimi_k25.py` / `modeling_deepseek.py` /
-  `kimi_k25_processor.py` 等 remote code（官方仓为旧版 transformers 准备，`config.json` 的
-  `auto_map` 指向它们），本族**刻意不使用**：那是与原生实现不同的一套代码（类名、processor 协议
-  均不同），使用它需要执行模型目录中的 Python 且要重做全部集成适配。
-- **权重需为 BF16**：官方 HF release 是 4-bit compressed-tensors 量化权重
-  （`text_config.quantization_config`），而 builder 会清掉该字段以匹配已反量化的 BF16 权重——
-  直接拿量化权重配 BF16 配置会形状不匹配。请先反量化（本仓库验证过 Ascend msModelSlim w4a8 →
-  BF16 的逐张量反量化路径），或改用量化加载路径。
-- 权重加载是**严格模式**（`load_pretrained_weights(..., strict=True)`）：键或形状不匹配直接报错；
-  这同时充当"原生实现与官方权重结构一致"的运行时校验。
+- spec 直接选择公共 `MultiLatentAttention`、`GroupedExperts`、`SwiGLUMLP`、`RMSNorm`、
+  `RotaryEmbedding`、`LearnedAxialVisionTransformer`、`SpatialPatchProjection` 和 `CausalLMHead`。
+  模块拥有 source 参数接纳、局部权重转换、数学和并行实现；此模型无需重复实现私有模块族。
+- 顶层模型拥有视觉输出与语言输入的架构融合、输出协议和末端 loss 组合。
+  不在模型实例或视觉实例上安装 `forward`，不通过 adapter 转发公共族。
+- decoder 类在完成视觉融合后对 `inputs_embeds` 切 CP 窗口，保留显式全局 `position_ids`
+  的偏移与重置，并构造相应 mask。完整 Omni CP 链路仍需单独验收，不能用 CP1 数值结果替代。
+- 路由和共享专家沿用源语义；Experts 拥有专家 GEMM 与 EP 通信。
+  旧 benchmark EP 名称仅通过 root spec 的有限别名解析到公共 recipe。
+- 不合并 Muon 的独立矩阵边界。验证从随机初始化开始，正式精度与性能用例位于仓外验证目录，
+  原始 recipes 保持原样。详细结果见 [验证报告](../../../docs/model-refactor-validation-report.md)。
 
 ## recipe 使用
 
@@ -137,14 +65,3 @@ NNODES=64 NODE_RANK=0 MASTER_ADDR=<rank0-ip> MASTER_PORT=6100 \
   真实数据（COCO 等）用 `--dataset.data_path` 覆盖。
 - 其它规模（1SN/2SN/3SN）需要同步调整 `accelerator.ep_size` 与 `fsdp_config` 的
   `dp_shard_size` / `edp_shard_size`，启动脚本对非 512 卡的 world size 默认拒绝启动。
-
-## 测试
-
-| 测试 | 覆盖内容 |
-|---|---|
-| `tests/ut/auto_models/test_kimi_k26_chunk_loss.py` | Chunk Loss 绑定、幂等性、守卫与数值一致性 |
-| `tests/ut/auto_models/distributed/test_kimi_k26_cp_input.py` | CP 输入切分契约（窗口、position_ids、mask） |
-| `tests/ut/data/vlm/test_dynamic_padding.py` | 动态 padding / 打包路径 |
-| `tests/ut/data/vlm/test_image_max_pixels.py` | 图像像素预算与 media token 数 |
-| `tests/ut/data/vlm/test_truncate_mode.py` | 截断策略与序列长度推断 |
-| `tests/ut/data/vlm/test_get_batch_cp.py` | CP batch 切分 |

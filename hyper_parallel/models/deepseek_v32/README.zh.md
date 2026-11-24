@@ -20,19 +20,13 @@ lightning indexer 为每个 query 选出 `index_topk` 个 key（官方 config �
 
 ```text
 models/deepseek_v32/
-├── __init__.py
-├── adapter/
-│   ├── conversion/
-│   │   └── module_replacement.py    # RMSNorm/DSA 工厂及历史专家入口
-│   ├── policies/
-│   │   └── sharding.py              # MLA 与 indexer 的 TP 分片规则
-│   ├── materialization.py           # 加载权重后恢复 RoPE 的 buffer
-│   └── registration.py              # ModelAdapterSpec
-├── generated/                       # codegen 生成的模型代码，仅 codegen: true 时使用
-└── recipes/
-    ├── run_parallel_offline.sh      # 在 8 卡上启动 train_parallel_offline.yaml
-    ├── train.yaml                   # 加载官方 checkpoint 的单进程配方
-    └── train_parallel_offline.yaml  # 8 层裁剪模型的 8 卡配方
+├── __init__.py                      # 模型包入口，不构造模型
+├── deepseek_v32_spec.py             # 公共模块族、模型身份及有限旧 YAML 名称声明
+├── generated/                      # 可选 codegen 产物，不拥有公共算法
+└── recipes/                        # 既有训练与启动配置，迁移保持原样
+    ├── run_parallel_offline.sh      # 八卡启动脚本
+    ├── train.yaml                   # 发布模型训练配置
+    └── train_parallel_offline.yaml  # 离线八卡裁剪配置
 ```
 
 ## 功能

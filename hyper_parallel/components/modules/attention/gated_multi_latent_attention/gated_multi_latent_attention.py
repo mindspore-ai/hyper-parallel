@@ -31,18 +31,38 @@ class GatedMultiLatentAttentionModule(MultiLatentAttentionModule):
     """Define NoPE attention and its mandatory output gate in one math module.
 
     The shared key features retain the source projection/checkpoint dimensions;
-    NoPE disables their rotation. Model adapters only preserve forward APIs.
+    NoPE disables their rotation. The family also retains the declared source result protocol.
     """
 
-    def __init__(self, *, module: nn.Module | None = None, config: Any = None) -> None:
+    source_extra_children = ("g_proj",)
+
+    def forward(self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        """Consume the selected source's positional arguments inside the complete family."""
+        if self.source_contract == "tensor":
+            names = ("attention_mask", "position_ids", "past_key_values")
+            if len(args) > len(names):
+                raise TypeError("NoPE source attention accepts at most three arguments after hidden_states")
+            for name, value in zip(names, args):
+                if name in kwargs:
+                    raise TypeError(f"Multiple values for attention argument {name}")
+                kwargs[name] = value
+            kwargs.pop("position_ids", None)
+            return super().forward(hidden_states, **kwargs)
+        return super().forward(hidden_states, *args, **kwargs)
+
+    def __init__(self, *, module: nn.Module | None = None, config: Any = None,
+                 fuse_latent_qkv: bool = True, source_contract: str = "tuple") -> None:
         """Construct mandatory-gate NoPE MLA with the ordinary MLA parameter layout.
 
         Args:
             module: Optional NoPE source with an enabled plain Linear output gate.
             config: Direct construction dimensions, exclusive with module; NoPE is intrinsic to this class.
         """
+        if source_contract not in ("tuple", "tensor"):
+            raise ValueError("Gated MLA source_contract must be tuple or tensor")
+        self.source_contract = source_contract
         if module is None:
-            super().__init__(config=config)
+            super().__init__(config=config, fuse_latent_qkv=fuse_latent_qkv, key_expansion_layout="bnsd")
             self.use_nope = True
             self.g_proj = nn.Linear(
                 config.hidden_size, self.num_heads * self.v_head_dim,
@@ -55,11 +75,13 @@ class GatedMultiLatentAttentionModule(MultiLatentAttentionModule):
             raise ValueError("GatedMultiLatentAttention requires an enabled output gate")
         if type(module.g_proj) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
             raise ValueError("Gated MLA requires a plain Linear output gate")
-        super().__init__(module=module, config=config)
+        super().__init__(module=module, config=config, fuse_latent_qkv=fuse_latent_qkv,
+                         key_expansion_layout="bnsd")
         self.use_nope = True
         self.g_proj = module.g_proj
 
     @staticmethod
+
     def apply_nope(tensor: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
                    *, interleaved: bool = False) -> torch.Tensor:
         """Keep Q/shared-K features unchanged through the CP rotary callback.
@@ -93,6 +115,7 @@ class GatedMultiLatentAttentionModule(MultiLatentAttentionModule):
         return tensor
 
     @staticmethod
+
     def prepare_positions(position_embeddings: Any) -> None:
         """Discard frequencies and their layout because this algorithm is NoPE.
 

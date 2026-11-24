@@ -29,9 +29,11 @@ from hyper_parallel.components.checkpoint.weight_conversion import WeightConvert
 
 from hyper_parallel.components import functional
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
-from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
+from hyper_parallel.components.functional.npu_fusion_attention import (
+    PACKED_SEQUENCE_ARGUMENTS, npu_fusion_attention_forward,
+)
+from hyper_parallel.components.functional.torch_attention import torch_attention
 from hyper_parallel.components.modules.common.rms_norm import RMSNorm
-
 
 
 def prepare_mla_attention_mask(
@@ -63,6 +65,7 @@ def apply_mla_rope(
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
     *,
     interleaved: bool = False,
+    use_fused_rotary_pos_emb: bool = True,
 ) -> torch.Tensor:
     """Rotate one BSND tensor so Q and shared K can be scheduled independently.
 
@@ -70,6 +73,7 @@ def apply_mla_rope(
         tensor: Query or unexpanded shared key, with rotary features in the last dimension.
         position_embeddings: Cosine/sine tables in SD or BSD, or None for an identity operation.
         interleaved: Whether the input stores real/imaginary features in adjacent pairs.
+        use_fused_rotary_pos_emb: Use the NPU fused arithmetic; False preserves eager rounding.
 
     Returns:
         Rotated BSND features. Interleaved inputs become the half-band order consumed by MLA.
@@ -77,6 +81,21 @@ def apply_mla_rope(
     """
     if position_embeddings is None:
         return tensor
+    if isinstance(position_embeddings, torch.Tensor) and position_embeddings.is_complex():
+        pairs = torch.view_as_complex(tensor.float().reshape(*tensor.shape[:-1], -1, 2))
+        rotated = pairs * position_embeddings.to(tensor.device).unsqueeze(2)
+        return torch.view_as_real(rotated).flatten(-2).to(tensor.dtype)
+    if tensor.device.type != "npu" or not use_fused_rotary_pos_emb:
+        cos, sin = (part.to(tensor.dtype) for part in position_embeddings)
+        if cos.ndim == 2:
+            cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+        cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
+        if interleaved:
+            real, imaginary = tensor[..., ::2], tensor[..., 1::2]
+            cosine, sine = cos[..., :real.shape[-1]], sin[..., :real.shape[-1]]
+            return torch.cat((real * cosine - imaginary * sine, imaginary * cosine + real * sine), dim=-1)
+        first, second = tensor.chunk(2, dim=-1)
+        return tensor * cos + torch.cat((-second, first), dim=-1) * sin
     cos, sin = (part.to(tensor.dtype) for part in position_embeddings)
     if cos.ndim == 2:
         cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
@@ -130,6 +149,11 @@ class MultiLatentAttentionModule(nn.Module):
         *,
         module: nn.Module | None = None,
         config: Any = None,
+        fuse_latent_qkv: bool = True,
+        use_fused_norm: bool | None = None,
+        use_fused_rotary_pos_emb: bool = True,
+        key_expansion_layout: str = "bsnd",
+        use_nope: bool | None = None,
         attention_interface: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] = (
             npu_fusion_attention_forward
         ),
@@ -141,6 +165,10 @@ class MultiLatentAttentionModule(nn.Module):
                 An already-fused MLA reuses all child modules and their Parameters.
             config: Direct construction dimensions and attention options; exclusive with module.
                 Uses the DeepSeek parameter layout: optional down/output bias, bias-free up projections.
+            fuse_latent_qkv: Pack the latent Q/KV down projections; False retains separate logical matrices.
+            use_fused_norm: Select the public RMSNorm backend inside MLA. None retains source norms.
+            use_fused_rotary_pos_emb: Use fused NPU RoPE; False preserves eager rounding.
+            use_nope: Disable positional rotation; None retains source or config metadata.
             attention_interface: Local FA implementation returning BSND output and optional weights.
 
         Note:
@@ -148,34 +176,46 @@ class MultiLatentAttentionModule(nn.Module):
             initializes native Linear weights and unit RMSNorm scales, without creating an HF model.
         """
         super().__init__()
+        if not isinstance(fuse_latent_qkv, bool):
+            raise TypeError("fuse_latent_qkv must be boolean")
+        if use_fused_norm is not None and not isinstance(use_fused_norm, bool):
+            raise TypeError("use_fused_norm must be a bool or None")
+        if not isinstance(use_fused_rotary_pos_emb, bool):
+            raise TypeError("use_fused_rotary_pos_emb must be bool")
+        if key_expansion_layout not in ("bsnd", "bnsd"):
+            raise ValueError("key_expansion_layout must be bsnd or bnsd")
+        if use_nope is not None and not isinstance(use_nope, bool):
+            raise TypeError("use_nope must be bool or None")
+        self.key_expansion_layout = key_expansion_layout
+        self.use_fused_rotary_pos_emb = use_fused_rotary_pos_emb
+        self.use_fused_norm = use_fused_norm
+        self.fuse_latent_qkv = fuse_latent_qkv
         self.attention_interface = attention_interface
         self._config_initialization = module is None or getattr(module, "_config_initialization", False)
         if module is None:
             if config is None:
                 raise ValueError("MLA construction requires config or a source module")
             self._initialize_config(config)
+            if use_nope is not None:
+                self.use_nope = use_nope
             return
         if config is not None:
             raise ValueError("MLA construction accepts config or module, not both")
         self._initialize_source(module)
+        if use_nope is not None:
+            self.use_nope = use_nope
+        if use_fused_norm is not None:
+            for name in ("q_a_layernorm", "kv_a_layernorm"):
+                norm = getattr(self, name, None)
+                if norm is not None:
+                    setattr(self, name, RMSNorm(module=norm, use_fused_ops=use_fused_norm))
 
     def _initialize_source(self, module: nn.Module) -> None:
         """Read source math options and reuse its managed projection children."""
-        self._source_is_fused = hasattr(module, "linear_qkv")
-        required = (
-            "q_a_layernorm",
-            "q_b_proj",
-            "kv_a_layernorm",
-            "kv_b_proj",
-            "o_proj",
-        )
-        required += ("linear_qkv",) if self._source_is_fused else ("q_a_proj", "kv_a_proj_with_mqa")
-        missing = [name for name in required if not hasattr(module, name)]
-        if missing:
-            raise TypeError(f"MultiLatentAttention source module is missing: {missing}")
-
+        self._read_projection_contract(module)
         config = module.config
         self.config = config
+        self.use_nope = getattr(module, "use_nope", False)
         self.layer_idx = getattr(module, "layer_idx", getattr(module, "layer_number", None))
         self.num_heads = getattr(module, "num_heads", config.num_attention_heads)
         self.num_key_value_heads = getattr(
@@ -188,8 +228,6 @@ class MultiLatentAttentionModule(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.q_lora_rank = getattr(module, "q_lora_rank", config.q_lora_rank)
         self.kv_lora_rank = getattr(module, "kv_lora_rank", config.kv_lora_rank)
-        if self.q_lora_rank is None:
-            raise ValueError("MultiLatentAttention requires the Q-LoRA projection path")
         self.qk_rope_head_dim = getattr(module, "qk_rope_head_dim", config.qk_rope_head_dim)
         self.qk_nope_head_dim = getattr(module, "qk_nope_head_dim", config.qk_nope_head_dim)
         self.v_head_dim = getattr(module, "v_head_dim", config.v_head_dim)
@@ -220,24 +258,57 @@ class MultiLatentAttentionModule(nn.Module):
 
         self._initialize_latent_projection(module)
 
-        self.q_a_layernorm = module.q_a_layernorm
+        self.q_a_layernorm = getattr(module, "q_a_layernorm", None)
         self.kv_a_layernorm = module.kv_a_layernorm
-        self.q_b_proj = module.q_b_proj
+        self.q_b_proj = getattr(module, "q_b_proj", None)
         self.kv_b_proj = module.kv_b_proj
         self.o_proj = module.o_proj
+        if not self.fuse_latent_qkv:
+            children = dict(self._modules)
+            self._modules.clear()
+            for name, child in module._modules.items():
+                if (name not in children and child is not None
+                        and name not in getattr(self, "source_extra_children", ())):
+                    raise ValueError(f"MLA source contains an unsupported child {name!r}")
+                self.add_module(name, children.get(name, child))
 
-        self.train(module.training)
+        self.training = module.training
+
+    def _read_projection_contract(self, module: nn.Module) -> None:
+        """Validate the source latent projection representation before adopting its state."""
+        self._source_is_fused = hasattr(module, "linear_qkv")
+        if isinstance(module, MultiLatentAttentionModule):
+            self.attention_interface = module.attention_interface
+        if isinstance(module, MultiLatentAttentionModule) and module.fuse_latent_qkv != self.fuse_latent_qkv:
+            raise ValueError("MLA promotion cannot change the latent projection representation")
+        if self._source_is_fused and not self.fuse_latent_qkv:
+            raise ValueError("Separate latent projections require a separate source representation")
+        self.query_projection_name = "q_proj" if module.config.q_lora_rank is None else "q_a_proj"
+        required = ("kv_a_layernorm", "kv_b_proj", "o_proj")
+        if module.config.q_lora_rank is not None:
+            required += ("q_a_layernorm", "q_b_proj")
+        required += (("linear_qkv",) if self._source_is_fused else
+                     (self.query_projection_name, "kv_a_proj_with_mqa"))
+        missing = [name for name in required if not hasattr(module, name)]
+        if missing:
+            raise TypeError(f"MultiLatentAttention source module is missing: {missing}")
+
 
     def _initialize_latent_projection(self, module: nn.Module) -> None:
         """Fuse compatible down projections or retain an already-fused source."""
-        self._q_latent_output_size = self.q_lora_rank
+        self._q_latent_output_size = (self.q_lora_rank if self.q_lora_rank is not None
+                                      else self.num_heads * self.qk_head_dim)
         self._kv_latent_output_size = self.kv_lora_rank + self.qk_rope_head_dim
         if self._source_is_fused:
             self.linear_qkv = module.linear_qkv
             self.attention_interface = module.attention_interface
         else:
-            q_a = module.q_a_proj
+            q_a = getattr(module, self.query_projection_name)
             kv_a = module.kv_a_proj_with_mqa
+            if not self.fuse_latent_qkv:
+                setattr(self, self.query_projection_name, q_a)
+                self.kv_a_proj_with_mqa = kv_a
+                return
             self._q_latent_output_size = q_a.out_features
             self._kv_latent_output_size = kv_a.out_features
             can_fuse = (
@@ -257,28 +328,26 @@ class MultiLatentAttentionModule(nn.Module):
                 device=q_a.weight.device,
                 dtype=q_a.weight.dtype,
             )
+            self.linear_qkv.training = q_a.training
             self.linear_qkv.weight.requires_grad_(q_a.weight.requires_grad)
             if q_a.bias is not None:
                 self.linear_qkv.bias.requires_grad_(q_a.bias.requires_grad)
+            if not self.linear_qkv.weight.is_meta:
+                source = dict(module.named_parameters())
+                with torch.no_grad():
+                    for converter in self.make_transforms():
+                        values = {name: source[name] for name in converter.source_patterns}
+                        for operation in converter.operations:
+                            values = operation.convert(values, converter.source_patterns, converter.target_patterns)
+                        for name, value in values.items():
+                            self.get_parameter(name).copy_(value)
 
     def _initialize_config(self, config: Any) -> None:
         """Construct the same parameter tree directly, without an intermediate HF model."""
         self.config = config
+        self.use_nope = getattr(config, "use_nope", False)
         self.layer_idx = getattr(config, "layer_idx", None)
-        dimensions = {
-            "num_heads": config.num_attention_heads,
-            "q_lora_rank": config.q_lora_rank,
-            "kv_lora_rank": config.kv_lora_rank,
-            "qk_nope_head_dim": config.qk_nope_head_dim,
-            "qk_rope_head_dim": config.qk_rope_head_dim,
-            "v_head_dim": config.v_head_dim,
-        }
-        if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in dimensions.values()):
-            raise ValueError("MLA dimensions must be positive integers, including q_lora_rank")
-        if dimensions["qk_rope_head_dim"] % 2:
-            raise ValueError("MLA rotary dimension must be even")
-        for name, value in dimensions.items():
-            setattr(self, name, value)
+        self._initialize_dimensions(config)
         self.num_key_value_heads = self.num_heads
         self.num_key_value_groups = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -291,30 +360,58 @@ class MultiLatentAttentionModule(nn.Module):
         if getattr(config, "use_mome", False) or getattr(config, "param_sink_number", 0) > 0:
             raise ValueError("MLA config construction does not support MOME or parameter-sink attention")
         self._source_is_fused = True
-        self._q_latent_output_size = self.q_lora_rank
+        self.query_projection_name = "q_proj" if self.q_lora_rank is None else "q_a_proj"
+        self._q_latent_output_size = (self.q_lora_rank if self.q_lora_rank is not None
+                                      else self.num_heads * self.qk_head_dim)
         self._kv_latent_output_size = self.kv_lora_rank + self.qk_rope_head_dim
         hidden_size = config.hidden_size
         if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
             raise ValueError("MLA hidden_size must be a positive integer")
         dtype = getattr(config, "dtype", None)
         bias = getattr(config, "attention_bias", False)
-        self.linear_qkv = nn.Linear(
-            hidden_size, self._q_latent_output_size + self._kv_latent_output_size, bias=bias, dtype=dtype,
-        )
+        if self.fuse_latent_qkv:
+            self.linear_qkv = nn.Linear(
+                hidden_size, self._q_latent_output_size + self._kv_latent_output_size, bias=bias, dtype=dtype)
+        else:
+            setattr(self, self.query_projection_name, nn.Linear(
+                hidden_size, self._q_latent_output_size, bias=bias, dtype=dtype))
+            self.kv_a_proj_with_mqa = nn.Linear(hidden_size, self._kv_latent_output_size, bias=bias, dtype=dtype)
         eps = getattr(config, "rms_norm_eps", 1e-6)
-        self.q_a_layernorm = RMSNorm(
-            config=SimpleNamespace(hidden_size=self.q_lora_rank, eps=eps), use_fused_ops=True,
-        ).to(dtype=dtype)
+        fused_norm = True if self.use_fused_norm is None else self.use_fused_norm
+        self.q_a_layernorm = (None if self.q_lora_rank is None else RMSNorm(
+            config=SimpleNamespace(hidden_size=self.q_lora_rank, eps=eps), use_fused_ops=fused_norm,
+        ).to(dtype=dtype))
         self.kv_a_layernorm = RMSNorm(
-            config=SimpleNamespace(hidden_size=self.kv_lora_rank, eps=eps), use_fused_ops=True,
+            config=SimpleNamespace(hidden_size=self.kv_lora_rank, eps=eps), use_fused_ops=fused_norm,
         ).to(dtype=dtype)
-        self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False, dtype=dtype)
+        self.q_b_proj = (None if self.q_lora_rank is None else nn.Linear(
+            self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False, dtype=dtype))
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False, dtype=dtype,
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden_size, bias=bias, dtype=dtype)
 
+    def _initialize_dimensions(self, config: Any) -> None:
+        """Validate and retain the logical MLA dimensions before allocating projections."""
+        dimensions = {
+            "num_heads": config.num_attention_heads,
+            "q_lora_rank": config.q_lora_rank,
+            "kv_lora_rank": config.kv_lora_rank,
+            "qk_nope_head_dim": config.qk_nope_head_dim,
+            "qk_rope_head_dim": config.qk_rope_head_dim,
+            "v_head_dim": config.v_head_dim,
+        }
+        if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
+               for key, value in dimensions.items() if key != "q_lora_rank" or value is not None):
+            raise ValueError("MLA dimensions must be positive integers; q_lora_rank may be None for direct queries")
+        if dimensions["qk_rope_head_dim"] % 2:
+            raise ValueError("MLA rotary dimension must be even")
+        for name, value in dimensions.items():
+            setattr(self, name, value)
+
+
     @staticmethod
+
     def _config_scaling(config: Any, default: float) -> float:
         """Keep the source-compatible YaRN factor and explicit scaling override."""
         rope = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
@@ -330,20 +427,24 @@ class MultiLatentAttentionModule(nn.Module):
         # framework also invokes this method after it, so source conversions must not reset them again.
         if not self._config_initialization:
             return
-        for projection in (self.linear_qkv, self.q_b_proj, self.kv_b_proj, self.o_proj):
-            projection.reset_parameters()
-        nn.init.ones_(self.q_a_layernorm.weight)
+        names = ("linear_qkv",) if self.fuse_latent_qkv else (self.query_projection_name, "kv_a_proj_with_mqa")
+        for name in (*names, "q_b_proj", "kv_b_proj", "o_proj"):
+            child = getattr(self, name)
+            if child is not None:
+                child.reset_parameters()
+        if self.q_a_layernorm is not None:
+            nn.init.ones_(self.q_a_layernorm.weight)
         nn.init.ones_(self.kv_a_layernorm.weight)
 
     def make_transforms(self) -> list[WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""
-        if self._source_is_fused:
+        if self._source_is_fused or not self.fuse_latent_qkv:
             return []
         suffixes = ("weight", "bias") if self.linear_qkv.bias is not None else ("weight",)
         sections = (self._q_latent_output_size, self._kv_latent_output_size)
         return [
             WeightConverter(
-                source_patterns=[f"q_a_proj.{suffix}", f"kv_a_proj_with_mqa.{suffix}"],
+                source_patterns=[f"{self.query_projection_name}.{suffix}", f"kv_a_proj_with_mqa.{suffix}"],
                 target_patterns=f"linear_qkv.{suffix}",
                 operations=[ConcatenateWithSections(sections=sections, dim=0)],
             )
@@ -361,13 +462,16 @@ class MultiLatentAttentionModule(nn.Module):
         Returns:
             Normalized query and KV latents, and the unrotated shared RoPE key.
         """
-        latent_states = self.linear_qkv(hidden_states)
-        query_latent, kv_nope, key_rope = torch.split(
-            latent_states,
-            (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
-            dim=-1,
-        )
-        return self.q_a_layernorm(query_latent), self.kv_a_layernorm(kv_nope), key_rope
+        if self.fuse_latent_qkv:
+            latent_states = self.linear_qkv(hidden_states)
+            query_latent, kv_nope, key_rope = torch.split(
+                latent_states, (self._q_latent_output_size, self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
+        else:
+            query_latent = getattr(self, self.query_projection_name)(hidden_states)
+            kv_nope, key_rope = self.kv_a_proj_with_mqa(hidden_states).split(
+                (self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
+        query_latent = query_latent if self.q_a_layernorm is None else self.q_a_layernorm(query_latent)
+        return query_latent, self.kv_a_layernorm(kv_nope), key_rope
 
     def apply_position(
         self, tensor: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
@@ -383,9 +487,12 @@ class MultiLatentAttentionModule(nn.Module):
         Returns:
             BSND features in the MLA key/query feature order.
         """
+        if self.use_nope:
+            return tensor
         return apply_mla_rope(
             tensor, position_embeddings,
             interleaved=self.rotary_interleaved if interleaved is None else interleaved,
+            use_fused_rotary_pos_emb=self.use_fused_rotary_pos_emb,
         )
 
     def project_query(
@@ -404,7 +511,8 @@ class MultiLatentAttentionModule(nn.Module):
             BNSD queries. The NoPE identity path preserves the projection view.
         """
         heads = self.num_heads if heads is None else heads
-        projected = self.q_b_proj(latent).view(*latent.shape[:2], heads, self.qk_head_dim)
+        projected = latent if self.q_b_proj is None else self.q_b_proj(latent)
+        projected = projected.view(*latent.shape[:2], heads, self.qk_head_dim)
         content, rotary = projected.split((self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
         rotation = self.apply_position if rotary_fn is None else rotary_fn
         rotated = rotation(rotary, position_embeddings, interleaved=self.rotary_interleaved)
@@ -431,17 +539,30 @@ class MultiLatentAttentionModule(nn.Module):
         return projected.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
 
     @staticmethod
-    def assemble_key(content: torch.Tensor, shared_key: torch.Tensor) -> torch.Tensor:
+
+    def assemble_key(content: torch.Tensor, shared_key: torch.Tensor, *, layout: str = "bsnd") -> torch.Tensor:
         """Join BSND content with one already-transformed shared key per token.
 
         Args:
             content: Head-specific key features in BSND.
             shared_key: BSR features after RoPE/NoPE; expansion itself is a view.
+            layout: Broadcast in historical BSND or source BNSD axes before restoring BSND.
 
         Returns:
             Full BSND keys with content followed by shared features.
         """
-        return torch.cat((content, shared_key.unsqueeze(2).expand(-1, -1, content.shape[2], -1)), dim=-1)
+        if layout == "bsnd":
+            return torch.cat((content, shared_key.unsqueeze(2).expand(-1, -1, content.shape[2], -1)), dim=-1)
+        if layout != "bnsd":
+            raise ValueError("key expansion layout must be bsnd or bnsd")
+        # Keep the source BNSD expansion axis: BF16 head-gradient reductions
+        # can round differently after an otherwise equivalent BSND expansion.
+        native_content = content.transpose(1, 2)
+        native_shared = shared_key.unsqueeze(1).expand(-1, content.shape[2], -1, -1)
+        key = native_content.new_empty(*native_content.shape[:-1], content.shape[-1] + shared_key.shape[-1])
+        key[..., :content.shape[-1]].copy_(native_content)
+        key[..., content.shape[-1]:].copy_(native_shared)
+        return key.transpose(1, 2)
 
     def assemble_key_value(
         self, projected: torch.Tensor, shared_key: torch.Tensor, *, heads: int | None = None,
@@ -459,7 +580,8 @@ class MultiLatentAttentionModule(nn.Module):
         heads = self.num_heads if heads is None else heads
         projected = projected.view(*projected.shape[:2], heads, self.qk_nope_head_dim + self.v_head_dim)
         content, value = projected.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
-        return self.assemble_key(content, shared_key).transpose(1, 2), value.transpose(1, 2)
+        return (self.assemble_key(content, shared_key, layout=self.key_expansion_layout).transpose(1, 2),
+                value.transpose(1, 2))
 
     def project_key_value(
         self, latent: torch.Tensor, shared_key: torch.Tensor, *, heads: int | None = None,
@@ -490,6 +612,7 @@ class MultiLatentAttentionModule(nn.Module):
         del past_key_values
 
     @staticmethod
+
     def prepare_positions(position_embeddings: Any) -> Any:
         """Preserve the algorithm's positional inputs; NoPE overrides this stage.
 
@@ -555,6 +678,13 @@ class MultiLatentAttentionModule(nn.Module):
         interface = options.pop("attention_interface", None)
         if interface is None:
             interface = self.attention_interface
+        if inputs.query.device.type != "npu" and interface is npu_fusion_attention_forward:
+            if any(options.get(name) is not None for name in PACKED_SEQUENCE_ARGUMENTS):
+                raise ValueError("Torch MLA SDPA does not support packed document metadata")
+            return torch_attention(inputs.query, inputs.key, inputs.value, attention_mask,
+                                   is_causal=options.get("is_causal", self.is_causal), scaling=self.scaling,
+                                   dropout=options["dropout"], sliding_window=options["sliding_window"],
+                                   implementation=getattr(self.config, "_attn_implementation", None) or "sdpa"), None
         return interface(self, inputs.query, inputs.key, inputs.value, attention_mask, **options)
 
     def restore_attention(self, output: torch.Tensor, hidden_states: torch.Tensor,
@@ -623,4 +753,5 @@ class MultiLatentAttentionModule(nn.Module):
         # Tensors saved for backward remain owned by autograd.
         del inputs
         output, output_state = self.restore_attention(output, hidden_states, output_state)
-        return self.project_output(output, hidden_states, output_state), weights
+        output = self.project_output(output, hidden_states, output_state)
+        return output if getattr(self, "source_contract", "tuple") == "tensor" else (output, weights)

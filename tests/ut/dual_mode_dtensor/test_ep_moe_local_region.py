@@ -1,7 +1,17 @@
 # Copyright 2025-2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
-
 """test_s4_ep.py: merged core suite file.
 
 Sources: test_s4_local_compute_fn.py, test_s4_moe_gate_compile.py, test_s5_hf_native_moe.py, test_s6_ep_extend.py
@@ -40,9 +50,6 @@ from hyper_parallel.distributed.recipe_spec import (
     local_compute,
 )
 from hyper_parallel.distributed._builder.precompiled_boundary import PrecompiledBoundary
-from hyper_parallel.models.qwen3_moe.adapter.distributed import (
-    expert_parallel as qwen3_adapter_ep,
-)
 from hyper_parallel.distributed._builder.parameter_sharding import (
     _StackedExperts,
     _stack_moe_experts,
@@ -89,7 +96,11 @@ from tests.ut.dual_mode_dtensor.conftest import _ensure_pg
 # classes/modules)
 # ==========================================================================
 
+qwen3_adapter_ep = ep_compute
+
+
 class _TinyMod(nn.Module):
+
     def __init__(self):
         super().__init__()
         self.lin = nn.Linear(4, 4)
@@ -99,6 +110,7 @@ class _TinyMod(nn.Module):
 
 
 class _TinyModel(nn.Module):
+
     def __init__(self):
         super().__init__()
         self.mod = _TinyMod()
@@ -108,6 +120,7 @@ class _TinyModel(nn.Module):
 
 
 class _TinyMultiOutputMod(nn.Module):
+
     def forward(self, x):
         return x, x + 1, x + 2
 
@@ -134,6 +147,7 @@ def _wrap_region(mod, spec, mesh, validate_mode):
 class _TinyMoeMod(nn.Module):
     """Minimal MoE-shaped module for archetype factory tests (gate + experts
     [+ shared_expert + shared_expert_gate])."""
+
     def __init__(self, with_shared=False):
         super().__init__()
         self.gate = nn.Linear(4, 4, bias=False)
@@ -144,6 +158,7 @@ class _TinyMoeMod(nn.Module):
 
 
 class _FakeEpMesh:
+
     def __getitem__(self, name):
         assert name == "ep"
         return self
@@ -709,7 +724,7 @@ def test_ep_archetype_factories(make_mesh, monkeypatch):
     # monkeypatched recipes primitives are still what the factory binds.
     module = _TinyMoeMod()
     captured = _capture_ep_primitives(monkeypatch)
-    compute_fn = qwen3_adapter_ep.qwen3moe_ep_compute_fn(
+    compute_fn = qwen3_adapter_ep.topk_router_ep_compute_fn(
         module=module,
         mesh=None,
         tp_mesh=None,
@@ -1125,8 +1140,10 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
     hidden_states = torch.randn(3, 4)
     expert_indices = torch.zeros(3, dtype=torch.long)
     output = _local_swiglu_expert_forward(experts, hidden_states, expert_indices)
-    gate_states, up_states = F.linear(hidden_states, experts.gate_up_proj[0]).chunk(2, dim=-1)
-    expected = F.linear(torch.tanh(gate_states) * up_states, experts.down_proj[0])
+    # Torch exposes this runtime callable through a native or generated descriptor.
+    gate_states, up_states = F.linear(hidden_states, experts.gate_up_proj[0]).chunk(2, dim=-1)  # pylint: disable=not-callable
+    # Torch exposes this runtime callable through a native or generated descriptor.
+    expected = F.linear(torch.tanh(gate_states) * up_states, experts.down_proj[0])  # pylint: disable=not-callable
     torch.testing.assert_close(
         output, expected, msg="case: local_expert_forward_uses_declared_activation")
 
@@ -1322,6 +1339,7 @@ def test_planner_ep_extend_contracts(tiny_hf_native_moe, tiny_hf_batched_moe,
     # configuration must override to TP Replicate (guard solution 2, and
     # out_src's TP must likewise be changed from the template-derived Partial
     # to Replicate).
+
     def rep():
         return {TP: Replicate(), CP: Replicate()}
     overrides = {"*.mlp": ModuleShardingSpec(

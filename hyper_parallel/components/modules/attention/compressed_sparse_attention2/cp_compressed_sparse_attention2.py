@@ -75,6 +75,7 @@ class _CPCompressor(CSA2Compressor):
     cp_context = None
 
     @classmethod
+
     def from_module(cls, module: CSA2Compressor) -> _CPCompressor:
         """Adopt children by identity without initializing another parameter tree."""
         result = object.__new__(cls)
@@ -194,12 +195,14 @@ class _CPIndexer(CSA2Indexer):
         object.__setattr__(self, "_wait_region", checkpoint_exclude_wrapper(self._finish_selection))
 
     @torch.no_grad()
+
     def _launch_selection(self, qr: torch.Tensor, weights: torch.Tensor, embeddings: tuple, lengths: tuple) -> Any:
         """Use the existing task planner and dtype-preserving input transport."""
         return launch_indexer_inputs(qr, weights, embeddings, lengths, self.compress_ratio, self.balance_mode,
                                      self.cp_context.mesh.get_group(), self.balance_block_size, self.zigzag_min_length)
 
     @torch.no_grad()
+
     def _prepare_dispatched(self, wave: Any) -> tuple | None:
         """Expand received qr once; cached selection needs no worker Q during replay."""
         if is_recomputing() and self._result_region is not None:
@@ -211,6 +214,7 @@ class _CPIndexer(CSA2Indexer):
         return query, weights, wave
 
     @torch.no_grad()
+
     def _select_dispatched(self, prepared: tuple, key: torch.Tensor) -> Any:
         """Consume worker Q once and launch the inverse ID transfer."""
         query, weights, wave = prepared
@@ -219,6 +223,7 @@ class _CPIndexer(CSA2Indexer):
 
     @staticmethod
     @torch.no_grad()
+
     def _finish_selection(result: Any) -> torch.Tensor:
         """Cache completed IDs; replay never consumes an already finished handle."""
         return result.wait().unsqueeze(0)
@@ -256,7 +261,7 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
     cp_context = None
 
     def __init__(self, module: torch.nn.Module | None = None, *, config: Any = None, layer_idx: int = 0,
-                 replace_indexer: bool = True, use_fused_ops: bool = False,
+                 replace_indexer: bool = True, use_fused_ops: bool = False, norm_cast_order: str | None = None,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
                  indexer_balance_block_size: int | None = None, indexer_zigzag_min_length: int | None = None) -> None:
         """Adopt mathematical children and choose CP stages without creating parameters."""
@@ -267,7 +272,7 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
         super().__init__(module, config=config, layer_idx=layer_idx,
-                         replace_indexer=replace_indexer, use_fused_ops=use_fused_ops)
+                         replace_indexer=replace_indexer, use_fused_ops=use_fused_ops, norm_cast_order=norm_cast_order)
         self.indexer_load_balance = indexer_load_balance
         self.main_kv_comm = main_kv_comm
         self.indexer_balance_block_size = indexer_balance_block_size

@@ -157,7 +157,7 @@ class TestRoutedGroupedExperts(unittest.TestCase):
                 self.assertIs(model.experts.gate_up_proj, source.gate_up_proj)
                 self.assertIs(model.experts.down_proj, source.down_proj)
         implementation = config.to_dict()["plan_overrides"][0]["replace"]["implementation"]
-        self.assertEqual(implementation["_target_"], path)
+        self.assertEqual(implementation, path)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",

@@ -1,10 +1,21 @@
 # Copyright 2025-2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
-
 """test_s1_plan_arch.py: merged core suite file (feature-combined, 15 cases).
 
-Sources: test_s1_arch_override.py, test_s1_head_count.py, test_s1_role_mapping.py, test_s1_semantic_infer.py, test_s1_mla_deepseek.py, test_s1_special_handlers.py, test_s1_compat.py, test_s1_sp_loss_matrix.py
+Sources: test_s1_arch_override.py, test_s1_head_count.py, test_s1_role_mapping.py, test_s1_semantic_infer.py,
+test_s1_mla_deepseek.py, test_s1_special_handlers.py, test_s1_compat.py, test_s1_sp_loss_matrix.py
 """
 
 import logging
@@ -35,6 +46,7 @@ from hyper_parallel.distributed._builder.planner import (
     ShardingPlanner,
     validate_model_compatibility,
 )
+from hyper_parallel.components.modules import MultiLatentAttention, get_family_build_info
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.distributed._builder.default_templates import (
     _placement_for_role,
@@ -85,6 +97,7 @@ def test_deferred_bias_output_helper():
 # ==========================================================================
 
 class _Model(nn.Module):
+
     def __init__(self, config=None):
         super().__init__()
         self.config = config
@@ -93,6 +106,7 @@ class _Model(nn.Module):
 
 
 class _Cfg:
+
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
@@ -419,21 +433,15 @@ def test_infer_boundary_type():
 # S1.14: DeepSeek MLA family sharding rules (ModelAdapterSpec.sharding_rules + ParamRole.REPLICATED).
 # ==========================================================================
 
-class _TinyMlaAttention(nn.Module):
-    """DeepSeek MLA structure (FQN matches HF DeepseekV2/V3 Attention)."""
-
-    def __init__(self, hidden=8, rank=4, q_out=8, kv_out=8):
-        super().__init__()
-        self.q_a_proj = nn.Linear(hidden, rank, bias=False)
-        self.q_a_layernorm = nn.RMSNorm(rank)
-        self.q_b_proj = nn.Linear(rank, q_out, bias=False)
-        self.kv_a_proj_with_mqa = nn.Linear(hidden, rank, bias=False)
-        self.kv_a_layernorm = nn.RMSNorm(rank)
-        self.kv_b_proj = nn.Linear(rank, kv_out, bias=False)
-        self.o_proj = nn.Linear(q_out, hidden, bias=False)
+def _tiny_mla_attention():
+    """Construct actual public MLA state instead of relying on retired model naming rules."""
+    config = _Cfg(hidden_size=8, num_attention_heads=2, q_lora_rank=4, kv_lora_rank=4,
+                  qk_nope_head_dim=2, qk_rope_head_dim=2, v_head_dim=2, rms_norm_eps=1e-6)
+    return MultiLatentAttention(config=config)
 
 
 class _TinyMlp(nn.Module):
+
     def __init__(self, hidden=8, inter=16):
         super().__init__()
         self.gate_proj = nn.Linear(hidden, inter, bias=False)
@@ -453,7 +461,7 @@ class _TinyDeepseek(nn.Module):
         self.model.layers = nn.ModuleList()
         for _ in range(2):
             layer = nn.Module()
-            layer.self_attn = _TinyMlaAttention()
+            layer.self_attn = _tiny_mla_attention()
             layer.mlp = _TinyMlp()
             layer.input_layernorm = nn.RMSNorm(8)
             layer.post_attention_layernorm = nn.RMSNorm(8)
@@ -463,46 +471,19 @@ class _TinyDeepseek(nn.Module):
 
 
 def test_mla_arch_override():
-    """MLA rules live in the deepseek_v3 family registration (all spellings resolve) + classification hits + no-override regression guard."""
-
-    # case: family_rules_registered_all_spellings -- v2/v3 are isomorphic; every
-    # spelling (arch / model_type / canonical) resolves to the family's rules
+    """Aliases select public MLA replacement; owned layouts replace source-name classification."""
     for key in ("deepseekv2", "deepseekv3", "deepseek_v2", "deepseek_v3"):
         spec = get_model_adapter(key)
-        assert spec is not None and spec.sharding_rules is not None, \
-            f"case: family_rules_registered_all_spellings[{key}]"
-        roles = [r for _, r in spec.sharding_rules()]
-        assert ParamRole.REPLICATED in roles, \
-            f"case: family_rules_registered_all_spellings[{key}]"
-        assert ParamRole.COLWISE in roles, \
-            f"case: family_rules_registered_all_spellings[{key}]"
-
-    # case: classifier_mla_roles -- q_a/kv_a->REPLICATED; q_b/kv_b->COLWISE; o->ROWWISE
-    model = _TinyDeepseek()
-    roles = ShardingPlanner()._classify_all_params(model, "deepseekv3")
-    p = "model.layers.0.self_attn."
-    assert roles[p + "q_a_proj.weight"] == ParamRole.REPLICATED, \
-        "case: classifier_mla_roles"
-    assert roles[p + "kv_a_proj_with_mqa.weight"] == ParamRole.REPLICATED, \
-        "case: classifier_mla_roles"
-    assert roles[p + "q_b_proj.weight"] == ParamRole.COLWISE, "case: classifier_mla_roles"
-    assert roles[p + "kv_b_proj.weight"] == ParamRole.COLWISE, "case: classifier_mla_roles"
-    assert roles[p + "o_proj.weight"] == ParamRole.ROWWISE, "case: classifier_mla_roles"
-    assert roles[p + "q_a_layernorm.weight"] == ParamRole.NORM, "case: classifier_mla_roles"
-    assert roles[p + "kv_a_layernorm.weight"] == ParamRole.NORM, "case: classifier_mla_roles"
-
-    # case: classifier_model_type_spelling -- deepseek_v3 hits as well
-    roles = ShardingPlanner()._classify_all_params(_TinyDeepseek(), "deepseek_v3")
-    assert roles["model.layers.0.self_attn.q_a_proj.weight"] == ParamRole.REPLICATED, \
-        "case: classifier_model_type_spelling"
-
-    # case: without_override_mla_params_skip -- regression guard for the pre-fix silent gap
-    clf = ParameterClassifier()   # no arch_overrides
-    roles = clf.classify(_TinyDeepseek(), "deepseekv3")
-    assert roles[p + "q_a_proj.weight"] == ParamRole.SKIP, \
-        "case: without_override_mla_params_skip"
-    assert roles[p + "kv_b_proj.weight"] == ParamRole.SKIP, \
-        "case: without_override_mla_params_skip"
+        assert spec is not None and spec.replacements is not None
+        assert spec.sharding_rules is None
+    module = _TinyDeepseek().model.layers[0].self_attn
+    info = get_family_build_info(module)
+    assert info.resolved.sharding is not None
+    assert info.request.target is MultiLatentAttention
+    # Generic naming remains unaware of MLA; its explicit family declaration
+    # supplies ownership instead of extending the global classifier.
+    roles = ParameterClassifier().classify(_TinyDeepseek(), "deepseekv3")
+    assert roles["model.layers.0.self_attn.kv_b_proj.weight"] == ParamRole.SKIP
 
 
 def test_mla_plan_attention_boundary_and_placements(make_mesh):
@@ -515,17 +496,15 @@ def test_mla_plan_attention_boundary_and_placements(make_mesh):
     spec = plan.modules["model.layers.0.self_attn"]
     names = ("tp",)
     assert tuple(resolve_placements(
-        spec.params["q_a_proj.weight"], names)) == (Replicate(),)
-    assert tuple(resolve_placements(
-        spec.params["kv_a_proj_with_mqa.weight"], names)) == (Replicate(),)
+        spec.params["linear_qkv.weight"], names)) == (Replicate(),)
     assert tuple(resolve_placements(
         spec.params["q_b_proj.weight"], names)) == (Shard(0),)
     assert tuple(resolve_placements(
         spec.params["kv_b_proj.weight"], names)) == (Shard(0),)
     assert tuple(resolve_placements(
         spec.params["o_proj.weight"], names)) == (Shard(1),)
-    # attention template flag: inject inner attention wrapper when CP is active
-    assert spec._needs_cp_attn is True
+    # Execution remains class-owned; the plan never installs a legacy callback.
+    assert spec.inner_wrapper is None
     # other boundaries unaffected by the override
     assert "model.layers.0.mlp" in plan.modules
     assert "model.embed_tokens" in plan.modules
@@ -551,7 +530,7 @@ def test_mla_plan_fallback_and_layer_coverage(make_mesh):
         assert f"model.layers.{i}.self_attn" in plan.modules, \
             "case: both_layers_sharded"
         spec = plan.modules[f"model.layers.{i}.self_attn"]
-        assert len(spec.params) == 5, "case: both_layers_sharded"   # q_a/q_b/kv_a/kv_b/o
+        assert len(spec.params) == 6, "case: both_layers_sharded"   # packed input, q/kv up, output, two norms
 
 
 # ==========================================================================
@@ -713,6 +692,7 @@ class _TinyBiasAttention(nn.Module):
 
 
 class _TinyBiasAttnModel(nn.Module):
+
     def __init__(self, h=8):
         super().__init__()
         self.config = _Cfg(architectures=["TinyBiasForCausalLM"],
@@ -747,6 +727,7 @@ class _WoBlock(nn.Module):
 
 
 class _CustomLinearModel(nn.Module):
+
     def __init__(self, h=8, block=None):
         super().__init__()
         self.config = _Cfg(architectures=["TinyBiasForCausalLM"],
@@ -885,7 +866,8 @@ class _TinyQwen2Moe(nn.Module):
 
 
 def test_qwen2moe_arch_override():
-    """Qwen2-MoE rules live in the qwen2_moe family registration (all spellings resolve) + shared_expert_gate REPLICATED."""
+    """Qwen2-MoE rules live in the qwen2_moe family registration (all spellings resolve) + shared_expert_gate
+    REPLICATED."""
 
     # case: family_rules_registered_all_spellings
     for key in ("qwen2moe", "qwen2_moe"):

@@ -21,10 +21,11 @@ from typing import Any
 
 from torch import Tensor, nn
 
-from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (
-    GroupedExpertsConfig, GroupedExpertsModule,
-)
 from hyper_parallel.components.modules.module_family import FamilyShardingContext
+from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (
+    GroupedExpertsConfig,
+    GroupedExpertsModule,
+)
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
 from hyper_parallel.distributed.module_binding import ParallelBinding, ParallelModuleSpec
@@ -59,6 +60,7 @@ class EPGroupedExperts(GroupedExpertsModule):
         self, *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
         module_fqn: str = "", context: Mapping[str, Any] | None = None,
         overlap_shared_expert: bool = True,
+        activation_dtype: str = "input", swiglu_limit: float | None = None,
     ) -> None:
         """Construct canonical parameters without acquiring communication resources.
 
@@ -69,7 +71,8 @@ class EPGroupedExperts(GroupedExpertsModule):
             context: Job facts and source/ancestor configuration.
             overlap_shared_expert: Enable context-owned shared FC1/FC2 scheduling.
         """
-        super().__init__(config=config, module=module, module_fqn=module_fqn, context=context)
+        super().__init__(config=config, module=module, module_fqn=module_fqn, context=context,
+                         activation_dtype=activation_dtype, swiglu_limit=swiglu_limit)
         self.ep_context: EPContext | None = None
         self.overlap_shared_expert = overlap_shared_expert
 

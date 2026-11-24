@@ -22,12 +22,20 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class EncoderParallelConfig:
-    """Configuration of a derived Encoder-DP/Encoder-CP domain."""
+    """Configuration of a derived Encoder-DP/Encoder-CP domain.
+
+    ``resource_domain="auto"`` selects the smallest whole-decoder domain that
+    fits Encoder-CP. ``decoder`` requires local capacity; ``global`` explicitly
+    pools the job. The execution protocol is identical for all three policies.
+    """
 
     enabled: bool = False
     encoder_cp_size: int = 1
+    resource_domain: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.resource_domain not in ("auto", "decoder", "global"):
+            raise ValueError("encoder resource_domain must be auto, decoder or global")
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean")
         if (isinstance(self.encoder_cp_size, bool) or not isinstance(self.encoder_cp_size, int)

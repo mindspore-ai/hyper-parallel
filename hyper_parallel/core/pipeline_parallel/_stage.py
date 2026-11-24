@@ -227,6 +227,10 @@ class PipelineStageBase:
             self._after_forward_chunk(self.stage_index, micro_index)
         return out
 
+    def _forward_submodule(self, *args, **kwargs) -> Any:
+        """Run the stage computation inside its checkpoint and HSDP lifecycle."""
+        return self.submodule(*args, **kwargs)
+
     def _forward_with_checkpoint(self, micro_index: int, args, kwargs: dict) -> Any:
         """Collect checkpoint frames created during the microbatch's forward."""
         # The scope also catches direct checkpoint() calls inside forward, not
@@ -237,7 +241,7 @@ class PipelineStageBase:
             scope = reentrant_checkpoint_scope(self._get_pp_autograd_params)
         with scope as frames:
             try:
-                out = self.submodule(*args, **kwargs)
+                out = self._forward_submodule(*args, **kwargs)
             except BaseException:
                 for frame in frames:
                     if isinstance(frame, ReentrantCheckpointHandle):

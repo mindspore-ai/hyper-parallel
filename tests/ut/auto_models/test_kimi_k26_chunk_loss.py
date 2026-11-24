@@ -26,18 +26,12 @@ import torch  # pylint: disable=wrong-import-position
 
 from hyper_parallel.components.losses import ChunkedCausalLMLoss  # pylint: disable=wrong-import-position
 from hyper_parallel.data.constants import IGNORE_INDEX  # pylint: disable=wrong-import-position
-from hyper_parallel.models.kimi_k26.adapter.loss import (  # pylint: disable=wrong-import-position
-    KimiChunkedCausalLMLoss,
-)
-from hyper_parallel.models.kimi_k26.adapter.chunk_loss import (  # pylint: disable=wrong-import-position
-    bind_chunk_loss,
-)
 
 VOCAB_SIZE = 64
 SEQ_LEN = 12
 
 
-def _tiny_model():
+def _tiny_model(*, native=True):
     """Return a tiny, randomly initialized Kimi-K2.6 model on CPU."""
     from transformers.models.kimi_k25 import (  # pylint: disable=import-outside-toplevel
         Kimi_K25Config,
@@ -86,6 +80,12 @@ def _tiny_model():
         tie_word_embeddings=False,
     )
     torch.manual_seed(0)
+    if native:
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.modeling_kimi_k26 import (  # pylint: disable=import-outside-toplevel
+            Kimi_K25ForConditionalGeneration as NativeModel,
+        )
+        return NativeModel(config)
     return Kimi_K25ForConditionalGeneration(config)
 
 
@@ -110,11 +110,13 @@ class TestKimiK26ChunkLoss(unittest.TestCase):
         """Chunk Loss must match the eager full-logits loss and weight gradients."""
         input_ids, labels = self._inputs()
 
-        reference = _tiny_model()
+        reference = _tiny_model(native=False)
         reference_out = reference(input_ids=input_ids, labels=labels)
         reference_loss = reference_out.loss
         reference_loss.backward()
         reference_head_grad = reference.lm_head.weight.grad.detach().clone()
+        expected_gradients = {name: None if value.grad is None else value.grad.detach().clone()
+                              for name, value in reference.named_parameters()}
 
         model = _tiny_model()
         model.load_state_dict(reference.state_dict())
@@ -126,8 +128,8 @@ class TestKimiK26ChunkLoss(unittest.TestCase):
             "labels": labels,
             "attention_mask": torch.ones_like(input_ids),
         }
-        # OmniParallelBatch publishes pre-shifted targets (labels_are_shifted
-        # defaults to True), aligned with every local hidden position.
+        # This test supplies explicit pre-shifted targets to exercise their precedence.
+        # Production Omni batches provide raw labels and select labels_are_shifted=False.
         shift_labels = torch.full_like(labels, IGNORE_INDEX)
         shift_labels[:, :-1] = labels[:, 1:]
         loss_inputs = {
@@ -152,12 +154,18 @@ class TestKimiK26ChunkLoss(unittest.TestCase):
             rtol=1e-3,
             atol=1e-6,
         )
+        for name, value in model.named_parameters():
+            expected = expected_gradients[name]
+            if expected is None:
+                self.assertIsNone(value.grad, name)
+            else:
+                torch.testing.assert_close(value.grad, expected, rtol=1e-3, atol=1e-6, msg=name)
 
     def test_family_loss_shifts_raw_vlm_labels(self) -> None:
         """Raw multimodal labels become the pre-shifted targets the core expects."""
         input_ids, labels = self._inputs()
         model = _tiny_model()
-        loss_fn = KimiChunkedCausalLMLoss(chunk_size=4, ignore_index=IGNORE_INDEX)
+        loss_fn = ChunkedCausalLMLoss(chunk_size=4, ignore_index=IGNORE_INDEX, labels_are_shifted=False)
         loss_fn.bind_model(model, _single_rank_setup())
 
         prepared = loss_fn.prepare_model_inputs(
@@ -179,7 +187,7 @@ class TestKimiK26ChunkLoss(unittest.TestCase):
         """A batch that already carries shift_labels is passed through unchanged."""
         input_ids, labels = self._inputs()
         model = _tiny_model()
-        loss_fn = KimiChunkedCausalLMLoss(chunk_size=4, ignore_index=IGNORE_INDEX)
+        loss_fn = ChunkedCausalLMLoss(chunk_size=4, ignore_index=IGNORE_INDEX, labels_are_shifted=False)
         loss_fn.bind_model(model, _single_rank_setup())
         shift_labels = torch.full_like(labels, IGNORE_INDEX)
         shift_labels[:, :-1] = labels[:, 1:]
@@ -194,17 +202,10 @@ class TestKimiK26ChunkLoss(unittest.TestCase):
     def test_family_loss_rejects_batches_without_targets(self) -> None:
         """Neither shift_labels nor raw labels is a hard error."""
         model = _tiny_model()
-        loss_fn = KimiChunkedCausalLMLoss(chunk_size=4, ignore_index=IGNORE_INDEX)
+        loss_fn = ChunkedCausalLMLoss(chunk_size=4, ignore_index=IGNORE_INDEX, labels_are_shifted=False)
         loss_fn.bind_model(model, _single_rank_setup())
         with self.assertRaises(ValueError):
             loss_fn.prepare_model_inputs({}, {})
-
-    def test_bind_rejects_foreign_model_family(self) -> None:
-        """Binding must refuse a model whose family has no Chunk Loss adapter."""
-        model = _tiny_model()
-        model.config.model_type = "not_kimi_k26"
-        with self.assertRaises(TypeError):
-            bind_chunk_loss(model)
 
 
 if __name__ == "__main__":

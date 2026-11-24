@@ -26,6 +26,7 @@ from unittest.mock import Mock, patch
 import torch
 import yaml
 from torch.nn import functional
+
 try:
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
@@ -38,22 +39,21 @@ from hyper_parallel.components.modules.attention.compressed_sparse_attention2.do
 )
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed.plan import ShardingPlan
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     deepseek_v41_ep_compute_fn,
     deepseek_v41_megamoe_compute_fn,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
-from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_deepseek_v41_validation_config
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41TopKRouter,
     _v41_sparse_moe_forward,
 )
+from hyper_parallel.models.deepseek_v41.validation.cropped_model import build_deepseek_v41_validation_config
 from hyper_parallel.trainer.config import PlanOverride, entries_to_plan_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
-
 
 # Match the text/VLM recipe contract without requiring repository-only examples.
 _ROUTER_OVERRIDE_YAML = """
@@ -65,7 +65,7 @@ plan_overrides:
       kind: method
       implementation:
         _target_: >-
-          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+          hyper_parallel.models.deepseek_v41.components.modality_moe.deepseek_v41_ep_compute_fn
         use_grouped_gemm: true
 """
 
@@ -199,7 +199,8 @@ class TestV41RouterAuxLoss(unittest.TestCase):
         router(inputs)
         self.assertIsNotNone(router.last_aux_loss)
         router.eval()
-        with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.sequence_load_balancing_loss") as loss:
+        target = "hyper_parallel.models.deepseek_v41.components.modality_router.sequence_load_balancing_loss"
+        with patch(target) as loss:
             router(inputs)
             self.assertIsNone(router.last_aux_loss)
             router.train()
@@ -238,7 +239,7 @@ class TestV41RouterAuxLoss(unittest.TestCase):
             router_fn(target, states)
             return torch.zeros_like(states)
 
-        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
         expert_mesh = Mock()
         expert_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
         with self.assertRaisesRegex(ValueError, "active ep_mesh"):
@@ -370,7 +371,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             _, weights = router_fn(target, inputs)
             return weights.sum(-1).reshape(*inputs.shape[:-1], 1).expand_as(inputs)
 
-        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
         with patch(f"{prefix}.bind_local_expert_forward"), patch(f"{prefix}.ep_routed_forward", side_effect=_dispatch):
             compute = deepseek_v41_ep_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=ep_mesh)
             output = compute(module, torch.randn(1, 4, 16), router_token_mask=torch.tensor([[True, True, False, True]]))
@@ -440,7 +441,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
                     plan = ShardingPlan(modules={"mlp": spec}, mesh_dim_names=())
                     expert_mesh = Mock()
                     expert_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
-                    prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+                    prefix = "hyper_parallel.models.deepseek_v41.components.modality_moe"
                     with (
                         patch("hyper_parallel.distributed.apply._resolve_parameter_source_meshes",
                               return_value=(expert_mesh, None, None)),

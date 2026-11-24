@@ -20,29 +20,29 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
-from hyper_parallel.core.dtensor.placement_types import Shard
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
-from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.components.modules import CompressedSparseAttention2
-from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
-from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding, validate_parallel_module
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer as attention
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer_kl_loss as loss_impl
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
+    compressed_sparse_attention2 as attention_impl,
+)
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
     compressed_sparse_attention2_family as family,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer as attention
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer_kl_loss as loss_impl
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    reference_sparse_attention,
 )
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
     SharedCompressedPackedSequence,
 )
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
-    compressed_sparse_attention2 as attention_impl,
-)
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
-    reference_sparse_attention,
-)
-from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
+from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
+from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_route, indexer_task_plan
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
+from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding, validate_parallel_module
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
 
 
@@ -326,7 +326,6 @@ class TestNaturalDocumentCompression(unittest.TestCase):
         self.assertIsNotNone(key.grad)
         torch.testing.assert_close(key.grad, torch.zeros_like(key), rtol=0, atol=0)
 
-
     def test_bsnd_natural_document_start_and_bank_offsets(self):
         """Canonical K ID two belongs to raw document six, despite compact prefix routing."""
         query = torch.zeros(1, 8, 2, 512, dtype=torch.bfloat16)
@@ -440,6 +439,7 @@ class TestSharedCompressedCPPlans(unittest.TestCase):
 
 class TestCSA2Family(unittest.TestCase):
     """Check selection, identity, layouts and single communication ownership on CPU."""
+
 
     def test_source_identity_and_four_members(self):
         """Source parameters/buffers and frozen state survive every allowlisted selection."""

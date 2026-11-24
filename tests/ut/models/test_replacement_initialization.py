@@ -318,3 +318,54 @@ class TestReplacementInitialization(unittest.TestCase):
         _initialize_model_weights(model)
         self.assertEqual(model.native_calls, 1)
         torch.testing.assert_close(model.projection.weight, torch.ones(2, 3))
+
+    def test_composite_families_reset_after_children_once(self) -> None:
+        """Feature: Composed family initialization.
+        Description: Materialize two composite families, each exposing an aliased child family.
+        Expectation: Children initialize once, parent policies run last, and sibling order remains stable.
+        """
+        calls = []
+
+        class Child(nn.Module):
+            """Bare state with an explicit child initialization law."""
+
+            _hp_reset_after_materialization = True
+
+            def __init__(self, label: str) -> None:
+                super().__init__()
+                self.label = label
+                self.weight = nn.Parameter(torch.empty(1))
+
+            def reset_parameters(self) -> None:
+                """Set the child scale before composite initialization reads it."""
+                calls.append(self.label + ".child")
+                nn.init.constant_(self.weight, 2.)
+
+        class Parent(nn.Module):
+            """Composite whose initialization consumes its child's final scale."""
+
+            _hp_reset_after_materialization = True
+
+            def __init__(self, label: str) -> None:
+                super().__init__()
+                self.label = label
+                self.child = Child(label)
+                self.alias = self.child
+                self.weight = nn.Parameter(torch.empty(1))
+
+            def reset_parameters(self) -> None:
+                """Apply the parent policy after the aliased child has initialized."""
+                calls.append(self.label + ".parent")
+                with torch.no_grad():
+                    self.weight.copy_(self.child.weight + 1)
+                    self.child.weight.fill_(7.)
+
+        with torch.device("meta"):
+            model = nn.Sequential(Parent("left"), Parent("right"))
+        model.to_empty(device="cpu")
+        _initialize_model_weights(model)
+        self.assertEqual(calls, ["left.child", "left.parent", "right.child", "right.parent"])
+        for parent in model:
+            torch.testing.assert_close(parent.weight, torch.tensor([3.]), atol=0, rtol=0)
+            torch.testing.assert_close(parent.child.weight, torch.tensor([7.]), atol=0, rtol=0)
+            self.assertIs(parent.child, parent.alias)

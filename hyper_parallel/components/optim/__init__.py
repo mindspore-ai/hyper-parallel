@@ -15,6 +15,7 @@
 """Optimizer and learning-rate scheduler interfaces for AutoModels."""
 
 from hyper_parallel.components.optim.builders import AdamW, Muon, Sinkhorn
+from hyper_parallel.components.optim.headwise import build_reshape_fn
 from hyper_parallel.components.optim.lr_scheduler import MultiLRScheduler
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
@@ -36,4 +37,5 @@ __all__ = [
     "get_adamw_param_groups",
     "get_parameter_names",
     "split_muon_adamw_params",
+    "build_reshape_fn",
 ]

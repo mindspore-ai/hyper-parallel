@@ -25,9 +25,8 @@ assets exercise only ``v41_model_mode="validation_crop"``.
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import torch
@@ -38,47 +37,50 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4PreTrainedModel,
-    DeepseekV4RMSNorm,
     DeepseekV4RotaryEmbedding,
 )
 
-from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
-from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
-from hyper_parallel.components.modules.moe.shared_expert import SharedExpertModule
-from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation
-from hyper_parallel.components.modules.moe.router import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
-from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
-from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
-from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
-    accumulate_router_load,
-    sequence_load_balancing_loss,
-    update_modality_bias,
-)
-from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
+from hyper_parallel.components.losses.chunked_cross_entropy import ChunkedCausalLMOutput
+from hyper_parallel.components.modules import CausalLMHead
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import CompressedSparseAttention2
+
 # pylint: disable=unused-import
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
-    _apply_v41_rope,
     CompressedSparseAttention2Module,
 )
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
     SharedCompressedAttentionState as SharedAttentionState,
 )
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    _apply_v41_rope,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressor import CSA2Compressor
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
     SharedCompressedPackedSequence as SharedPackedSequence,
 )
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
     CSA2Indexer,
 )
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressor import CSA2Compressor
-from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
+from hyper_parallel.components.modules.common.rms_norm import RMSNorm, RMSNormModule
+from hyper_parallel.components.modules.common.swiglu_mlp import swiglu_activation
+from hyper_parallel.components.modules.engram import Engram, EngramModule, NgramHashMapping
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
+from hyper_parallel.components.modules.megakernel_utils import prepare_module_runtimes
+from hyper_parallel.components.modules.mhc import PipelinedMhc, PipelinedMhcModule, pipelined_mhc_post
+from hyper_parallel.models.deepseek_v41.components.dspark import DeepseekV41DSpark, DSpark
+from hyper_parallel.models.deepseek_v41.components.modality_moe import ModalityMoE
+from hyper_parallel.models.deepseek_v41.components.modality_router import (
+    DeepseekV41TopKRouter,
+)
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import DeepseekV41MegaMoeExperts
+from hyper_parallel.models.deepseek_v41.components.vision_transformer import VisionTransformer, encode_image_features
+from hyper_parallel.models.deepseek_v41.dataset_preprocessing.image_processor import (
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
     IMAGE_START,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
-from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -204,166 +206,10 @@ class DeepseekV41Engram(nn.Module):
         )
 
 
-def _router_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
-    """Convert router logits to the released nonnegative expert scores."""
-    if scoring_func not in ("sqrtsoftplus", "softmax", "sigmoid"):
-        raise ValueError(f"Unsupported V4.1 router scoring function: {scoring_func!r}")
-    return routing_scores(logits, scoring_func)
 
 
-def _apply_router_training_state(
-        module: nn.Module,
-        hidden_states: torch.Tensor,
-        scores: torch.Tensor | None,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-        image_mask: torch.Tensor | None,
-        token_mask: torch.Tensor | None,
-        sequence_partition_groups: tuple[Any, ...],
-        sequence_ids: torch.Tensor | None,
-        num_sequences: int | None,
-) -> torch.Tensor:
-    """Attach sequence auxiliary gradients and deferred modality counts."""
-    if token_mask is not None:
-        if token_mask.shape != hidden_states.shape[:-1] or token_mask.dtype != torch.bool:
-            raise ValueError("token_mask must be boolean and match the hidden-state token dimensions")
-        token_mask = token_mask.reshape(-1)
-    module.last_aux_loss = None
-    if module.training and module.aux_loss_coeff:
-        if scores is None:
-            raise RuntimeError("router scores are required when auxiliary loss is enabled")
-        if sequence_ids is None:
-            num_sequences = hidden_states.shape[0] if hidden_states.ndim == 3 else 1
-            sequence_ids = torch.arange(num_sequences, device=scores.device).repeat_interleave(
-                hidden_states.shape[-2],
-            )
-        elif sequence_ids.shape != hidden_states.shape[:-1] or num_sequences is None:
-            raise ValueError("sequence_ids must match token dimensions and specify num_sequences")
-        unbiased_indices = torch.topk(scores, module.top_k, dim=-1, sorted=False).indices
-        aux_loss = sequence_load_balancing_loss(
-            scores,
-            unbiased_indices,
-            sequence_ids.reshape(-1),
-            num_sequences,
-            token_mask,
-            sequence_partition_groups,
-        )
-        module.last_aux_loss = aux_loss.detach()
-        weights = aux_loss_auto_scale(weights, aux_loss * module.aux_loss_coeff)
-    if module.training and module.enable_expert_bias:
-        weights = accumulate_router_load(weights, indices, image_mask, token_mask, module.tokens_per_expert)
-    return weights
 
 
-class DeepseekV41TopKRouter(nn.Module):
-    """V4.1 learned router with independent text and image correction biases."""
-
-    def __init__(self, config: Any) -> None:
-        """Create the released noaux_tc routing parameter layout."""
-        super().__init__()
-        self.hidden_size = int(config.hidden_size)
-        self.num_experts = int(config.num_local_experts)
-        self.top_k = int(config.num_experts_per_tok)
-        self.scoring_func = str(config.scoring_func)
-        self.routed_scaling_factor = float(config.routed_scaling_factor)
-        self.aux_loss_coeff = float(getattr(config, "router_aux_loss_coef", 0.0))
-        if not math.isfinite(self.aux_loss_coeff) or self.aux_loss_coeff < 0:
-            raise ValueError("router_aux_loss_coef must be finite and nonnegative")
-        self.last_aux_loss: torch.Tensor | None = None
-        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
-        self.expert_bias_update_rate = float(getattr(config, "router_bias_update_rate", 0.001))
-        if not math.isfinite(self.expert_bias_update_rate) or self.expert_bias_update_rate < 0:
-            raise ValueError("router_bias_update_rate must be finite and nonnegative")
-        self.enable_expert_bias = self.expert_bias_update_rate > 0
-        self.expert_bias_update_groups: tuple[Any, ...] | None = None
-        self.register_buffer("tokens_per_expert", torch.zeros(2, self.num_experts, dtype=torch.long), persistent=False)
-        register_rebuildable_buffer(
-            self, "tokens_per_expert", value=torch.zeros(2, self.num_experts, dtype=torch.long, device="cpu"),
-        )
-        self.bias = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False)
-        if bool(getattr(config, "v41_vision_enabled", False)):
-            self.bias_vl = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False)
-        else:
-            self.register_parameter("bias_vl", None)
-
-    def forward(
-            self,
-            hidden_states: torch.Tensor,
-            image_mask: torch.Tensor | None = None,
-            token_mask: torch.Tensor | None = None,
-            sequence_partition_groups: tuple[Any, ...] = (),
-            sequence_ids: torch.Tensor | None = None,
-            num_sequences: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return raw logits, routing weights, and selected experts.
-
-        ``bias`` and ``bias_vl`` select experts only; the gathered routing
-        weights intentionally use the unbiased scores, matching V4.1.
-
-        Args:
-            hidden_states: Token activations ending in the hidden dimension.
-            image_mask: Optional boolean [batch, sequence] image-token mask.
-            token_mask: Optional boolean mask matching the token dimensions;
-                true tokens contribute to auxiliary statistics.
-            sequence_partition_groups: Independent CP/TP groups partitioning
-                one microbatch's token stream, supplied by the parallel adapter.
-            sequence_ids: Optional logical sample IDs matching the token dimensions.
-            num_sequences: Total logical samples, including samples absent on this rank.
-
-        Returns:
-            Flattened logits, scaled top-k weights, and expert indices. During
-            training with a positive coefficient, weights carry the auxiliary
-            gradient and ``last_aux_loss`` stores its unweighted detached value.
-        """
-        flattened = hidden_states.reshape(-1, self.hidden_size)
-        logits = functional.linear(  # pylint: disable=not-callable
-            flattened.float(), self.weight.float()
-        )
-        scores = _router_scores(logits, self.scoring_func)
-        correction_bias = self.bias
-        if image_mask is not None:
-            if image_mask.shape != hidden_states.shape[:-1] or image_mask.dtype != torch.bool:
-                raise ValueError("image_mask must be boolean and match the hidden-state token dimensions")
-            if self.bias_vl is not None:
-                correction_bias = torch.where(
-                    image_mask.reshape(-1, 1),
-                    self.bias_vl.unsqueeze(0),
-                    self.bias.unsqueeze(0),
-                )
-        weights, indices = select_topk_scores(
-            scores, top_k=self.top_k, correction_bias=correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor, normalize_topk=self.top_k > 1,
-        )
-        weights = _apply_router_training_state(
-            self,
-            hidden_states,
-            scores,
-            weights,
-            indices,
-            image_mask,
-            token_mask,
-            sequence_partition_groups,
-            sequence_ids,
-            num_sequences,
-        )
-        return logits, weights, indices
-
-    @torch.no_grad()
-    def update_expert_bias(self, lr: float | None = None, num_recomputations: int = 1) -> None:
-        """Update text/image selection biases once after the optimizer step.
-
-        The shared monitor synchronizes counts first. Backward counts each
-        microbatch once, so checkpoint recomputation needs no correction.
-
-        Args:
-            lr: Optional step size, defaulting to this router's configured rate.
-            num_recomputations: Shared monitor compatibility argument; unused.
-        """
-        del num_recomputations
-        if lr is None:
-            lr = self.expert_bias_update_rate
-        update_modality_bias(self.bias, self.tokens_per_expert, lr, vision_bias=self.bias_vl)
-        self.tokens_per_expert.zero_()
 
 
 def deepseek_v41_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
@@ -696,8 +542,33 @@ def _v41_decoder_layer_forward(
     return hidden_states, ffn_pre
 
 
+class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
+    """Construct V4.1 computation from complete public and model-owned families."""
+
+    def __init__(self, config: Any, layer_idx: int) -> None:
+        """Retain native parameter paths and the decoder's activation-checkpoint call boundary."""
+        # Initialize registries without allocating the inherited HF architecture a second time.
+        nn.Module.__init__(self)  # pylint: disable=non-parent-init-called
+        self.layer_idx = layer_idx
+        self.self_attn = CompressedSparseAttention2(config=config, layer_idx=layer_idx, use_fused_ops=False)
+        self.mlp = ModalityMoE(config=config)
+        norm_config = SimpleNamespace(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config=norm_config, cast_order="after_weight", fp32_weight=True)
+        self.post_attention_layernorm = RMSNorm(config=norm_config, cast_order="after_weight", fp32_weight=True)
+        mhc_config = SimpleNamespace(num_stream=config.hc_mult, hidden_size=config.hidden_size,
+                                    sinkhorn_iters=config.hc_sinkhorn_iters, hc_eps=config.hc_eps,
+                                    norm_eps=config.rms_norm_eps, use_gamma=False,
+                                    init_scale=1.0, init_method_std=config.initializer_range)
+        self.attn_hc = PipelinedMhc(config=mhc_config)
+        self.ffn_hc = PipelinedMhc(config=mhc_config)
+
+    forward = _v41_decoder_layer_forward
+
+
 class DeepseekV41Model(DeepseekV4PreTrainedModel):
     """Depth-configurable V4.1 backbone with optional native vision support."""
+
+    _no_split_modules = ["DeepseekV41DecoderLayer"]
 
     def __init__(self, config: Any) -> None:
         """Create the configured backbone and attach active V4.1 modules."""
@@ -725,28 +596,33 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            DeepseekV41DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)
         )
-        for layer_idx in range(config.num_hidden_layers):
-            layer = self.layers[layer_idx]
-            layer.attn_hc = DeepseekV41PipelinedHyperConnection(layer.attn_hc)
-            layer.ffn_hc = DeepseekV41PipelinedHyperConnection(layer.ffn_hc)
-            layer.self_attn = DeepseekV41Attention(config, layer_idx)
-            layer.forward = MethodType(_v41_decoder_layer_forward, layer)
-            layer.mlp.gate = DeepseekV41TopKRouter(config)
-            layer.mlp.shared_experts = SharedExpertModule(
-                module=layer.mlp.shared_experts, preserve_source_layout=True,
-                activation_dtype="float32", swiglu_limit=layer.mlp.shared_experts.limit,
-            )
-            layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in getattr(config, "v41_engram_layer_ids", assets["layer_ids"]):
-            self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
-        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            layer_index = assets["layer_ids"].index(layer_id)
+            rows = int(assets["num_embeddings"][layer_index])
+            multiple = int(getattr(config, "v41_engram_table_pad_multiple", 1))
+            if multiple < 1:
+                raise ValueError("Engram table padding multiple must be positive")
+            padded_sizes = assets.get("padded_num_embeddings")
+            padded = (rows + multiple - 1) // multiple * multiple if padded_sizes is None else padded_sizes[layer_index]
+            engram_config = SimpleNamespace(
+                layer_id=layer_id, hidden_size=config.hidden_size, hc_mult=config.hc_mult,
+                eps=config.rms_norm_eps, clamp_value=1e-6, assets=assets,
+                embedding_dim=int(assets["head_dim"]), padded_num_embeddings=padded,
+                engram_max_pending_entries=getattr(config, "engram_max_pending_entries", 1000000),
+                engram_max_sparse_rows_per_step=getattr(config, "engram_max_sparse_rows_per_step", 1000000),
+            )
+            self.layers[layer_id].engram = Engram(
+                config=engram_config, engram_storage_backend=getattr(config, "engram_storage_backend", "device"),
+            )
+        self.norm = RMSNorm(config=SimpleNamespace(hidden_size=config.hidden_size, eps=config.rms_norm_eps),
+                            cast_order="after_weight", fp32_weight=True)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.vision = None
         self.aligner = None
         if bool(getattr(config, "v41_vision_enabled", False)):
-            self.vision = DeepseekV41VisionTower(config)
+            self.vision = VisionTransformer(config=config, module_fqn="model.vision")
             self.aligner = DeepseekV41VisionAligner(config)
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
@@ -762,9 +638,11 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         experts = [layer.mlp.experts for layer in self.layers
                    if isinstance(layer.mlp.experts, DeepseekV41MegaMoeExperts)]
         DeepseekV41MegaMoeExperts.prepare_runtime_group(experts)
+        prepare_module_runtimes(self)
         self._megamoe_runtime_prepared = True
 
     @torch.no_grad()
+
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize backbone state after FSDP has established local shards."""
         if isinstance(module, HostEngramTable):
@@ -774,7 +652,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             return
         super()._init_weights(module)
         _initialize_v41_owned_module(module, self.config.initializer_range)
-        if isinstance(module, DeepseekV41Model) and module.vision is not None:
+        if isinstance(module, DeepseekV41Model) and getattr(module, "image_start", None) is not None:
             nn.init.normal_(module.image_start, mean=0.0, std=self.config.initializer_range)
             nn.init.normal_(module.image_end, mean=0.0, std=self.config.initializer_range)
             nn.init.normal_(module.image_newline, mean=0.0, std=self.config.initializer_range)
@@ -794,37 +672,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         executes per image because V4.1 applies bidirectional attention only
         inside a single image grid; no image may attend to another image.
         """
-        if self.vision is None or self.aligner is None:
-            raise ValueError("received image inputs but V4.1 vision is disabled")
-        image_count = image_vit_grid_hw.shape[0]
-        required_shapes = {
-            "image_patch_offsets": image_patch_offsets.numel() == image_count + 1,
-            "image_llm_grid_hw": image_llm_grid_hw.shape == image_vit_grid_hw.shape,
-            "image_batch_indices": image_batch_indices.numel() == image_count,
-            "image_token_starts": image_token_starts.numel() == image_count,
-        }
-        invalid = [name for name, valid in required_shapes.items() if not valid]
-        if invalid:
-            raise ValueError(f"inconsistent V4.1 image metadata: {', '.join(invalid)}")
-        if pixel_values.ndim != 4:
-            raise ValueError("pixel_values must have shape [total_patches, 3, patch, patch]")
-        image_records = []
-        for image_index in range(image_count):
-            patch_start = int(image_patch_offsets[image_index])
-            patch_end = int(image_patch_offsets[image_index + 1])
-            vit_height, vit_width = (int(value) for value in image_vit_grid_hw[image_index])
-            llm_height, llm_width = (int(value) for value in image_llm_grid_hw[image_index])
-            batch_index = int(image_batch_indices[image_index])
-            token_start = int(image_token_starts[image_index])
-            vision_features = self.vision(pixel_values[patch_start:patch_end], vit_height, vit_width)
-            image_features = self.aligner(vision_features, vit_height, vit_width)
-            if image_features.shape[0] != llm_height * llm_width:
-                raise ValueError(
-                    f"aligner/image-token count mismatch for image {image_index}: "
-                    f"{image_features.shape[0]} versus {llm_height * llm_width}"
-                )
-            image_records.append((batch_index, token_start, llm_height, llm_width, image_features))
-        return image_records
+        return encode_image_features(self.vision, self.aligner, pixel_values, image_patch_offsets,
+                                     image_vit_grid_hw, image_llm_grid_hw, image_batch_indices, image_token_starts)
 
     def _merge_image_embeddings(
             self,
@@ -908,6 +757,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
 
     @staticmethod
+
     def _build_segment_start_mask(
             packed_sequence: Any | None,
             input_ids: torch.LongTensor,
@@ -974,6 +824,27 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             inputs_embeds = inputs_embeds + anchor.to(inputs_embeds.dtype) * 0.0
         return inputs_embeds
 
+    def _prepare_decoder_inputs(self, input_ids, inputs_embeds, position_ids, kwargs):
+        """Prepare rotary and packed-sequence metadata for the local decoder layers."""
+        if position_ids is None:
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+        position_embeddings = {
+            "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
+            "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
+        }
+        packed_sequence = kwargs.get("packed_seq_params")
+        if packed_sequence is not None:
+            if not isinstance(packed_sequence, SharedPackedSequence):
+                raise TypeError("packed_seq_params must be SharedCompressedPackedSequence")
+            packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
+            kwargs["packed_seq_params"] = packed_sequence
+
+            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
+            kwargs["router_sequence_ids"] = sequence_ids
+            kwargs["router_num_sequences"] = sequence_capacity
+        segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
+        return position_ids, position_embeddings, segment_start_mask
+
     def _run_decoder_layers(
             self,
             hidden_states: torch.Tensor,
@@ -988,8 +859,10 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             engram_token_mask: torch.Tensor | None,
             image_mask: torch.Tensor | None,
             dspark_layer_ids: tuple[int, ...],
+            pending_mhc: tuple[torch.Tensor, ...] = (),
+            finish_mhc: bool = True,
             **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         """Run decoder boundaries and collect detached DSpark targets.
 
         Args:
@@ -1004,21 +877,25 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             engram_token_mask: Mask selecting tokens with Engram contributions.
             image_mask: Mask selecting visual tokens.
             dspark_layer_ids: Layers whose outputs supervise the drafter.
+            pending_mhc: Shifted FFN output and mixing tensors from the previous stage.
+            finish_mhc: Apply the last deferred FFN residual on the output stage.
             **kwargs: Additional decoder-layer keyword arguments.
 
         Returns:
             Completed residual streams and final input-mixing coefficients.
         """
-        shifted_mhc_layers = [_uses_shifted_mhc(layer) for layer in self.layers]
+        shifted_mhc_layers = [_uses_shifted_mhc(layer) for layer in self.layers.children()]
         if any(shifted_mhc_layers) and not all(shifted_mhc_layers):
             raise RuntimeError("shifted mHC must replace every retained V4.1 boundary")
         shifted_mhc = all(shifted_mhc_layers)
         previous_output = post_mix = residual_mix = None
-        if shifted_mhc:
+        if pending_mhc:
+            previous_output, post_mix, residual_mix = pending_mhc
+        elif shifted_mhc:
             previous_output = torch.zeros_like(hidden_states[:, :, 0])
             post_mix = torch.zeros_like(pre_mix)
             residual_mix = _identity_residual_mix(pre_mix)
-        for layer_index, layer in enumerate(self.layers):
+        for layer_index, layer in enumerate(self.layers.children()):
             if shifted_mhc:
                 previous_output, hidden_states, pre_mix, post_mix, residual_mix = layer(
                     hidden_states,
@@ -1059,6 +936,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                         target_hidden = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
                     self.dspark_target_hiddens.append(_hc_pre(target_hidden, pre_mix).detach())
         if shifted_mhc:
+            if not finish_mhc:
+                return hidden_states, pre_mix, previous_output, post_mix, residual_mix
             hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
         return hidden_states, pre_mix
 
@@ -1128,23 +1007,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
         image_mask = None if token_types is None else token_types >= 0
         engram_token_mask = None if image_mask is None else ~image_mask
-        if position_ids is None:
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
-        position_embeddings = {
-            "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-            "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
-        }
-        packed_sequence = kwargs.get("packed_seq_params")
-        if packed_sequence is not None:
-            if not isinstance(packed_sequence, SharedPackedSequence):
-                raise TypeError("packed_seq_params must be SharedCompressedPackedSequence")
-            packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
-            kwargs["packed_seq_params"] = packed_sequence
-
-            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
-            kwargs["router_sequence_ids"] = sequence_ids
-            kwargs["router_num_sequences"] = sequence_capacity
-        segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
+        position_ids, position_embeddings, segment_start_mask = self._prepare_decoder_inputs(
+            input_ids, inputs_embeds, position_ids, kwargs,
+        )
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
@@ -1170,55 +1035,6 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
-def _dspark_sparse_moe_forward(
-        self: nn.Module,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        image_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Drafter MoE forward that recomputes the shared expert in backward.
-
-    The routed-expert container performs the expert-parallel dispatch and
-    must not sit inside a recomputed region (its collectives would
-    interleave with FSDP backward collectives), but the shared expert is
-    purely local, so checkpointing it trims the drafter's resident
-    activations on the long flattened draft stream.
-
-    Args:
-        self: Bound HF MoE module (gate / experts / shared_experts).
-        hidden_states: ``[batch, seq, hidden]`` FFN input.
-        input_ids: Unused router-correction hook argument.
-        image_mask: Visual-token mask forwarded to the router.
-
-    Returns:
-        Combined routed plus shared expert output.
-    """
-    del input_ids
-    batch_size, sequence_length, hidden_size = hidden_states.shape
-    _, weights, indices = self.gate(hidden_states, image_mask=image_mask)
-    routed = self.experts(hidden_states.view(-1, hidden_size), indices, weights)
-    if torch.is_grad_enabled() and self.training:
-        shared = torch.utils.checkpoint.checkpoint(
-            self.shared_experts, hidden_states, use_reentrant=False)
-    else:
-        shared = self.shared_experts(hidden_states)
-    return routed.view(batch_size, sequence_length, hidden_size) + shared
-
-
-def _build_dspark_mlp(config: Any) -> nn.Module:
-    """Build one DSpark-stage MoE FFN reusing the crop expert container."""
-    import copy  # local: config templates are cloned only when DSpark is on  # pylint: disable=C0415
-
-    dspark_config = copy.deepcopy(config)
-    experts = int(getattr(config, "v41_dspark_n_routed_experts", config.num_local_experts))
-    dspark_config.n_routed_experts = experts
-    dspark_config.num_local_experts = experts
-    dspark_config.num_experts_per_tok = int(getattr(config, "v41_dspark_top_k", config.num_experts_per_tok))
-    mlp = DeepseekV4DecoderLayer(dspark_config, 0).mlp
-    mlp.gate = DeepseekV41TopKRouter(dspark_config)
-    mlp.forward = MethodType(_dspark_sparse_moe_forward, mlp)
-    return mlp
-
 
 class DeepseekV41CroppedForCausalLM(DeepseekV4ForCausalLM):
     """Causal-LM facade for the four-layer V4.1 validation backbone."""
@@ -1227,24 +1043,28 @@ class DeepseekV41CroppedForCausalLM(DeepseekV4ForCausalLM):
 class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     """Causal-LM facade shared by full and validation-crop configurations."""
 
+    _no_split_modules = ["DeepseekV41DecoderLayer"]
+    supports_chunked_loss = True
+
     def __init__(self, config: Any) -> None:
         """Create the configured backbone and unchanged causal-LM facade."""
         DeepseekV4PreTrainedModel.__init__(self, config)  # pylint: disable=non-parent-init-called
         self.model = DeepseekV41Model(config)
         self.model_mode = self.model.model_mode
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = CausalLMHead(config=config)
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.dspark = None
         self.dspark_loss_coeff = 0.0
         if int(getattr(config, "v41_dspark_depth", 0) or 0) > 0:
-            self.dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _build_dspark_mlp(config))
+            self.dspark = DSpark(config=config)
             self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
         self.post_init()
 
     @torch.no_grad()
+
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize V4.1-only state in addition to the inherited V4 modules."""
         if isinstance(module, HostEngramTable):
@@ -1255,23 +1075,69 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         super()._init_weights(module)
         _initialize_v41_owned_module(module, self.config.initializer_range)
 
+    def _forward_chunked(
+            self, *, input_ids: torch.Tensor | None, targets: torch.Tensor,
+            loss_mask: torch.Tensor | None, chunk_size: int, ignore_index: int, **kwargs: Any,
+    ) -> ChunkedCausalLMOutput:
+        """Compose the native backbone, terminal CE family and optional draft objective."""
+        if kwargs.get("past_key_values") is not None or kwargs.get("use_cache"):
+            raise ValueError("V4.1 chunked training does not support KV cache")
+        retained = kwargs.pop("logits_to_keep", 0)
+        if isinstance(retained, torch.Tensor) or retained != 0 or kwargs.pop("return_dict", True) is False:
+            raise ValueError("V4.1 chunked training requires complete tokens and return_dict=True")
+        kwargs["use_cache"] = False
+        outputs = self.model(input_ids=input_ids, **kwargs)
+        terminal = self.lm_head(outputs.last_hidden_state, targets=targets, loss_mask=loss_mask,
+                                chunk_size=chunk_size, ignore_index=ignore_index)
+        draft_loss = None
+        if self.dspark is not None:
+            if input_ids is None:
+                raise ValueError("DSpark chunked training requires input_ids")
+            draft_targets = getattr(self.model, "dspark_target_hiddens", None)
+            if not draft_targets:
+                raise RuntimeError("DSpark requires collected backbone target hiddens")
+            draft_loss, metrics = self.dspark(
+                draft_targets, input_ids, targets, self.model.dspark_inputs_embeds, self.lm_head,
+            )
+            self.pending_extra_metrics = metrics
+        return ChunkedCausalLMOutput(
+            loss_sum=terminal.loss_sum, valid_token_count=terminal.valid_token_count,
+            aux_loss=draft_loss, aux_loss_coef=self.dspark_loss_coeff,
+            hidden_states=getattr(outputs, "hidden_states", None),
+            attentions=getattr(outputs, "attentions", None),
+        )
+
     def forward(
             self,
             input_ids: torch.LongTensor | None = None,
             labels: torch.LongTensor | None = None,
+            chunk_loss_targets: torch.Tensor | None = None,
+            chunk_loss_mask: torch.Tensor | None = None,
+            chunk_loss_chunk_size: int = 1024,
+            chunk_loss_ignore_index: int = -100,
             **kwargs: Any,
     ) -> Any:  # pylint: disable=arguments-differ
         """Run the causal LM and, when enabled, add the DSpark objective.
 
         Args:
             input_ids: Input token ids forwarded to the V4 causal LM.
-            labels: Supervised labels; DSpark runs only when present.
+            labels: Source labels for the ordinary causal-LM objective.
+            chunk_loss_targets: Pre-shifted targets for native memory-bounded CE.
+            chunk_loss_mask: Optional token mask for the chunked objective.
+            chunk_loss_chunk_size: Maximum tokens per terminal projection chunk.
+            chunk_loss_ignore_index: Ignored target value in chunked training.
             **kwargs: Remaining Transformers forward arguments.
 
         Returns:
             The causal-LM output with the DSpark objective folded into
             ``loss`` and drafter metrics attached when enabled.
         """
+        if chunk_loss_targets is not None:
+            if labels is not None:
+                raise ValueError("Pass pre-shifted chunk_loss_targets without source labels")
+            return self._forward_chunked(input_ids=input_ids, targets=chunk_loss_targets,
+                                         loss_mask=chunk_loss_mask, chunk_size=chunk_loss_chunk_size,
+                                         ignore_index=chunk_loss_ignore_index, **kwargs)
         outputs = super().forward(input_ids=input_ids, labels=labels, **kwargs)
         # The trainer may keep labels on its loss-only path, so the drafter
         # must not depend on them: it supervises from input_ids when absent.
@@ -1298,15 +1164,16 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         return outputs
 
     @classmethod
+
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":
         """Construct the model from its translated V4.1 configuration.
 
         Args:
             config: Translated DeepSeek-V4.1 model configuration.
-            **kwargs: Unused model construction options.
+            **kwargs: Native HF construction options, including dtype and attention implementation.
         """
-        del kwargs
-        return cls(config)
+        kwargs.pop("trust_remote_code", None)
+        return cls._from_config(config, **kwargs)
 
 
 __all__ = [

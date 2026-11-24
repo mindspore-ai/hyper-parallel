@@ -22,7 +22,9 @@ distributed runtime, GPU, or preprocess module.  Schedules are built via
 """
 import itertools
 import unittest
+from unittest.mock import Mock
 
+from hyper_parallel import PipelineStage
 from hyper_parallel.core.pipeline_parallel.scheduler import (
     MetaStep,
     MetaStepType,
@@ -32,6 +34,7 @@ from hyper_parallel.core.pipeline_parallel.mpipe import (
     MpipeStepType,
     ScheduleMPipeTranspose,
 )
+from tests.common.mark_utils import arg_mark
 
 _MPIPE_STEP_TYPES = frozenset({
     MpipeStepType.MPIPE_PARAM_BROADCAST,
@@ -551,6 +554,21 @@ class TestMPipeTransposeBodyPreserved(unittest.TestCase):
 
 class TestMPipeTransposeValidation(unittest.TestCase):
     """Constructor argument validation that runs before any distributed setup."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_hsdp_requires_singleton_mesh_and_stage_zero_backward(self) -> None:
+        """Feature: HSDP stage validation in MPipe.
+        Description: Construct the schedule with a sharded mesh or owner-side prefix backward.
+        Expectation: Both unsupported combinations fail before initializing communication.
+        """
+        for mesh_size, owner_backward in ((2, False), (1, True)):
+            with self.subTest(mesh_size=mesh_size, owner_backward=owner_backward):
+                stage = Mock(spec=PipelineStage)
+                scheduler = Mock()
+                scheduler.mesh.size.return_value = mesh_size
+                stage.all_hsdp_schedulers = [scheduler]
+                with self.assertRaisesRegex(ValueError, "singleton meshes and stage-zero prefix backward"):
+                    ScheduleMPipeTranspose(stage, 2, None, 0, owner_backward=owner_backward)
 
     def test_swap_rejected_before_other_constructor_work(self):
         """MPipe rejects swap before inspecting stages or preprocess state."""

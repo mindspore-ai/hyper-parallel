@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import torch
 
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
-from hyper_parallel.models.deepseek_v41.adapter.optim.host_sparse import HostSparseOptimizerCoordinator
+from hyper_parallel.components.modules.engram.host_optimizer import HostSparseOptimizerCoordinator
 
 
 class TestHostOptimizerRestore(unittest.TestCase):

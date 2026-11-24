@@ -13,11 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """Essential linear-attention family ownership, promotion and packed-lifetime contracts."""
+import unittest
 from copy import deepcopy
 from functools import partial
 from itertools import product
 from types import SimpleNamespace
-import unittest
 from unittest.mock import patch
 
 import torch
@@ -25,14 +25,13 @@ from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
 
-from tests.common.mark_utils import arg_mark
-
-from hyper_parallel.components.modules import KimiDeltaAttention, GatedDeltaNet
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
+from hyper_parallel.components.modules import GatedDeltaNet, KimiDeltaAttention
 from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest
+from tests.common.mark_utils import arg_mark
 
 
 def _layer(kind, **options):
@@ -133,7 +132,7 @@ class TestLinearAttentionFamily(unittest.TestCase):
                 "linear_key_head_dim": 4,
                 "linear_value_head_dim": 3,
             })
-            with self.subTest(ratio=ratio, offsets=offsets), patch.object(qwen, "FusedRMSNormGated", None):
+            with self.subTest(ratio=ratio, offsets=offsets), patch.object(qwen, "FusedRMSNormGated", None, create=True):
                 torch.manual_seed(319)
                 reference = qwen.Qwen3_5GatedDeltaNet(config, 0)
                 reference.causal_conv1d_fn = None

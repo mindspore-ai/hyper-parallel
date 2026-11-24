@@ -42,11 +42,13 @@ class SparseAttentionSequenceMetadata:
     key_ends: torch.Tensor
 
     @property
+
     def sequence_lengths(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return cumulative int32 Q/K endpoints for the existing CANN kernels."""
         return self.query_ends, self.key_ends
 
     @classmethod
+
     def build(
         cls, *, batch_size: int, local_seq_len: int, device: torch.device,
         actual_seq_len: torch.Tensor | Sequence[int] | None = None,
@@ -447,7 +449,7 @@ class DeepseekSparseAttentionModule(nn.Module):
     def __init__(
         self, *, config: Any = None, module: nn.Module | None = None,
         module_fqn: str = "", context: Mapping[str, Any] | None = None,
-        kv_cp_size: int = 1, kv_cp_strategy: str = "allgather",
+        kv_cp_size: int | None = None, kv_cp_strategy: str = "allgather",
         cp_comm_overlap: bool = False, dense_warmup: bool | None = None,
     ) -> None:
         """Construct native sparse attention parameters, convert a source, or promote a local member.
@@ -458,7 +460,7 @@ class DeepseekSparseAttentionModule(nn.Module):
             module: Source attention or an unbound concrete family member.
             module_fqn: Source path supplied by replacement.
             context: Logical construction context, without execution resources.
-            kv_cp_size: KV domain size retained for deferred family promotion.
+            kv_cp_size: Explicit KV domain size, or None to follow the final job CP size.
             kv_cp_strategy: KV transport, currently allgather.
             cp_comm_overlap: Submit key-bank gathers asynchronously when enabled.
             dense_warmup: None follows the mutable training stage; bool pins it.
@@ -467,8 +469,10 @@ class DeepseekSparseAttentionModule(nn.Module):
         del module_fqn, context
         if (config is None) == (module is None):
             raise ValueError("DeepSeek-V3.2 sparse attention requires exactly one of config or module")
-        if not isinstance(kv_cp_size, int) or isinstance(kv_cp_size, bool) or kv_cp_size < 1:
-            raise ValueError("kv_cp_size must be a positive integer")
+        if kv_cp_size is not None and (
+            not isinstance(kv_cp_size, int) or isinstance(kv_cp_size, bool) or kv_cp_size < 1
+        ):
+            raise ValueError("kv_cp_size must be a positive integer or None for the job CP size")
         if kv_cp_strategy != "allgather":
             raise ValueError("DeepSeek sparse attention supports only kv_cp_strategy='allgather'")
         self._config_initialization = module is None or getattr(module, "_config_initialization", False)
@@ -545,6 +549,7 @@ class DeepseekSparseAttentionModule(nn.Module):
         return transforms
 
     @staticmethod
+
     def _invalid_position_ids(
         position_ids: torch.Tensor | None,
         batch_size: int,
@@ -558,6 +563,7 @@ class DeepseekSparseAttentionModule(nn.Module):
         return position_ids.shape[0] not in (1, batch_size) or position_ids.shape[1] != seq_length
 
     @staticmethod
+
     def _validate_forward_inputs(
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,

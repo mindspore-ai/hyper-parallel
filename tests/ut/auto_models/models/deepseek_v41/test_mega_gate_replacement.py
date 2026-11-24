@@ -23,8 +23,8 @@ import torch
 
 from hyper_multicore.modules.mega_gate import function as gate_function
 
-from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import (
-    DeepseekV41MegaGate,
+from hyper_parallel.models.deepseek_v41.components.modality_router import (
+    ModalityTopKRouter, FusedModalityTopKRouter,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
@@ -40,8 +40,9 @@ def _config(vision: bool, scoring: str = "sqrtsoftplus") -> SimpleNamespace:
     )
 
 
-def _replace(router: DeepseekV41TopKRouter) -> DeepseekV41MegaGate:
-    return DeepseekV41MegaGate(
+def _replace(router: DeepseekV41TopKRouter) -> FusedModalityTopKRouter:
+    return ModalityTopKRouter(
+        use_fused_ops=True,
         module=router, module_fqn="model.layers.0.mlp.gate", context={},
     )
 

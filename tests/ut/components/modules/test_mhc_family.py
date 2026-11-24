@@ -18,10 +18,15 @@ from types import SimpleNamespace
 
 import torch
 
-from examples.torch.module_family.config import MHCPreConfig, MHCPostConfig, PipelinedMhcConfig
+from examples.torch.module_family.config import MHCPostConfig, MHCPreConfig, PipelinedMhcConfig
 from hyper_parallel.components.modules import (
-    MHCPre, MHCPost, PipelinedMhc, get_family_build_info,
-    MhcPreModule, MhcPostModule, PipelinedMhcModule,
+    MHCPost,
+    MhcPostModule,
+    MHCPre,
+    MhcPreModule,
+    PipelinedMhc,
+    PipelinedMhcModule,
+    get_family_build_info,
 )
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementSpec
@@ -29,6 +34,7 @@ from hyper_parallel.models.replacement import ModuleReplacementSpec
 
 class TestMHCFamily(unittest.TestCase):
     """Verify the three distinct component contracts."""
+
 
     def test_model_owned_config(self):
         """Independent model configs retain direct and source construction validation."""

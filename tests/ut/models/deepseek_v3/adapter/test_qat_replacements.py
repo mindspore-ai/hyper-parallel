@@ -38,7 +38,7 @@ from hyper_parallel.components.quantization.functional.mxfp8_linear_func import 
 from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
 from hyper_parallel.components.quantization.tensor import QuantizedTensorStorage
-from hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement import (
+from hyper_parallel.components.quantization.modules.replacement import (
     replace_grouped_experts,
     replace_linear,
 )

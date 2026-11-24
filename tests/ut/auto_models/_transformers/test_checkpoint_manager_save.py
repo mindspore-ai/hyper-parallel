@@ -122,7 +122,7 @@ class TestCheckpointManagerSave(unittest.TestCase):
             self.assertIs(export_model._weight_conversions, replacements)
             return {"weight": state["weight"] + 1}
 
-        with patch("hyper_parallel.models.qwen3_5.adapter.checkpoint.revert_weight_conversion",
+        with patch("hyper_parallel.components.checkpoint.export_policy.revert_weight_conversion",
                    side_effect=reverse_layout) as reverse:
             CheckpointManager(model).save_pretrained("/unused")
 
@@ -165,7 +165,7 @@ class TestCheckpointManagerSave(unittest.TestCase):
         model = ExportableModel("qwen3_5_text")
         original_mapping = model._weight_conversions = [object()]
         model._hp_used_replacement_weight_conversions = [object()]
-        with patch("hyper_parallel.models.qwen3_5.adapter.checkpoint.revert_weight_conversion",
+        with patch("hyper_parallel.components.checkpoint.export_policy.revert_weight_conversion",
                    side_effect=ValueError("conversion failed")):
             with self.assertRaisesRegex(ValueError, "conversion failed"):
                 CheckpointManager(model).save_pretrained("/unused", save_original_format=False)
