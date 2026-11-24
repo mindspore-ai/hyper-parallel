@@ -14,12 +14,18 @@
 # ============================================================================
 """Model-level loss objectives and calling adapters — design doc §10 + §10.0."""
 
-from hyper_parallel.components.losses.dispatcher import calculate_loss
+from hyper_parallel.components.losses.aux_loss import (
+    aux_loss_auto_scale,
+    aux_loss_scale_context,
+    bind_aux_loss_scale,
+    set_aux_loss_scale,
+)
 from hyper_parallel.components.losses.chunked_cross_entropy import (
     ChunkedCausalLMLoss,
     ChunkedCausalLMOutput,
     chunked_cross_entropy,
 )
+from hyper_parallel.components.losses.dispatcher import calculate_loss
 from hyper_parallel.components.losses.masked_ce import MaskedCrossEntropy
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.components.losses.mtp import calculate_mtp_loss, compute_mtp_loss
@@ -36,8 +42,12 @@ __all__ = [
     "MaskedCrossEntropy",
     "ModelOutputLoss",
     "FusedLinearCrossEntropy",
+    "aux_loss_auto_scale",
+    "aux_loss_scale_context",
+    "bind_aux_loss_scale",
     "calculate_loss",
     "chunked_cross_entropy",
     "calculate_mtp_loss",
     "compute_mtp_loss",
+    "set_aux_loss_scale",
 ]

@@ -36,13 +36,13 @@ from verl.workers.engine.base import BaseEngine, BaseEngineCtx
 from verl.workers.engine.utils import detach_tree, postprocess_batch_func, prepare_micro_batches
 
 from hyper_parallel import DTensor, HSDPModule, Shard
-from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.integration.verl.engine.checkpoint import VeRLCheckpointAdapter
 from hyper_parallel.integration.verl.engine.trainer import VerlTrainerAdapter
 from hyper_parallel.components.losses._vocab_parallel_cross_entropy import (
     entropy_from_logits,
     vocab_parallel_cross_entropy_local,
 )
+from hyper_parallel.components.losses.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
 from hyper_parallel.trainer.runtime.distributed import create_distributed_setup_from_config
 from hyper_parallel.integration.verl.engine.weight_export import get_per_tensor_param

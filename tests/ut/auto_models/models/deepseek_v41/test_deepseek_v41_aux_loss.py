@@ -23,7 +23,7 @@ import torch
 from torch.nn import functional
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_parallel.components.functional.aux_loss import (
+from hyper_parallel.components.losses.aux_loss import (
     aux_loss_auto_scale,
     aux_loss_scale_context,
     bind_aux_loss_scale,
@@ -112,7 +112,7 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             indices = torch.zeros(tokens, 2, dtype=torch.long)
             ids = torch.zeros(tokens, dtype=torch.long)
             group = object()
-            module = "hyper_parallel.components.losses.moe_aux_loss"
+            module = "hyper_parallel.components.losses.aux_loss"
             with patch(f"{module}.dist.all_reduce") as reduce_counts, patch(
                     f"{module}.differentiable_all_reduce", side_effect=lambda tensor, *args: tensor,
             ) as reduce_probs:
@@ -146,7 +146,7 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             remote_sum = torch.zeros(2, 3).index_add(
                 0, remote_ids, functional.normalize(values[remote_slice], p=1, dim=-1),
             )
-            module = "hyper_parallel.components.losses.moe_aux_loss"
+            module = "hyper_parallel.components.losses.aux_loss"
             with (
                 patch(f"{module}.dist.all_reduce",
                       side_effect=lambda tensor, counts=remote_counts, **kwargs: tensor.add_(counts)),

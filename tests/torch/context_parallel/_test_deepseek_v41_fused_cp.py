@@ -28,7 +28,7 @@ from transformers.utils import is_torchvision_available
 from hyper_parallel.components.modules import CompressedSparseAttention2
 from hyper_parallel.distributed.context_parallel.cp_context import CPContext
 from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
-from hyper_parallel.components.functional.aux_loss import set_aux_loss_scale
+from hyper_parallel.components.losses.aux_loss import set_aux_loss_scale
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
     SharedCompressedPackedSequence, SharedCompressedAttentionState,
 )

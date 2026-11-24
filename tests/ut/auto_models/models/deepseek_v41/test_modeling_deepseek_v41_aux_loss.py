@@ -32,7 +32,7 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
-from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
     SharedCompressedPackedSequence,
 )

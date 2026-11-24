@@ -20,17 +20,23 @@ The MoE package exports the factory and config; the legacy production entry is u
 
 from __future__ import annotations
 
-from typing import Any
 import warnings
+from typing import Any
 
 from torch import nn
 
 from hyper_parallel.components.modules.module_family import (
-    FamilyShardingContext, ModuleFamily, ResolvedFamily, SelectorSpec, VariantRule,
-    build_family, register_module_family,
+    FamilyShardingContext,
+    ModuleFamily,
+    ResolvedFamily,
+    SelectorSpec,
+    VariantRule,
+    build_family,
+    register_module_family,
 )
 from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (
-    GroupedExpertsConfig, GroupedExpertsModule,
+    GroupedExpertsConfig,
+    GroupedExpertsModule,
 )
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
@@ -91,6 +97,7 @@ def GroupedExperts(  # pylint: disable=invalid-name
     *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Any = None, mesh: Any = None,
     megakernel: bool = False, moonep: bool = False, overlap_shared_expert: bool = True,
+    activation_dtype: str = "input", swiglu_limit: float | None = None,
     dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
     capacity_growth_factor: float | None = None, moonep_replica_capacity: int | None = None,
 ) -> nn.Module:
@@ -105,6 +112,8 @@ def GroupedExperts(  # pylint: disable=invalid-name
         megakernel: Select fused Mega transport/compute for EP>1; EP=1 warns and uses local GMM.
         moonep: Select collective MoonEP with dynamic execution replicas.
         overlap_shared_expert: Let ordinary/Moon EP schedule a bound shared family member.
+        activation_dtype: SwiGLU precision for packed source adoption by the local or ordinary EP member.
+        swiglu_limit: Clamp override for packed source adoption by the local or ordinary EP member.
         dispatch_mode: Mega transport policy, push or pull.
         initial_capacity_factor: Mega push receive-capacity factor; None uses the backend default.
         capacity_growth_factor: Mega push growth factor; None uses the backend default.
@@ -118,6 +127,7 @@ def GroupedExperts(  # pylint: disable=invalid-name
     return build_family(GroupedExperts, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, megakernel=megakernel, moonep=moonep,
                         overlap_shared_expert=overlap_shared_expert,
+                        activation_dtype=activation_dtype, swiglu_limit=swiglu_limit,
                         dispatch_mode=dispatch_mode, initial_capacity_factor=initial_capacity_factor,
                         capacity_growth_factor=capacity_growth_factor, moonep_replica_capacity=moonep_replica_capacity)
 

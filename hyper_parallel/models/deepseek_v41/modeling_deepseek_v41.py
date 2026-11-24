@@ -42,7 +42,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4RotaryEmbedding,
 )
 
-from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
 from hyper_parallel.components.modules.moe.shared_expert import SharedExpertModule
 from hyper_parallel.components.modules.mlp import swiglu_activation

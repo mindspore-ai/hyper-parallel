@@ -49,7 +49,7 @@ permutation, expert computation and local/EP transport.
 
 ## Auxiliary-loss functions
 
-`hyper_parallel.components.functional` also exports `aux_loss_auto_scale` and `set_aux_loss_scale` for auxiliary-loss gradient injection.
+Import auxiliary-loss gradient scaling from [`hyper_parallel.components.losses.aux_loss`](../losses/aux_loss.py).
 
 ## DeepSeek V3.2 DSA
 

@@ -19,7 +19,8 @@ import unittest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_parallel.components.functional.aux_loss import (
+from hyper_parallel.components import functional, losses
+from hyper_parallel.components.losses.aux_loss import (
     aux_loss_auto_scale,
     aux_loss_scale_context,
     bind_aux_loss_scale,
@@ -38,6 +39,13 @@ class TestAuxLossScale(unittest.TestCase):
     def tearDown(self) -> None:
         """Restore the standalone API's default scale."""
         set_aux_loss_scale(torch.tensor(1.0))
+
+    def test_scaling_exports_belong_to_losses(self) -> None:
+        """Resolve the package exports to the scaler and microstep context in losses."""
+        for function in (aux_loss_auto_scale, aux_loss_scale_context, bind_aux_loss_scale, set_aux_loss_scale):
+            with self.subTest(name=function.__name__):
+                self.assertIs(getattr(losses, function.__name__), function)
+                self.assertFalse(hasattr(functional, function.__name__))
 
     def test_weighting_and_checkpoint_match_explicit_loss(self) -> None:
         """
