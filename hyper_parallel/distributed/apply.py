@@ -32,7 +32,12 @@ This module is a thin public facade: the implementation lives in
 """
 
 from typing import Any, Optional, Tuple
+from types import SimpleNamespace
 
+from hyper_parallel.components.modules.module_family import (
+    _family_mesh, _family_parameter_shapes, _record_family_layouts,
+)
+from hyper_parallel.distributed.module_binding import bind_parallel_modules
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import (
     _normalize_out_fields,
@@ -49,6 +54,7 @@ from hyper_parallel.distributed._builder.parameter_sharding import (
     _replicate_tied_weights,
     _resolve_parameter_source_meshes,
     _shard_planned_parameters,
+    _set_param_by_path,
     detect_tied_weights,
 )
 
@@ -59,13 +65,7 @@ def _prepare_sharding_meshes(
     mesh: Any,
 ) -> Tuple[Any, Any, Any, Any, Any]:
     """Resolve active and parameter source meshes before plan application."""
-    # Lazy import: components.distributed.__init__ re-exports this module, so
-    # a module-level import of the mesh module would cycle through the
-    # package __init__.
-    from hyper_parallel.distributed.mesh import (  # pylint: disable=C0415
-        MeshContext,
-    )
-    mesh_context = mesh if isinstance(mesh, MeshContext) else None
+    mesh_context = mesh if hasattr(mesh, "device_mesh") else None
     if mesh_context is None:
         device_mesh = mesh
     else:
@@ -120,6 +120,12 @@ def apply_sharding_plan(
       experts from the expert mesh);
     - validate: no unwrap (parameters remain DTensors); source_shard_info is None.
     """
+    original_mesh = mesh
+    for part in model if isinstance(model, list) else [model]:
+        original_mesh = _family_mesh(part, original_mesh)
+    mesh = original_mesh
+    shapes = {id(part): _family_parameter_shapes(part)
+              for part in (model if isinstance(model, list) else [model])}
     mesh, models, expert_mesh, dense_source_mesh, expert_source_mesh = (
         _prepare_sharding_meshes(model, plan, mesh)
     )
@@ -142,6 +148,9 @@ def apply_sharding_plan(
         expert_source_mesh,
         validate_mode,
     )
+    for part in models:
+        for canonical, alias in plan.parameter_aliases:
+            _set_param_by_path(part, alias, part.get_parameter(canonical))
 
     # ====== Phase C: wrap forward ======
     for part in models:
@@ -151,5 +160,15 @@ def apply_sharding_plan(
     tied_pairs = list(plan.tied_pairs) or detect_tied_weights(models[0])
     for part in models:
         _replicate_tied_weights(part, tied_pairs)
+
+    runtime_mesh = original_mesh if hasattr(original_mesh, "device_mesh") else SimpleNamespace(
+        device_mesh=original_mesh, fsdp_moe_mesh=expert_mesh,
+    )
+    if plan.parallel_modules:
+        for part in models:
+            bind_parallel_modules(part, plan, runtime_mesh)
+
+    for part in models:
+        _record_family_layouts(part, plan, runtime_mesh, shapes[id(part)], source_shard_info)
 
     return model, source_shard_info

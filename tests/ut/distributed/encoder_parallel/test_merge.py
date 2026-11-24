@@ -23,14 +23,11 @@ from hyper_parallel.distributed.encoder_parallel.planning import DecoderSequence
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
 from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Model
-from tests.common.mark_utils import arg_mark
 
 
 class TestEncoderMerge(unittest.TestCase):
     """Keep CP-local input IDs and route only local auxiliary rows to merge."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_merge_uses_tp_local_token_types_and_global_start(self):
         """Feature: DeepSeek image merge after TP reduce-scatter.
 
@@ -81,8 +78,6 @@ class TestEncoderMerge(unittest.TestCase):
         self.assertIsNotNone(vision_anchor.grad)
         self.assertIsNotNone(parameter_anchor.grad)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_disabled_encoder_merges_the_tp_local_image_interval(self):
         """Feature: native visual path with Decoder sequence parallelism.
 
@@ -113,8 +108,6 @@ class TestEncoderMerge(unittest.TestCase):
         self.assertTrue(torch.equal(captured[0][0], token_types[:, 96:128]))
         self.assertEqual(captured[0][1:], (["image-record"], 96))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_runtime_image_start_follows_sequence_parallel_shard(self):
         """Feature: runtime image insertion coordinate under Decoder SP.
 

@@ -58,6 +58,25 @@ an AI CPU collective launch is not by itself a compute fallback. Use
 [cluster-debug](../../cluster-debug/SKILL.md),
 [debug](../../debug/SKILL.md), and [profiling](../../profiling/SKILL.md) for collection.
 
+## Distinguish allocator and communicator failures
+
+- For activation offload, capture device HBM, live and cached pinned Host
+  allocations, and system memory at the same execution boundaries. A pinned
+  allocation can fail while HBM and ordinary Host memory remain available.
+  Validate producer and copy-stream dependencies before releasing inactive cache.
+- Compare pinned and pageable storage for the affected tensors with the same
+  workload. Verify their values and gradients, then replay through the original
+  failure point at full concurrency. Measure transfer and synchronization costs
+  in a separate benchmark before adopting the storage policy for performance.
+- For a collective initialization failure, correlate the framework stack with
+  the earliest backend error, communicator size, and actual membership. A
+  broadcast within a one-rank replica group is an identity. If removing the
+  redundant call, verify that multi-rank relays still forward the correct data
+  and preserve dependencies between asynchronous hops.
+- Check capture windows against the resolved update count before launch. Preserve
+  training-update coverage and collector teardown status independently when a
+  profiler fails after training completes.
+
 ## Establish logical initialization identity across layouts
 
 The same seed does not guarantee the same logical parameters after changing FSDP,

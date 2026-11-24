@@ -31,7 +31,6 @@ from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.models._transformers.model_builder import _refresh_hsdp_precision_state
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
 from hyper_parallel.trainer.config.parser import parse_training_args
-from tests.common.mark_utils import arg_mark
 
 
 class _DecoderModel(nn.Module):
@@ -85,8 +84,6 @@ class TestFSDPCustomPrecisionConfig(unittest.TestCase):
         self.assertNotIn(model.layers[0].weight, bindings)
         self.assertIn(model.layers[0].bias, bindings)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_trainer_yaml_preserves_custom_params(self) -> None:
         """Feature: Trainer custom precision YAML.
         Description: Parse fsdp_config.mix_precision.custom_params and build the core policy.
@@ -131,8 +128,6 @@ fsdp_config:
         self.assertEqual(policy.custom_params[id(model.weight)], {"param_dtype": torch.float32, "reduce_dtype": None})
         self.assertEqual(policy.custom_params[id(model.bias)], {"reduce_dtype": torch.float16})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_global_policy_build_does_not_need_a_model(self) -> None:
         """Feature: Model-independent precision construction.
         Description: Build a configured global precision policy without supplying a model or parameter mapping.
@@ -150,8 +145,6 @@ fsdp_config:
         self.assertFalse(policy.cast_forward_inputs)
         self.assertIsNone(policy.custom_params)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nested_units_capture_overrides_before_parameter_replacement(self) -> None:
         """Feature: Nested FSDP precision policy.
         Description: Wrap two child units and the root, then refresh precision through the model builder.
@@ -194,8 +187,6 @@ fsdp_config:
         self.assertTrue(all(storage_ref.expired() for storage_ref in storage_refs))
         self.assertEqual(len(root_state.mp_policy.custom_params), 2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_reusing_manager_rebuilds_policy_for_each_model(self) -> None:
         """Feature: Shared precision policy lifetime.
         Description: Wrap two models with one manager, changing global precision between builds.
@@ -226,8 +217,6 @@ fsdp_config:
                 self.assertEqual(weight.all_gather_inputs[0].dtype, torch.float32)
                 self.assertEqual(bias.all_gather_inputs[0].dtype, dtype)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_unknown_parameter_fails_before_wrapping(self) -> None:
         """Feature: Parameter name validation.
         Description: Configure an override for a nonexistent parameter name.
@@ -245,8 +234,6 @@ fsdp_config:
 
         self.assertIs(model.layers[0].weight, weight)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_expert_units_share_the_resolved_precision_policy(self) -> None:
         """Feature: Expert FSDP precision overrides.
         Description: Wrap dense and expert units on their respective meshes with an expert override.
@@ -285,8 +272,6 @@ fsdp_config:
         self.assertEqual(expert_state.hsdp_params[0].all_gather_inputs[0].dtype, torch.float32)
         self.assertEqual(expert_state.hsdp_params[0].reduce_comm_dtype(torch.ones(4)), torch.float32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tied_parameter_aliases_resolve_one_identity(self) -> None:
         """Feature: Shared parameter configuration.
         Description: Resolve equal and conflicting overrides under aliases of one Parameter.
@@ -310,8 +295,6 @@ fsdp_config:
         with self.assertRaisesRegex(ValueError, "conflicting overrides for tied_weight"):
             manager._resolve_custom_params(parameters_by_fqn)  # pylint: disable=protected-access
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_patterns_select_parameters_by_name(self) -> None:
         """Feature: Pattern keys in custom precision overrides.
         Description: Resolve wildcard and exact names, equal and conflicting overlaps, and unmatched patterns.
@@ -343,8 +326,6 @@ fsdp_config:
         with self.assertRaisesRegex(ValueError, r"matches no parameter: \*\.gate\.weight"):
             manager._resolve_custom_params(parameters_by_fqn)  # pylint: disable=protected-access
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_invalid_yaml_overrides_are_rejected(self) -> None:
         """Feature: YAML precision validation.
         Description: Supply invalid parameter names, override shapes, fields, and dtype strings.

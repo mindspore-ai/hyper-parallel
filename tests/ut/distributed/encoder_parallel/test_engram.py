@@ -23,14 +23,11 @@ from hyper_parallel.components.modules.engram import local_token_mask
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_engram_compute_fn,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class TestEngramSPAlignment(unittest.TestCase):
     """Keep EP1 hash lookup and image masking on the active TP/SP interval."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ep1_factory_uses_tp_rank_and_local_mask(self):
         """Feature: Engram EP1 with decoder sequence parallelism.
 
@@ -64,8 +61,6 @@ class TestEngramSPAlignment(unittest.TestCase):
         output.sum().backward()
         self.assertTrue(torch.equal(hidden.grad, torch.ones_like(hidden)))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_incompatible_mask_fails(self):
         """Feature: Engram token-mask geometry check.
 

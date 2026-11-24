@@ -40,7 +40,6 @@ from hyper_parallel.core.multicore.modules.mega_gate.plan import (
     MEGA_GATE_AIV_WORKER_CAPACITY, MEGA_GATE_ROUTE_TASK_TYPES, MEGA_GATE_ROUTE_GRAD_TASK_TYPES,
     MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES, _build_pipeline_runtime_config, build_mega_gate_plan,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _runtime_config(task_capacity: int = 16) -> RuntimeConfigC:
@@ -70,8 +69,6 @@ def _graph():
 class TestDiagnosticMetadata(unittest.TestCase):
     """Distinguish Host identity from profiling-specific serialized IDs."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_graph_metadata_is_read_only(self):
         """Feature: MegaKernel diagnostics.
         Description: Resolving task identity must never annotate the base TaskDesc.
@@ -87,8 +84,6 @@ class TestDiagnosticMetadata(unittest.TestCase):
         with self.assertRaises(TypeError):
             metadata.stage_names[0] = "changed"
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_repeated_names_have_distinct_stage_ids(self):
         """Feature: MegaKernel diagnostics.
         Description: Profiling supports repeated display names without conflating task identity.
@@ -100,8 +95,6 @@ class TestDiagnosticMetadata(unittest.TestCase):
         metadata = build_graph_metadata(graph, _runtime_config(), DiagnosticSpec("Custom"))
         self.assertEqual(metadata.stage_names, {0: "Repeated", 1: "Repeated"})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_optional_and_invalid_owners(self):
         """Feature: MegaKernel diagnostics.
         Description: Allow missing owners but reject IDs outside the serializable uint32 range.
@@ -114,8 +107,6 @@ class TestDiagnosticMetadata(unittest.TestCase):
                 spec = DiagnosticSpec("Custom", owner_resolver=lambda *_, value=owner: value)
                 build_graph_metadata(graph, config, spec)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_trace_encoding_uses_a_private_configuration(self):
         """Feature: MegaKernel diagnostics.
         Description: Only profiling owns profile_desc_id and profile_owner_id.
@@ -133,8 +124,6 @@ class TestDiagnosticMetadata(unittest.TestCase):
         self.assertEqual(trace.task_stage_names[2], "Second")
         self.assertEqual(bytes(config), original)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_sparse_termination_preserves_unrelated_slots(self):
         """Feature: MegaKernel diagnostics.
         Description: Queue-only system tasks do not cause annotation of unused task slots.
@@ -150,8 +139,6 @@ class TestDiagnosticMetadata(unittest.TestCase):
         self.assertEqual(config.all_tasks[7].profile_desc_id, 0x10006)
         self.assertEqual(config.all_tasks[1].profile_desc_id, 0xABCDEF)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_only_selected_profiler_prepares_a_trace_image(self):
         """Feature: MegaKernel diagnostics.
         Description: Normal preparation produces exactly one normal image and no trace state.
@@ -214,8 +201,6 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.aic_required_records, 258)
         self.assertEqual(layout.aic_record_capacity, 272)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mega_gate_pipeline_runtime_configs(self):
         """Feature: MegaKernel diagnostics.
         Description: Validate forward, ordinary-grad and K=1 descriptor streams.
@@ -264,8 +249,6 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
                     list(stage_names),
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mega_gate_plan_uses_the_distributed_rank(self):
         """Feature: MegaKernel diagnostics.
         Description: Use the global process rank for cycle-trace ownership.

@@ -35,6 +35,12 @@ benefit without producing a warning. Positive evidence of path engagement is req
 - **Declare numerical criteria.** Prefer elementwise equality for selection results.
   Record BF16 tie differences below 1 ULP as known numerical noise. Do not silently
   reduce score precision.
+- **Preserve precision casts inside fused expressions.** Check the order of
+  normalization, dtype conversion, and learned scaling in the source module. If
+  the fused kernel rounds after scaling and the source rounds before it, use
+  native unit-scale normalization followed by the original multiply. Compare the
+  output and input and weight gradients at the deployed shape before rerunning the
+  training trajectory gate.
 - **Asynchronous failures escape synchronous fallback.** An adapter that catches
   non-OOM exceptions can handle only synchronous failures. Errors such as
   `ACL stream synchronize failed` surface at stream synchronization, outside the
@@ -43,6 +49,11 @@ benefit without producing a warning. Positive evidence of path engagement is req
 - **Inspect postprocessing.** Use TopK kernels where integer ArgSort falls back to
   AI CPU. Where equivalent, replace an AI CPU `scatter_reduce` path with `scatter`
   and `view/amax`. Search runtime logs for `npu_cpu_fallback` to locate these hotspots.
+- **Check index multiplicity before changing backward.** If each selected token
+  position occurs once, expanding its gradient can use a direct indexed write.
+  Repeated positions require additive accumulation. Measure peak allocation and
+  latency on the deployed vocabulary shape in both deterministic and benchmark
+  modes. Use any recovered capacity to evaluate whether replay can be reduced.
 
 ## Related references
 

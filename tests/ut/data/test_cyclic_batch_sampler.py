@@ -18,7 +18,6 @@ import random
 import unittest
 
 from hyper_parallel.data.parallel.batch_sampler import build_dataset_batch_sampler
-from tests.common.mark_utils import arg_mark
 
 
 class TestCyclicBatchSampler(unittest.TestCase):
@@ -107,7 +106,6 @@ class TestCyclicBatchSampler(unittest.TestCase):
             expected = [rank * 4 + offset for offset in offsets]
             self.assertEqual(self._indices(rank, 19, 1, True), expected)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_changed_gbs_preserves_sharded_order_when_dp_is_unchanged(self):
         """Changing accumulation alone preserves each rank's shuffled suffix."""
         for rank in range(4):

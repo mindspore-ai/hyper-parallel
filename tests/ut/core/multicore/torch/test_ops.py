@@ -20,10 +20,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
 from hyper_parallel.core.multicore.torch import ops
-from tests.common.mark_utils import arg_mark
 
 
 # Registration-cache and alias-ABI checks require Torch's private operator schema and loader.
@@ -51,8 +49,6 @@ class TestTorchOps(unittest.TestCase):
         )
         return SimpleNamespace(default=SimpleNamespace(_schema=schema))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_adapter_failure_reports_original_cause(self):
         """Feature: Native adapter load diagnostics.
         Description: Register the backend and fail the actual adapter library load.
@@ -66,8 +62,6 @@ class TestTorchOps(unittest.TestCase):
         ):
             ops._load_native()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_successful_registration_is_cached(self):
         """Feature: Cached native registration.
         Description: Load the backend and adapter twice, then reject mismatched native schemas.

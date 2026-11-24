@@ -31,6 +31,30 @@ from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion
 from hyper_parallel.models.replacement import module_replacement
 
 
+def prepare_mla_attention_mask(
+    attention_mask: torch.Tensor | None,
+    query_length: int,
+    key_length: int,
+) -> torch.Tensor | None:
+    """Disambiguate MLA Q/K masks before calling a shared attention interface.
+
+    Args:
+        attention_mask: Optional mask. A two-dimensional Q/K matrix takes
+            precedence over padding in MLA, including when batch equals query length.
+        query_length: Number of query tokens visible to the attention interface.
+        key_length: Number of key tokens visible to the attention interface.
+
+    Returns:
+        A broadcastable four-dimensional view for a Q/K matrix. Other inputs
+        pass through unchanged, preserving padding and compressed causal paths.
+    """
+    if (attention_mask is not None and attention_mask.ndim == 2
+            and attention_mask.shape == (query_length, key_length)):
+        # Shared FA interprets 2D masks as batch padding; MLA also accepts Q/K matrices.
+        return attention_mask[None, None, :, :]
+    return attention_mask
+
+
 @dataclass
 class _MLALatents:
     batch_size: int
@@ -325,6 +349,9 @@ class MLAAttention(nn.Module):
             past_key_values,
         )
 
+        attention_mask = prepare_mla_attention_mask(
+            attention_mask, query_states.shape[2], key_states.shape[2],
+        )
         attn_output, attn_weights = self.attention_interface(
             self,
             query_states,

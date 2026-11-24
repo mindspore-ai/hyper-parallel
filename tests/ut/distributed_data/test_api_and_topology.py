@@ -25,13 +25,11 @@ from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMeta
 from hyper_parallel.distributed_data.locality import _create_locality_groups, _fixed_rank_groups
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data.topology import DataTopology
-from tests.common.mark_utils import arg_mark
 
 
 class TestDistributedDataPublicApi(unittest.TestCase):
     """Verify that the public API is expressed in training-facing terms."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_config_uses_sequence_and_local_batch_sizing(self) -> None:
         """Feature: Distributed data configuration.
         Description: Inspect sequence, local-batch, and sharding fields.
@@ -60,7 +58,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertFalse(hasattr(config, "micro_batch_num"))
         self.assertFalse(hasattr(config, "buffer_size_multiplier"))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_builder_accepts_a_raw_dataset_and_constructor_callbacks(self) -> None:
         """Feature: Distributed DataLoader builder API.
         Description: Inspect the raw Dataset and constructor callback parameters.
@@ -83,7 +80,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertNotIn("raw_sample_size", parameters)
         self.assertNotIn("micro_batch_num", parameters)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_public_default_callbacks_preserve_nested_batch_boundaries(self) -> None:
         """Feature: Default data construction callbacks.
         Description: Pack raw samples and collate multiple planned sequences.
@@ -98,7 +94,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertEqual(collated, (({"id": 0}, {"id": 1}), ({"id": 2},)))
         self.assertIsInstance(collated, tuple)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_backend_selection_is_internal(self) -> None:
         """Feature: Fixed control-plane backend.
         Description: Inspect the public configuration fields.
@@ -108,7 +103,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertNotIn("cpu_backend", field_names)
         self.assertNotIn("payload_backend", field_names)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_dataset_already_sharded_must_be_boolean(self) -> None:
         """Feature: Dataset Reader sharding.
         Description: Configure the reader-stride switch with a truthy non-boolean value.
@@ -117,7 +111,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dataset_already_sharded must be boolean"):
             DistributedDatasetConfig(seq_len=32, local_batch_size=1, dataset_already_sharded=1)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_mode_must_be_boolean(self) -> None:
         """Feature: Explicit metadata source selection.
         Description: Configure metadata mode with a truthy non-boolean value.
@@ -126,7 +119,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "metadata_mode must be boolean"):
             DistributedDatasetConfig(seq_len=32, local_batch_size=1, metadata_mode=1)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_plan_broadcast_defaults_on_and_requires_boolean(self) -> None:
         """Feature: Configurable plan broadcast.
         Description: Use the default, disable broadcast, and supply invalid flag values.
@@ -138,7 +130,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "broadcast_plan must be boolean"):
                 DistributedDatasetConfig(seq_len=32, local_batch_size=1, broadcast_plan=value)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_balance_logging_defaults_off_and_requires_boolean(self) -> None:
         """Feature: Opt-in balancing reports.
         Description: Omit the switch, enable it, and supply non-boolean values.
@@ -150,7 +141,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "log_balance must be boolean"):
                 DistributedDatasetConfig(seq_len=32, local_batch_size=1, log_balance=value)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_text_repacking_config_defaults_and_constraints(self) -> None:
         """Feature: Built-in text repacking configuration.
         Description: Inspect defaults and reject invalid flags, PAD IDs and offline metadata.
@@ -168,7 +158,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repack_sequences requires online metadata"):
             DistributedDatasetConfig(seq_len=12, local_batch_size=1, repack_sequences=True, metadata_mode=True)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_balance_group_size_is_positive_and_topology_divisible(self) -> None:
         """Feature: Local balancing groups.
         Description: Configure fixed-size groups over the root mesh rank order.
@@ -185,7 +174,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must divide the root mesh size"):
             _fixed_rank_groups(topology, 3)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_locality_groups_use_nodes_or_fixed_rank_order(self) -> None:
         """Feature: Local balancing group discovery.
         Description: Build node-based and fixed-size groups with mocked WORLD communication.
@@ -231,7 +219,6 @@ class TestDistributedDataBuildState(unittest.TestCase):
         """Return a standalone mesh that needs no distributed initialization."""
         return SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_sampler_modes_yield_sampled_data(self) -> None:
         """Feature: Dataset Reader construction.
         Description: Build native sampler loaders in online and metadata modes.
@@ -252,7 +239,6 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 )
                 self.assertEqual(list(loader), [(0,), (1,)])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_length_mismatch_raises_before_group_creation(self) -> None:
         """Feature: Local metadata alignment.
         Description: Supply fewer metadata entries than Dataset samples.
@@ -271,7 +257,6 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 )
             create_groups.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_config_raises_before_group_creation(self) -> None:
         """Feature: Local configuration validation.
         Description: Supply invalid configuration objects to the builder.
@@ -285,7 +270,6 @@ class TestDistributedDataBuildState(unittest.TestCase):
                     build_distributed_dataloader([], self._mesh(), config)
                 create_groups.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_partial_build_failures_raise_before_group_creation(self) -> None:
         """Feature: Local builder input validation.
         Description: Supply invalid loader options, devices, and metadata combinations.
@@ -311,7 +295,6 @@ class TestDistributedDataBuildState(unittest.TestCase):
                         build_distributed_dataloader([0, 1], self._mesh(), config, **kwargs)
                     create_groups.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_mode_requires_the_configured_metadata_source(self) -> None:
         """Feature: Explicit metadata mode.
         Description: Supply metadata sources that conflict with the configured mode.
@@ -351,7 +334,6 @@ class TestDistributedDataBuildState(unittest.TestCase):
                         device="cpu", cost_model=lambda sample_metadata: sample_metadata.cost,
                     )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_sampler_rejects_local_balance_groups(self) -> None:
         """Feature: Local balancing groups.
         Description: Pass a local group size to the native sampler path.
@@ -384,7 +366,6 @@ class TestDataTopology(unittest.TestCase):
             dp_dim_names=("dp",),
         )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_dp2_mp4_has_two_constructors_and_two_mp_groups(self) -> None:
         """Feature: Data topology derivation.
         Description: Build an eight-rank topology with two-way DP and four-way MP.
@@ -405,7 +386,6 @@ class TestDataTopology(unittest.TestCase):
                 self.assertEqual(topology.model_parallel_ranks, expected_mp_groups[expected_data_rank])
                 self.assertEqual(topology.is_constructor, global_rank in (0, 4))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rank_one_still_knows_every_group_but_consumes_rank_zero_batch(self) -> None:
         """Feature: Model-group topology visibility.
         Description: Inspect topology from a non-constructor rank.

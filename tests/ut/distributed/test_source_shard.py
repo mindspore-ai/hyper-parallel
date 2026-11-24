@@ -21,7 +21,6 @@ import torch
 from torch import nn
 
 from hyper_parallel.distributed._builder.source_shard import _build_managed_source_shard_info
-from tests.common.mark_utils import arg_mark
 
 
 def _manager_without_meshes() -> SimpleNamespace:
@@ -33,8 +32,6 @@ def _manager_without_meshes() -> SimpleNamespace:
 class TestBuildManagedSourceShardInfo(unittest.TestCase):
     """Parameter selection for one FSDP wrap call."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ignored_parameters_are_excluded_from_the_mapping(self):
         """Ignored params neither appear in the result nor need metadata."""
         owner = nn.Module()
@@ -46,8 +43,6 @@ class TestBuildManagedSourceShardInfo(unittest.TestCase):
         self.assertEqual(set(result), {owner.dense})
         self.assertIs(result[owner.dense], metadata[owner.dense])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_uncovered_managed_parameter_is_rejected(self):
         """A managed parameter without metadata and no default raises."""
         owner = nn.Module()
@@ -55,8 +50,6 @@ class TestBuildManagedSourceShardInfo(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not cover an FSDP-managed parameter"):
             _build_managed_source_shard_info(_manager_without_meshes(), owner, {})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_none_metadata_stays_none(self):
         """No metadata mapping means no managed selection at all."""
         owner = nn.Module()

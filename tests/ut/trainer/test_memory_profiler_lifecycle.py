@@ -24,7 +24,6 @@ from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config.training import MemoryConfig
 from hyper_parallel.trainer.text_trainer import TextTrainer
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
-from tests.common.mark_utils import arg_mark
 
 
 class _ProbeError(RuntimeError):
@@ -48,7 +47,6 @@ def _reset_profiler(*args: object, events: list[str], **kwargs: object) -> None:
 class TestMemoryProfilerLifecycle(unittest.TestCase):
     """Verify every Trainer uses the singleton at the required boundaries."""
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_reset_runs_after_setup_and_before_model_build(self) -> None:
         """Initialize profiling at the earliest point where rank metadata exists.
 
@@ -78,7 +76,6 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
                     self.assertEqual(events, ["setup", "reset"])
                     build_model_mock.assert_not_called()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_train_step_advances_profiler_before_accessing_trainer_state(self) -> None:
         """Advance the profiler before batch fetch and all other step work.
 
@@ -103,7 +100,6 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
 
                     step_mock.assert_called_once_with()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_normal_train_stops_profiler_before_train_end_callbacks(self) -> None:
         """Flush memory history before ordinary train-end callbacks run.
 
@@ -135,7 +131,6 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
                 ["train_begin", "memory_stop", "train_end", "synchronize", "destroy"],
             )
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_failed_train_saves_snapshot_before_abort_without_train_end(self) -> None:
         """Save allocator history before cleanup when training raises.
 
@@ -166,7 +161,6 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
                     stop_mock.assert_called_once_with()
                     train_end_mock.assert_not_called()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_failed_train_closes_performance_profiler_without_masking_error(self) -> None:
         """Preserve the training error even if profiler finalization fails.
 

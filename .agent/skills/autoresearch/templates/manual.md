@@ -14,6 +14,7 @@ declared target files, run the gate and benchmark, and record `keep`, `discard`,
 - **Measurement windows:** <FILL: correctness and performance windows, topology, probes, routing, and metric convention>
 - **Change classes and gates:** <FILL: evidence for equivalent implementations, numerical tolerances, or training-policy changes>
 - **Retry tags:** <FILL: stable configuration scopes used in this run, such as optimizer-residency>
+- **RSI learning mode:** `acceptance` by default; `continuous` if selected by the user.
 
 ## Editable files
 
@@ -79,6 +80,10 @@ Within the declared budget:
 resource failures. Record the fix, retry conditions, and evidence paths.
 
 **Stop:** Record whether the target was met, the remaining gap, and the stopping reason.
+Reconcile all experiments in `rsi/review.json` using the generated retrieval task.
+Reuse existing rules; improve them in place or add qualified, portable experience
+through `learn`. Run `finalize` and deliver `RSI_REPORT.html` alongside the
+acceptance report. This is automatic Agent work; it needs no further user reminder.
 
 ## Environment requirements
 

@@ -4,8 +4,8 @@ description: >
   Bounded autonomous-experiment loop for kernel / graph optimization:
   benchmark + correctness gate + keep/discard/crash decision + append-only
   bookkeeping + commit/restore git protocol, with four rules enforced in
-  code rather than left to agent discipline. Use for automated experiments,
-  performance optimization loops, iterative operator tuning, or any "measure a pending edit against the best
+  code rather than left to agent discipline. Use for 自动实验/性能优化循环/
+  autoresearch/算子调优迭代, or any "measure a pending edit against the best
   recorded result and keep it only if it wins and the gate passes" workflow.
   The agent owns the creative half (pick an idea, make the edit); this skill
   owns the deterministic half.
@@ -14,9 +14,9 @@ description: >
 # Autoresearch
 
 A bounded autonomous-experiment loop. One iteration = one optimization
-experiment: edit the declared target file(s), pass the correctness gate,
-benchmark the candidate, record the outcome, and keep / discard / crash.
-The Agent drives iterations within the declared budget. Design follows torchtitan's `graph_trainer/autoresearch`,
+experiment: edit the single declared target file, benchmark it, pass the
+correctness gate, record the outcome, and keep / discard / crash. Runs until
+the agent stops. Design follows torchtitan's `graph_trainer/autoresearch`,
 promoting its deterministic protocol from prose into code.
 
 **This file is the index + hard rules.** The per-run operating manual is
@@ -53,6 +53,8 @@ python .agent/skills/autoresearch/scripts/autoresearch.py <subcommand> [options]
 | Record a baseline | `baseline --run-dir <d>` | benchmark the current commit as the first keep |
 | Evaluate a pending change | `iterate --run-dir <d> --description "<what>"` | commit→gate→benchmark→decide→record→keep/restore |
 | Inspect progress | `status --run-dir <d>` | summarize the run so far |
+| Reconcile experience | `learn --run-dir <d>` | apply the selected RSI learning policy |
+| Complete delivery | `finalize --run-dir <d>` | require complete experience review and generate its report |
 
 `iterate` expects the experimental edit to sit **uncommitted** in the run's
 target files, with nothing else dirty outside the run directory.
@@ -71,6 +73,8 @@ target files, with nothing else dirty outside the run directory.
 - `training_protocol`: optional workload ID and full-window step counts.
   Use it with a separate `gate_cmd` and the
   [structured training receipt](../perf-playbook/references/training-rsi.md#structured-training-receipts).
+- `rsi_mode`: `acceptance` (default) or `continuous`; initialization exposes
+  `--rsi-mode`. Both modes require the final RSI improvement report.
 
 ## The experiment loop (agent side)
 
@@ -79,8 +83,12 @@ target files, with nothing else dirty outside the run directory.
 2. Edit the target file(s) — keep the tree dirty only there.
 3. `iterate --run-dir <d> --description "..."` — the tool owns the rest.
 4. Append an `experiment_log.md` entry; update `ideas.md` / `learnings.md`.
+   Reconcile the generated task using
+   [automatic experience consolidation](references/experience-consolidation.md).
+   Do not wait for another user request to consolidate knowledge.
 Continue within the declared budget. Record which targets passed, which
-remain open, and why the loop stopped.
+remain open, and why the loop stopped. Run `finalize` before final delivery;
+deliver the acceptance report and separate `RSI_REPORT.html` together.
 
 ## Candidate receipts and retries
 
@@ -105,8 +113,6 @@ gate or benchmark invocation, including failed noise-confirmation attempts.
   and budget for every retry.
 
 For training runs, follow the [training RSI protocol](../perf-playbook/references/training-rsi.md).
-Use [MFU Riser](../mfu-riser/SKILL.md) when the task needs architecture FLOPs
-audits, linked capacity series, or screening followed by performance acceptance.
 
 ## Hard rules (must not violate)
 
@@ -121,14 +127,12 @@ Two field runs drove the DeepSeek-V4.1 fused Lightning-Indexer adapter: the
 first took a four-probe metric 697→123ms over three experiments; the second
 (master baseline, six probes including long sequences) took 4617→261ms and
 caught a wrong bf16-scoring optimization at the gate (crash, logged). Both
-runs informed the fused-indexer integration. The original run artifacts were
-stored in external `autoresearch/` and `autoresearch2/` directories; these
-numbers are historical context, not benchmark results reproduced by this
-checkout. The unit tests below exercise the experiment protocol locally.
+runs' product changes were delivered through the fused-indexer PR; the run
+directories (`autoresearch/`, `autoresearch2/`) carry the full logs.
 
 ## Unit tests
 
-`tests/ut/tools/test_autoresearch_loop.py` drives baseline / keep / discard /
+`.agent/tests/tools/test_autoresearch_loop.py` drives baseline / keep / discard /
 crash / dirty-tree / noise-confirm / aux-capture against a temporary git
 repository (CPU, no accelerator). It puts the engine directory on `sys.path`
 the same way the entry script does.

@@ -38,14 +38,11 @@ from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
 )
 from hyper_parallel.models.external_state import CheckpointRuntime, ExternalLoadContext
-from tests.common.mark_utils import arg_mark
 
 
 class TestHostEngramTable(unittest.TestCase):
     """Compare touched-row gradients with a full device-style embedding."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_bf16_model_keeps_fp32_host_rows_and_sparse_grads(self):
         """Convert dense weights while preserving FP32 host rows and gradients.
 
@@ -78,8 +75,6 @@ class TestHostEngramTable(unittest.TestCase):
         self.assertEqual(pending.dtype, torch.float32)
         torch.testing.assert_close(pending.to_dense()[2], torch.tensor([2.0, 2.0]))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_host_precision_modes_require_matching_reduction(self):
         """Accept the two supported dense precision policies.
 
@@ -103,8 +98,6 @@ class TestHostEngramTable(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "float32 with fp32 main parameters"):
             _validate_external_state_build(object(), False, setup, manager, torch.bfloat16)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_ep_lookup_transfers_bf16_rows(self):
         """Send BF16 row values over the owner route.
 
@@ -137,8 +130,6 @@ class TestHostEngramTable(unittest.TestCase):
         self.assertEqual(table.host_to_device_bytes, 8)
         self.assertEqual(table.forward_a2a_bytes, 24)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_bf16_engram_forward_and_backward(self):
         """Run the full Host Engram gate with BF16 dense parameters.
 
@@ -188,8 +179,6 @@ class TestHostEngramTable(unittest.TestCase):
         self.assertEqual(host.wkv.weight.grad.dtype, torch.bfloat16)
         self.assertEqual(host.embed.coalesce_pending().dtype, torch.float32)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_ep1_repeated_rows_and_sparse_step(self):
         """Compare repeated Host rows to a dense embedding.
 
@@ -239,8 +228,6 @@ class TestHostEngramTable(unittest.TestCase):
         self.assertIsNone(table.weight.grad)
         self.assertFalse(table.pending_chunks)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_empty_and_padding(self):
         """Check empty requests and logical padding.
 
@@ -259,8 +246,6 @@ class TestHostEngramTable(unittest.TestCase):
         with self.assertRaises(IndexError):
             table(torch.tensor([15]))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_pretrained_slice_uses_mapped_key_and_rejects_duplicates(self):
         """Check mapped source slices and duplicate rejection.
 
@@ -293,8 +278,6 @@ class TestHostEngramTable(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Multiple Host Engram source keys"):
                 state.materialize(context)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_full_engram_forward_and_backward_match_device_mode(self):
         """Compare all module outputs and gradients with device Engram.
 
@@ -347,8 +330,6 @@ class TestHostEngramTable(unittest.TestCase):
                                        device.get_parameter(name).grad)
         torch.testing.assert_close(host.embed.coalesce_pending().to_dense(), device.embed.weight.grad)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_pretrained_manifest_reads_owner_and_rejects_row_gap(self):
         """Check physical row fragments for exact owner coverage.
 
@@ -390,8 +371,6 @@ class TestHostEngramTable(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "row gap or overlap"):
                 state.materialize(ExternalLoadContext(True, directory, mapping))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_activation_checkpoint_adds_backward_rows_once(self):
         """Count sparse rows once across activation recomputation.
 
@@ -416,8 +395,6 @@ class TestHostEngramTable(unittest.TestCase):
         self.assertEqual(len(table.pending_chunks), 1)
         torch.testing.assert_close(table.coalesce_pending().values(), torch.tensor([[2.0, 2.0]]))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_random_owner_initialization_is_layer_specific(self):
         """Keep deterministic owner replicas distinct across layers.
 
@@ -451,8 +428,6 @@ class TestHostEngramTable(unittest.TestCase):
         for name in first.tables:
             torch.testing.assert_close(first.tables[name].weight, second.tables[name].weight)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_sidecar_save_preserves_lazy_moments_and_preflight_validates_rank_keys(self):
         """Keep a first-step save read-only and reject malformed rank metadata.
 

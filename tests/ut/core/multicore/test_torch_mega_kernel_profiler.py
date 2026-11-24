@@ -30,7 +30,6 @@ from hyper_parallel.core.multicore.diagnostics.profiler import api as torch_prof
 from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments
 from hyper_parallel.core.multicore.diagnostics.common.session import _get_active_session
 from hyper_parallel.core.multicore.torch import ops as multicore_adapter
-from tests.common.mark_utils import arg_mark
 
 
 def _prepare_profile_call(runtime, *, direction, fallback_event_counters):
@@ -175,8 +174,6 @@ class _FakeNpu:
 class TestMegaKernelSchedule(unittest.TestCase):
     """Validate Torch-compatible schedule window semantics."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_schedule_actions(self):
         """Feature: MegaKernel diagnostics.
         Description: Map each configured schedule region to its expected action.
@@ -204,8 +201,6 @@ class TestMegaKernelSchedule(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_schedule_rejects_invalid_values(self):
         """Feature: MegaKernel diagnostics.
         Description: Reject schedule values that cannot form a valid capture cycle.
@@ -224,8 +219,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         """Reset the process-local diagnostic session after each test."""
         _reset_active_session_for_test()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_inactive_call_uses_disabled_runtime_without_profile_allocation(self):
         """Feature: MegaKernel diagnostics.
         Description: Keep inactive calls on the disabled RuntimeConfig and fallback buffer.
@@ -248,8 +241,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         self.assertEqual(event_counters.requested_slices, [])
         mock_empty.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_inactive_eventless_call_does_not_allocate_profile_storage(self):
         """Feature: MegaKernel diagnostics.
         Description: Keep MegaGate free of profile allocation when capture is off.
@@ -264,8 +255,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         self.assertIsNone(call.event_counters)
         mock_empty.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_active_eventless_call_allocates_only_a_profile_buffer(self):
         """Feature: MegaKernel diagnostics.
         Description: Capture MegaGate without creating or clearing an event-counter tensor.
@@ -293,8 +282,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
 
         self.assertEqual(profile_buffer.storage.resize_calls, 1)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_active_window_exports_internal_trace_at_step_boundary(self):
         """Feature: MegaKernel diagnostics.
         Description: Export retained active-window calls when the step closes the window.
@@ -370,8 +357,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             },
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_diagnostic_buffer_is_hidden_from_public_low_level_signatures(self):
         """Feature: MegaKernel diagnostics.
         Description: Keep the new native ABI input private to managed MegaMoe execution.
@@ -386,8 +371,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             inspect.signature(multicore_adapter.mega_moe_grad).parameters,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_context_exit_discards_host_data_on_parse_failure(self) -> None:
         """Feature: MegaKernel profiler exception cleanup.
 
@@ -430,8 +413,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         self.assertIsNone(_get_active_session())
         self.assertFalse(profiler._entered, f"Expected entered=False, got {profiler._entered}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_step_discards_host_data_immediately_on_parse_failure(self) -> None:
         """Feature: MegaKernel capture window failure.
 
@@ -469,8 +450,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             f"Expected released=True, got {profile_buffer.storage.released}",
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_context_exit_discards_host_data_when_drain_fails(self) -> None:
         """Feature: MegaKernel profiler final cleanup.
 
@@ -510,8 +489,6 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         self.assertIsNone(_get_active_session())
         self.assertFalse(profiler._entered, f"Expected entered=False, got {profiler._entered}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_pending_invocations_use_distinct_private_buffers(self):
         """Feature: MegaKernel diagnostics.
         Description: Do not overwrite an earlier layer call before the window is drained.

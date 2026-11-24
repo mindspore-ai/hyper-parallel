@@ -90,10 +90,10 @@ Check the PR diff for:
 - `.gitmodules`, any submodule pin bump, third-party version change.
 - Build files: `build.sh`, `CMakeLists.txt`, top-level `setup.py`, any
   `*.cmake` under the touched directory tree.
-- Environment / runtime config: `ASCEND_*`, `MS_DEV_*`, `GLOG_*`,
+- Environment / runtime config: `ASCEND_*`, `TORCH_*`, `HCCL_*`, `NCCL_*`,
   conda or pip pinning, container image references.
 - Test scaffolding the failing test loads transitively:
-  `tests/mark_utils.py`, fixtures under the test's `conftest.py` chain.
+  `tests/common/mark_utils.py`, fixtures under the test's `conftest.py` chain.
 
 If yes → likely PR-INDUCED even when the failing test file isn't
 touched.
@@ -104,8 +104,8 @@ Grep the failing test file and the modules it imports for symbols
 defined in the PR diff. A failing `test_swiglu_*` for a PR that only
 touches `tests/torch/llama3_examples/` shows no overlap —
 that's a real "no". A failing `test_with_stream.py` for a PR that
-adds a new ops entry in `mindspore/ops/api_def/` may overlap through
-the generated dispatch table — that's a "maybe yes".
+adds an operator registration in `hyper_parallel/core/shard/ops/yaml/`
+may overlap through dispatch — that's a "maybe yes".
 
 When the test reaches PR code via an indirect import path (codegen,
 plugin registration), trust the import chain over the test name.

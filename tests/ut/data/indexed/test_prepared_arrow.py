@@ -49,7 +49,6 @@ from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
 from hyper_parallel.data.tools.io import IndexedDatasetBuilder
 from hyper_parallel.distributed_data import WorkloadCost
 from hyper_parallel.trainer.config.resolver import resolve_config
-from tests.common.mark_utils import arg_mark
 
 
 @contextmanager
@@ -156,7 +155,6 @@ class TestPreparedArrow(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, f"expected {length}, got 5"):
                                 next(iter(loader))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_indexed_input_ids_through_balancing_and_repacking(self) -> None:
         """Feature: Unified Indexed text fields.
         Description: Feed real Arrow records through Trainer balancing with and without repacking.

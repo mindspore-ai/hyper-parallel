@@ -129,6 +129,18 @@ trajectory**, normally over 1,000 steps. They must not be reused as
 per-tensor tolerances. For BF16 selection ties, follow the rule's
 below-one-ULP boundary and report the tie count and worst score gap.
 
+### Localize errors inside large tensors
+
+For a suspect activation or gradient, align its logical token, head, channel, or
+expert coordinates across the compared layouts. Use the tensor-level summary
+to prioritize triage, then report maximum and p95 relative L2 across the relevant
+slices with the worst coordinate, rank, and step. Report absolute error and
+nonfinite values separately, especially for slices with near-zero reference norm.
+Check valid, masked, and padded positions against the operator contract. Use
+short matched captures for the forward output and corresponding gradients.
+Keep these measurements as localization evidence under the existing training
+acceptance policy.
+
 ## 3. Report
 
 Use `templates/precision-report.md` to record the earliest divergence,

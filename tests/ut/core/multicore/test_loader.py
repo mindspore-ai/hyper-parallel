@@ -26,7 +26,6 @@ from unittest.mock import patch
 
 from hyper_parallel.core.multicore import _loader
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
-from tests.common.mark_utils import arg_mark
 
 class TestMulticoreNative(unittest.TestCase):
     """Verify component-owned OPP environment and payload lookup."""
@@ -95,8 +94,6 @@ class TestMulticoreNative(unittest.TestCase):
         self.assertEqual(opp_value, environment["ASCEND_CUSTOM_OPP_PATH"])
         self.assertEqual(library_value, environment["LD_LIBRARY_PATH"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_missing_opp_environment_requires_set_env(self):
         """Feature: MegaKernel diagnostics.
         Description: The loader requires explicit environment activation before a framework is loaded.
@@ -112,8 +109,6 @@ class TestMulticoreNative(unittest.TestCase):
         ):
             _loader.require_multicore_environment()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_missing_opp_environment_after_framework_import_is_too_late(self):
         """Feature: MegaKernel diagnostics.
         Description: The loader rejects activation after framework initialization.

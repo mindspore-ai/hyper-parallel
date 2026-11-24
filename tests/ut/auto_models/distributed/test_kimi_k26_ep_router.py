@@ -28,8 +28,6 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # pylint: disable=wrong-import-position
 
-from tests.common.mark_utils import arg_mark  # pylint: disable=wrong-import-position
-
 from hyper_parallel.models.kimi_k26.adapter.distributed import (  # pylint: disable=wrong-import-position
     ep_compute,
 )
@@ -83,8 +81,6 @@ class TestFactorySwitch(unittest.TestCase):
             ep_compute.build_ep_compute = original
         return captured
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fix_router_is_forwarded_to_the_framework(self) -> None:
         """The archetype names its router and asks the skeleton to resolve the switch."""
         default = self._capture()
@@ -95,8 +91,6 @@ class TestFactorySwitch(unittest.TestCase):
         self.assertEqual(asked["router_fn"], "deepseekv3")
         self.assertTrue(asked["fix_router"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_family_carries_no_private_balanced_router(self) -> None:
         """One implementation, in the framework: a family copy would drift from it."""
         self.assertFalse(hasattr(ep_compute, "_balanced_router"))
@@ -135,8 +129,6 @@ class TestOverlapAndCapacitySwitches(unittest.TestCase):
             ep_compute.build_ep_compute = original
         return captured
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_both_switches_default_off_and_are_forwarded(self) -> None:
         """Off by default; on when asked for, as the recipe asks for the overlap."""
         default = self._capture()
@@ -147,8 +139,6 @@ class TestOverlapAndCapacitySwitches(unittest.TestCase):
         self.assertTrue(callable(asked["overlap_fn"]))
         self.assertEqual(asked["capacity_factor"], 2.0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_combine_uses_the_overlapped_branch_when_it_is_given_one(self) -> None:
         """The overlap is real only if ``combine`` consumes the precomputed branch.
 

@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { evaluate_labels, STATUS_CONTEXT, TTL_MS } from './ci-label-expiry.mjs';
 
 // Keep the existing required status context so the active Rulesets continue to enforce this check.
 export const CHECK_CONTEXT = 'all-reviewers-approved';
@@ -88,9 +89,10 @@ export function evaluate_reviews(pull, reviews) {
 
 /** Keep automatic merges behind enforced GitHub rules, including stale review dismissal. */
 export function permits_auto_merge(rules) {
-  const has_gate = rules.some(rule => rule.type === 'required_status_checks' &&
-    rule.parameters.required_status_checks.some(check =>
-      check.context === CHECK_CONTEXT && check.integration_id === ACTIONS_APP_ID));
+  const has_gate = [CHECK_CONTEXT, STATUS_CONTEXT].every(context =>
+    rules.some(rule => rule.type === 'required_status_checks' &&
+      rule.parameters.required_status_checks.some(check =>
+        check.context === context && check.integration_id === ACTIONS_APP_ID)));
   const has_reviews = rules.some(rule => rule.type === 'pull_request' &&
     rule.parameters.dismiss_stale_reviews_on_push && rule.parameters.required_approving_review_count >= 1);
   return has_gate && has_reviews && !rules.some(rule => rule.type === 'merge_queue');
@@ -129,6 +131,10 @@ export class GitHubClient {
 
   get_reviews(number) {
     return this.api(`pulls/${number}/reviews?per_page=100`, { paginate: true });
+  }
+
+  get_label_events(number) {
+    return this.api(`issues/${number}/events?per_page=100`, { paginate: true });
   }
 
   latest_status(sha) {
@@ -174,9 +180,18 @@ function same_review_requests(before, after) {
     JSON.stringify(teams(before)) === JSON.stringify(teams(after));
 }
 
+function ci_expiration(client, pull, now) {
+  const current = client.api(`pulls/${pull.number}`);
+  if (!same_snapshot(pull, current) || !same_review_requests(pull, current)) {
+    throw new Error('The PR changed before the CI validity check; retry with fresh state.');
+  }
+  const labels = evaluate_labels(current, client.get_label_events(pull.number), now());
+  return Math.max(0, ...labels.map(label => Date.parse(label.added_at) + TTL_MS));
+}
+
 /** Reconcile live API state. Dry runs never publish checks or enable merging. */
 export function reconcile(client, policy, options = {}) {
-  const { write = false, policy_sha, target_url, only_pr } = options;
+  const { write = false, policy_sha, target_url, only_pr, now = Date.now } = options;
   if (write && only_pr) throw new Error('A writing run must reconcile all open PRs.');
   validate_policy(policy, client.repository);
   const pulls = client.list_pulls().filter(pull => policy.base_branches.includes(pull.base.ref));
@@ -220,10 +235,18 @@ export function reconcile(client, policy, options = {}) {
           throw new Error('The PR or trusted policy changed during evaluation; retry with fresh state.');
         }
       }
+      const reviews_ready = results.every(result => result.ready);
+      if (reviews_ready) {
+        const expirations = group.map(pull => ci_expiration(client, pull, now));
+        const checked_at = now();
+        results = results.map((result, index) => ({ ...result,
+          ci_valid: checked_at < expirations[index], ready: checked_at < expirations[index] }));
+      }
       const ready = results.every(result => result.ready);
       const state = ready ? 'success' : 'pending';
-      const description = ready ? 'Approval quorum met for the current commit.' :
-        'Waiting for the approval quorum or blocking review requirements.';
+      const description = ready ? 'Approval quorum met and CI labels are fresh for the current commit.' :
+        reviews_ready ? 'Waiting for fresh CI pass labels before allowing auto-merge.' :
+          'Waiting for the approval quorum or blocking review requirements.';
       if (write && (previous?.state !== state || previous?.description !== description)) {
         client.publish(sha, state, description, target_url);
       }
@@ -237,6 +260,12 @@ export function reconcile(client, policy, options = {}) {
               `rules/branches/${encodeURIComponent(pull.base.ref)}?per_page=100`, { paginate: true }));
           }
           if (permits_auto_merge(branch_rules.get(pull.base.ref)) && !pull.auto_merge) {
+            // Enabling auto-merge may merge immediately. Recheck after rule reads;
+            // already enabled PRs are guarded before publishing success above.
+            const expirations = group.map(value => ci_expiration(client, value, now));
+            if (expirations.some(expires_at => now() >= expires_at)) {
+              throw new Error('CI pass labels expired before enabling auto-merge; run CI again.');
+            }
             client.enable_auto_merge(pull);
           }
         }
@@ -246,7 +275,7 @@ export function reconcile(client, policy, options = {}) {
       if (write) {
         // Fail closed, including when a prior successful check existed.
         try {
-          client.publish(sha, 'error', 'Unable to verify approvals; see the gate workflow log.', target_url);
+          client.publish(sha, 'error', 'Unable to verify approvals or CI validity; see the gate workflow log.', target_url);
         } catch (publish_error) {
           console.error(`Could not invalidate ${sha}: ${publish_error.message}`);
         }
@@ -288,6 +317,7 @@ function main() {
   const lines = result.reports.map(report =>
     `PR #${report.number}: ${report.ready ? 'approved' : 'waiting'}; ` +
     `approvals: ${report.approval_count}/${report.approval_threshold}; ` +
+    `CI labels: ${report.ci_valid === undefined ? 'not checked' : report.ci_valid ? 'fresh' : 'expired or missing'}; ` +
     `pending reviewers: ${report.missing.join(', ') || '(none)'}; ` +
     `changes requested by: ${report.changes_requested_by.join(', ') || '(none)'}; ` +
     `pending teams: ${report.pending_teams.join(', ') || '(none)'}; head: ${report.sha}`);

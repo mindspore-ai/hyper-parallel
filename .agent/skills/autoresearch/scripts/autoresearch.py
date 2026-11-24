@@ -30,6 +30,7 @@ decision, bookkeeping, restore - is owned by the tool.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import shlex
 import shutil
@@ -47,6 +48,10 @@ from loop import (
 )
 
 _TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+_LEARNING_SPEC = importlib.util.spec_from_file_location(
+    "hp_rsi_learning", Path(__file__).resolve().parents[3] / "scripts/rsi_learning.py")
+LEARNING = importlib.util.module_from_spec(_LEARNING_SPEC)
+_LEARNING_SPEC.loader.exec_module(LEARNING)
 
 
 def _repo_root(start: Path) -> Path:
@@ -76,6 +81,7 @@ def command_init(args: argparse.Namespace) -> int:
         "noise_fraction": args.noise_fraction,
         "bench_must_match": list(args.bench_must_match),
         "gate_must_match": list(args.gate_must_match),
+        "rsi_mode": args.rsi_mode,
     }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     for name in ("manual.md", "ideas.md", "learnings.md", "experiment_log.md"):
         destination = run_dir / name
@@ -84,6 +90,7 @@ def command_init(args: argparse.Namespace) -> int:
     results = run_dir / "results.tsv"
     if not results.exists():
         results.write_text(RESULTS_HEADER, encoding="utf-8")
+    LEARNING.initialize(run_dir, args.rsi_mode)
     print(f"initialized autoresearch run at {run_dir}")
     print("next: edit manual.md [SETUP], seed ideas.md, then run `baseline`")
     return 0
@@ -97,7 +104,9 @@ def _load(args: argparse.Namespace):
 
 def command_baseline(args: argparse.Namespace) -> int:
     """Benchmark the current commit and record the first keep row."""
-    outcome = record_baseline(_load(args), args.description)
+    config = _load(args)
+    outcome = record_baseline(config, args.description)
+    _learning_checkpoint(config)
     print(f"{outcome.status}: metric={outcome.metric} ({outcome.detail})")
     return 0 if outcome.kept else 1
 
@@ -111,6 +120,7 @@ def command_iterate(args: argparse.Namespace) -> int:
     print(f"experiment_commit={outcome.experiment_commit} ({outcome.detail})")
     for row in pending_retries(config):
         print(f"retry_ready={row['commit']} ({row['description']})")
+    _learning_checkpoint(config)
     return 0 if outcome.status != "crash" else 1
 
 
@@ -118,6 +128,31 @@ def command_status(args: argparse.Namespace) -> int:
     """Print a short summary of the run."""
     print(run_status(_load(args), tail=args.tail))
     return 0
+
+
+def _learning_checkpoint(config, phase: str = "iteration") -> dict:
+    """Reconcile lessons after measured work and commit only validated learning paths."""
+    raw = json.loads((config.run_dir / CONFIG_NAME).read_text(encoding="utf-8"))
+    result = LEARNING.synchronize(config.repo_root, config.run_dir, phase, raw.get("rsi_mode", "acceptance"),
+                                  require_clean_targets=True)
+    changed = list(result.get("changed_files", {})) if result["complete"] else []
+    if changed:
+        # A separate local commit keeps the next experiment's dirty-target contract intact.
+        done = subprocess.run(["git", "-C", str(config.repo_root), "status", "--porcelain", "--", *changed],
+                              capture_output=True, text=True, check=True)
+        if done.stdout.strip():
+            subprocess.run(["git", "-C", str(config.repo_root), "add", "--", *changed], check=True)
+            subprocess.run(["git", "-C", str(config.repo_root), "commit", "--only", "-m",
+                            "feat(agent): consolidate validated RSI experience", "--", *changed], check=True)
+    print(f"rsi_learning={result['state']} report={config.run_dir / 'RSI_REPORT.html'}")
+    return result
+
+
+def command_learning(args: argparse.Namespace) -> int:
+    """Apply the selected learning mode; final delivery requires a complete RSI report."""
+    phase = "acceptance" if args.command == "finalize" else "iteration"
+    result = _learning_checkpoint(_load(args), phase)
+    return 0 if phase == "iteration" or result["complete"] else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -139,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--bench-must-match", action="append", default=[])
     init.add_argument("--gate-must-match", action="append", default=[])
     init.add_argument("--force", action="store_true")
+    init.add_argument("--rsi-mode", choices=LEARNING.MODES, default="acceptance")
     init.set_defaults(handler=command_init)
 
     baseline = commands.add_parser("baseline", help="record the starting metric")
@@ -159,6 +195,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--run-dir", required=True)
     status.add_argument("--tail", type=int, default=5)
     status.set_defaults(handler=command_status)
+    for name in ("learn", "finalize"):
+        command = commands.add_parser(name, help="reconcile reusable experience and generate the RSI report")
+        command.add_argument("--run-dir", required=True)
+        command.set_defaults(handler=command_learning)
     return parser
 
 

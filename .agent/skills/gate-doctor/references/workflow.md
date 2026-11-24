@@ -24,27 +24,34 @@ Before any subcommand runs:
 2. Current working dir is inside a git repo whose `origin` is the user's
    GitCode fork and `upstream` is the upstream repo.
 3. Local branch matches the PR head branch — if not, switch:
+
    ```bash
    git checkout <pr_head_branch>
    git fetch origin '+refs/heads/<pr_head_branch>:refs/remotes/origin/<pr_head_branch>'
    ```
+
    The explicit refspec (`+refs/heads/...`) is **required**: a plain
    `git fetch origin <branch>` only updates FETCH_HEAD, leaving the
    remote-tracking ref stale. (autogit has the same gotcha.)
+4. Set `GATE_DOCTOR_REPO=owner/hyper-parallel` before using bare PR numbers,
+   or pass a full GitCode PR URL / `owner/repo#N` explicitly.
+5. For `diagnose` and `autofix`, set `JENKINS_URL` to the actual Jenkins
+   base URL, including any deployment context path. Obtain it from the CI
+   configuration; do not guess a host.
 
 ## `retest`
 
-```
-user: 触发门禁 #647            # default = hyper-parallel
-user: 触发门禁 https://gitcode.com/mindspore/mindspore/pull/92567   # ms via URL
-user: 触发门禁 mindspore/mindspore#92567                            # ms short form
+```text
+user: 触发门禁 #647            # requires GATE_DOCTOR_REPO
+user: 触发门禁 https://gitcode.com/<owner>/hyper-parallel/pull/647
+user: 触发门禁 <owner>/hyper-parallel#647
 ```
 
 Steps:
 
 1. `python3 gate_doctor.py retest <ref>` → POSTs `/retest` as a PR comment
-   on the repo resolved from `<ref>`. A bare number lands on
-   `mindspore/hyper-parallel`; full URL / `owner/repo#N` overrides.
+   on the repo resolved from `<ref>`. A bare number uses
+   `GATE_DOCTOR_REPO`; full URL / `owner/repo#N` overrides.
 2. Wait ~30s; re-call `diagnose <ref>` and check whether a new pipeline
    number appears in the comments (`micro-compass: The pipeline #NNNN is
    running...`).
@@ -60,7 +67,7 @@ build pipeline.
 
 ## `diagnose` (read-only)
 
-```
+```text
 user: 看下 #92567 流水线为啥挂了
 ```
 
@@ -73,7 +80,8 @@ Steps:
    parse failure lines per [common-failures.md](common-failures.md)
    patterns.
 3. Emit JSON to stdout:
-   ```
+
+   ```text
    {
      "pipeline_number": 3903,
      "pipeline_url": "<jenkins-build-url>",
@@ -90,6 +98,7 @@ Steps:
      "raw_log_excerpt": "...last ~200 ERROR/FAILURE lines from Jenkins..."
    }
    ```
+
 4. **Show the JSON to the user**. Don't patch yet.
 
 Verify: `pipeline_number` must be non-null OR `check_pr_failure` set.
@@ -113,18 +122,20 @@ only the cheap mechanical bits of one iteration.
 3. **Patch:** apply each edit with `Read` + `Edit`. Never rewrite
    code unrelated to the failure.
 4. **Local pylint verify:** if any `.py` file changed, run
+
    ```bash
-   curl -fsSL https://tools.mindspore.cn/tools/check/pylint/rules/pylintrc \
-        -o /tmp/ms_pylintrc
-   pylint --rcfile=/tmp/ms_pylintrc <changed files...>
+   pylint --rcfile=.pylintrc <changed files...>
    ```
-   The score must be **10.00/10**. (CI uses the same rcfile + pylint
-   3.3.7; install locally with `pip install pylint==3.3.7`.)
+
+   Resolve the reported violations. Use the pylint version declared in
+   `.pre-commit-config.yaml` and the repository's `.pylintrc`.
 5. **Commit + push:**
+
    ```bash
    python3 .agent/skills/autogit/scripts/autogit.py commit \
        -m "fix(<pkg>): satisfy <Check_X> (<rule>)"
    ```
+
    The commit message must cite the failing stage and rule so the
    next `diagnose` can confirm it was addressed.
 6. **Retest:** `gate_doctor.py retest <pr>`.
@@ -151,5 +162,5 @@ If the gate page shows a pipeline label like `stat/checking` for >30 min and
 no Jenkins log appears:
 
 1. `gate_doctor.py retest <pr>` to nudge it.
-2. If still stuck, ask the user to escalate via the MindSpore-Assistant
-   label or to ping a maintainer. Do not edit code blindly.
+2. If still stuck, escalate to the HyperParallel CI maintainers with the
+   PR link and observed pipeline state. Do not edit code blindly.

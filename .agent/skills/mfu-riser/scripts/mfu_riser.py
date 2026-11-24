@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import importlib.util
 import json
 import os
 from os import killpg
@@ -32,7 +33,13 @@ import time
 import uuid
 
 from riser_contract import (PERFORMANCE_SCOPES, decide, digest_json, hash_file, read_json, require,
-                            series_transition, validate_config, validate_measurement)
+                            series_transition, step_time_budget, target_hfu_at_fixed_work_ratio,
+                            validate_config, validate_measurement)
+
+_LEARNING_SPEC = importlib.util.spec_from_file_location(
+    "hp_rsi_learning", Path(__file__).resolve().parents[3] / "scripts/rsi_learning.py")
+LEARNING = importlib.util.module_from_spec(_LEARNING_SPEC)
+_LEARNING_SPEC.loader.exec_module(LEARNING)
 
 
 def save(path: Path, value: dict) -> None:
@@ -127,6 +134,7 @@ def initialize(root: Path, config: dict, parent_root: Path | None = None) -> dic
         state["parent_series"] = parent_series
     save(root / "controller.json", state)
     (root / "history.jsonl").touch()
+    LEARNING.initialize(root, config.get("rsi_mode", "acceptance"))
     return state
 
 
@@ -364,6 +372,7 @@ def run_trial(root: Path, plan: dict) -> dict:
             save(directory / "result.json", result)
             return result
         complete_trial(root, state, result)
+        learning_checkpoint(root, "acceptance" if stop_reason(config, state) else "iteration")
         return result
 
 
@@ -403,20 +412,33 @@ def status(root: Path) -> dict:
     reason = stop_reason(config, state)
     policy = config.get("performance_policy") or {}
     level = policy.get("validation_level", "acceptance")
-    best_mfu = best["metrics"]["mfu_percent"] if best else None
+    best_metrics = best["metrics"] if best else None
+    best_mfu = best_metrics["mfu_percent"] if best_metrics else None
+    target_mfu = config["target_mfu_percent"]
+    budget = savings = projected_hfu = None
+    if best_metrics:
+        budget, savings = step_time_budget(best_metrics["mean_step_seconds"], best_mfu, target_mfu)
+        projected_hfu = target_hfu_at_fixed_work_ratio(best_metrics, target_mfu)
     next_action = "stop" if reason else "plan_from_best_profiling"
     if not reason and best is None:
         next_action = "baseline"
-    elif not reason and best_mfu >= config["target_mfu_percent"]:
+    elif not reason and best_mfu >= target_mfu:
         next_action = "start_acceptance_series" if level == "screening" else "confirm_best"
     elif not reason and best_mfu < (policy.get("low_mfu_threshold_percent") or 0):
         next_action = "plan_from_critical_path"
     now = time.time()
+    learning_path = root / "rsi/report.json"
+    learning = read_json(learning_path) if learning_path.exists() else {"complete": False, "state": "REVIEW_REQUIRED"}
+    if reason and not state["pending"] and not learning["complete"]:
+        next_action = "finalize_learning"
     return {"next_action": next_action, "stop_reason": reason, "best": state["best"],
-            "best_metrics": best["metrics"] if best else None,
+            "rsi_learning": {key: learning[key] for key in ("state", "complete")},
+            "best_metrics": best_metrics, "target_mfu_percent": target_mfu,
+            "target_step_budget_seconds": budget, "required_step_savings_seconds": savings,
+            "target_hfu_percent_at_fixed_work_ratio": projected_hfu,
             "attempts": state["attempts"], "seconds_left": max(0, state["deadline"] - now),
             "elapsed_seconds": now - state["started"], "validation_level": level,
-            "required_throughput_multiplier": config["target_mfu_percent"] / best_mfu if best_mfu else None,
+            "required_throughput_multiplier": target_mfu / best_mfu if best_mfu else None,
             "parent_series": state.get("parent_series")}
 
 
@@ -428,10 +450,14 @@ def report(root: Path) -> Path:
     """
     summary = status(root)
     state = read_json(root / "controller.json")
+    learning = (summary["rsi_learning"] if state["pending"] else
+                learning_checkpoint(root, "acceptance" if summary["stop_reason"] else "iteration"))
+    summary = status(root)
     lines = ["# MFU Riser experiment record", "", f"Next action: {summary['next_action']}",
              f"Stop reason: {summary['stop_reason']}", f"Best trial: {summary['best']}",
              f"Validation level: {summary['validation_level']}", f"Elapsed seconds: {summary['elapsed_seconds']:.1f}",
              "", "MFU uses fixed model work and measured training time. HFU reports executed work.", "",
+             f"RSI consolidation: {learning['state']}. [Separate RSI report](RSI_REPORT.html).", "",
              "| Trial | Decision | MFU % | HFU % | HFU method | tokens/s/device | Device seconds | Evidence |",
              "|---|---|---:|---:|---|---:|---:|---|"]
     stage_totals = {}
@@ -452,6 +478,19 @@ def report(root: Path) -> Path:
     return path
 
 
+def learning_checkpoint(root: Path, phase: str = "iteration") -> dict:
+    """Consolidate only after trial cleanup, outside the timed training region."""
+    config, state = load_run(root)
+    require(state["pending"] is None, "Learning must wait for trial cleanup")
+    workspace = config.get("learning_repository")
+    if workspace is None and state["attempts"]:
+        context = read_json(root / "trials" / state["attempts"][-1] / "context.json")
+        workspace = context["plan"]["workspace"]
+    if workspace is None:
+        workspace = Path(__file__).resolve().parents[4]
+    return LEARNING.synchronize(Path(workspace).resolve(), root, phase, config.get("rsi_mode", "acceptance"))
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch a controller command.
 
@@ -459,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         argv: Optional argument list for programmatic invocation.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("init", "trial", "status", "report", "recover"))
+    parser.add_argument("command", choices=("init", "trial", "status", "report", "recover", "learn", "finalize"))
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--plan", type=Path)
@@ -478,10 +517,13 @@ def main(argv: list[str] | None = None) -> int:
             result = recover(root)
         elif args.command == "report":
             result = {"report": str(report(root))}
+        elif args.command in ("learn", "finalize"):
+            result = learning_checkpoint(root, "acceptance" if args.command == "finalize" else "iteration")
         else:
             result = status(root)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
-        return 2 if result.get("decision") == "crash" else 0
+        return 2 if (result.get("decision") == "crash" or
+                     (args.command == "finalize" and not result["complete"])) else 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 1

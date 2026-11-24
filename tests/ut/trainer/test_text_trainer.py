@@ -24,7 +24,6 @@ import torch
 
 from hyper_parallel.trainer.config.data import ModelAssetsConfig
 from hyper_parallel.trainer.config.training import DebugConfig
-from tests.common.mark_utils import arg_mark
 from hyper_parallel.trainer.base import BaseTrainer
 
 
@@ -50,8 +49,6 @@ TextTrainer = _load_text_trainer()
 class TestTextTrainer(unittest.TestCase):
     """Verify text training streams prepared batches into callbacks."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_template_logging_is_independent_of_dataset_debug(self) -> None:
         """Feature: Independent template debug configuration.
 
@@ -77,12 +74,6 @@ class TestTextTrainer(unittest.TestCase):
                     chat_template_kwargs={}, log_first_rendered_template=enabled,
                 )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_forward_backward_dispatches_metric_hook_before_forward(self) -> None:
         """Send detached metric inputs before executing the model forward.
 

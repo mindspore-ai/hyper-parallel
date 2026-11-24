@@ -11,6 +11,7 @@ implementations and dependencies; these are not candidate tuning targets.
 ```json
 {
   "schema": "mfu-riser/v1",
+  "rsi_mode": "acceptance",
   "workload": {
     "model": "model architecture and config hash",
     "weights_id": "checkpoint manifest hash",
@@ -48,6 +49,12 @@ achievable target, or actual noise. Calibrate noise with same-node A/A measureme
 or existing comparable records. Additional workload fields are allowed; every field
 is compared.
 
+`rsi_mode` defaults to `acceptance`; choose `continuous` for consolidation between
+completed trials. Optional `learning_repository` identifies the current HP
+checkout receiving portable improvements; otherwise the trial workspace is used.
+Use a separate checkout for changes to frozen source or validators. See the
+[consolidation contract](../../autoresearch/references/experience-consolidation.md).
+
 ## Performance policy
 
 Add `performance_policy` to the run configuration when using the S4 performance workflow.
@@ -70,6 +77,8 @@ sequence length and global batch changes.
 - Omit the threshold when the task has no low-MFU policy. Below the configured threshold,
   `status` returns `plan_from_critical_path` and the target-to-best throughput multiplier
   for the current workload. The planner sizes candidate gains from measured exposed time.
+- With a validated best result, `status` includes the nonnegative fixed-work time savings
+  required and the corresponding step-time budget under the same MFU convention.
 - List only workload fields the task leaves open. Supported fields are `sequence_length`,
   `micro_batch_size`, `global_batch_size`, and `gradient_accumulation_steps`.
 - Use `{"method": "approximation", "max_relative_error": 0.02}` with a declared
@@ -215,7 +224,11 @@ Optional `executed_work` has `method` (`hardware_counters` or `estimate`),
 `executed_flops`. Each step must belong to the unprofiled window and appear
 once. The validator checks that the counts cover the declared device set and
 configuration. The controller uses the matching unprofiled step times for HFU
-and records the sampled steps, coverage, and method.
+and records the sampled steps, coverage, and method. It computes
+`model_mfu_in_hfu_window_percent` over the same steps and elapsed time.
+`status` uses this matched MFU for `target_hfu_percent_at_fixed_work_ratio`
+when hardware counters are available. This field is null for estimates and
+older receipts without matched MFU.
 
 Optional `allocation` has `device_seconds`, `evidence`, and `sha256`. Derive
 device seconds from actual job allocations. Trial results also record wall time

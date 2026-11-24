@@ -154,6 +154,35 @@ class TestMLAContextParallel(unittest.TestCase):
                 without_mask.attention_mask.expand_as(all_valid.attention_mask), all_valid.attention_mask,
             )
 
+    def test_explicit_mask_preserves_query_axis(self) -> None:
+        """Keep MLA Q/K matrices distinct from FA padding masks, including B == S."""
+        mask = torch.ones(4, 4, dtype=torch.bool).tril()
+        mask[1] = False
+        original = mask.clone()
+        for batch in (1, 2, 4):
+            for causal in (False, True):
+                for strategy in (None, "expanded_ulysses", "latent_kv_head"):
+                    with self.subTest(batch=batch, causal=causal, strategy=strategy):
+                        module = make_mla()
+                        attention = Mock(side_effect=_reference_attention)
+                        if strategy is None:
+                            module.attention_interface = attention
+                        else:
+                            install_mla_cp(module, TestCPMesh(singleton=True), strategy,
+                                           attention_interface=attention)
+                        # Only bypass the device check; run actual MLA projections and mask preparation.
+                        with patch("hyper_parallel.distributed.context_parallel.mla_context_parallel._validate_state"):
+                            module(torch.randn(batch, 4, 12, dtype=torch.float64),
+                                   attention_mask=mask, is_causal=causal)
+                        args, options = attention.call_args
+                        self.assertEqual(args[4].shape, (1, 1, 4, 4))
+                        self.assertEqual(args[4].untyped_storage().data_ptr(), mask.untyped_storage().data_ptr())
+                        context = _prepare_fusion_attention_context(*args, options)
+                        self.assertEqual(context.input_layout, "BNSD")
+                        self.assertEqual(context.attention_mask.shape, (1, 1, 4, 4))
+                        torch.testing.assert_close(context.valid_rows, mask.any(dim=-1)[None, None])
+                        torch.testing.assert_close(mask, original)
+
     def test_projection_preserves_module_hooks_and_parameter_identity(self) -> None:
         """
         Feature: Head-selective KV projection with managed module hooks.

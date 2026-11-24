@@ -58,6 +58,36 @@ Three measurement requirements apply.
 
 ## 3. Acceptance criteria for a fused path
 
+Configure the custom-operator package and its search path in the launcher
+before the accelerator runtime initializes. In a fresh process, validate the
+package's forward and backward entry points using the training dtype, layout,
+and shapes. Record the package identity and active execution path. Repeat
+initialization checks after a runtime or package change.
+
+For a normalization replacement, retain the source forward keyword contract,
+checkpoint parameter representation, and precision conversion order. When the
+reference forms an FP32 scale from a learned offset, apply the offset and
+normalization in FP32 before casting to the input dtype. Compare activation and
+learned scale gradients, then exercise the unchanged optimizer and input path in
+the full-model gate.
+
+Check the registered module, parameter, and buffer names and retained tensor
+identities through HyperParallel's replacement path before scheduling a training
+run. `state_dict()` equality alone can miss a new non-persistent buffer or a
+`None` registration. For disposable scratch tensors, use unregistered runtime
+storage and rebuild it when the required device, dtype, shape, or layout changes.
+Keep source buffers registered with their original identities. Intentional schema
+changes need an explicit model-owned checkpoint transform. See the
+[replacement validator](../../../../hyper_parallel/models/replacement.py).
+
+When backward is dominated by copies from disjoint strided slices, match the
+device task shapes and call count to the source views. For a signed channel
+permutation, group adjacent channels and apply the transposed permutation
+directly to the upstream gradient. Preserve untouched channels and precision
+boundaries. Overlapping reads and repeated indices still require gradient
+accumulation. Compare outputs and gradients at the actual training strides.
+Confirm the effect with a matched whole-model gate and an independent repeat.
+
 All six criteria must be satisfied before declaring the path ready. If any fails,
 qualify the conclusion rather than reporting the optimization as fully enabled.
 

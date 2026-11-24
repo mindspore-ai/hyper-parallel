@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Packing-only graph regressions independent of Compressor and Indexer."""
+"""Dynamic-static unified packing and DSA compression graph regressions."""
 
 import unittest
 from contextlib import nullcontext
@@ -24,6 +24,7 @@ from torch import nn
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph, run_traced_graph
+from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
 from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
@@ -31,10 +32,16 @@ from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.runtime.model_integration import DisabledModelIntegrationSession
 
 
-def _inputs(boundaries: list[int], *, graph: bool = True) -> dict:
-    """Build metadata using the standard adapter without compression configuration binding."""
+def _inputs(
+        boundaries: list[int], *, graph: bool = True,
+        compress_ratios: tuple[int, ...] = (),
+) -> dict:
+    """Build metadata using the standard adapter, optionally with compression."""
     ids = torch.arange(boundaries[-1]).unsqueeze(0)
-    runtime = DeepseekV41Runtime(include_position_ids=False, include_image_sequence_start=False)
+    runtime = DeepseekV41Runtime(
+        include_position_ids=False, include_image_sequence_start=False,
+        compress_ratios=compress_ratios,
+    )
     result = runtime.build(
         batch={"input_ids": ids, "cu_seq_lens": torch.tensor(boundaries, dtype=torch.int32)},
         parallel_context=SimpleNamespace(tp_rank=0, tp_world_size=1, cp_rank=0, cp_world_size=1),
@@ -61,6 +68,27 @@ class _PackingModel(nn.Module):
         values = (input_ids.float() + packed.local_segment_starts(input_ids.device)
                   + packed.local_positions(input_ids.device) + document_ids
                   + packed.segment_start_mask(input_ids.device))
+        return (values * self.weight).square().mean()
+
+
+class _CompressionPackingModel(nn.Module):
+    """Consume compressed-key metadata exactly as attention layers do."""
+
+    def __init__(self, compress_ratio: int) -> None:
+        """Keep the consumed ratio and one deterministic parameter."""
+        super().__init__()
+        self.compress_ratio = compress_ratio
+        self.weight = nn.Parameter(torch.tensor(0.25))
+
+    def forward(
+            self, input_ids: torch.Tensor, packed_seq_params: object, use_cache: bool = False,
+    ) -> torch.Tensor:
+        """Read per-token minima and causal bounds shared by eager and graph."""
+        del use_cache
+        packed = packed_seq_params.prepare(input_ids.device, (self.compress_ratio,))
+        minima = packed.minimum_key_indices(input_ids.device, self.compress_ratio)
+        upper = packed.causal_key_upper_bounds(input_ids.device, self.compress_ratio)
+        values = (minima + upper + input_ids.long()).float()
         return (values * self.weight).square().mean()
 
 
@@ -122,7 +150,9 @@ class TestPackingOnlyGraph(unittest.TestCase):
     def test_graph_preparation_does_not_mutate_eager_inputs(self) -> None:
         """Preparing graph inputs leaves the source usable by eager compression."""
         source = _inputs([0, 3, 8], graph=False)
-        runtime = DeepseekV41Runtime(include_position_ids=False, include_image_sequence_start=False)
+        runtime = DeepseekV41Runtime(
+            include_position_ids=False, include_image_sequence_start=False,
+        )
         prepared = runtime.prepare_graph_inputs(source)
         self.assertIsNot(prepared["packed_seq_params"], source["packed_seq_params"])
         leaves, spec = tree_flatten(source["packed_seq_params"])
@@ -131,7 +161,7 @@ class TestPackingOnlyGraph(unittest.TestCase):
         leaves, spec = tree_flatten(prepared["packed_seq_params"])
         graph = tree_unflatten(leaves, spec)
         self.assertEqual(graph.cu_seq_lens.numel(), 0)
-        with self.assertRaisesRegex(ValueError, "packing-only graph inputs"):
+        with self.assertRaisesRegex(ValueError, "no compressed-key metadata for ratio 2"):
             graph.prepare(torch.device("cpu"), (2,))
 
     def test_symbolic_joint_graph_replays_lengths_boundaries_and_gradients(self) -> None:
@@ -195,6 +225,176 @@ class TestPackingOnlyGraph(unittest.TestCase):
         torch.testing.assert_close(updated.local_segment_starts(torch.device("cpu")),
                                    torch.tensor([[0, 0, 2, 2, 2, 2, 2, 2]]))
         torch.testing.assert_close(before, torch.tensor([[0, 0, 0, 0, 4, 4, 4, 4]]))
+
+
+class TestCompressionGraphInputs(unittest.TestCase):
+    """Graph packing metadata carries compressed-key geometry for DSA layers."""
+
+    def test_graph_metadata_matches_eager_compressed_keys(self) -> None:
+        """Restored graph inputs reproduce eager minima and causal bounds exactly."""
+        device = torch.device("cpu")
+        # Ratio 1 carries no alignment contract, so natural lengths replay too.
+        cases = [([0, 3, 8], 1), ([0, 1, 3, 8], 1), ([0, 7], 1), ([0, 3, 10], 1)]
+        # Ratio 2 requires the data-side per-document alignment the collate pads.
+        cases += [([0, 4, 8], 2), ([0, 2, 4, 8], 2), ([0, 8], 2), ([0, 6, 10], 2)]
+        for boundaries, ratio in cases:
+            with self.subTest(boundaries=boundaries, ratio=ratio):
+                eager = _inputs(boundaries, graph=False)["packed_seq_params"]
+                prepared = eager.prepare(device, (ratio,))
+                graph = _inputs(boundaries, compress_ratios=(1, ratio))["packed_seq_params"]
+                torch.testing.assert_close(
+                    graph.minimum_key_indices(device, ratio),
+                    prepared.minimum_key_indices(device, ratio),
+                )
+                torch.testing.assert_close(
+                    graph.causal_key_upper_bounds(device, ratio),
+                    prepared.causal_key_upper_bounds(device, ratio),
+                )
+
+    def test_causal_bounds_reproduce_segment_math_including_misaligned_docs(self) -> None:
+        """The shared tensor bound equals the legacy Python segment derivation."""
+        device = torch.device("cpu")
+        for boundaries in ([0, 3, 8], [0, 1, 4, 9], [0, 2, 7, 8]):
+            for ratio in (2, 3):
+                with self.subTest(boundaries=boundaries, ratio=ratio):
+                    packed = _inputs(boundaries, graph=False)["packed_seq_params"]
+                    prepared = packed.prepare(device, (ratio,))
+                    query = torch.zeros(1, boundaries[-1], 1, 4)
+                    segment_upper, lower = attention._causal_key_bounds(  # pylint: disable=protected-access
+                        query, ratio, 0,
+                        prepared.minimum_key_indices(device, ratio),
+                        prepared.indexer_segments(ratio),
+                    )
+                    tensor_upper, tensor_lower = attention._causal_key_bounds(  # pylint: disable=protected-access
+                        query, ratio, 0,
+                        prepared.minimum_key_indices(device, ratio),
+                        None,
+                        prepared.causal_key_upper_bounds(device, ratio),
+                    )
+                    self.assertEqual(tensor_upper.ndim, 2)
+                    torch.testing.assert_close(tensor_upper.long(), segment_upper.long())
+                    torch.testing.assert_close(tensor_lower, lower)
+
+    def test_graph_boundary_rejects_misaligned_documents(self) -> None:
+        """Compression capture refuses boundaries that cross a complete block."""
+        with self.assertRaisesRegex(ValueError, "multiple of 2"):
+            _inputs([0, 3, 8], compress_ratios=(1, 2))
+        # Even boundaries pass and restore one alignment fact for in-graph checks.
+        leaves, spec = tree_flatten(_inputs([0, 4, 8], compress_ratios=(1, 2))["packed_seq_params"])
+        restored = tree_unflatten(leaves, spec)
+        self.assertTrue(restored._restored_from_packing_tensors)  # pylint: disable=protected-access
+        self.assertTrue(restored.is_compression_aligned(2))
+        self.assertTrue(restored.is_compression_aligned(1))
+
+    def test_restored_inputs_keep_graph_only_semantics(self) -> None:
+        """Restored inputs answer alignment, bank length and plan questions tensor-side."""
+        leaves, spec = tree_flatten(_inputs([0, 4, 8], compress_ratios=(1, 2))["packed_seq_params"])
+        restored = tree_unflatten(leaves, spec)
+        self.assertEqual(restored.block_plan(2, 1, 0), None)
+        self.assertEqual(restored.compressed_key_length(2), 4)
+        self.assertEqual(restored.compressed_key_length(1), 8)
+        self.assertEqual(restored.compressed_key_length(0), 8)
+        self.assertEqual(restored.raw_document_starts(), ())
+        with self.assertRaisesRegex(NotImplementedError, "Python document segments"):
+            restored.indexer_segments(2)
+
+    def test_compression_schema_is_stable_across_batches(self) -> None:
+        """Adding compressed-key metadata keeps one pytree schema for every batch."""
+        first, spec = tree_flatten(_inputs([0, 4, 8], compress_ratios=(1, 2))["packed_seq_params"])
+        second, updated = tree_flatten(_inputs([0, 2, 4, 8], compress_ratios=(1, 2))["packed_seq_params"])
+        self.assertEqual(spec, updated)
+        self.assertTrue(all(isinstance(value, torch.Tensor) for value in first + second))
+
+    def test_symbolic_graph_replays_compressed_keys_across_batches(self) -> None:
+        """One guarded graph serves every document count and length with DSA metadata."""
+        model = _CompressionPackingModel(compress_ratio=2)
+        initial = _inputs([0, 4, 8], compress_ratios=(1, 2))
+        graph = trace_model_graph(model, _train_fn, {"model_inputs": initial}, dynamic=True)
+        for boundaries in ([0, 2, 4, 8], [0, 4, 8], [0, 8], [0, 6, 10]):
+            with self.subTest(boundaries=boundaries):
+                current = _inputs(boundaries, compress_ratios=(1, 2))
+                eager_packed = _inputs(boundaries, graph=False, compress_ratios=(1, 2))["packed_seq_params"]
+                device = torch.device("cpu")
+                prepared = eager_packed.prepare(device, (2,))
+                ids = current["input_ids"]
+                values = (prepared.minimum_key_indices(device, 2)
+                          + prepared.causal_key_upper_bounds(device, 2) + ids.long()).float()
+                expected = (values * model.weight).square().mean()
+                gradient = torch.autograd.grad(expected, model.weight)[0]
+                loss, gradients, _ = run_traced_graph(graph, model, {"model_inputs": current})
+                torch.testing.assert_close(loss, expected.detach())
+                torch.testing.assert_close(gradients[0], gradient)
+
+    def test_topk_multichunk_slices_bounds_along_queries(self) -> None:
+        """Chunked reference selection stays query-aligned when S exceeds the chunk."""
+        device = torch.device("cpu")
+        torch.manual_seed(7)
+        # Reviewer regression shape: two 256-token documents, default chunk 256,
+        # plus a ragged chunk tail; the packed tensor bound must match segments.
+        boundaries = [0, 256, 512]
+        packed = _inputs(boundaries, graph=False)["packed_seq_params"]
+        prepared = packed.prepare(device, (2,))
+        query = torch.randn(1, 512, 2, 8)
+        key = torch.randn(1, 256, 8)
+        weights = torch.rand(1, 512, 2)
+        shared = {
+            "compress_ratio": 2, "sparse_count": 3,
+            "minimum_key_indices": prepared.minimum_key_indices(device, 2),
+        }
+        for chunk in (256, 100):
+            with self.subTest(chunk=chunk):
+                from_segments = attention.compressed_causal_topk(
+                    query, key, weights, query_segments=prepared.indexer_segments(2),
+                    query_chunk_size=chunk, **shared,
+                )
+                from_tensors = attention.compressed_causal_topk(
+                    query, key, weights,
+                    causal_upper=prepared.causal_key_upper_bounds(device, 2),
+                    query_chunk_size=chunk, **shared,
+                )
+                self.assertEqual(tuple(from_tensors.shape), (1, 512, 3))
+                torch.testing.assert_close(from_tensors, from_segments)
+        # Multi-document, multi-chunk tail on a tiny sequence.
+        small = _inputs([0, 4, 8], graph=False)["packed_seq_params"].prepare(device, (2,))
+        small_shared = {
+            "compress_ratio": 2, "sparse_count": 2,
+            "minimum_key_indices": small.minimum_key_indices(device, 2),
+        }
+        small_query = torch.randn(1, 8, 1, 4)
+        small_key = torch.ones(1, 4, 4)
+        small_weights = torch.ones(1, 8, 1)
+        from_segments = attention.compressed_causal_topk(
+            small_query, small_key, small_weights, query_segments=small.indexer_segments(2),
+            query_chunk_size=3, **small_shared,
+        )
+        from_tensors = attention.compressed_causal_topk(
+            small_query, small_key, small_weights,
+            causal_upper=small.causal_key_upper_bounds(device, 2),
+            query_chunk_size=3, **small_shared,
+        )
+        torch.testing.assert_close(from_tensors, from_segments)
+
+    def test_topk_selection_matches_between_tensor_and_segment_bounds(self) -> None:
+        """Reference selection picks the same keys from either bound source."""
+        boundaries = [0, 3, 8]
+        ratio = 2
+        device = torch.device("cpu")
+        packed = _inputs(boundaries, graph=False)["packed_seq_params"]
+        prepared = packed.prepare(device, (ratio,))
+        query = torch.ones(1, 8, 1, 2)
+        key = torch.ones(1, 3, 2)
+        weights = torch.ones(1, 8, 1)
+        shared = {
+            "compress_ratio": ratio, "sparse_count": 3,
+            "minimum_key_indices": prepared.minimum_key_indices(device, ratio),
+        }
+        from_segments = attention.compressed_causal_topk(
+            query, key, weights, query_segments=prepared.indexer_segments(ratio), **shared,
+        )
+        from_tensors = attention.compressed_causal_topk(
+            query, key, weights, causal_upper=prepared.causal_key_upper_bounds(device, ratio), **shared,
+        )
+        torch.testing.assert_close(from_tensors, from_segments)
 
 
 if __name__ == "__main__":

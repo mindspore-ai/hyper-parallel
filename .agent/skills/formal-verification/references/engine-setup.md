@@ -169,9 +169,9 @@ replace HyperParallel-specific paths, rules, test launchers and public API assum
 Run its independent standard-library tests with:
 
 ```bash
-python -m pytest --confcutdir=tests/ut/agent tests/ut/agent/formal_verification -q
-python -m pylint .agent/skills/formal-verification/scripts/verify.py tests/ut/agent/formal_verification/test_verify.py
-python scripts/pre-commit/run_lizard.py .agent/skills/formal-verification/scripts/verify.py tests/ut/agent/formal_verification/test_verify.py
+python -m pytest --confcutdir=.agent/tests/agent .agent/tests/agent/formal_verification -q
+python -m pylint .agent/skills/formal-verification/scripts/verify.py .agent/tests/agent/formal_verification/test_verify.py
+python scripts/pre-commit/run_lizard.py .agent/skills/formal-verification/scripts/verify.py .agent/tests/agent/formal_verification/test_verify.py
 python .agent/scripts/check_agents_catalog.py
 ```
 

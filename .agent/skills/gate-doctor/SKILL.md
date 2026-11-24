@@ -1,23 +1,25 @@
 ---
 name: gate-doctor
 description: >
-  Drive a red MindSpore-family GitCode PR gate to green: diagnose,
+  Drive a red HyperParallel GitCode PR gate to green: diagnose,
   /check-pr → /retest, triage failures, patch or escalate, loop until
   both pr-check-pass and ci-pipeline-passed. Use for 门禁/CI/retest/
-  check-pr/autofix/把 PR 修绿, or any MindSpore GitCode PR gate request.
-  Default repo mindspore/hyper-parallel; pass full URL or owner/repo#N
-  for cross-repo. Details load from references/ on demand.
+  check-pr/autofix/把 PR 修绿, or any HyperParallel GitCode PR gate request.
+  Use a full PR URL or owner/repo#N; configure GATE_DOCTOR_REPO for bare
+  numbers. Details load from references/ on demand.
 ---
 
 # Gate Doctor
 
-End-to-end PR gate diagnose + autofix for MindSpore-family GitCode repos.
+End-to-end PR gate diagnose + autofix for HyperParallel on GitCode.
 **This file is the index + hard red lines.** Load the matching
 `references/*.md` before acting on that topic — do not improvise policy.
 
 ## Tool Requirements
 
 - `GITCODE_TOKEN` (PR-comment write), same as autogit
+- `GATE_DOCTOR_REPO=owner/hyper-parallel` when using bare PR numbers
+- `JENKINS_URL` set to the deployment's Jenkins base URL for diagnose/autofix
 - `git` with `origin` (fork) + `upstream` (main)
 - `python3.8+` with `pylint==3.3.7` (CI parity)
 - Working `autogit` skill (autofix commits via it)
@@ -35,11 +37,12 @@ End-to-end PR gate diagnose + autofix for MindSpore-family GitCode repos.
 python3 {skill_dir}/scripts/gate_doctor.py <subcommand> <pr_ref> [options]
 ```
 
-PR refs: `#647` → `mindspore/hyper-parallel`; full URL or `owner/repo#N`
-for others; unknown Jenkins mapping needs `--jenkins-job=<name>`.
+PR refs: `#647` uses `GATE_DOCTOR_REPO`; a full GitCode URL or `owner/repo#N`
+selects the repository explicitly. HyperParallel uses `Hyper-Parallel_Atomgit_Gate`;
+other repositories need `--jenkins-job=<name>`.
 No PR id → resolve from current branch via GitCode API, else ask once.
 
-Announce at start: `Running gate-doctor `<subcommand>` …`
+Announce at start: `Running gate-doctor <subcommand> …`
 
 ## Load-by-phase navigation
 
@@ -72,7 +75,7 @@ labels for green. Always start a bare PR link with `diagnose`.
 
 - No file edits before `diagnose`.
 - Never `git push --force`.
-- After `.py` edits, local pylint + MindSpore rcfile must be 10.00/10.
+- After `.py` edits, run pylint with the repository's `.pylintrc` and resolve reported violations.
 - Out-of-diff failures need 3-question triage — not auto-UNRELATED.
 - PR-INDUCED → root-cause fix in **production** code (no skip/xfail/
   soften asserts / drop params / change `arg_mark` level) — see
@@ -87,7 +90,7 @@ labels for green. Always start a bare PR link with `diagnose`.
 - `autofix` stays inside the PR diff; never edit `upstream/master`;
   touch PR template only if that is the failing check.
 - No AI attribution trailers in commits (`autogit` hook rejects them).
-- Do not touch submodules (`mindformers` / `metadef` / …) unless the
+- Do not touch submodules unless the
   failure is inside tracked submodule files.
 - If `.agent/rules/code-style.md` exists, load it before patching
   (tie-break vs pylint).
@@ -97,7 +100,8 @@ labels for green. Always start a bare PR link with `diagnose`.
 | Error | Fix |
 |---|---|
 | `GITCODE_TOKEN not found` | `export GITCODE_TOKEN=<token>` |
-| `Cannot reach build.mindspore.cn` | Escalate — host has no network path |
+| Missing repository or Jenkins configuration | Set `GATE_DOCTOR_REPO` or pass an explicit PR reference; set `JENKINS_URL` for diagnosis |
+| Cannot reach the configured Jenkins host | Verify `JENKINS_URL` and the network path |
 | `No failure comments on PR` | `retest` then re-`diagnose` |
 | Same failure after autofix | Stop; ask user (may need manual root cause) |
 | autogit refuses (submodule dirty) | `git -C <submodule> clean -fdx` then retry |

@@ -30,24 +30,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-
 from hyper_parallel.models._transformers import config_resolver
 from hyper_parallel.models import registry
-from tests.common.mark_utils import arg_mark
 
 
 class TestEmptyMappingFallback(unittest.TestCase):
     """Custom-architecture resolution and HF fallback semantics."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_unknown_arch_resolves_to_none(self):
         """An unregistered architecture (e.g. Qwen3MoeForCausalLM) falls back."""
         self.assertIsNone(registry._resolve_custom_model_cls("Qwen3MoeForCausalLM"))
         self.assertIsNone(registry._resolve_custom_model_cls(""))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_get_is_hf_model(self):
         """Unknown and missing architectures select the HF implementation."""
         config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
@@ -58,8 +52,6 @@ class TestEmptyMappingFallback(unittest.TestCase):
         # force_hf short-circuits regardless of architectures
         self.assertTrue(config_resolver.get_is_hf_model(config, force_hf=True))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_custom_model_resolution_triggers_family_discovery(self):
         """AutoModel path selection should not require registry preheating."""
         config = SimpleNamespace(
@@ -80,8 +72,6 @@ class TestEmptyMappingFallback(unittest.TestCase):
         discover.assert_called_once_with("lazy_family")
         resolve.assert_called_once_with("LazyFamilyForCausalLM")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_lazy_load_success_and_failure(self):
         """A resolvable entry returns the class; a broken entry falls back to None."""
         registry.MODEL_ARCH_MAPPING["_M0GoodArch"] = ("builtins", "dict")

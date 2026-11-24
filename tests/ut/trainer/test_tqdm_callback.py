@@ -23,7 +23,6 @@ from unittest.mock import patch
 
 from hyper_parallel.trainer.callbacks import TqdmCallback
 from hyper_parallel.trainer.state import TrainerState
-from tests.common.mark_utils import arg_mark
 
 
 class _FakeTqdm:
@@ -49,12 +48,6 @@ class TestTqdmCallback(unittest.TestCase):
             step_env_metrics={"performance/tokens_per_second": 128.1254},
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_redirected_stream_writes_one_snapshot_per_step(self) -> None:
         """Emit one newline and no carriage returns when stderr is not a TTY.
 
@@ -91,12 +84,6 @@ class TestTqdmCallback(unittest.TestCase):
         self.assertIn("loss=2.5", output, f"progress metrics missing from output, got={output!r}")
         self.assertIn("step=1 epoch=0", output, f"structured log message missing from output, got={output!r}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_optional_tflops_metric_reaches_the_postfix(self) -> None:
         """Show the per-device TFLOP/s metric beside the existing throughput fields.
 
@@ -127,12 +114,6 @@ class TestTqdmCallback(unittest.TestCase):
         self.assertIn("TFLOP/s=23.558", output, f"tflops metric missing from postfix, got={output!r}")
         self.assertIn("tokens/s=65536.000", output, f"throughput metric missing from postfix, got={output!r}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_absent_tflops_metric_is_not_rendered(self) -> None:
         """Leave the postfix unchanged when the optional metric is disabled.
 
@@ -156,36 +137,6 @@ class TestTqdmCallback(unittest.TestCase):
         output = stream.getvalue()
         self.assertNotIn("TFLOP/s", output, f"disabled metric must not render, got={output!r}")
         self.assertIn("tokens/s=128.125", output, f"existing metric missing from postfix, got={output!r}")
-
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
-    def test_progress_shows_flops_utilization_when_published(self) -> None:
-        """Show model TFLOPS, MFU and HFU only when the environment meter publishes them.
-
-        Feature: Trainer progress output for PaLM MFU.
-        Description: Build the progress postfix with and without utilization metrics.
-        Expectation: Published metrics appear with percent formatting; absent ones add no columns.
-        """
-        trainer = self._build_trainer()
-        callback = TqdmCallback(trainer)
-        build_postfix = getattr(callback, "_postfix")
-        postfix = build_postfix()
-        for label in ("tflops/device", "mfu", "hfu"):
-            self.assertNotIn(label, postfix, f"case: {label}_absent_without_metric, got={postfix}")
-
-        trainer.step_env_metrics = {
-            "performance/model_tflops_per_device": 49.1834,
-            "performance/mfu_percent": 12.29585,
-            "performance/hfu_percent": 16.12,
-        }
-        postfix = build_postfix()
-        expected = {"tflops/device": "49.18", "mfu": "12.30%", "hfu": "16.12%"}
-        for label, value in expected.items():
-            self.assertEqual(postfix.get(label), value, f"case: {label}_formatted, got={postfix}")
 
 
 if __name__ == "__main__":

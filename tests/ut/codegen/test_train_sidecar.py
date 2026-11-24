@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 from hyper_parallel.codegen import train_sidecar
 
@@ -100,51 +100,6 @@ class TestTrainSidecar(unittest.TestCase):
 
         self.assertIn("exit code 7", captured.output[0])
         self.assertIn("native training continues", captured.output[0])
-
-    def test_native_training_entry_starts_codegen_with_same_arguments(self) -> None:
-        """The package-owned training integration starts generation first."""
-        config = MagicMock()
-        config._yaml_path = "/recipes/train.yaml"  # pylint: disable=protected-access
-        parse_args = MagicMock(return_value=config)
-        trainer_type = MagicMock()
-        overrides = ["--accelerator.tp_size=2", "--training.train_iters=10"]
-
-        with patch.object(train_sidecar, "start_codegen_sidecar") as start_sidecar:
-            train_sidecar.run_training_with_codegen(
-                parse_args,
-                trainer_type,
-                ["scripts/train_lm.py", "train.yaml", *overrides],
-            )
-
-        start_sidecar.assert_called_once_with(config._yaml_path, overrides)  # pylint: disable=protected-access
-        trainer_type.assert_called_once_with(config)
-        trainer_type.return_value.train.assert_called_once_with()
-
-    def test_shared_training_entry_starts_sidecar_before_trainer(self) -> None:
-        """Generation starts before Trainer construction without waiting for it."""
-        config = MagicMock()
-        config._yaml_path = "train.yaml"  # pylint: disable=protected-access
-        parse_args = MagicMock(return_value=config)
-        trainer_type = MagicMock()
-        overrides = ["--accelerator.cp_size=2"]
-        sequence = MagicMock()
-        sequence.attach_mock(parse_args, "parse_args")
-        sequence.attach_mock(trainer_type, "trainer_type")
-
-        with patch.object(train_sidecar, "start_codegen_sidecar") as start_sidecar:
-            sequence.attach_mock(start_sidecar, "start_sidecar")
-            train_sidecar.run_training_with_codegen(
-                parse_args, trainer_type, ["train_vl.py", "train.yaml", *overrides],
-            )
-
-        self.assertEqual(sequence.mock_calls, [
-            call.parse_args(),
-            call.start_sidecar("train.yaml", overrides),
-            call.trainer_type(config),
-            call.trainer_type().train(),
-        ])
-        start_sidecar.return_value.wait.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,7 +38,6 @@ from hyper_parallel.distributed.encoder_parallel.attention import (
 from hyper_parallel.models._transformers.model_builder import validate_model_init_dtype
 from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41VisionBridge
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower, _vision_attention
-from tests.common.mark_utils import arg_mark
 
 
 def _vision_model() -> nn.Module:
@@ -71,8 +70,6 @@ class TestVisionRecompute(unittest.TestCase):
         DefaultDeviceType.set_device_type("cpu")
         self.addCleanup(DefaultDeviceType.set_device_type, previous_device_type)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_inactive_checkpoint_contexts_leave_attention_inactive(self) -> None:
         """Feature: Vision checkpointing without encoder parallelism.
 
@@ -83,8 +80,6 @@ class TestVisionRecompute(unittest.TestCase):
             with context:
                 self.assertIsNone(current_encoder_attention_context())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_replay_restores_original_batch_and_keeps_audits_independent(self) -> None:
         """Feature: Encoder attention checkpoint metadata ownership.
 
@@ -114,8 +109,6 @@ class TestVisionRecompute(unittest.TestCase):
         self.assertEqual(later.seen, {})
         self.assertIsNone(current_encoder_attention_context())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_full_checkpointing_preserves_vision_output_and_all_gradients(self) -> None:
         """Feature: Model-owned full vision activation checkpointing.
 
@@ -148,8 +141,6 @@ class TestVisionRecompute(unittest.TestCase):
             self.assertIsNotNone(parameter.grad)
             torch.testing.assert_close(parameter.grad, target.grad)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_encoder_rejects_nested_checkpoint_even_with_supported_block(self) -> None:
         """Feature: Encoder checkpoint collective safety validation.
 
@@ -173,8 +164,6 @@ class TestVisionRecompute(unittest.TestCase):
 class TestVisionAttention(unittest.TestCase):
     """Check padding and the NPU host-side dispatch contract on CPU tensors."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_padding_prefix_matches_dense_attention_and_gradients(self) -> None:
         """Feature: Encoder vision attention padding isolation.
 
@@ -197,8 +186,6 @@ class TestVisionAttention(unittest.TestCase):
         for tensor in tensors[1:]:
             torch.testing.assert_close(tensor.grad[3:], torch.zeros_like(tensor.grad[3:]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_npu_dispatch_uses_canonical_layout_and_bidirectional_options(self) -> None:
         """Feature: NPU vision attention layout and argument translation.
 
@@ -237,8 +224,6 @@ class TestVisionAttention(unittest.TestCase):
 class TestFusedModulePrecision(unittest.TestCase):
     """Validate model dtype checks against the modules' real FP32 declarations."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_bf16_conversion_preserves_declared_fp32_parameters(self) -> None:
         """Feature: BF16 model validation with fused-module FP32 parameters.
 

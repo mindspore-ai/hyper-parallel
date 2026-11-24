@@ -1,22 +1,22 @@
-# Autoresearch experiment log
+# Autoresearch 实验日志
 
-Append one entry per experiment. Never rewrite previous entries. Read the log at the
-start of each iteration to avoid repeating failed approaches.
+逐实验流水账，只追加，永不改写旧条目。每轮开始重读，避免重复已失败
+的路线。
 
-## Entry format
+## 条目格式
 
 ```markdown
-## <Short title> — <status> (<commit>)
+## <短标题> — <status>（<commit>）
 
-- **Hypothesis:** What was tried and why it was expected to help.
-- **Change:** What was modified; summarize rather than pasting the full diff.
-- **Engagement and gate:** Executed path, evidence location, and gate result. On failure, record the first failing stage and assertion.
-- **Result:** Primary metric, measurement convention, and breakdown, or reason for noncompletion.
-- **Analysis:** Why it helped, had no effect, or failed.
-- **Lesson:** What to retain or avoid in future iterations.
-- **Retry conditions:** Configuration changes that justify retrying, and how to reapply the candidate to the current best version.
+- **想法**：试了什么、为什么预期有效。
+- **改动**：实际改了哪里（概述，不贴全量 diff）。
+- **命中与门禁**：实际执行的路径、证据位置、门禁结果。失败时记首个失败阶段与断言。
+- **结果**：主指标、采样口径和分项，或未完成原因。
+- **分析**：为什么有效 / 无效 / 坏掉。
+- **教训**：往后要沿用或避开什么。
+- **复测条件**：哪些配置域变化后值得重试，如何在当前最佳版本重放改动。
 ```
 
 ---
 
-(Empty. Seeded by the experiment owner or populated by the Agent.)
+（空——由实验者播种，或由代理补充）

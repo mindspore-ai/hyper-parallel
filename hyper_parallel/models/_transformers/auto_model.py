@@ -38,6 +38,9 @@ from hyper_parallel.models._transformers.model_builder import (
     instantiate_infrastructure,
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
+from hyper_parallel.models.module_build import (
+    attach_build_context, build_module_context, construct_family_model, resolve_effective_model_spec,
+)
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models.build_options import (  # pylint: disable=syntax-error
     CompileConfig,
@@ -131,7 +134,8 @@ def _load_pretrained_config(
         kwargs: dict[str, Any],
 ) -> PretrainedConfig:
     """Load the HF configuration with call-time overrides."""
-    config_kwargs = dict(kwargs)
+    config_kwargs = {name: value for name, value in kwargs.items()
+                     if name not in {"model_factory", "model_spec"}}
     config_kwargs.update(config_overrides or {})
     return get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
 
@@ -168,6 +172,16 @@ def _prepare_pretrained_build(
     is_hf_model = get_is_hf_model(hf_config, force_hf)
 
     return sharding_planner, fsdp2_manager, hf_config, is_hf_model
+
+
+def _resolve_module_construction(kwargs, hf_config, distributed_setup, dtype):
+    """Consume model construction arguments and create one shared build context."""
+    factory = kwargs.pop("model_factory", None)
+    spec = resolve_effective_model_spec(hf_config, kwargs.pop("model_spec", None))
+    context = build_module_context(
+        distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec,
+    )
+    return factory, context
 
 
 class _BaseHyperAutoModelClass:
@@ -405,6 +419,9 @@ class _BaseHyperAutoModelClass:
             world_size > 1 or not is_hf_model or defer_hf_load
         ) and not quantized_init
 
+        model_factory, module_context = _resolve_module_construction(
+            kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,
+        )
         init_ctx = _model_init_context(is_meta_device)
 
         # Step 2: Config-first construction defers pretrained I/O until after sharding.
@@ -416,16 +433,18 @@ class _BaseHyperAutoModelClass:
             load_base_model=init_pretrained_path is not None,
         )
         with init_ctx:
-            _, model = _init_model(
-                cls,
-                init_pretrained_path,
-                hf_config,
-                attn_implementation,
-                torch_dtype,
-                is_hf_model,
-                *model_args,
-                **init_kwargs,
-            )
+            if model_factory is not None:
+                if model_args:
+                    raise ValueError("model_factory uses config and context, not additional positional model arguments")
+                if quantized_init:
+                    raise ValueError("model_factory requires config-first floating-point initialization")
+                model = construct_family_model(model_factory, hf_config, context=module_context)
+            else:
+                _, model = _init_model(
+                    cls, init_pretrained_path, hf_config, attn_implementation,
+                    torch_dtype, is_hf_model, *model_args, **init_kwargs,
+                )
+                attach_build_context(model, module_context)
 
         # Step 3-12: Apply infrastructure
         model = apply_model_infrastructure(

@@ -30,7 +30,6 @@ import sys
 import types
 import unittest.mock
 
-
 import pytest
 from torch import nn
 
@@ -38,42 +37,31 @@ from hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement impor
     _validate_batched_experts_contract,
     replace_qwen3_moe_grouped_experts,
 )
-from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_batched_layout_is_accepted(batched_experts):
     """The batched gate_up_proj/down_proj layout passes validation."""
     _validate_batched_experts_contract(batched_experts, "model.layers.0.mlp.experts")
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_legacy_module_list_layout_is_rejected(legacy_experts):
     """The legacy 4.57 ModuleList layout fails with a clear error."""
     with pytest.raises(TypeError, match="legacy Transformers expert layout"):
         _validate_batched_experts_contract(legacy_experts, "model.layers.0.mlp")
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_bare_module_list_target_is_rejected():
     """A bare ModuleList target (legacy ``*.mlp.experts``) is rejected."""
     with pytest.raises(TypeError, match="legacy Transformers expert layout"):
         _validate_batched_experts_contract(nn.ModuleList(), "model.layers.0.mlp.experts")
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_missing_batched_parameters_are_named():
     """A module without the batched parameters names what is missing."""
     with pytest.raises(TypeError, match="gate_up_proj"):
         _validate_batched_experts_contract(nn.Module(), "model.layers.0.mlp.experts")
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_factory_rejects_legacy_before_npu_import(legacy_experts):
     """The factory rejects the legacy layout on CPU-only checkouts.
 
@@ -87,8 +75,6 @@ def test_factory_rejects_legacy_before_npu_import(legacy_experts):
         )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_factory_delegates_batched_layout_to_grouped_experts(batched_experts):
     """The accepted batched layout is handed to ``modules.GroupedExperts``."""
     fake_modules = types.ModuleType("hyper_parallel.components.modules")

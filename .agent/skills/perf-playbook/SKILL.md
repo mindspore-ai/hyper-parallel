@@ -43,7 +43,9 @@ down, and this playbook maps those findings to techniques and records the summar
 | Operator-level climb: localize, time it under several clocks, decide whether a fused path is really unlocked | [references/fusion-methodology.md](references/fusion-methodology.md) |
 | Optimizer-phase overhead: Newton–Schulz FLOPs, accounting the executed work that MFU does not count, what to do about it | [references/optimizer-overhead.md](references/optimizer-overhead.md) |
 | Performance-driven training RSI, architecture FLOPs audits, scoped workload tuning, and tiered gates | [references/training-rsi.md](references/training-rsi.md) |
+| Framework/module/overlap optimization first; model-dependent escalation to CUBE, HBM, and interconnect efficiency analysis | [references/hierarchical-performance-diagnosis.md](references/hierarchical-performance-diagnosis.md) |
 | Runtime failures, material performance defects, layout initialization, and original-workload regression | [references/failure-repair.md](references/failure-repair.md) |
+| Acceptance retrospective, evidence qualification, negative results, and integration into executable checks | [references/acceptance-learning.md](references/acceptance-learning.md) |
 
 ## Scripts
 

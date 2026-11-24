@@ -27,7 +27,6 @@ from hyper_parallel.distributed.encoder_parallel.attention import (
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderSegment, EncoderWorkItem
 from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41EncoderParallelAttention
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionAttention
-from tests.common.mark_utils import arg_mark
 
 
 class _OneRankMesh:
@@ -40,8 +39,6 @@ class _OneRankMesh:
 class TestEncoderAttention(unittest.TestCase):
     """Compare fallback and active attention with a one-rank Ulysses oracle."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fallback_preserves_forward_and_gradient(self):
         """Feature: inactive DeepSeek vision attention replacement.
 
@@ -68,8 +65,6 @@ class TestEncoderAttention(unittest.TestCase):
            side_effect=lambda tensor, **kwargs: tensor)
     @patch("hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.ulysses_head_to_seq",
            side_effect=lambda tensor, **kwargs: tensor)
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_segments_do_not_cross_attend(self, unused_head_to_seq, unused_seq_to_head):
         """Feature: segmented Encoder-CP attention.
 
@@ -98,8 +93,6 @@ class TestEncoderAttention(unittest.TestCase):
         self.assertIsNone(current_encoder_attention_context())
         self.assertTrue(torch.allclose(expected, actual, atol=1e-6))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_audit_rejects_duplicate_call(self):
         """Feature: exact visual attention execution audit.
 

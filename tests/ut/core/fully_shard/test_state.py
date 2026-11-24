@@ -35,7 +35,6 @@ from hyper_parallel.core.fully_shard import hsdp_state as state_mod
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.param_group import AllReduceParamGroup
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2, _to_dtype_if_needed
-from tests.common.mark_utils import arg_mark
 
 
 class _FakeGroup:
@@ -348,8 +347,6 @@ class TestHSDPStateV2(unittest.TestCase):
         self.assertFalse(state.requires_all_reduce)
         self.assertFalse(state.param_group.requires_all_reduce)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_init_mp_dtypes_initializes_each_param_independently(self) -> None:
         """Feature: Shared precision policy initialization.
         Description: Initialize two parameters independently from their state's policy.

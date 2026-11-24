@@ -31,8 +31,6 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # pylint: disable=wrong-import-position
 
-from tests.common.mark_utils import arg_mark  # pylint: disable=wrong-import-position
-
 from hyper_parallel.distributed.expert_parallel import (  # pylint: disable=wrong-import-position
     recipes as recipes_module,
 )
@@ -80,8 +78,6 @@ class _StubRouter:
 class TestBalancedExpertIndices(unittest.TestCase):
     """The round-robin assignment itself."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_spreads_slots_evenly_over_destination_ranks(self) -> None:
         """Every destination rank gets the same slot count; experts differ by <=1."""
         tokens, per_token, total, local = 10, 2, 8, 2
@@ -101,16 +97,12 @@ class TestBalancedExpertIndices(unittest.TestCase):
         self.assertLessEqual(int(per_expert.max() - per_expert.min()), 1,
                              f"expert load spread too wide: {per_expert.tolist()}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_indivisible_expert_layout(self) -> None:
         """A global expert count that does not split evenly fails fast."""
         with self.assertRaises(ValueError):
             routing_module._balanced_expert_indices(  # pylint: disable=protected-access
                 4, 1, 6, 4, device=torch.device("cpu"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_a_non_positive_local_count(self) -> None:
         """A rank that owns no expert cannot take slots; fail instead of dividing by 0."""
         with self.assertRaises(ValueError):
@@ -121,8 +113,6 @@ class TestBalancedExpertIndices(unittest.TestCase):
 class TestMakeBalancedRouter(unittest.TestCase):
     """The wrapper is generic: it balances whatever real router it is given."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_wraps_any_real_router_and_keeps_its_weights(self) -> None:
         """The real router still runs; only the destinations are replaced.
 
@@ -147,8 +137,6 @@ class TestMakeBalancedRouter(unittest.TestCase):
         self.assertEqual(len(set(per_destination.tolist())), 1,
                          f"destination load is not uniform: {per_destination.tolist()}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_names_the_wrapper_after_the_real_router(self) -> None:
         """The variant is identifiable in a log line."""
         balanced = routing_module.make_balanced_router(_StubRouter(2, 1))
@@ -158,8 +146,6 @@ class TestMakeBalancedRouter(unittest.TestCase):
 class TestResolveMoeRouter(unittest.TestCase):
     """The single place the ``fix_router`` flag becomes a router."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_name_resolves_plain_and_fixed(self) -> None:
         """A registry name maps to itself, or to its ``_fixed`` variant."""
         self.assertIs(routing_module.resolve_moe_router("mixtral"),
@@ -167,8 +153,6 @@ class TestResolveMoeRouter(unittest.TestCase):
         self.assertIs(routing_module.resolve_moe_router("mixtral", fix_router=True),
                       routing_module.MOE_ROUTER_ADAPTERS["mixtral_fixed"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_every_registered_adapter_has_a_fixed_variant(self) -> None:
         """``<name>_fixed`` exists for every alias, and there is no double suffix."""
         for name in routing_module.MOE_ROUTER_ADAPTERS:
@@ -179,8 +163,6 @@ class TestResolveMoeRouter(unittest.TestCase):
         self.assertFalse(any(name.endswith("_fixed_fixed")
                              for name in routing_module.MOE_ROUTER_ADAPTERS))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_deepseekv3_fixed_is_the_archived_router(self) -> None:
         """The benchmark router the recorded 2-SN numbers used is unchanged."""
         self.assertIs(routing_module.MOE_ROUTER_ADAPTERS["deepseekv3_fixed"],
@@ -188,8 +170,6 @@ class TestResolveMoeRouter(unittest.TestCase):
         self.assertIs(routing_module.MOE_ROUTER_ADAPTERS["deepseek_v3_fixed"],
                       routing_module._balanced_router)  # pylint: disable=protected-access
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_callable_is_wrapped_only_when_asked(self) -> None:
         """A family that carries its own adapter still gets the switch for free."""
         real = _StubRouter(2, 1)
@@ -198,8 +178,6 @@ class TestResolveMoeRouter(unittest.TestCase):
         self.assertIsNot(wrapped, real)
         self.assertEqual(wrapped.__name__, "balanced__StubRouter")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_unknown_name_and_bad_type_raise(self) -> None:
         """A typo must not silently keep the real router."""
         with self.assertRaises(KeyError):
@@ -267,8 +245,6 @@ class TestBuildEpComputeSwitch(unittest.TestCase):
             recipes_module.ep_routed_forward = original_forward
         return captured
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fix_router_selects_the_fixed_adapter(self) -> None:
         """Off keeps the real router; on swaps in the registered variant."""
         off = self._build(fix_router=False)
@@ -276,8 +252,6 @@ class TestBuildEpComputeSwitch(unittest.TestCase):
         on = self._build(fix_router=True)
         self.assertIs(on["router_fn"], routing_module.MOE_ROUTER_ADAPTERS["mixtral_fixed"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_callable_router_is_balanced_by_the_skeleton(self) -> None:
         """A family passing its own adapter gets the balanced variant too."""
         captured = {}

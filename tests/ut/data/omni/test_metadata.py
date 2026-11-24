@@ -19,13 +19,11 @@ import unittest
 import torch
 
 from hyper_parallel.data.omni.metadata import vlm_sample_metadata
-from tests.common.mark_utils import arg_mark
 
 
 class TestVlmSampleMetadata(unittest.TestCase):
     """Validate model-neutral image-text workload extraction."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_uses_raw_image_grid_and_keeps_sample_unchanged(self) -> None:
         """Feature: Omni workload metadata.
         Description: Extract image grids and token lengths from a raw sample.
@@ -46,7 +44,6 @@ class TestVlmSampleMetadata(unittest.TestCase):
         for key, value in original.items():
             torch.testing.assert_close(sample[key], value)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rejects_batched_or_mismatched_modality_fields(self) -> None:
         """Feature: Omni metadata validation.
         Description: Provide batched tokens or mismatched image patches.

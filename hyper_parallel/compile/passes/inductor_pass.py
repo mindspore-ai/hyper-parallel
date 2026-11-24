@@ -174,9 +174,16 @@ def _node_is_side_effectful(node: fx.Node) -> bool:
     """Whether the node targets a function registered as side-effectful.
 
     ``FSDPPass`` registers the reshard storage-free op there so DCE keeps it;
-    compiling such a node would let Inductor drop or defer the free.
+    compiling such a node would let Inductor drop or defer the free. The
+    ``ao::`` offload/reload/wait ops are also kept eager: they own a transfer
+    stream and an event registry outside the compiled region, and rewriting
+    them as fused kernels would break the host/device synchronization.
     """
-    return node.op == "call_function" and node.target in _side_effectful_functions
+    if node.op != "call_function":
+        return False
+    if node.target in _side_effectful_functions:
+        return True
+    return str(node.target).startswith("ao.")
 
 
 def _flatten_nested_outputs(

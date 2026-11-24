@@ -26,7 +26,6 @@ import torch
 from hyper_parallel.trainer.callbacks.profiler_callback import ProfilerCallback
 from hyper_parallel.trainer.config.training import ProfilingAnalysisConfig, ProfilingConfig
 from hyper_parallel.trainer.state import TrainerState
-from tests.common.mark_utils import arg_mark
 
 
 class TestProfilerCallback(unittest.TestCase):
@@ -73,7 +72,6 @@ class TestProfilerCallback(unittest.TestCase):
         """Stop patches created by helper methods."""
         patch.stopall()
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_analysis_options_are_forwarded_only_to_npu(self) -> None:
         """Route automatic analysis controls only to the Ascend trace handler.
 
@@ -97,7 +95,6 @@ class TestProfilerCallback(unittest.TestCase):
                     options = {"analyse_flag": enabled, "async_mode": asynchronous} if device == "npu" else {}
                     backend.tensorboard_trace_handler.assert_called_once_with(str(callback.output_path), **options)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_analysis_rejects_non_boolean_options(self) -> None:
         """Reject ambiguous analysis settings before resolving a backend.
 
@@ -115,7 +112,6 @@ class TestProfilerCallback(unittest.TestCase):
                             ProfilerCallback(self._trainer(config))
                         backend.assert_not_called()
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_disabled_profile_does_not_initialize_backend(self) -> None:
         """Keep a disabled profile from initializing a backend.
 
@@ -131,7 +127,6 @@ class TestProfilerCallback(unittest.TestCase):
         self.assertIsNone(callback.profiler)
         get_device_type_mock.assert_not_called()
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_cpu_schedule_and_lifecycle_match_mindformers(self) -> None:
         """Capture the inclusive CPU profiling window.
 
@@ -173,7 +168,6 @@ class TestProfilerCallback(unittest.TestCase):
         fake_profiler.stop.assert_called_once_with()
         self.assertIsNone(callback.profiler)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_collection_starts_at_first_step(self) -> None:
         """Start collection at the first training step.
 
@@ -203,7 +197,6 @@ class TestProfilerCallback(unittest.TestCase):
         fake_profiler.step.assert_called_once_with()
         fake_profiler.add_metadata_json.assert_called_once()
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_only_explicit_ranks_are_selected(self) -> None:
         """Collect profiles only on explicitly selected ranks.
 
@@ -227,7 +220,6 @@ class TestProfilerCallback(unittest.TestCase):
             self.assertIsNone(callback.profiler)
         backend_profile_mock.assert_called_once()
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_empty_rank_list_profiles_all_ranks(self) -> None:
         """Treat an empty rank list as selecting every rank.
 
@@ -245,7 +237,6 @@ class TestProfilerCallback(unittest.TestCase):
         self.assertIs(callback.profiler, fake_profiler)
         profile_mock.assert_called_once()
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_rank_ids_must_be_within_world_size(self) -> None:
         """Reject profile ranks outside the distributed world.
 
@@ -258,7 +249,6 @@ class TestProfilerCallback(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"\[0, 8\)"):
             ProfilerCallback(self._trainer(config, world_size=8))
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_cuda_backend_collects_cpu_and_cuda_activities(self) -> None:
         """Collect CPU and CUDA activities for a CUDA backend.
 
@@ -278,7 +268,6 @@ class TestProfilerCallback(unittest.TestCase):
             [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         )
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_invalid_steps_reset_to_mindformers_defaults(self) -> None:
         """Reset an inverted collection window to default steps.
 
@@ -295,7 +284,6 @@ class TestProfilerCallback(unittest.TestCase):
         self.assertEqual((callback.start_step, callback.stop_step), (1, 10))
         schedule_mock.assert_called_once_with(wait=0, warmup=0, active=10, repeat=1, skip_first=1)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_npu_options_and_metadata_are_forwarded(self) -> None:
         """Forward Ascend options and topology metadata.
 
@@ -361,7 +349,6 @@ class TestProfilerCallback(unittest.TestCase):
             },
         )
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_close_flushes_partial_window_once(self) -> None:
         """Flush a partial collection window when training ends early.
 
@@ -381,7 +368,6 @@ class TestProfilerCallback(unittest.TestCase):
         self.assertIsNone(callback.profiler)
 
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_real_cpu_trace_contains_only_selected_steps(self) -> None:
         """Check inclusive schedule boundaries in an exported CPU trace.
 
@@ -416,7 +402,6 @@ class TestProfilerCallback(unittest.TestCase):
                               if event["name"].startswith("training-step-")}
                     self.assertEqual(labels, {f"training-step-{step}" for step in range(start_step, 5)})
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_invalid_warmup_fails_before_backend_access(self) -> None:
         """Reject invalid warmup types and steps outside the preceding window.
 
@@ -438,7 +423,6 @@ class TestProfilerCallback(unittest.TestCase):
 class TestProfilingConfig(unittest.TestCase):
     """Verify the breaking public profiler configuration surface."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_defaults_use_nested_profiler_names(self) -> None:
         """Expose concise defaults inside the profiler section.
 

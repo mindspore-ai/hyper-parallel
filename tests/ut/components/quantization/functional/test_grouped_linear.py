@@ -41,15 +41,6 @@ from hyper_parallel.components.quantization.functional.strategy_factory import (
 from hyper_parallel.components.quantization.functional.w4a8_gmm_func import (
     W4A8GroupedLinear,
 )
-from tests.common.mark_utils import arg_mark
-
-
-cpu_test = arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 
 
 class _DenseStorage:
@@ -221,7 +212,6 @@ class TestStrategyFactory(unittest.TestCase):
             mock.patch(f"{module}.validate_hifloat8_gmm_runtime"),
         )
 
-    @cpu_test
     def test_dispatches_w8a8_w4a8_fake_w4a8_and_hifloat8(self):
         """Supported native/fake policies choose their independent strategies."""
         aligned32 = ((2, 64, 32), (2, 32, 64))
@@ -267,7 +257,6 @@ class TestStrategyFactory(unittest.TestCase):
         fake_probe.assert_called_once_with(32)
         hif8_probe.assert_called_once_with()
 
-    @cpu_test
     def test_alignment_and_unsupported_policies_fail_at_factory(self):
         """Bad tiles and unimplemented family combinations fail before replacement."""
         module = "hyper_parallel.components.quantization.functional.strategy_factory"
@@ -298,7 +287,6 @@ class TestStrategyFactory(unittest.TestCase):
 class TestGroupedLinearLifecycle(unittest.TestCase):
     """The shared autograd bridge preserves dense forward/dgrad/wgrad semantics."""
 
-    @cpu_test
     def test_weight_direction_policy_builds_and_retains_required_views(self):
         """One forward direction determines construction and dgrad retention."""
         cases = (
@@ -327,7 +315,6 @@ class TestGroupedLinearLifecycle(unittest.TestCase):
                 f"expected {(built, retained)}, got {actual}",
             )
 
-    @cpu_test
     def test_forward_and_both_gradients_match_dense_reference(self):
         """Live [E,O,K] weights are transposed only at the GMM seam."""
         torch.manual_seed(7)
@@ -350,7 +337,6 @@ class TestGroupedLinearLifecycle(unittest.TestCase):
         torch.testing.assert_close(actual_grads[0], expected_grads[0])
         torch.testing.assert_close(actual_grads[1], expected_grads[1])
 
-    @cpu_test
     def test_empty_input_has_shaped_output_and_zero_gradients(self):
         """Experts receiving zero total tokens remain valid in forward/backward."""
         inputs = torch.empty(0, 4, requires_grad=True)
@@ -366,7 +352,6 @@ class TestGroupedLinearLifecycle(unittest.TestCase):
         torch.testing.assert_close(inputs.grad, torch.zeros_like(inputs))
         torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
 
-    @cpu_test
     def test_shared_shape_and_group_validation(self):
         """Malformed geometry is rejected consistently for every strategy."""
         inputs = torch.randn(3, 4)

@@ -25,15 +25,12 @@ from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.multicore import MegaGate, MegaMhc, MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_gate import module as gate_module
 from hyper_parallel.core.multicore.modules.mega_moe import module as moe_module
-from tests.common.mark_utils import arg_mark
 from tests.common.multicore.mega_mhc_golden import torch_mega_mhc
 
 
 class TestFrontendMigration(unittest.TestCase):
     """Check original Parameter ownership and mathematical configuration at replacement boundaries."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ep_size_follows_explicit_subgroup_and_rejects_implicit_world(self) -> None:
         """Feature: MegaKernel frontend migration.
         Description: Ep size follows explicit subgroup and rejects implicit world.
@@ -53,8 +50,6 @@ class TestFrontendMigration(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ep_group explicitly"):
                 MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_moe_migration_converts_each_expert_without_aliasing_source(self) -> None:
         """Feature: MegaKernel frontend migration.
         Description: Convert each expert to EIO and EOI without aliasing noncontiguous source weights.
@@ -87,8 +82,6 @@ class TestFrontendMigration(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "materialize and initialize"):
             MegaMoeExperts.from_module(source.to("meta"), top_k=2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_gate_migration_and_gradient_parity(self) -> None:
         """Feature: MegaKernel frontend migration.
         Description: Gate migration and gradient parity.
@@ -130,8 +123,6 @@ class TestFrontendMigration(unittest.TestCase):
                     if source_vision:
                         self.assertIs(migrated.bias_vl, original.bias_vl)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dtype_conversion_preserves_control_values_and_existing_gradients(self) -> None:
         """Feature: MegaKernel frontend migration.
         Description: Dtype conversion preserves control values and existing gradients.
@@ -157,8 +148,6 @@ class TestFrontendMigration(unittest.TestCase):
             torch.testing.assert_close(parameter, value, rtol=0, atol=0)
             torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mhc_migration_keeps_parameters_and_gradients(self) -> None:
         """Feature: MegaKernel frontend migration.
         Description: Compare migrated and source modules with the same five input tensors.
@@ -190,8 +179,6 @@ class TestFrontendMigration(unittest.TestCase):
         for got, want in zip((*migrated, *actual), (*original, *expected)):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_gate_dispatch_preserves_scoring_device_and_empty_input_rules(self) -> None:
         """Feature: MegaGate implementation selection.
         Description: Exercise forward selection without loading native plans or running NPU operations.

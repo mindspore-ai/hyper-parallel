@@ -19,7 +19,6 @@ import unittest
 
 from hyper_parallel.trainer.runtime.flops import estimate_flops_per_token
 from hyper_parallel.trainer.runtime.flops import estimate_step_flops
-from tests.common.mark_utils import arg_mark
 
 
 def qwen3_moe_config(**overrides: object) -> SimpleNamespace:
@@ -54,12 +53,6 @@ def qwen3_moe_config(**overrides: object) -> SimpleNamespace:
 class TestEstimateFlopsPerToken(unittest.TestCase):
     """Verify the estimator counts activations, not parameters or experts."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_qwen3_moe_matches_closed_form(self) -> None:
         """Add attention, top-1 MoE and logits terms into one per-token total.
 
@@ -74,12 +67,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
             f"expected 2*1296 attention + 2*576 moe + 1536 logits, got={flops}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_causal_attention_scales_with_sequence_length(self) -> None:
         """Charge only the causal-attention term for longer sequences.
 
@@ -94,12 +81,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
             f"expected the 5280 baseline plus 480 attention FLOPs, got={flops}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_topk_routing_sizes_the_moe_term(self) -> None:
         """Scale the MoE term by activated experts instead of total experts.
 
@@ -114,12 +95,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
             f"expected 2592 attention + 2304 top-2 moe + 1536 logits, got={flops}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_ffn_projection_count_is_activation_independent(self) -> None:
         """Keep the three gated-FFN GEMMs regardless of ``hidden_act``.
 
@@ -138,12 +113,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
                 f"got={flops} for hidden_act={hidden_act!r}",
             )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_mlp_only_layers_use_the_dense_term(self) -> None:
         """Route ``mlp_only_layers`` entries through the dense MLP term.
 
@@ -158,12 +127,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
             f"expected 2592 attention + 2304 dense + 576 moe + 1536 logits, got={flops}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_decoder_sparse_step_selects_every_nth_layer(self) -> None:
         """Apply ``decoder_sparse_step`` to decide which layers are MoE.
 
@@ -180,12 +143,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
             f"expected 4*1296 attention + 2*2304 dense + 2*576 moe + 1536 logits, got={flops}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_zero_experts_falls_back_to_the_dense_term(self) -> None:
         """Treat a zero-expert configuration as a dense decoder.
 
@@ -200,12 +157,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
             f"expected 2592 attention + 2*2304 dense + 1536 logits, got={flops}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_unsupported_model_type_returns_none(self) -> None:
         """Return ``None`` instead of guessing for an unsupported model family.
 
@@ -223,12 +174,6 @@ class TestEstimateFlopsPerToken(unittest.TestCase):
 class TestEstimateStepFlops(unittest.TestCase):
     """Verify step FLOPs accumulate the real attention boundaries."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_equal_lengths_match_the_per_token_estimate(self) -> None:
         """Reproduce the per-token estimate when every sequence is equal.
 
@@ -248,12 +193,6 @@ class TestEstimateStepFlops(unittest.TestCase):
             "equal-length steps must agree with the per-token estimator",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_variable_lengths_beat_the_mean_length_approximation(self) -> None:
         """Accumulate ``sum(S ** 2)`` instead of one averaged sequence length.
 
@@ -277,12 +216,6 @@ class TestEstimateStepFlops(unittest.TestCase):
             f"got={mean_length_approximation} against {flops}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_unsupported_model_type_returns_none(self) -> None:
         """Return ``None`` instead of guessing for an unsupported model family.
 

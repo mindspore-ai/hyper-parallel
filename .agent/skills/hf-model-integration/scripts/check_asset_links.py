@@ -25,7 +25,7 @@ The first announces itself the moment someone runs the command. The second
 is silent: nothing fails, capability is simply unreachable. Both are checked
 here, because a review that only resolves references sees half the problem.
 
-    python check_asset_links.py --skill-dir .agent/skills/<name>             [--also examples/training_demo/<kit>]
+    python check_asset_links.py --skill-dir .agent/skills/<name>             [--also .agent/examples/<kit>]
 
 Exit 0 when every reference resolves and every asset is referenced; 2
 otherwise, naming each violation.
@@ -91,8 +91,8 @@ def dangling_references(prose: list[Path], roots: list[Path]) -> list[str]:
             parts = Path(match).parts
             if not any(part in owned for part in parts[:-1]):
                 continue
-            if any((root / Path(match).name).exists()
-                   or any(root.rglob(Path(match).name)) for root in roots):
+            if (document.parent / match).is_file() or any(
+                    (root / Path(match).name).exists() or any(root.rglob(Path(match).name)) for root in roots):
                 continue
             problems.append(f"{document.name} references missing {match}")
     return sorted(set(problems))

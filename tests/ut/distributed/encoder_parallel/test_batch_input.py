@@ -22,7 +22,6 @@ import torch
 
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
 from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
-from tests.common.mark_utils import arg_mark
 
 
 class _RecordedRuntime:
@@ -74,8 +73,6 @@ class TestEncoderParallelInputAdapter(unittest.TestCase):
             parallel_sizes={"tp": 1, "cp": 1}, options={},
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_composes_model_inputs_and_one_plan_in_order(self):
         """An image batch and text-only batch each get exactly one ordered plan."""
         events = []
@@ -89,8 +86,6 @@ class TestEncoderParallelInputAdapter(unittest.TestCase):
                                       "encoder_parallel_plan": (expected, "layout")})
         self.assertEqual(events, ["preflight", "inner", "finalize"] * 2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_collision_stops_before_collective_planning(self):
         """A model provider cannot overwrite the batch or visual plan field."""
         events = []
@@ -108,8 +103,6 @@ class TestEncoderParallelInputAdapter(unittest.TestCase):
             )
         self.assertEqual(events, [])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_standalone_provider_rejects_existing_plan(self):
         """A caller-provided plan is rejected before finalization."""
         events = []

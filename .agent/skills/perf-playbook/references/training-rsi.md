@@ -20,6 +20,11 @@ with declared screening and acceptance gates.
   bottlenecks and consider equivalent module replacements, operator fusion,
   communication scheduling, and parallel layout changes. A threshold such as
   10% is a task-specific trigger for this investigation.
+- Prioritize framework execution, pipeline scheduling, compatible high-performance
+  module/kernel reuse, and computation-communication overlap. Escalate to hardware
+  counters and custom kernel tuning when current-workload evidence shows a plateau
+  in those opportunities, not when MFU crosses a universal threshold. Follow
+  [hierarchical performance diagnosis](hierarchical-performance-diagnosis.md).
 - Preserve model depth, width, expert count, logical Top-K, required token
   work, and training semantics. Tune execution settings such as parallel layout,
   activation lifetime, prefetch, and optimizer implementation within that scope.
@@ -61,6 +66,14 @@ performance window with matched instrumentation across candidates and
 baselines. Prefer lightweight markers that verify the intended path was
 engaged. Measure validation overhead separately when it matters.
 
+If input fingerprinting dominates validation, measure its transfer and
+serialization separately. For pure data parallelism the Trainer's
+[InputIdentityRecorder](../../../../hyper_parallel/tools/model_integration/tensor_probes.py)
+hashes field values on their owning ranks and exchanges the component digests.
+Context-sharded fields retain their logical tensor reconstruction. Validate the
+expected rank and microbatch coverage and compare the complete fingerprints
+and numerical trajectory when introducing a recorder optimization.
+
 Freeze the effective native execution mode as well as the requested configuration:
 extension and operator-package digests, reduction determinism, and plan-selection
 overrides can change the arithmetic path without changing the model commit. If
@@ -75,10 +88,9 @@ Choose the gate before running a candidate:
 | Fused or different-precision kernels | Local parity and a full-model check against predeclared tolerances |
 | Training policy such as optimizer, routing, or data semantics | A separately approved training-quality protocol with matched evaluation inputs and budget |
 
-Use fixed expert routing for an authorized performance workload when route learning
-or load balancing is outside the task. Declare the routing mode and preserve it
-within each comparison series. Use native routing to validate native-routing
-training quality.
+Treat fixed expert routing as a performance diagnostic. Use native routing
+for training-quality acceptance. A benchmark with a changed routing, data, or
+instrumentation policy has its own comparison series.
 
 ## Structured training receipts
 
@@ -132,9 +144,16 @@ continue using the existing marker protocol.
 
 ## Carry evidence across iterations
 
+Treat [acceptance learning](acceptance-learning.md) as a required deliverable of
+every RSI task, without waiting for another user request. Use the
+[automatic consolidation workflow](../../autoresearch/references/experience-consolidation.md):
+default to acceptance-time consolidation, or use continuous consolidation when
+the user selects it. Reconcile all results,
+not only retained improvements. Distinguish procedures from implemented Harness
+checks, and do not promote unverified suggestions into measured guidance.
+
 - Record which path ran, the first failing phase or step, the assertion or
-  error, and the gate and performance windows. Retain evidence for recurring
-  slow steps, resource contention, and skipped or cancelled trials. For an operator that passes
+  error, and the gate and performance windows. For an operator that passes
   local parity but fails while reading offloaded state, isolate the observer
   from the training path before reassessing the operator.
 - Preserve deferred candidates with their dependency scopes in the

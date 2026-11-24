@@ -21,8 +21,8 @@ Fast pass on **changed files only**. Speed over depth. Never modify code.
 
 1. `.agent/rules/code-style.md` — header, naming, types, docstrings
 2. `.agent/rules/distributed.md` — stream sync + memory (if touching collectives/FSDP/PP)
-4. Quick spot-checks:
-   - Native Torch APIs everywhere — no `platform/` references, no MindSpore dispatch
+3. Quick spot-checks:
+   - Native Torch APIs everywhere — no framework-dispatch abstraction
    - `is_partial()` called with `()`; YAML vs `parallel_*.py` if ops changed
 
 ## Output

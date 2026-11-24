@@ -17,7 +17,7 @@ to land, what's forbidden, when to stop and ask for human guidance.
 
 | The failure is | Verdict | Action |
 |---|---|---|
-| Trivial, recipe in [common-failures.md](common-failures.md) | PR-INDUCED | Patch the file the linter named; local pylint 10.00/10; `autogit commit`; `/retest`. |
+| Trivial, recipe in [common-failures.md](common-failures.md) | PR-INDUCED | Patch the file the linter named; pass repository pylint checks; `autogit commit`; `/retest`. |
 | Smoke/UT assertion, shape/dispatch/numerical, multi-file, or no canonical recipe | PR-INDUCED | **Stop before patching.** Set `terminal_state = "needs-human-guidance"`, emit the final report with the diagnose JSON, and ask the user to describe the production fix or hand over the specific production file to edit. |
 | Test contract genuinely changed by PR (rare, needs user authorization) | PR-INDUCED | Update the test in a follow-up commit per the user's confirmation. |
 | Confirmed unrelated, sticky across ≥2 builds, PR-author authorized | UNRELATED | Path C temp comment-out on the test in the PR branch, with revert-before-merge marker. See [flake-policy.md](flake-policy.md) § "Path C". |
@@ -59,7 +59,7 @@ the deadline is tight:
   or any other softening.
 - Replace a real comparison with `assert x is not None` /
   `assert True`.
-- Mock the failing op's output (e.g. patch `ms.ops.foo` to return a
+- Mock the failing op's output (e.g. patch the operator to return a
   fixed tensor inside the test).
 - Move the test to a directory that isn't picked up by the gate.
 - Hide the test under a `@arg_mark(level_mark='level…')` change that
@@ -152,8 +152,8 @@ Examples:
 - Check_Pylint W1510 → add `check=False` to the `subprocess.run`
   call at the named line.
 - Check_Pylint W0612 → remove the unused variable assignment.
-- Check_DT_Design missing fields → add `Feature:`, `Description:`,
-  `Expectation:` lines to the docstring.
+- Check_DT_Design missing fields → follow the active job's documented
+  requirements, only when that check is enabled.
 - Check_Codespell → swap the typo for the suggested word.
 - Check_Tab → convert tabs to spaces in the named line range.
 - Check_Markdownlint MDxxx → apply the recipe for that rule code.
@@ -166,8 +166,8 @@ A deep fix is one where any of these are true:
   `Smoke_CPU`, `Smoke_GPU`, `ut`, `st`, etc.).
 - The failure is an assertion / numerical / shape / dtype / dispatch
   error that requires understanding the op's semantics.
-- The fix touches multiple files (e.g. `op_def/yaml/*.yaml` plus
-  `ops/infer/ops_func_impl/*.cc` plus a Python wrapper).
+- The fix touches multiple files (e.g. operator registration YAML plus
+  `hyper_parallel/core/shard/ops/parallel_*.py` and its callers).
 - No canonical recipe exists in `common-failures.md`.
 - The diagnose log surfaces a stack trace into C++ kernels or
   generated dispatch code.
@@ -181,7 +181,7 @@ and surface this message to the user:
 stage=<Smoke_Ascend|...>, signature=<one-line excerpt>.
 
 Production cause is likely in <best-guess directory under
-mindspore/...> based on triage Q2.
+hyper_parallel/...> based on triage Q2.
 
 This is in the ops / kernel / dispatch surface and a blind patch
 risks shipping a shallow fix that masks the real bug. I'd like
@@ -222,9 +222,9 @@ needs to find the right file to edit. Use this in order:
    or modifies a kernel.
 3. **Symbol grep** — grep the failing test for ops / functions it
    exercises, then grep PR diff for those symbols.
-4. **Infer/dispatch trace** — for shape/dtype errors, follow the
-   `ops/op_def/yaml/<op>_op.yaml` → `ops/infer/ops_func_impl/<op>.cc`
-   chain; for dispatch errors, follow `ops/api_def/<op>.yaml`.
+4. **Infer/dispatch trace** — follow the registration in
+   `hyper_parallel/core/shard/ops/yaml/`, its `parallel_*.py`
+   implementation, and the affected `infer_layout` / dispatch callers.
 
 If the production cause is **not** in the PR diff (e.g. failing test
 points to a file the PR doesn't touch), revisit the 3-question
@@ -237,10 +237,10 @@ is broken downstream.
 
 Before committing any production-code fix:
 
-1. **Local pylint** the touched `.py` files with the MindSpore rcfile;
-   must hit 10.00/10.
-2. **Local build sanity** for C++ touches: `bash build.sh -e cpu -j8`
-   at minimum, ideally the same backend as the failing smoke stage.
+1. **Local pylint** the touched `.py` files with the repository's
+   `.pylintrc`; resolve reported violations.
+2. **Local build sanity** for native-code changes: follow the affected
+   component's build instructions on the backend used by the failing stage.
 3. **Local repro of the failing test** if possible:
    `pytest <test-nodeid> -v`. If the test now passes, that's the
    strongest signal the fix is real.

@@ -28,6 +28,9 @@ from typing import Any, Dict, List, Tuple
 import torch
 from torch import nn
 
+from hyper_parallel.components.modules.module_family import (
+    _family_source_shard_info, get_family_build_info, _validate_applied_layout,
+)
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed.recipe_spec import (
@@ -211,7 +214,7 @@ def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
     """Resolve dense TP and virtual-EP source meshes for one sharding plan."""
     # Lazy import: applier imports parameter_sharding (_resolve_module) at
     # module level — importing applier here at module level would cycle.
-    from hyper_parallel.distributed._builder.applier import (  # pylint: disable=C0415
+    from hyper_parallel.distributed._builder.applier import (  # pylint: disable=C0415,R0401
         _build_expert_mesh,
     )
     ep_size = next(
@@ -223,7 +226,7 @@ def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
         0,
     )
     if mesh_context is not None:
-        expert_mesh = mesh_context.fsdp_moe_mesh
+        expert_mesh = getattr(mesh_context, "fsdp_moe_mesh", None)
     elif ep_size > 0:
         expert_mesh = _build_expert_mesh(
             full_mesh,
@@ -244,7 +247,7 @@ def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
     # axes itself and records the complete source (non-FSDP) layout.
     dense_source_mesh = (
         mesh_context.fsdp_non_moe_mesh
-        if mesh_context is not None and mesh_context.fsdp_non_moe_mesh is not None
+        if mesh_context is not None and getattr(mesh_context, "fsdp_non_moe_mesh", None) is not None
         else tp_mesh
     )
     expert_source_mesh = (
@@ -260,6 +263,10 @@ def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
     for model in models:
         for module_fqn, spec in plan.modules.items():
             module = _resolve_module(model, module_fqn)
+            info = get_family_build_info(module)
+            if info is not None and info.layout is not None and info.layout.applied:
+                _validate_applied_layout(info.layout, spec, module_fqn)
+                continue
             # Runtime planner metadata is internal to the sharding pipeline.
             if spec._ep_stack:  # pylint: disable=protected-access
                 _stack_moe_experts(
@@ -317,17 +324,21 @@ def _build_runtime_source_shard_info(
     if validate_mode:
         return None
     source_shard_records = {}
+    existing = {}
     for model in models:
         source_shard_records.update(_local_params_context(model))
-    if not source_shard_records:
+        existing.update(_family_source_shard_info(model))
+    if not source_shard_records and not existing:
         return None
     if dense_source_mesh is None and expert_source_mesh is None:
-        return None
-    return build_source_shard_info(
+        return existing or None
+    result = build_source_shard_info(
         plan,
         dense_source_mesh,
         expert_source_mesh=expert_source_mesh,
     )
+    result.update(existing)
+    return result
 
 
 def _shard_module_params(module, param_specs, mesh, mesh_dim_names):

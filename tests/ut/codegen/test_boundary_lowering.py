@@ -62,7 +62,6 @@ from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.framework_spec import cp_dispatch_shell_body
 from hyper_parallel.codegen.inline.observations import collect_source_observations
-from tests.common.mark_utils import arg_mark
 
 SOURCE_TEXT = '''\
 import torch
@@ -84,8 +83,6 @@ class Beta(nn.Module):
 '''
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_inline_meta_normalization_does_not_mutate_native_observation():
     """Source normalization returns an emission copy and preserves native metadata."""
     meta = SimpleNamespace(
@@ -129,8 +126,6 @@ def test_inline_meta_normalization_does_not_mutate_native_observation():
         ),
     ),
 )
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_delegating_cp_wrapper_exposes_source_visible_helper(factory, helper):
     """Delegating wrappers retain a module-level helper for code generation."""
     target = inner_wrapper_target(factory)
@@ -139,8 +134,6 @@ def test_delegating_cp_wrapper_exposes_source_visible_helper(factory, helper):
     assert target.helper_name == helper
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_framework_inner_wrapper_resolves_without_model_adapter_path():
     """A declared framework wrapper participates in generic CP lowering."""
     target = (
@@ -156,8 +149,6 @@ def test_framework_inner_wrapper_resolves_without_model_adapter_path():
     assert spec.imports[0].names == ("sdpa_hf_cp_forward",)
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_closure_cp_wrapper_exposes_source_visible_forward():
     """Closure state published by a rewrite request lowers into its host."""
     factory = (
@@ -177,8 +168,6 @@ def test_closure_cp_wrapper_exposes_source_visible_forward():
     assert "super().forward(*args, **call_kwargs)" in target.inline_body
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_closure_cp_wrapper_materializes_imported_replacement_host(monkeypatch):
     """A closure wrapper and an imported replacement compose end to end."""
     wrapper = (
@@ -272,8 +261,6 @@ def _plan(*, alpha_first: bool) -> dict:
     )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_lowering_bytes_are_order_independent():
     """Reversing the ``param_plan`` key order must not change the emitted bytes.
 
@@ -297,8 +284,6 @@ def test_lowering_bytes_are_order_independent():
     assert text_a == text_b
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_rewritten_forwards_bind_instance_boundary_plans():
     """No per-boundary global constants are emitted; forwards use the bound plan.
 
@@ -357,8 +342,6 @@ def _single_plan(entry: dict) -> tuple[dict, dict]:
     return plan, {"blocks.alpha": "Alpha"}
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_local_region_lowering_requires_builder_recording():
     """A local-compute boundary cannot fall back to an equivalent source rewrite.
 
@@ -378,8 +361,6 @@ def test_local_region_lowering_requires_builder_recording():
         lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_runtime_only_local_compute_does_not_poison_shared_source_class():
     """A skipped local-compute injection must not affect another class instance."""
     entry = _identity_entry()
@@ -399,8 +380,6 @@ def test_runtime_only_local_compute_does_not_poison_shared_source_class():
     ) == SOURCE_TEXT
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_recorded_local_compute_rewrites_same_class_with_ep_toggle():
     """A recorded EP patch keeps the original class and forward implementation."""
     alpha_type = type("Alpha", (), {"forward": _recorded_alpha_forward})
@@ -444,8 +423,6 @@ def test_recorded_local_compute_rewrites_same_class_with_ep_toggle():
         )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_recorded_ep_toggle_prevents_second_same_class_boundary_lowering():
     """One class-level EP toggle excludes all its FQNs from later lowering."""
     alpha_type = type("Alpha", (), {"forward": _recorded_alpha_forward})
@@ -501,8 +478,6 @@ def test_recorded_ep_toggle_prevents_second_same_class_boundary_lowering():
     assert lowered == rendered
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_frozen_local_compute_rewrites_class_without_live_record():
     """Explicit frozen injections remain visible in offline-only snapshots."""
     meta = SimpleNamespace(
@@ -533,8 +508,6 @@ def test_frozen_local_compute_rewrites_class_without_live_record():
     }]
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_cp_dispatch_rewrites_same_class_without_constructor_swap():
     """CP dispatch is an in-place forward rewrite with the original signature."""
     patches = InlinePatchSet(
@@ -568,8 +541,6 @@ def test_cp_dispatch_rewrites_same_class_without_constructor_swap():
         )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_same_class_cp_and_boundary_merge_into_one_forward_impl():
     """A source-owned CP host keeps one method after boundary lowering."""
     patches = InlinePatchSet(
@@ -612,8 +583,6 @@ def test_same_class_cp_and_boundary_merge_into_one_forward_impl():
     assert "return x * 2" in rendered
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
     """The verifier accepts the same-class CP form used by generated models."""
     alpha_type = type("Alpha", (), {})
@@ -663,8 +632,6 @@ def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
     }]
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_replacement_verifier_requires_constructor_call():
     """An imported replacement symbol alone is not a materialized replacement."""
     source_type = type("SourceBlock", (), {})
@@ -698,8 +665,6 @@ def test_replacement_verifier_requires_constructor_call():
     }]
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_bound_method_local_compute_satisfies_verification():
     """A model-owned MethodType wrapper is a visible local-compute patch."""
     module_type = type("ImportedMoe", (), {})
@@ -742,8 +707,6 @@ owner.forward = MethodType(source_forward, owner)
     }]
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_imported_cp_host_is_rendered_as_same_name_class():
     """An imported replacement gets a visible same-name CP class."""
     patches = InlinePatchSet(
@@ -768,8 +731,6 @@ def test_imported_cp_host_is_rendered_as_same_name_class():
     assert "def _forward_impl" not in rendered
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_observed_replacement_supplies_missing_cp_host_import():
     """A native replacement record supplies an imported CP host generically."""
     replacement_type = type("ObservedAttention", (), {})
@@ -798,8 +759,6 @@ def test_observed_replacement_supplies_missing_cp_host_import():
     assert "return observed_cp_forward(self, *args, **kwargs)" in rendered
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_observed_inner_wrapper_rebinds_boundary_to_replacement_type():
     """Strategy ownership follows the target selected by the native wrapper."""
     replacement_type = type("ObservedAttention", (), {})
@@ -825,8 +784,6 @@ def test_observed_inner_wrapper_rebinds_boundary_to_replacement_type():
     }
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_model_adapter_replacement_keeps_declared_factory_contract():
     """Observed types do not erase a model-owned factory's interface facts."""
     meta = SimpleNamespace(
@@ -848,8 +805,6 @@ def test_model_adapter_replacement_keeps_declared_factory_contract():
     assert rules[0].replace_target == meta.module_overrides[0]["replacement_target"]
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_imported_cp_host_and_boundary_share_one_forward_impl():
     """CP dispatch and boundary lowering compose into one implementation."""
     patches = InlinePatchSet(
@@ -895,8 +850,6 @@ def test_imported_cp_host_and_boundary_share_one_forward_impl():
     assert "return self._forward_impl(*args, **kwargs)" not in rendered
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_imported_replacement_owner_is_lowered_after_root_construction():
     """An observed wrapper needs no constructor call in the copied source."""
     source = """\
@@ -931,8 +884,6 @@ class Root(nn.Module):
     assert "module=_hp_source, module_fqn=_hp_fqn, context={}" in rendered
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_tp_collective_boundary_renders_static_operators():
     """A TP-lowerable boundary with a static signature renders bare operators.
 
@@ -957,8 +908,6 @@ def test_tp_collective_boundary_renders_static_operators():
     assert "self._hp_boundary" not in text
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_identity_boundary_forward_is_pruned():
     """An all-identity boundary keeps its original forward untouched.
 
@@ -995,8 +944,6 @@ def _degenerate_entry() -> dict:
     }
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_degenerate_topology_identity_ep_keys_are_pruned():
     """Empty active axes + identity ``ep`` keys prune the rewrite entirely.
 
@@ -1021,8 +968,6 @@ def test_degenerate_topology_identity_ep_keys_are_pruned():
     assert text == SOURCE_TEXT
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_degenerate_topology_changing_ep_renders_generic():
     """Empty active axes + a changing ``ep`` placement keep the generic rewrite.
 
@@ -1049,8 +994,6 @@ def test_degenerate_topology_changing_ep_renders_generic():
     assert "self._hp_boundary.redistribute_outputs" in text
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_tp_collective_falls_back_to_generic_on_variadic_signature():
     """A ``*args``/``**kwargs`` forward cannot carry the static template.
 
@@ -1076,8 +1019,6 @@ def test_tp_collective_falls_back_to_generic_on_variadic_signature():
     assert "self._hp_boundary.redistribute_outputs" in text
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_tp_collective_allows_kwargs_and_tuple_output():
     """HF-style ``**kwargs`` and tuple output can still expose bare TP ops.
 
@@ -1122,8 +1063,6 @@ def _generic_entry() -> dict:
     }
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_generic_deferred_bias_hook_renders_last():
     """D-22: the exit hook is the LAST statement of the generic exit block.
 
@@ -1145,8 +1084,6 @@ def test_generic_deferred_bias_hook_renders_last():
     assert hook_at > text.index("self._hp_boundary.redistribute_outputs(outputs)")
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_tp_collective_deferred_bias_hook_renders_after_exit_ops():
     """D-22: the static template re-adds the bias after the exit reduction.
 
@@ -1172,8 +1109,6 @@ def test_tp_collective_deferred_bias_hook_renders_after_exit_ops():
     assert hook_at < text.index("return outputs")
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_local_region_deferred_bias_still_requires_native_phase_c():
     """D-22 does not permit a local-region source rewrite.
 
@@ -1193,8 +1128,6 @@ def test_local_region_deferred_bias_still_requires_native_phase_c():
         lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_no_deferred_bias_no_hook_line():
     """Entries without deferred params emit no hook (byte-stable artifacts).
 
@@ -1212,8 +1145,6 @@ def test_no_deferred_bias_no_hook_line():
         assert "_hp_deferred_bias" not in text
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_identity_boundary_with_deferred_bias_fails_fast():
     """D-22: an identity-pruned boundary cannot carry deferred bias params.
 

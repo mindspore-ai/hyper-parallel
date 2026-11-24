@@ -31,7 +31,6 @@ from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import 
     build_deepseek_v41_validation_config,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Engram, DeepseekV41ForCausalLM
-from tests.common.mark_utils import arg_mark
 
 
 def _write_engram_assets(
@@ -142,8 +141,6 @@ def _write_released_config(directory: str) -> Path:
     return path
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 class TestDeepseekV41ValidationCrop(unittest.TestCase):
     """Depth crops preserve retained model roles and reject inconsistent layouts."""
 

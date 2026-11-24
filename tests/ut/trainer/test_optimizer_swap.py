@@ -31,8 +31,6 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 import torch
 from torch import nn
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.components.optim.builders import AdamW as AdamWBuilder
 from hyper_parallel.core.optimizer import ChainedOptimizer, SwapOptimizerConfig
 from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
@@ -48,12 +46,6 @@ from hyper_parallel.trainer.config import (
 )
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_config
 
-_MARK = {
-    "plat_marks": ["cpu_linux", "cpu_macos"],
-    "level_mark": "level0",
-    "card_mark": "allcards",
-    "essential_mark": "essential",
-}
 _THIS_MODULE = "tests.ut.trainer.test_optimizer_swap"
 _ADAMW_TARGET = "hyper_parallel.components.optim.builders.AdamW"
 
@@ -134,7 +126,6 @@ def _materialize_adam_state(optimizer: torch.optim.Optimizer, param: torch.nn.Pa
 class TestOptimizerSwapConfig(unittest.TestCase):
     """Defaults, validation and YAML shape of ``OptimizerSwapConfig``."""
 
-    @arg_mark(**_MARK)
     def test_defaults_match_the_swap_runtime(self):
         """Feature: optimizer.swap defaults.
         Description: an omitted YAML section constructs ``OptimizerSwapConfig()``.
@@ -151,7 +142,6 @@ class TestOptimizerSwapConfig(unittest.TestCase):
             target=Target(_no_model, target_path=f"{_THIS_MODULE}._no_model"),
         ).swap, swap)
 
-    @arg_mark(**_MARK)
     def test_rejects_non_positive_swap_times(self):
         """Feature: optimizer.swap validation.
         Description: construct the section with a zero or negative partition count.
@@ -164,7 +154,6 @@ class TestOptimizerSwapConfig(unittest.TestCase):
 
         self.assertEqual(OptimizerSwapConfig(swap_times=1).swap_times, 1)
 
-    @arg_mark(**_MARK)
     def test_rejects_negative_min_numel(self):
         """Feature: optimizer.swap validation.
         Description: construct the section with a negative state-size floor.
@@ -175,7 +164,6 @@ class TestOptimizerSwapConfig(unittest.TestCase):
 
         self.assertEqual(OptimizerSwapConfig(min_numel=0).min_numel, 0)
 
-    @arg_mark(**_MARK)
     def test_accepts_known_state_keys_across_optimizer_families(self):
         """Feature: optimizer.swap state-key validation.
         Description: request logical slots owned by the Adam and Muon adapters.
@@ -187,7 +175,6 @@ class TestOptimizerSwapConfig(unittest.TestCase):
         adam = OptimizerSwapConfig(state_keys=["exp_avg", "exp_avg_sq"])
         self.assertEqual(adam.state_keys, ["exp_avg", "exp_avg_sq"])
 
-    @arg_mark(**_MARK)
     def test_resolves_from_yaml_and_serializes_back(self):
         """Feature: optimizer.swap YAML section.
         Description: resolve the nested section, then serialize the config back.
@@ -213,7 +200,6 @@ class TestOptimizerSwapConfig(unittest.TestCase):
         self.assertEqual(config.optimizer.swap, OptimizerSwapConfig(**swap_node))
         self.assertEqual(config.optimizer.to_dict()["swap"], swap_node)
 
-    @arg_mark(**_MARK)
     def test_rejects_invalid_yaml_swap_values(self):
         """Feature: optimizer.swap YAML validation.
         Description: resolve sections with a bad width, slot name and field name.
@@ -248,7 +234,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         """Give every test its own model."""
         self.model = _Model()
 
-    @arg_mark(**_MARK)
     def test_disabled_keeps_the_built_optimizer_unchanged(self):
         """Feature: optimizer.swap disabled.
         Description: build the trainer optimizer with the default section.
@@ -262,7 +247,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         self.assertIs(built, optimizer)
         self.assertFalse(is_swap_optimizer(built))
 
-    @arg_mark(**_MARK)
     def test_enabled_wraps_a_bare_adamw(self):
         """Feature: optimizer.swap with a bare AdamW target.
         Description: build with swap enabled over the fused AdamW the real config uses.
@@ -277,7 +261,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         self.assertIsInstance(built.adapter, swap_adapters.TorchNativeAdamWAdapter)
         self.assertIs(built.optimizer, optimizer)
 
-    @arg_mark(**_MARK)
     def test_enabled_wraps_every_leaf_of_a_chained_optimizer(self):
         """Feature: optimizer.swap with a chained optimizer.
         Description: build the shipped AdamW YAML target, which chains its leaves.
@@ -302,7 +285,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
                 ))
         self.assertEqual(list(built.chained_optimizers), list(built.optimizers_dict.values()))
 
-    @arg_mark(**_MARK)
     def test_swap_config_gets_the_yaml_values(self):
         """Feature: swap config translation.
         Description: build with a fully specified section and capture the swap call.
@@ -333,7 +315,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         self.assertEqual(list(passed.state_keys), ["exp_avg"])
         self.assertIs(passed.packed_swap, True)
 
-    @arg_mark(**_MARK)
     def test_unspecified_packed_swap_keeps_the_backend_default(self):
         """Feature: swap config translation.
         Description: leave ``packed_swap`` unset and build on the Torch backend.
@@ -350,7 +331,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         self.assertIs(swap_config.packed_swap, True)
         self.assertTrue(built.runtime.packed_enabled)
 
-    @arg_mark(**_MARK)
     def test_wrapped_optimizer_keeps_param_groups_and_checkpoint_api(self):
         """Feature: swap wrapper transparency.
         Description: wrap an AdamW with materialized state and read the public API.
@@ -376,7 +356,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         built.load_state_dict(before)
         self.assertTrue(torch.equal(built.state[param]["exp_avg"], before["state"][0]["exp_avg"]))
 
-    @arg_mark(**_MARK)
     def test_chained_optimizer_checkpoint_api_works_through_wrapped_leaves(self):
         """Feature: chained optimizer checkpoint API.
         Description: snapshot and restore a swap-wrapped chained optimizer on CPU.
@@ -402,7 +381,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
             len(group["params"]) for group in built.param_groups))
         built.load_state_dict(state_dict)
 
-    @arg_mark(**_MARK)
     def test_fp32_main_params_keeps_the_mixed_precision_alias_in_sync(self):
         """Feature: optimizer.swap with fp32 main parameters.
         Description: enable both the fp32 main-parameter wrap and swap.

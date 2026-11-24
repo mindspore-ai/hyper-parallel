@@ -19,14 +19,11 @@ import unittest
 
 from hyper_parallel.data.constants import ONLINE_SOURCE_PATH_KEY
 from hyper_parallel.data.online.format import InstructionMessages, convert_sharegpt_to_messages, normalize_conversation
-from tests.common.mark_utils import arg_mark
 
 
 class TestConversationFormat(unittest.TestCase):
     """Keep text and media conversion contracts independent of tokenization."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_instruction_messages_preserve_fields_and_separator(self):
         """Feature: Instruction formatting.
 
@@ -48,8 +45,6 @@ class TestConversationFormat(unittest.TestCase):
         with self.assertRaises(ValueError):
             InstructionMessages({"instruction": "q", "output": "a"}, None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_text_aliases_and_loss_masks(self):
         """Feature: Shared role normalization.
 
@@ -67,8 +62,6 @@ class TestConversationFormat(unittest.TestCase):
                 self.assertEqual(result, [{"role": target, "content": "text", "loss_mask": 0}])
                 self.assertEqual(sample, before)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_openai_tool_and_media_fields(self):
         """Feature: Native message preservation.
 
@@ -86,8 +79,6 @@ class TestConversationFormat(unittest.TestCase):
         self.assertEqual(sample, before)
         self.assertIsNot(result[0], sample[0])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_media_sharegpt_preserves_mask_and_order(self):
         """Feature: Shared normalization inside media conversion.
 
@@ -108,8 +99,6 @@ class TestConversationFormat(unittest.TestCase):
         self.assertEqual(result[1], {"role": "assistant", "content": "reply", "loss_mask": 0})
         self.assertEqual(sample, before)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_invalid_messages_and_media_contract(self):
         """Feature: Format boundary validation.
 

@@ -25,6 +25,11 @@ Execution Order:
    ``autograd_backward`` tag makes FSDPPass count them as backward
    consumers and re-gather parameters for them). Running AC after FSDP
    would make recompute read sharded placeholders.
+2b. CPU offload: CpuOffloadPass (``activation_swap`` != none) moves saved
+   attention activations to host memory. It runs before FSDP so reload nodes
+   become ordinary backward consumers for parameter re-gathers. Attention swap
+   is incompatible with activation checkpointing (enforced in ``PassConfig``),
+   so it never runs alongside recompute.
 3. Execution layer:
    - FSDPPass (FSDP)
    - FsdpBucketingPass (opt-in AG/RS fusion; supports FSDP with PP disabled).
@@ -58,6 +63,7 @@ from ..pass_config import PassConfig
 from .activation_checkpoint import ActivationCheckpointPass
 from .base import GraphPass
 from .bucketing.bucketing_pass import FsdpBucketingPass
+from .cpu_offload import CpuOffloadPass
 from .inductor_pass import InductorPass
 from .overlap.schedule import AutoOverlapPass, FsdpOverlapPass
 from .parallel.fsdp_pass import FSDPPass
@@ -101,6 +107,13 @@ class PassPipeline:
         # parameter all-gathers / backward re-gathers around them.
         if self.config.ac_mode != "off":
             self.passes.append(ActivationCheckpointPass())
+
+        # 2b. CPU offload: saved attention activations move to host memory.
+        # Runs before FSDP so reload nodes are ordinary backward consumers when
+        # parameter re-gathers are inserted. Attention swap is incompatible with
+        # activation checkpointing, so AC never runs alongside this pass.
+        if self.config.activation_swap != "none":
+            self.passes.append(CpuOffloadPass())
 
         # 3. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):

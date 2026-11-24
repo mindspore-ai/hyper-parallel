@@ -31,14 +31,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.route import (
     prepare_topk_route,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeRoute(unittest.TestCase):
     """Validate trusted Router counts and bounded capacity without hardware."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_route_grows_before_writing_pull_source(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -92,8 +89,6 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertEqual(route.metadata.expert_capacity, 514)
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_invalid_automatic_pull_route_never_allocates_or_writes_source(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -117,8 +112,6 @@ class TestMegaMoeRoute(unittest.TestCase):
         callback.assert_not_called()
         permute.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_staged_pull_publishes_only_after_capacity_agreement(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -175,8 +168,6 @@ class TestMegaMoeRoute(unittest.TestCase):
         torch.testing.assert_close(prepared.routed_tokens, staged, rtol=0, atol=0)
         torch.testing.assert_close(old_buffer, torch.zeros_like(old_buffer), rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_small_pull_staging_keeps_collective_rejection_ahead_of_publication(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -205,8 +196,6 @@ class TestMegaMoeRoute(unittest.TestCase):
         grow.assert_not_called()
         publish.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_pull_staging_is_limited_by_actual_tensor_bytes(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -221,8 +210,6 @@ class TestMegaMoeRoute(unittest.TestCase):
                 self.assertEqual(route_module._can_stage_pull(tensor, spec), expected)
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dynamic_ragged_counts_preserve_exact_round_trip_intervals(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -243,8 +230,6 @@ class TestMegaMoeRoute(unittest.TestCase):
             self.assertEqual(meta.group_list.tolist(), [3, 4] if rank == 0 else [2, 2])
             self.assertEqual(int(meta.dispatch_size.sum()), 0 if rank == 0 else 6)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dynamic_invalid_calls_fail_on_every_rank(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -263,8 +248,6 @@ class TestMegaMoeRoute(unittest.TestCase):
         spec = replace(self._spec(ep_size=2), max_local_num_tokens=257, receive_capacity=4)
         self.assertEqual(route_module._dynamic_summary(valid, spec)[2], 6)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_empty_dynamic_route_keeps_autograd_without_native_permute(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -286,8 +269,6 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertEqual(tuple(hidden.grad.shape), (0, 4))
         self.assertEqual(tuple(weights.grad.shape), (0, 2))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dynamic_gather_keeps_variable_payload_without_token_padding(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -342,8 +323,6 @@ class TestMegaMoeRoute(unittest.TestCase):
             num_cube_cores=24,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_router_counts_are_reused_or_computed_only_when_omitted(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -366,8 +345,6 @@ class TestMegaMoeRoute(unittest.TestCase):
             f"computed counts mismatch: expected={expected}, got={computed}",
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_count_gather_overlaps_permute_and_builds_metadata(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -494,8 +471,6 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertEqual(pull.metadata.dispatch_size.tolist(), [3, 4, 7, 8])
         self.assertEqual(pull.maximum_received_slots, 22)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_local_capacity_tracks_routes_below_source_size_and_empty_ranks(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -560,9 +535,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         schedule = max(128, (maximum_tokens + 127) // 128 * 128)
         return max(1, int(loads[spec.rank_id])), schedule, int(loads.max())
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
-    )
     def test_host_and_device_summary_policies_match_exact_route_counts(self) -> None:
         """Feature: dynamic count summary.
 
@@ -579,9 +551,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                             route_module._read_dynamic_route(payload, spec)[0], self._reference(payload, spec)
                         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
-    )
     def test_large_summary_never_copies_the_complete_count_table_to_host(self) -> None:
         """Feature: bounded summary transfer.
 
@@ -602,9 +571,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         with patch.object(torch.Tensor, "tolist", tolist):
             self.assertEqual(route_module._read_dynamic_route(payload, spec)[0], expected)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
-    )
     def test_summary_validation_remains_collective_for_both_table_policies(self) -> None:
         """Feature: distributed dynamic validation.
 
@@ -627,9 +593,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "INT32"):
                 route_module._read_dynamic_route(invalid, self._spec(experts))
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
-    )
     def test_host_descriptors_match_independent_tensor_prefixes(self) -> None:
         """Feature: packed native route descriptors.
 
@@ -663,8 +626,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                                     else:
                                         self.assertEqual(observed, value)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cached_routes_reuse_descriptors_but_permute_current_ids(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -742,8 +703,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                 torch.testing.assert_close(getattr(third.metadata, key), value, rtol=0, atol=0)
                 torch.testing.assert_close(getattr(first.metadata, key), first_fields[key], rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cached_pull_still_rejects_changed_peer_before_workspace_write(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -776,8 +735,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             permute.assert_not_called()
             self.assertIs(workspace.route_cache, previous)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cached_descriptors_wait_and_retain_storage_on_another_stream(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -811,8 +768,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             header.wait("npu:0")
         self.assertEqual(order, ["wait", "record"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dynamic_headers_reuse_immutable_storage_and_track_mask_changes(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -835,8 +790,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         torch.testing.assert_close(changed, torch.tensor([0, 129, 15], dtype=torch.int32), rtol=0, atol=0)
         torch.testing.assert_close(resized, torch.tensor([0, 257, 15], dtype=torch.int32), rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_changed_tables_do_not_create_descriptor_cache_events(self) -> None:
         """Feature: Automatic MegaMoe descriptor cache admission.
 
@@ -868,8 +821,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             event.assert_called_once()
             ready.record.assert_called_once_with(producer)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_changed_headers_do_not_create_unused_readiness_events(self) -> None:
         """Feature: Automatic MegaMoe control header cache admission.
 
@@ -897,8 +848,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             event.assert_called_once()
             ready.record.assert_called_once_with(producer)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cached_device_dispatch_sizes_own_their_count_snapshot(self) -> None:
         """Feature: Automatic MegaMoe cached descriptor ownership.
 
@@ -919,8 +868,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         self.assertIsNotNone(cached)
         torch.testing.assert_close(cached.dispatch_size, payload[spec.rank_id, 3:], rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_changing_wide_tables_back_off_and_recover_on_repeated_counts(self) -> None:
         """Feature: Automatic MegaMoe route cache reprobing.
 
@@ -954,8 +901,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         _, _, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
         self.assertIs(cached, metadata)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_header_is_int32_and_bounded_header_remains_int64(self) -> None:
         """Feature: dynamic count wire format.
 
@@ -992,8 +937,6 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             self.assertEqual(prepared.metadata.combine_size.dtype, torch.int32)
             self.assertEqual(prepared.metadata.dispatch_src_off.dtype, torch.int64)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_unrepresentable_automatic_source_still_joins_rejection_collective(self) -> None:
         """Feature: coordinated automatic overflow.
 

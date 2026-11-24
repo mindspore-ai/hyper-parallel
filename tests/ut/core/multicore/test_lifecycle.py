@@ -27,7 +27,6 @@ from hyper_parallel.core.multicore import _automatic, _collective
 from hyper_parallel.core.multicore.modules import module as module_api
 from hyper_parallel.core.multicore.modules.mega_moe.function import _release_completed_graph
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
-from tests.common.mark_utils import arg_mark
 
 # pylint: disable=protected-access
 
@@ -188,8 +187,6 @@ class TestLifecycle(unittest.TestCase):
             self.assertIs(raised.exception.__cause__, error)
             self.assertIn("ValueError: invalid communicator", str(raised.exception))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_remote_failure_keeps_successful_rank_registered(self):
         """Feature: remote failure keeps successful rank registered.
         Description: Report remote failure after local resource or runtime close succeeds.

@@ -89,6 +89,22 @@ def positive(value: object, name: str) -> float:
     return float(value)
 
 
+def step_time_budget(mean_step_seconds: float, mfu_percent: float,
+                     target_mfu_percent: float) -> tuple[float, float]:
+    """Calculate the time budget for a target at fixed useful work and peak.
+
+    Args:
+        mean_step_seconds: Complete-step mean for the measured workload.
+        mfu_percent: Aggregate model utilization for the same window.
+        target_mfu_percent: Positive target using the same FLOPs and device peak.
+
+    Returns:
+        Target seconds per step and the nonnegative time savings required.
+    """
+    budget = mean_step_seconds * (mfu_percent / target_mfu_percent)
+    return budget, max(0.0, mean_step_seconds - budget)
+
+
 def _validate_workload(workload: dict, validation_level: str) -> None:
     for key in WORKLOAD_KEYS:
         require(key in workload and workload[key] not in (None, "", []), f"Missing workload.{key}")
@@ -135,6 +151,7 @@ def validate_config(config: dict) -> None:
         config: Proposed comparison-series configuration.
     """
     require(config.get("schema") == "mfu-riser/v1", "Unsupported run config schema")
+    require(config.get("rsi_mode", "acceptance") in ("acceptance", "continuous"), "Invalid rsi_mode")
     policy = config.get("performance_policy")
     if policy is not None:
         _validate_performance_policy(policy, config["workload"])
@@ -232,19 +249,30 @@ def _executed_work_metrics(receipt: dict, samples: list, peak: float, root: Path
     _verified_evidence(root, receipt, "executed_work", artifacts)
     measurements = receipt.get("samples")
     require(isinstance(measurements, list) and bool(measurements), "Missing executed work samples")
-    times = {row["step"]: row["time_s"] for row in samples}
+    by_step = {row["step"]: row for row in samples}
     seen = set()
-    flops = seconds = 0.0
+    executed_flops = model_flops = seconds = 0.0
     for row in measurements:
         require(isinstance(row, dict), "Invalid executed work sample")
         step = row.get("step")
-        require(isinstance(step, int) and not isinstance(step, bool) and step in times and step not in seen,
+        require(isinstance(step, int) and not isinstance(step, bool) and step in by_step and step not in seen,
                 "Invalid or duplicate executed work step")
         seen.add(step)
-        seconds += times[step]
-        flops += positive(row.get("executed_flops"), "executed_flops")
-    return {"hfu_percent": flops / (seconds * peak) * 100, "hfu_method": receipt["method"],
+        seconds += by_step[step]["time_s"]
+        model_flops += by_step[step]["model_flops"]
+        executed_flops += positive(row.get("executed_flops"), "executed_flops")
+    scale = 100 / (seconds * peak)
+    return {"hfu_percent": executed_flops * scale, "hfu_method": receipt["method"],
+            "model_mfu_in_hfu_window_percent": model_flops * scale,
             "hfu_coverage": coverage, "hfu_steps": sorted(seen)}
+
+
+def target_hfu_at_fixed_work_ratio(metrics: dict, target_mfu_percent: float) -> float | None:
+    """Project covered HFU if executed FLOPs per useful FLOP stay constant."""
+    matched_mfu = metrics.get("model_mfu_in_hfu_window_percent")
+    if metrics.get("hfu_method") != "hardware_counters" or matched_mfu is None:
+        return None
+    return target_mfu_percent * metrics["hfu_percent"] / matched_mfu
 
 
 def _validate_checks(data: dict, context: dict, root: Path) -> dict:

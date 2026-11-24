@@ -11,12 +11,49 @@ the method when adapting another model, rather than hard-coding model-specific c
 2. Freeze source, configuration, data, and the actual environment. Before importing
    training modules, each worker computes the declared source-manifest digest and records
    its editable-install/import path. Independently compute and compare the actual digest;
-   echoing an expected remote digest is not verification.
+   echoing an expected remote digest is not verification. Include imported
+   adapter modules and their recipe files, and verify the resolved factory
+   before launch when the job adds adapter-specific overrides.
 3. Match input tokens/hashes, actual batches and sequence lengths, masks, and the
    declared routing mode. Keep global tokens and useful model FLOPs unchanged and audit MFU independently
    per step. Exclude padding, redundant fused work, and recomputation from MFU. Device peak
    throughput comes from an external specification or an explicit task parameter, not
    a guessed script default.
+   For ordinary causal attention, count `sum(L * (L + 1) / 2)` valid query--key pairs
+   over the independent segments in each physical row. For sliding-window, sparse,
+   or compressed attention, count the visible keys per query on each active layer.
+   Count active MoE expert and router work, and audit recurrent blocks separately
+   from softmax attention. When the objective supervises only part of a sequence,
+   count the vocabulary projection work for the supervised positions. Use this same
+   objective work for a reference that projects every row and an equivalent candidate
+   that projects only the supervised subset.
+   Check packing against separate rows at fixed tokens and model semantics. Before
+   timing either path, test a masked cross-segment dependency against the reference
+   at the actual attention call site. A boolean keep mask requires conversion
+   when passed to an implementation that expects additive attention bias.
+   Freeze this component breakdown before comparing candidates. A Trainer's
+   full-square estimate can be retained for historical replay. Use the independent
+   useful-work audit for the target when the two metrics differ. Recount the baseline
+   and every candidate over their original windows when adopting a new convention.
+   Across sequence or batch choices, report effective tokens/s/device and peak memory
+   alongside the declared model FLOPs. Use a same-workload reference to attribute an
+   implementation speedup.
+   For multimodal packing, verify text sequence isolation independently of
+   spatial rotary positions. Reconstruct image/video encoder and projector
+   work from runtime patch grids and attention windows on every source rank.
+   Compare against separate-sample outputs and gradients before timing.
+   When eliminating a square mask, validate the runtime geometry and the
+   backend's implicit causal contract before timing. A/B compares mask
+   semantics at the real call site. Include a matched A/A trajectory when
+   numerical variation can affect the gate. Keep the original verdict if a
+   later replay adds evidence at a different scope.
+   If a candidate introduces derived projection or layout metadata, compare
+   all logical tensors at the last common boundary, including media values.
+   In trajectory mode, hash the public batch and loss inputs before a
+   model-integrated loss prepares its execution arguments. Verify the actual
+   forward fields, operator shapes, and rank coverage independently. For
+   adapters that derive metadata earlier, compare the logical tensors at a
+   shared boundary before either adapter derives the fields.
 4. Check finite loss and gradients and compare input, loss, and gradient-norm trajectories.
    Check bitwise equivalence directly where applicable. When fusion changes rounding,
    declare tolerances in advance, validate module forward outputs and all input/parameter
@@ -33,6 +70,10 @@ the method when adapting another model, rather than hard-coding model-specific c
    the maximum complete-step duration across ranks. Declare timing boundaries for the
    optimizer, input pipeline, synchronization, and logging. Use a separate short profile
    to explain the mechanism.
+   Record device occupancy at admission and verify isolation during the run with a
+   lightweight out-of-band check. A process outside the trial appearing on a measured
+   device invalidates that run's resource conditions. Retain its logs and repeat on
+   isolated resources. Cancel only workers whose ownership by the trial is verified.
 
 The earlier `analyze.py` validated rank-steps, weight loading, input hashes, FLOPs, Muon
 invocation shapes, and recomputed layer counts. An adapted version can serve as this
@@ -79,6 +120,15 @@ For acceptance, use the declared full numerical gate and the frozen screened
 candidate. Cover equivalent parameter updates and model-level behavior with
 predeclared tolerances. Capture fixed-routing and learned-routing evidence in
 their declared workloads. Use learned routing to accept a learned training policy.
+
+For projection packing, check the optimizer on the original logical parameter
+boundaries. A fused Gate/Up projection can preserve forward outputs and gradients
+while changing the matrix used by Muon. Compare an update starting from the same
+weights, gradients, and momentum. When the reference orthogonalizes the two
+projections independently, preserve both their Newton--Schulz inputs and RMS
+scales. If the runtime provides a logical-matrix view hook, verify that it is
+invoked for the packed weights. Check the resulting updates after unpacking,
+then run the original model-level gate.
 
 ## Five-stage adapter
 

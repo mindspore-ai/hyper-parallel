@@ -27,7 +27,6 @@ from pathlib import Path
 
 import hyper_parallel
 from hyper_parallel.core import multicore
-from tests.common.mark_utils import arg_mark
 
 
 class TestMulticoreBoundary(unittest.TestCase):
@@ -101,8 +100,6 @@ class TestMulticoreBoundary(unittest.TestCase):
             ),
         }
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_business_symbols_are_exported_only_by_multicore(self):
         """Verify the Multicore public export boundary.
 
@@ -134,8 +131,6 @@ class TestMulticoreBoundary(unittest.TestCase):
             self.assertFalse(hasattr(hyper_parallel, name))
         self.assertNotIn("hyper_parallel_shmem_torch", sys.modules)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mhc_exposes_only_canonical_module_name(self) -> None:
         """Feature: Single public mHC module name.
         Description: Import all business classes with the NPU backend blocked, then inspect mHC exports.
@@ -197,8 +192,6 @@ assert load_torch_npu.cache_info().currsize == 0
                 self.assertNotIn("HyperMegaMhc", getattr(namespace, "__all__", ()))
                 self.assertFalse(hasattr(namespace, "HyperMegaMhc"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_runtime_sources_import_no_platform_layer(self):
         """Verify production sources stay Torch-only.
 
@@ -223,8 +216,6 @@ assert load_torch_npu.cache_info().currsize == 0
                     with self.subTest(path=path, module=module):
                         self.assertFalse(module.startswith("hyper_parallel.platform"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_native_mega_kernels_share_cached_op_api_bridge(self):
         """Feature: Shared ACLNN bridge.
         Description: Inspect the native delegation and existing operator call sites.
@@ -248,8 +239,6 @@ assert load_torch_npu.cache_info().currsize == 0
                 direct = re.search(r"(?<!HYPER_)EXEC_NPU_CMD_(?:V1_|V2_)?EXT\s*\(", source)
                 self.assertIsNone(direct, msg=f"{name}: expected no direct native calls, actual={direct!r}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_torch_build_contract_follows_active_stack(self):
         """Feature: Torch native build compatibility.
         Description: Compile legacy/interface contracts and reject unusable metadata.
@@ -314,8 +303,6 @@ hp_apply_torch_cxx_standard(probe "${STACK_CXX_STANDARD}")
                 )
                 self.assertIn(diagnostic, output, msg=f"Expected diagnostic={diagnostic!r}, actual={output!r}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_torch_native_targets_use_shared_build_contract(self):
         """Feature: Torch native build compatibility.
         Description: Inspect adapter and SHMEM CMake integration boundaries.
@@ -343,8 +330,6 @@ hp_apply_torch_cxx_standard(probe "${STACK_CXX_STANDARD}")
             present = [name for name, source in sources.items() if forbidden in source]
             self.assertEqual(present, [], msg=f"Expected no {forbidden} consumer, actual={present}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_diagnostics_dependency_boundaries(self):
         """Feature: MegaKernel diagnostics.
         Description: Keep common code tool-neutral and both tools independent of business adapters.

@@ -30,14 +30,11 @@ from hyper_parallel.core.multicore.scheduler.config import (
     TaskType,
     _validate_runtime_task_queues,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMhcGraph(unittest.TestCase):
     """Validate token-tile ordering, ring reuse, and per-stage dependencies."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_builds_six_stage_pure_aic_aiv_pipeline(self) -> None:
         """Validate the six-stage task graph.
 
@@ -115,8 +112,6 @@ class TestMegaMhcGraph(unittest.TestCase):
             {config.all_tasks[task_id].task_aicore_type for task_id in range(config.task_num)},
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_schedules_aiv_pipeline_in_core_sized_waves(self) -> None:
         """Validate AIV wave ordering.
 
@@ -137,8 +132,6 @@ class TestMegaMhcGraph(unittest.TestCase):
         expected_ids.extend(range(4 * tile_count, 5 * tile_count))
         self.assertEqual(vector_ids, tuple(expected_ids))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_defaults_to_measured_32_token_tile(self) -> None:
         """Validate the default token tile.
 
@@ -151,8 +144,6 @@ class TestMegaMhcGraph(unittest.TestCase):
         self.assertEqual(post.task_num, 32)
         self.assertEqual(post.split_value, 32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_enlarges_tile_to_keep_large_t_event_count_bounded(self) -> None:
         """Validate large-token event-capacity protection.
 
@@ -166,8 +157,6 @@ class TestMegaMhcGraph(unittest.TestCase):
         tile_count = graph.get_op("mhc_post").task_num
         self.assertLessEqual(build_event_layout(tile_count).event_count, 1024)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_atomic_write_tail_is_reserved_at_event_boundary(self) -> None:
         """Feature: Forward event storage bounds.
 

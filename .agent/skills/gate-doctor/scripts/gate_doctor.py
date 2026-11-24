@@ -19,6 +19,8 @@ sibling `autogit` skill.
 
 Environment:
     GITCODE_TOKEN   PRIVATE-TOKEN value (same one autogit uses)
+    GATE_DOCTOR_REPO   owner/repo used for bare PR numbers
+    JENKINS_URL   Jenkins base URL for diagnose and autofix
 
 Subcommands:
     diagnose <pr>       Print a JSON report of the latest pipeline failure.
@@ -42,31 +44,18 @@ import urllib.request
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-DEFAULT_OWNER = "mindspore"
-DEFAULT_REPO = "hyper-parallel"
 GITCODE_API = "https://gitcode.com/api/v5"
-JENKINS_BASE = "https://build.mindspore.cn"
-# Repo -> Jenkins gate job name. Verified jobs as of 2026-05-16:
-#   mindspore/mindspore      -> MindSpore_Atomgit_Gate
-#   mindspore/hyper-parallel -> Hyper-Parallel_Atomgit_Gate
-# Add new entries here when the skill is adopted for another repo.
-_JENKINS_JOBS = {
-    ("mindspore", "mindspore"):      "MindSpore_Atomgit_Gate",
-    ("mindspore", "hyper-parallel"): "Hyper-Parallel_Atomgit_Gate",
-}
 
 
 def jenkins_job_for(owner: str, repo: str, override: Optional[str] = None) -> str:
     """Resolve the Jenkins job name for a (owner, repo)."""
     if override:
         return override
-    job = _JENKINS_JOBS.get((owner, repo))
-    if job:
-        return job
+    if repo == "hyper-parallel":
+        return "Hyper-Parallel_Atomgit_Gate"
     raise GateDoctorError(
         f"No Jenkins gate job mapped for {owner}/{repo}. "
-        f"Pass --jenkins-job=<name> or add an entry to _JENKINS_JOBS in "
-        f"gate_doctor.py."
+        "Pass --jenkins-job=<name>."
     )
 
 
@@ -75,6 +64,20 @@ def jenkins_job_for(owner: str, repo: str, override: Optional[str] = None) -> st
 # ---------------------------------------------------------------------------
 class GateDoctorError(RuntimeError):
     """User-facing error message; printed and exits 1."""
+
+
+def _jenkins_base() -> str:
+    """Read the configured Jenkins URL, retaining any deployment context path."""
+    base = os.environ.get("JENKINS_URL", "").strip().rstrip("/")
+    try:
+        parsed = urllib.parse.urlsplit(base)
+    except ValueError as exc:
+        raise GateDoctorError("Set JENKINS_URL to the Jenkins HTTP(S) base URL.") from exc
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment):
+        raise GateDoctorError("Set JENKINS_URL to the Jenkins HTTP(S) base URL.")
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +92,12 @@ def parse_pr_ref(ref: str) -> tuple[str, str, int]:
     """Parse a PR reference and return (owner, repo, number).
 
     Accepted forms:
-      - ``647``                                  -> default (mindspore/hyper-parallel)
-      - ``#647``                                 -> default (mindspore/hyper-parallel)
-      - ``mindspore/mindspore#92567``            -> explicit owner/repo
-      - ``mindspore/hyper-parallel#647``         -> explicit owner/repo
-      - ``https://gitcode.com/mindspore/mindspore/pull/92567``        -> explicit
-      - ``https://gitcode.com/mindspore/hyper-parallel/pull/647``     -> explicit
+      - ``647`` or ``#647`` -> repository configured by ``GATE_DOCTOR_REPO``
+      - ``owner/hyper-parallel#647`` -> explicit owner/repo
+      - ``https://gitcode.com/owner/hyper-parallel/pull/647`` -> explicit URL
 
-    A bare number always falls back to the default repo (hyper-parallel,
-    because that's where this skill lives). To target a different repo,
-    pass the full URL or the ``owner/repo#N`` form.
+    Set ``GATE_DOCTOR_REPO=owner/hyper-parallel`` to use bare PR numbers.
+    Explicit repository references take precedence over that configuration.
     """
     ref = ref.strip().lstrip("#")
     m = _PR_URL_RE.match(ref)
@@ -109,7 +108,14 @@ def parse_pr_ref(ref: str) -> tuple[str, str, int]:
         owner, repo = repo_part.split("/", 1)
         return owner, repo, int(num)
     if ref.isdigit():
-        return DEFAULT_OWNER, DEFAULT_REPO, int(ref)
+        configured_repo = os.environ.get("GATE_DOCTOR_REPO", "").strip()
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", configured_repo)
+        if not match:
+            raise GateDoctorError(
+                "Set GATE_DOCTOR_REPO=owner/repo for bare PR numbers, "
+                "or pass a full GitCode PR URL or owner/repo#N."
+            )
+        return match.group(1), match.group(2), int(ref)
     raise GateDoctorError(f"Cannot parse PR reference: {ref!r}")
 
 
@@ -196,6 +202,7 @@ def get_pr_labels(owner: str, repo: str, pr: int, token: str) -> list[str]:
 
 
 def post_pr_comment(owner: str, repo: str, pr: int, body: str, token: str) -> dict:
+    """Post one command or report to the selected PR."""
     status, data = _request(
         "POST",
         f"{GITCODE_API}/repos/{owner}/{repo}/pulls/{pr}/comments",
@@ -214,7 +221,7 @@ _PIPE_LINK_RE = re.compile(
     r"\((https?://\S+?/job/[^/]+/(\d+)/[^)]*)\)"
 )
 # micro-compass build result rows look like:
-#   `|  | Check_Pylint | **FAILURE** | [3903](https://build.mindspore.cn/.../3903...) |`
+#   `|  | Check_Pylint | **FAILURE** | [3903](https://ci.example.org/job/gate/3903/) |`
 # The FAILURE/SUCCESS token is usually wrapped in `**`, sometimes preceded by
 # `:x:` on the project summary row (which we filter out by requiring the
 # stage column to match `Check_XXX`).
@@ -249,6 +256,22 @@ class PipelineFailureSummary:
     latest_comment_id: Optional[int] = None
 
 
+def _record_build_table(summary: PipelineFailureSummary, body: str,
+                        comment_id: Optional[int]) -> bool:
+    """Record the first build table encountered in newest-first comments."""
+    stages: list[StageStatus] = []
+    for match in _BUILD_TABLE_RE.finditer(body):
+        name, status, pipe_num, url = match.groups()
+        stages.append(StageStatus(name=name, status=status, pipeline=int(pipe_num), url=url))
+    if not stages:
+        return False
+    summary.pipeline_number = stages[0].pipeline
+    summary.pipeline_url = stages[0].url
+    summary.latest_comment_id = comment_id
+    summary.failed_stages = [stage for stage in stages if stage.status == "FAILURE"]
+    return True
+
+
 def parse_latest_failure(comments: list[dict]) -> PipelineFailureSummary:
     """Walk PR comments newest-first; collect three independent signals.
 
@@ -279,20 +302,7 @@ def parse_latest_failure(comments: list[dict]) -> PipelineFailureSummary:
         ts = c.get("created_at", "")
 
         if not seen_build_table:
-            stages_in_comment: list[StageStatus] = []
-            for m in _BUILD_TABLE_RE.finditer(body):
-                name, status, pipe_num, url = m.groups()
-                stages_in_comment.append(StageStatus(
-                    name=name, status=status, pipeline=int(pipe_num), url=url
-                ))
-            if stages_in_comment:
-                failed = [s for s in stages_in_comment if s.status == "FAILURE"]
-                summary.pipeline_number = stages_in_comment[0].pipeline
-                summary.pipeline_url = stages_in_comment[0].url
-                summary.latest_comment_id = c.get("id")
-                if failed:
-                    summary.failed_stages = failed
-                seen_build_table = True
+            seen_build_table = _record_build_table(summary, body, c.get("id"))
 
         if not seen_check_pr_fail and _CHECK_PR_FAIL_RE.search(body):
             summary.check_pr_failure = body
@@ -326,7 +336,7 @@ def find_latest_pr_build(pr_number: int, job: str,
     builds get aborted and the *previous* fully-completed result is what
     actually represents the gate verdict.
     """
-    url = (f"{JENKINS_BASE}/job/{job}/api/json"
+    url = (f"{_jenkins_base()}/job/{job}/api/json"
            f"?tree=builds[number,result,building,description,timestamp,duration,url]"
            f"{{0,{scan_depth}}}")
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -378,7 +388,7 @@ def fetch_jenkins_console(pipeline_url_or_num: str | int,
         if not m:
             raise GateDoctorError(f"Cannot derive consoleText URL from: {pipeline_url_or_num}")
         job, build_num = m.group(1), int(m.group(2))
-    url = f"{JENKINS_BASE}/job/{job}/{build_num}/consoleText"
+    url = f"{_jenkins_base()}/job/{job}/{build_num}/consoleText"
     req = urllib.request.Request(url, headers={"Accept": "text/plain"})
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -458,7 +468,8 @@ def _token() -> str:
     return tok
 
 
-def cmd_retest(args) -> int:
+def cmd_retest(args: argparse.Namespace) -> int:
+    """Request a CI rerun on the selected PR."""
     owner, repo, pr = parse_pr_ref(args.pr)
     post_pr_comment(owner, repo, pr, "/retest", _token())
     print(f"/retest posted on {owner}/{repo}#{pr}")
@@ -466,11 +477,41 @@ def cmd_retest(args) -> int:
     return 0
 
 
-def cmd_check_pr(args) -> int:
+def cmd_check_pr(args: argparse.Namespace) -> int:
+    """Request description and checklist validation on the selected PR."""
     owner, repo, pr = parse_pr_ref(args.pr)
     post_pr_comment(owner, repo, pr, "/check-pr", _token())
     print(f"/check-pr posted on {owner}/{repo}#{pr}")
     return 0
+
+
+def _parse_test_failures(console: str) -> list[dict]:
+    """Extract pytest failure summaries from timestamped Jenkins output."""
+    test_failures: list[dict] = []
+    for raw in console.splitlines():
+        line = _strip_ansi(raw)
+        line = re.sub(r"^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]\s*", "", line)
+        match = re.match(r"FAILED\s+(\S+?)::(\S+?)(?:\s*-\s*(.*))?$", line.strip())
+        if match:
+            test_failures.append({
+                "file": match.group(1),
+                "test": match.group(2),
+                "summary": (match.group(3) or "").strip(),
+            })
+    return test_failures
+
+
+def _failure_log_excerpt(console: str) -> str:
+    """Keep the last 200 log lines matching common failure markers."""
+    excerpt = []
+    pattern = re.compile(r"\[(ERROR|FAILURE)\]|FAILED\s+\S+::|FAILURE\b|"
+                         r"\[PYTHON\] Function|pylint.*\[[WE]\d{4}|AssertionError|"
+                         r"currentBuild\.result\s*=\s*FAILURE")
+    for raw in console.splitlines():
+        line = _strip_ansi(raw)
+        if pattern.search(line):
+            excerpt.append(line)
+    return "\n".join(excerpt[-200:])
 
 
 def _build_report_from_jenkins(owner: str, repo: str, pr: int,
@@ -485,7 +526,7 @@ def _build_report_from_jenkins(owner: str, repo: str, pr: int,
     """
     labels = labels or []
     build_num = int(jenkins_build["number"])
-    build_url = jenkins_build.get("url") or f"{JENKINS_BASE}/job/{job}/{build_num}/"
+    build_url = jenkins_build.get("url") or f"{_jenkins_base()}/job/{job}/{build_num}/"
     result = jenkins_build.get("result") or "BUILDING"
     console = fetch_jenkins_console(build_num, default_job=job)
     parsed = parse_console_failures(console)
@@ -502,28 +543,7 @@ def _build_report_from_jenkins(owner: str, repo: str, pr: int,
     for f in parsed:
         stages_failed.add(f.stage)
 
-    # Smoke / test failures: pull pytest "FAILED ..." lines
-    test_failures: list[dict] = []
-    for raw in console.splitlines():
-        s = _strip_ansi(raw)
-        s = re.sub(r"^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]\s*", "", s)
-        m = re.match(r"FAILED\s+(\S+?)::(\S+?)(?:\s*-\s*(.*))?$", s.strip())
-        if m:
-            test_failures.append({
-                "file": m.group(1),
-                "test": m.group(2),
-                "summary": (m.group(3) or "").strip(),
-            })
-
-    # Excerpt: last ~200 lines that match common failure markers
-    excerpt = []
-    pat = re.compile(r"\[(ERROR|FAILURE)\]|FAILED\s+\S+::|FAILURE\b|"
-                     r"\[PYTHON\] Function|pylint.*\[[WE]\d{4}|AssertionError|"
-                     r"currentBuild\.result\s*=\s*FAILURE")
-    for raw in console.splitlines():
-        s = _strip_ansi(raw)
-        if pat.search(s):
-            excerpt.append(s)
+    test_failures = _parse_test_failures(console)
 
     duration_ms = int(jenkins_build.get("duration") or 0)
     # A bypass build is a fake green: someone posted /retest while
@@ -555,7 +575,7 @@ def _build_report_from_jenkins(owner: str, repo: str, pr: int,
         # gate_ok aggregates pipeline-side + /check-pr-side verdicts. Set by
         # cmd_diagnose after the comment stream is parsed.
         "gate_ok": None,
-        "raw_log_excerpt": "\n".join(excerpt[-200:]),
+        "raw_log_excerpt": _failure_log_excerpt(console),
     }
 
 
@@ -598,10 +618,9 @@ def _diagnose_finished_build(owner, repo, pr, build, job) -> int:
     return 0
 
 
-def _diagnose_pending(owner, repo, pr, build, job) -> int:
-    """Emit the report when no build is registered yet or one is still building."""
-    comments = get_pr_comments(owner, repo, pr, _token())
-    summary = parse_latest_failure(comments)
+def _build_pending_report(owner: str, repo: str, pr: int, build: Optional[dict],
+                          summary: PipelineFailureSummary) -> dict:
+    """Combine comment signals with the current in-progress build identity."""
     # When the newest Jenkins build is still in progress, the comment-derived
     # `summary.pipeline_number` is a previous (stale) build. Override the
     # reported pipeline_number with the building one so the caller doesn't
@@ -634,6 +653,14 @@ def _diagnose_pending(owner, repo, pr, build, job) -> int:
         report["note"] = (f"Build #{pipe_num} is currently running for "
                           f"{owner}/{repo}#{pr}. Re-run diagnose once it "
                           f"completes for failure detail.")
+    return report
+
+
+def _diagnose_pending(owner, repo, pr, build, job) -> int:
+    """Emit the report when no build is registered yet or one is still building."""
+    comments = get_pr_comments(owner, repo, pr, _token())
+    summary = parse_latest_failure(comments)
+    report = _build_pending_report(owner, repo, pr, build, summary)
     if summary.pipeline_url:
         console = fetch_jenkins_console(
             summary.pipeline_number or summary.pipeline_url, default_job=job)
@@ -647,7 +674,7 @@ def _diagnose_pending(owner, repo, pr, build, job) -> int:
         not report["failed_stages"]
         and report["check_pr_failure"] is None
         and report["gate_trigger_blocked"] is None
-        and pipe_res != "BUILDING"
+        and report["pipeline_result"] != "BUILDING"
     )
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
@@ -655,7 +682,7 @@ def _diagnose_pending(owner, repo, pr, build, job) -> int:
                  or summary.gate_trigger_blocked or summary.pipeline_number) else 1
 
 
-def cmd_diagnose(args) -> int:
+def cmd_diagnose(args: argparse.Namespace) -> int:
     """Emit a JSON report of the PR's latest pipeline + ``/check-pr`` state."""
     owner, repo, pr = parse_pr_ref(args.pr)
 
@@ -668,7 +695,7 @@ def cmd_diagnose(args) -> int:
     return _diagnose_pending(owner, repo, pr, build, job)
 
 
-def cmd_autofix(args) -> int:
+def cmd_autofix(args: argparse.Namespace) -> int:
     """Emit a structured plan; the LLM caller executes the patch+commit step."""
     owner, repo, pr = parse_pr_ref(args.pr)
 
@@ -697,10 +724,10 @@ def cmd_autofix(args) -> int:
                  "the failure is unrelated. Out-of-diff failures CAN be "
                  "PR-induced via submodule pins, env vars, or site-packages."),
                 "Edit only the files truly responsible.",
-                "Run pylint --rcfile=ms_pylintrc on touched .py files; ensure 10.00/10.",
+                "Run pylint --rcfile=.pylintrc on touched .py files; resolve reported violations.",
                 (f"`autogit commit -m \"fix(...): satisfy "
                  f"{', '.join(plan['failed_stages']) or 'gate'}\"`"),
-                f"`gate_doctor.py retest {pr}`",
+                f"`gate_doctor.py retest {owner}/{repo}#{pr}`",
             ]
         json.dump(plan, sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
@@ -720,9 +747,9 @@ def cmd_autofix(args) -> int:
         plan["actions"] = [
             "Read references/common-failures.md for each unique stage above.",
             "Edit the offending files using the Read+Edit tools.",
-            "Run pylint --rcfile=ms_pylintrc on touched .py files; ensure 10.00/10.",
+            "Run pylint --rcfile=.pylintrc on touched .py files; resolve reported violations.",
             f"`autogit commit -m \"fix(...): satisfy {', '.join(plan['failed_stages'])}\"`",
-            f"`gate_doctor.py retest {pr}`",
+            f"`gate_doctor.py retest {owner}/{repo}#{pr}`",
         ]
     elif summary.check_pr_failure:
         plan["check_pr_failure"] = summary.check_pr_failure
@@ -730,12 +757,12 @@ def cmd_autofix(args) -> int:
         plan["actions"] = [
             "Update PR description to satisfy the failing check-list / template item.",
             "Use `autogit update <pr> --title --body` to push the new description.",
-            f"`gate_doctor.py check-pr {pr}`",
+            f"`gate_doctor.py check-pr {owner}/{repo}#{pr}`",
         ]
     else:
         plan["diagnose_only"] = True
         plan["note"] = "No failure detected. Pipeline may not have run yet."
-        plan["actions"] = [f"`gate_doctor.py retest {pr}` if you want to trigger a fresh run."]
+        plan["actions"] = [f"`gate_doctor.py retest {owner}/{repo}#{pr}` if you want to trigger a fresh run."]
 
     json.dump(plan, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
@@ -759,26 +786,24 @@ def _build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=fn.__doc__.splitlines()[0] if fn.__doc__ else "")
         sp.add_argument(
             "pr",
-            help=("PR reference. A bare number / '#N' resolves to the default "
-                  "repo (mindspore/hyper-parallel). Use full URL "
+            help=("PR reference. A bare number / '#N' uses GATE_DOCTOR_REPO. Use full URL "
                   "'https://gitcode.com/<owner>/<repo>/pull/<N>' or "
-                  "'<owner>/<repo>#<N>' to target another repo "
-                  "(e.g. mindspore/mindspore).")
+                  "'<owner>/<repo>#<N>' to specify the repository explicitly.")
         )
         if name in ("diagnose", "autofix"):
             sp.add_argument(
                 "--jenkins-job",
                 default=None,
-                help=("Override the Jenkins gate job. By default the script "
-                      "picks the right one from the (owner, repo) pair. "
-                      "Pass this when the skill is used in a repo that isn't "
-                      "in the built-in mapping.")
+                help=("Override the Jenkins gate job. The HyperParallel job is selected "
+                      "for repositories named hyper-parallel; other repositories require "
+                      "this option. Set JENKINS_URL to the Jenkins base URL.")
             )
         sp.set_defaults(func=fn)
     return p
 
 
 def main() -> int:
+    """Dispatch the selected command and report configuration or API errors."""
     parser = _build_parser()
     args = parser.parse_args()
     try:

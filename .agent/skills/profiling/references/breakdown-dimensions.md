@@ -93,6 +93,11 @@ Self`, and a `c10d::allreduce_` interval inherited 5,370 microseconds even
 though per-step communication was only 1,272 microseconds. Use the step
 trace or `communication.json` for communication timing.
 
+Use long Host operator intervals to locate potential wait boundaries. Align the
+framework call with its device tasks and adjacent queued work before assigning
+a time-saving budget. A paired full-workload benchmark determines how much
+of the interval a local replacement can remove from the critical path.
+
 ## Consistency checks
 
 `breakdown.py` reports these checks and exits with code 2 when a required

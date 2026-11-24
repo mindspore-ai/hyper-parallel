@@ -21,14 +21,11 @@ import torch
 
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.models.deepseek_v41.adapter.optim.host_sparse import HostSparseOptimizerCoordinator
-from tests.common.mark_utils import arg_mark
 
 
 class TestHostOptimizerRestore(unittest.TestCase):
     """Keep lazy optimizer initialization out of persisted Host state."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_native_bf16_dense_moments_not_in_checkpoint_are_pruned(self):
         """Prune unsaved BF16 moments without an FP32 main parameter wrapper.
 
@@ -48,8 +45,6 @@ class TestHostOptimizerRestore(unittest.TestCase):
         self.assertIn(model.active, leaf.state)
         self.assertNotIn(model.inactive, leaf.state)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_lazy_moments_not_in_checkpoint_are_pruned(self):
         """Drop unpersisted moments after dense DCP load.
 

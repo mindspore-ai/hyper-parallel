@@ -29,8 +29,6 @@ from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import 
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import hifloat8_matmul
 from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
 
-from tests.common.mark_utils import arg_mark
-
 
 class IdentityOps:
     """CPU arithmetic adapter; deliberately does not emulate low-precision rounding."""
@@ -117,8 +115,6 @@ class MemoryContractsTests(unittest.TestCase):
             y = hifloat8_linear(x, w, q, q, q)
         return x, w, y
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_repeat_backward_retained_graph(self) -> None:
         """
         Feature: Low-precision memory contracts.
@@ -138,8 +134,6 @@ class MemoryContractsTests(unittest.TestCase):
                         with self.assertRaises(RuntimeError):
                             torch.autograd.grad(y.sum(), variables)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_saved_tensors_are_released_after_backward(self) -> None:
         """
         Feature: Low-precision memory contracts.
@@ -156,8 +150,6 @@ class MemoryContractsTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     _ = node.saved_tensors
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_double_backward_is_explicitly_unsupported(self) -> None:
         """
         Feature: Low-precision memory contracts.
@@ -172,8 +164,6 @@ class MemoryContractsTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'once_differentiable'):
                     dx.sum().backward()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_payload_lifetime_follows_retained_graph(self) -> None:
         """
         Feature: Low-precision memory contracts.
@@ -193,8 +183,6 @@ class MemoryContractsTests(unittest.TestCase):
                 gc.collect()
                 self.assertTrue(all(ref() is None for ref in payloads))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_from_module_keeps_weights_and_rng(self) -> None:
         """
         Feature: Low-precision memory contracts.
@@ -213,8 +201,6 @@ class MemoryContractsTests(unittest.TestCase):
         self.assertIs(target.down_proj, source.down_proj)
         torch.testing.assert_close(torch.get_rng_state(), rng)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_missing_scale_is_rejected_at_construction(self) -> None:
         """
         Feature: Low-precision memory contracts.
@@ -228,8 +214,6 @@ class MemoryContractsTests(unittest.TestCase):
                         cls((2, 2), torch.bfloat16, quantizer=IdentityQuantizer(),
                             **{field: torch.ones(2, 2)})
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_direction_requires_both_data_and_scale(self) -> None:
         """
         Feature: Low-precision memory contracts.
@@ -245,8 +229,6 @@ class MemoryContractsTests(unittest.TestCase):
         tensor.col_scale = None
         self.assertFalse(tensor.is_colwise())
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_shared_scale_and_usage_still_work(self) -> None:
         """
         Feature: Low-precision memory contracts.

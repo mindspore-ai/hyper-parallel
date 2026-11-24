@@ -32,7 +32,6 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from torch import nn
 
-from tests.common.mark_utils import arg_mark
 
 # transformer-heavy import chain: on CI pythons without liblzma the lazy
 # transformers -> torchvision import dies, so guard as the sibling tests do.
@@ -75,6 +74,7 @@ class TestApplyParameterFreezing(unittest.TestCase):
 
     @staticmethod
     def _freeze(model, patterns):
+        """Apply parameter-freezing patterns when model dependencies are available."""
         try:
             from hyper_parallel.models._transformers.model_builder import (
                 _apply_parameter_freezing,
@@ -88,8 +88,6 @@ class TestApplyParameterFreezing(unittest.TestCase):
 
         return _apply_parameter_freezing(model, patterns)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_glob_freezes_only_the_matched_subtree(self):
         """A tower glob freezes that tower and leaves every sibling trainable."""
         model = _build_model()
@@ -100,8 +98,6 @@ class TestApplyParameterFreezing(unittest.TestCase):
         self.assertTrue(_all_trainable(model.model.mm_projector))
         self.assertTrue(_all_trainable(model.model.language_model))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_accepts_a_bare_string_pattern(self):
         """A single pattern need not be wrapped in a list."""
         model = _build_model()
@@ -110,8 +106,6 @@ class TestApplyParameterFreezing(unittest.TestCase):
 
         self.assertTrue(_all_frozen(model.model.vision_tower))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_multiple_patterns_and_deep_names(self):
         """Patterns compose, and ``*`` crosses dotted module boundaries."""
         model = _build_model()
@@ -122,15 +116,11 @@ class TestApplyParameterFreezing(unittest.TestCase):
         self.assertTrue(_all_frozen(model.model.mm_projector))
         self.assertTrue(_all_trainable(model.model.language_model))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_no_match_raises_instead_of_silently_continuing(self):
         """A typo must fail loudly: a quietly trainable tower invalidates the A/B."""
         with self.assertRaisesRegex(ValueError, "matched no parameter"):
             self._freeze(_build_model(), ["model.vison_tower*"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_empty_pattern_list_is_a_no_op(self):
         """An empty list freezes nothing and does not raise."""
         model = _build_model()
@@ -140,8 +130,6 @@ class TestApplyParameterFreezing(unittest.TestCase):
         self.assertTrue(_all_trainable(model.model.vision_tower))
         self.assertTrue(_all_trainable(model.model.language_model))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_freezing_twice_is_idempotent(self):
         """Re-applying the same patterns keeps the state and does not raise."""
         model = _build_model()

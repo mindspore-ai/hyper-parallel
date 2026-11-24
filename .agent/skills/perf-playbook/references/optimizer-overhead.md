@@ -116,6 +116,26 @@ provide `source`.
    can make HFU substantially higher than MFU. Include both terms in HFU before
    interpreting low MFU as an execution defect.
 
+### Sharded matrix optimizer scheduling
+
+Inspect optimizer traces across compute owners using the actual matrix shapes and
+the communication group membership. Reconstruct each serialized batch's owners,
+the largest per-owner Newton–Schulz workload, and the tensors moved by each
+collective. A low-work rank can spend time in a collective while another rank is
+orthogonalizing a larger matrix. Use cross-rank device traces to distinguish this
+dependency from poor link bandwidth.
+
+For uniformly sharded matrices, evaluate sending source slices only to each
+compute owner and returning only the update slice required by each destination.
+Check device support for the required split sizes and layouts. Budget input
+assembly and update buffers together before changing batch size. Keep optimizer
+state ownership, iteration coefficients, and parameter update arithmetic fixed.
+Verify the returned update shards with a same-input and same-state module probe,
+then compare complete steps with a matched numerical gate and an independent
+unprofiled repeat. Confirm the intended path and supported layouts at runtime.
+Record measured throughput and peak memory for each workload. Keep logical
+payload estimates separate from measured physical link bandwidth.
+
 ## 5. A measured accounting example
 
 In one sparse-MoE pretraining utilization audit with a matrix-heavy optimizer, the

@@ -236,6 +236,7 @@ def set_model_state_dict(
     state_dict: dict[str, Any],
     *,
     options: Optional[StateDictOptions] = None,
+    assign: bool = True,
 ) -> None:
     """Load state dict into model, scattering full tensors to DTensor shards.
 
@@ -253,7 +254,7 @@ def set_model_state_dict(
 
     Note:
         ``ignore_frozen_params`` is intentionally a no-op on the setter path,
-        mirroring torch.distributed.checkpoint.state_dict: frozen parameters
+        matching the distributed checkpoint contract: frozen parameter
         filtering is a getter-only feature. Callers that strip frozen keys
         from the input should also pass ``strict=False``.
 
@@ -263,6 +264,8 @@ def set_model_state_dict(
             when ``full_state_dict=True`` or sharded DTensors otherwise.
         options: Controls full_state_dict, cpu_offload, strict and
             broadcast_from_rank0 flags.
+        assign: Replace parameters when True; use False when an optimizer already
+            owns the final parameters and their identities must remain stable.
 
     Raises:
         ValueError: If ``broadcast_from_rank0`` is True while
@@ -294,7 +297,7 @@ def set_model_state_dict(
     else:
         scattered = state_dict
 
-    model.load_state_dict(scattered, strict=options.strict, assign=True)
+    model.load_state_dict(scattered, strict=options.strict, assign=assign)
 
 
 # =====================================================================
@@ -510,6 +513,7 @@ def _build_result_param_groups(
     saved_id_to_fqn: Dict[int, str],
 ) -> List[Dict[str, Any]]:
     """Build result param_groups with FQN keys from saved id-based groups."""
+    del optimizer
     result_param_groups: List[Dict[str, Any]] = []
     for saved_group in raw_sd["param_groups"]:
         pg: Dict[str, Any] = {}
@@ -675,6 +679,7 @@ def _build_target_fqn_mappings(
     Returns:
         Tuple of (fqn_to_saved_id, dtensor_state_ids).
     """
+    del param_by_fqn
     target_raw_sd = optimizer.state_dict()
 
     target_id_to_param: Dict[int, nn.Parameter] = {}
@@ -822,6 +827,11 @@ def set_optim_state_dict(
     optimizer.load_state_dict(target_raw_sd)
 
 
+def _optimizer_tensor_result(tensor: DTensor, stores_dtensor: bool) -> Union[torch.Tensor, DTensor]:
+    """Keep global layout only when the target optimizer stores DTensor values."""
+    return tensor if stores_dtensor else tensor.to_local()
+
+
 def _convert_input_tensor_to_target(
     tensor: torch.Tensor,
     param: nn.Parameter,
@@ -867,21 +877,15 @@ def _convert_input_tensor_to_target(
 
     if isinstance(tensor, DTensor):
         if tensor.device_mesh == mesh and tensor.placements == placements:
-            if stores_dtensor:
-                return tensor
-            return tensor.to_local()
+            return _optimizer_tensor_result(tensor, stores_dtensor)
         redistributed = tensor.redistribute(mesh, placements)
-        if stores_dtensor:
-            return redistributed
-        return redistributed.to_local()
+        return _optimizer_tensor_result(redistributed, stores_dtensor)
 
     if full_state_dict:
         if cpu_offload:
             tensor = tensor.to(target_device)
         dt = distribute_tensor(tensor, mesh, placements)
-        if stores_dtensor:
-            return dt
-        return dt.to_local()
+        return _optimizer_tensor_result(dt, stores_dtensor)
 
     if cpu_offload and tensor.device != target_device:
         tensor = tensor.to(target_device)
@@ -1474,7 +1478,8 @@ def _parse_nested_state_entry(
     cpu_offload: bool,
 ) -> Optional[Tuple[str, str, torch.Tensor]]:
     """Parse a state.* metadata entry and return (fqn, state_key, tensor) or None."""
-    from hyper_parallel.core.distributed_checkpoint.metadata import (
+    # DCP re-exports these state helpers; defer metadata to avoid that package import cycle.
+    from hyper_parallel.core.distributed_checkpoint.metadata import (  # pylint: disable=import-outside-toplevel
         TensorStorageMetadata,
     )
 
@@ -1509,7 +1514,8 @@ def _parse_nested_param_group_entry(
     meta_val: Any,
 ) -> Optional[Tuple[int, str, torch.Tensor]]:
     """Parse a param_group.* metadata entry and return (group_idx, field_name, tensor) or None."""
-    from hyper_parallel.core.distributed_checkpoint.metadata import (
+    # DCP re-exports these state helpers; defer metadata to avoid that package import cycle.
+    from hyper_parallel.core.distributed_checkpoint.metadata import (  # pylint: disable=import-outside-toplevel
         TensorStorageMetadata,
     )
 
@@ -1602,7 +1608,8 @@ def _build_flatten_template_from_metadata(
         state.<FQN>.<state_key>  -> TensorStorageMetadata
         param_group.<FQN>.<field> -> TensorStorageMetadata or BytesStorageMetadata
     """
-    from hyper_parallel.core.distributed_checkpoint.metadata import (
+    # DCP re-exports these state helpers; defer metadata to avoid that package import cycle.
+    from hyper_parallel.core.distributed_checkpoint.metadata import (  # pylint: disable=import-outside-toplevel
         TensorStorageMetadata,
     )
 

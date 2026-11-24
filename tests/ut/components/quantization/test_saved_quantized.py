@@ -24,7 +24,6 @@ from typing import Any, Callable
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from tests.common.mark_utils import arg_mark
 from tests.ut.components.quantization import test_memory_contracts as hif8_tests
 from tests.ut.components.quantization import test_mxfp8_memory as mx_tests
 
@@ -48,7 +47,6 @@ class SavedQuantizedTests(unittest.TestCase):
             return mx_tests.MXFP8MemoryTests.projection(grouped, needs, empty=empty)[:3]
         return hif8_tests.MemoryContractsTests.make_projection(grouped, *needs, empty=empty)
 
-    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='onecard', essential_mark='essential')
     def test_save_on_cpu_repeated_backward(self):
         """
         Feature: Quantized saved-tensor hooks.
@@ -78,7 +76,6 @@ class SavedQuantizedTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         _ = output.grad_fn.saved_tensors
 
-    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='onecard', essential_mark='essential')
     def test_hooks_receive_physical_tensors_and_release_copies(self):
         """
         Feature: Quantized saved-tensor hooks.
@@ -108,7 +105,6 @@ class SavedQuantizedTests(unittest.TestCase):
                 for actual, repeated in zip(first, second):
                     torch.testing.assert_close(actual, repeated, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='onecard', essential_mark='essential')
     def test_physical_payload_version_counter(self):
         """
         Feature: Quantized saved-tensor version checks.
@@ -124,7 +120,6 @@ class SavedQuantizedTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'modified by an inplace operation'):
                     output.sum().backward()
 
-    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='onecard', essential_mark='essential')
     def test_checkpoint_and_offload(self):
         """
         Feature: Quantized checkpoint compatibility.

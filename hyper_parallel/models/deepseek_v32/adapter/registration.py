@@ -15,6 +15,7 @@
 """Architecture and lazy provider registration for DeepSeek-V3.2."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.deepseek_v32.adapter.materialization import register_rotary_materialization
 from hyper_parallel.models.deepseek_v32.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
@@ -43,6 +44,7 @@ DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV32ForCausalLM",
     model_type="deepseek_v32",
     replacements=_load_replacements,
+    materialization=register_rotary_materialization,
     context_parallel=_load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
 )

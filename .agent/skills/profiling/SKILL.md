@@ -77,6 +77,68 @@ produced a ratio of 1.77 with both files parsed correctly.
 |---|---|
 | Identify profiler files, column meanings, accounting identities, and parsing pitfalls | [Output files](references/output-files.md) |
 | Apply time-accounting, accelerator-core, communication, and consistency rules | [Breakdown dimensions](references/breakdown-dimensions.md) |
+| Decide when to add hardware counters, normalize CUBE/HBM/link efficiency, and distinguish activity ratios from achieved throughput | [Hierarchical performance diagnosis](../perf-playbook/references/hierarchical-performance-diagnosis.md) |
+
+## GEMM throughput estimate
+
+When the end-to-end breakdown points to matrix computation, use the sampled kernel
+durations and BF16 GEMM geometry to estimate achieved throughput per shape.
+
+```bash
+python .agent/skills/profiling/scripts/gemm_throughput.py /path/to/kernel_details.csv \
+  --steps 8 9 10 --peak-tflops 353 --out /path/to/gemm-throughput.json
+```
+
+Use the captured step IDs and the declared dense BF16 peak for the reported die.
+The output lists recognized matrix shapes and their timing coverage. Blocked layouts,
+fused operators and other dtypes require their own accounting. Use the coverage and
+critical-path contribution when comparing regions. For executed HFU, use actual
+arithmetic counters with matching scope.
+
+When the native rank capture has been decoded but CSV export is incomplete, select
+one rank directory containing `ge_info.db` and `ascend_task.db`.
+
+```bash
+python .agent/skills/profiling/scripts/gemm_throughput.py \
+  --native-rank /path/to/decoded/rank --peak-tflops 353 --out /path/to/gemm-throughput.json
+```
+
+The native mode covers the complete decoded capture and records database digests,
+the count of unresolved compute tasks, and their summed duration. Check the
+capture window and rank identity before comparing results. Use output shapes to resolve each contraction.
+The same input shapes can describe a projection or a weight gradient with
+different arithmetic counts.
+
+
+Mixed kernels can appear as a launch envelope and named execution components.
+Use their shared launch identity and verify interval containment before
+attributing time. Use the component with resolved shape metadata for geometry.
+Account for the shared interval once in critical-path timing. Investigate
+unresolved records before inferring an additional hotspot from their duration.
+
+## Recover a partial CANN arithmetic export
+
+When collection finishes and export times out, retain the raw `PROF_*`
+directory and the rank boundary receipts. Parse a copy of the captured
+directory using the same CANN profiler version. This can recover missing
+per-device databases without rerunning the workload.
+
+```bash
+msprof --parse=on --output="$profile_copy"
+python .agent/skills/profiling/scripts/arithmetic_counters.py "$profile_copy" \
+  --devices 0 1 2 3 4 5 6 7 --cube-cores-per-die 25 --vector-cores-per-die 50 \
+  --out "$counter_receipt"
+```
+
+Supply physical device IDs from the capture inventory and the expected core
+counts for that accelerator. The example covers eight dies with 25 CUBE and
+50 Vector cores per die. Check each host's export before combining ranks in a
+multi-node capture. The extractor requires finalized `EventCount` databases
+and verifies both engine exports, distinct physical cores, and integer
+registers for every declared device. It records the export hashes and raw
+registers. A failed check leaves the destination untouched. Convert the
+registers with the calibrated runtime-specific event definitions and retain
+the matched unprofiled update window before reporting HFU.
 
 ## Report
 

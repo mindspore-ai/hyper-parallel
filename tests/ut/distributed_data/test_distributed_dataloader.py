@@ -32,7 +32,6 @@ from hyper_parallel.distributed_data.batch_sampler import _ReaderPlanInput
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import DistributedPackingPlan, SampleKey, WorkloadCost
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
-from tests.common.mark_utils import arg_mark
 
 
 class _StandaloneMesh:
@@ -84,7 +83,6 @@ def _window_reader_inputs(source_bins, reference_bins, local_size):
 class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
     """Verify that each native sampler plan consumes one complete step."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_collectives_and_construction_share_one_producer(self) -> None:
         """Feature: Independent single-round prefetch.
         Description: Consume steps with implicit or repeated explicit prefetch hooks.
@@ -138,7 +136,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 self.assertIsNot(worker, current_thread())
 
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_single_round_hooks_and_checkpoint_do_not_wait_for_future_work(self) -> None:
         """Feature: Nonblocking single-round training hooks.
         Description: Hold the next step at each data preparation stage without calling Trainer hooks.
@@ -182,7 +179,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     release.set()
 
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_wait_error_reaches_consumer(self) -> None:
         """Feature: Metadata completion error propagation.
         Description: Fail metadata gathering for the next single-round step.
@@ -207,7 +203,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
 
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_non_planner_rank_builds_batches_without_plan_broadcast(self) -> None:
         """Feature: Independent planning on every data-plane rank.
         Description: Run online and metadata loading through both prefetch paths on a non-Planner rank.
@@ -238,7 +233,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     self.assertEqual(list(loader), [(0, 1), (2, 3), (4, 5)])
                     self.assertEqual(plan.call_count, 3)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_sampler_paths_stage_h2d_before_model_broadcast(self) -> None:
         """Feature: Shared sampler H2D staging.
         Description: Consume and checkpoint online and metadata sampler batches.
@@ -288,7 +282,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         self.assertEqual(len(copies), 2)
                         self.assertEqual(next(loader)["data"], (2, 3))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_plan_preserves_source_groups_and_filters_non_readers(self) -> None:
         """Feature: Native sampler planning.
         Description: Non-reader ranks in a non-contiguous group are filtered without changing selected indices.
@@ -319,7 +312,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertEqual(plan_step.call_args.kwargs["reference_bins"], ((first.key,), (second.key,)))
         self.assertEqual(set(plan.selected_keys), {first.key, second.key})
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_reader_only_rank_routes_payloads_without_constructing(self) -> None:
         """Feature: Separate data-plane roles.
         Description: Process an assigned plan on an online or metadata Reader without Constructor ownership.
@@ -355,7 +347,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     transport.prepare_exchange.assert_called_once_with({1: [(samples[0].key, _steps()[0][0])]})
                     transport.exchange_prepared.assert_called_once_with(transport.prepare_exchange.return_value)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_readers_must_exhaust_at_the_same_step(self) -> None:
         """Feature: Native sampler exhaustion.
         Description: Dataset Reader ranks reach EOF at different rounds.
@@ -374,7 +365,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 loader._build_plan_control(partial)
             self.assertIsNone(loader._build_plan_control(exhausted))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_reference_preserves_source_groups_and_mesh_order(self) -> None:
         """Feature: Reader-owned original layouts.
         Description: Plan repeated and split records with collective ranks in a different order from DP ranks.
@@ -419,7 +409,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         for plan in plans for batch in plan.local_batches for packing_bin in batch
                     ), reference_bins)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_original_layout_rejects_unequal_or_incomplete_windows(self) -> None:
         """Feature: Source-window shape validation.
         Description: Supply unequal round counts or an incomplete local batch.
@@ -443,7 +432,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     ):
                         loader._plan_native_batch([full, other])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_missing_payload_fails_before_committing_reader(self) -> None:
         """Feature: Native payload validation.
         Description: The Reader returns an incomplete selected payload set.
@@ -458,7 +446,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
 
         self.assertEqual(reader.batch_position, 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_active_step_requires_non_none_batch(self) -> None:
         """Feature: Native batch construction.
         Description: The constructor returns the end-of-stream sentinel for an active step.
@@ -470,7 +457,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 next(loader)
         self.assertEqual(loader._dataset_reader.batch_position, 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_mode_requires_batch_sampler(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: Metadata alone cannot activate a streaming selector, even for an empty Dataset.
@@ -503,7 +489,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     )
                 groups.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_online_dataset_requires_explicit_step_source(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: Removing metadata streaming must not re-enable implicit online selection.
@@ -515,7 +500,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 metadata_fn=lambda _: SampleMetadata(1),
             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_metadata_plans_before_reads_without_payload_exchange(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: One sampler yield supplies indices; only assigned samples are materialized.
@@ -563,7 +547,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertEqual(broadcast.call_count, 2)
         self.assertEqual(len(broadcast.call_args.args[0].selected_keys), 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_sampler_steps_do_not_borrow_future_samples(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: Sampler rounds control membership without a read-ahead selector.
@@ -581,7 +564,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 self.assertEqual(prepare.call_count, position + 2)
         self.assertFalse(hasattr(loader, "_step_sample_selector"))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_planner_exception_propagates_before_broadcast(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: Planner failure must not be turned into a refill request.
@@ -595,7 +577,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 next(loader)
         broadcast.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_end_of_stream_and_epoch_reset(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: None denotes EOF; a fresh epoch replays the same explicitly selected steps.
@@ -608,7 +589,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         loader.set_epoch(1)
         self.assertEqual(list(loader), expected)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_double_buffer_reuses_worker_and_preserves_pending_result(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: The background producer prepares exactly one next step while training consumes.
@@ -625,7 +605,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertIs(loader._prefetch_thread, thread)
         list(loader)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_background_error_is_raised_by_foreground(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: A producer exception wakes the consuming thread instead of hanging it.
@@ -636,7 +615,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "reader failed"):
                 next(loader)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_and_online_sampler_checkpoints_replay_pending_step(self) -> None:
         """Feature: Producer-defined step boundaries.
         Description: Saved progress describes delivered steps, not speculative reads.

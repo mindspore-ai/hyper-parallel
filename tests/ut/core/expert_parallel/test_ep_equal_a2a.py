@@ -57,7 +57,6 @@ import torch
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from hyper_parallel.distributed.expert_parallel import collectives as ep_collectives  # noqa: E402
-from tests.common.mark_utils import arg_mark  # noqa: E402
 
 _EP_SIZE = 4
 _HIDDEN = 3
@@ -67,8 +66,6 @@ _SYNC = "sync"
 _ASYNC = "async"
 _HCCL = "hccl"
 _GLOO = "gloo"
-_CPU_MARKS = {"plat_marks": ["cpu_linux", "cpu_macos"], "level_mark": "level0",
-              "card_mark": "allcards", "essential_mark": "essential"}
 
 
 class _VirtualEpGroup:
@@ -590,7 +587,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
                     f"{label}: rank {rank} gradient is {grads[rank].flatten().tolist()}, "
                     f"the plan says {expected[rank].flatten().tolist()}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_knob_off_keeps_the_ragged_path(self):
         """Unset (or 0) issues exactly the ragged exchange it issues today.
 
@@ -607,7 +603,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
         self._assert_matches_reference(run.outputs, send_plan, "knob off")
         self._assert_grad_matches_reference(run.grads, send_plan, "knob off")
 
-    @arg_mark(**_CPU_MARKS)
     def test_knob_on_with_uniform_counts_takes_the_equal_path(self):
         """A uniform plan issues the split-free collective, forward and backward.
 
@@ -624,7 +619,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
         self._assert_matches_reference(run.outputs, send_plan, "knob on")
         self._assert_grad_matches_reference(run.grads, send_plan, "knob on")
 
-    @arg_mark(**_CPU_MARKS)
     def test_equal_path_is_bit_identical_to_the_ragged_path(self):
         """Both paths move the same rows: same output, same backward, no tolerance.
 
@@ -647,7 +641,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
                     f"rank {rank}: ragged grad={ragged.grads[rank].flatten().tolist()}, "
                     f"equal grad={equal.grads[rank].flatten().tolist()}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_knob_on_with_uneven_counts_keeps_the_ragged_path(self):
         """An uneven plan must not be re-chunked into equal pieces.
 
@@ -665,7 +658,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
         self._assert_matches_reference(run.outputs, send_plan, "uneven plan")
         self._assert_grad_matches_reference(run.grads, send_plan, "uneven plan")
 
-    @arg_mark(**_CPU_MARKS)
     def test_uniform_counts_that_do_not_describe_the_payload_fall_back(self):
         """Uniform counts for the wrong payload size stay on the ragged path.
 
@@ -688,7 +680,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
         self.assertEqual(world.calls(0), [],
                          f"nothing may be exchanged here, but rank 0 issued {world.calls(0)}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_gloo_backend_ignores_the_knob(self):
         """The padded fallback is not touched: even on a uniform plan it pads.
 
@@ -705,7 +696,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
                                  f"rank {rank} issued {run.world.calls(rank)}")
         self._assert_matches_reference(run.outputs, send_plan, "gloo fallback")
 
-    @arg_mark(**_CPU_MARKS)
     def test_async_entry_takes_the_lazy_equal_path_on_a_uniform_plan(self):
         """The async entry issues the split-free exchange and keeps it pending.
 
@@ -729,7 +719,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
                          f"the lazy exchange was still used: {run.lazy_calls}")
         self._assert_matches_reference(run.outputs, send_plan, "async equal")
 
-    @arg_mark(**_CPU_MARKS)
     def test_async_entry_returns_a_tensor_in_eager_mode(self):
         """``HP_EP_EQUAL_A2A=eager`` keeps the split-free kernel, not the laziness.
 
@@ -750,7 +739,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
                     f"rank {rank} must get a tensor, got {type(run.pending[rank])}")
         self._assert_matches_reference(run.outputs, send_plan, "async equal eager")
 
-    @arg_mark(**_CPU_MARKS)
     def test_a_caller_that_cannot_defer_gets_a_materialized_exchange(self):
         """``allow_pending=False`` refuses the handle and keeps the eager kernel.
 
@@ -796,7 +784,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
                          f"an eager exchange must not touch the comm stream, "
                          f"but it was created {streams.new_stream_calls} times")
 
-    @arg_mark(**_CPU_MARKS)
     def test_async_entry_keeps_the_lazy_exchange_when_the_knob_is_off(self):
         """Unchanged behaviour: the knob off leaves the lazy path in place.
 
@@ -819,7 +806,6 @@ class TestEqualA2ADispatch(unittest.TestCase):
                 for rank in range(_EP_SIZE)),
             f"the lazy exchange must take every rank's counts, got {run.lazy_calls}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_async_entry_keeps_the_lazy_exchange_on_an_uneven_plan(self):
         """An uneven plan keeps the lazy exchange, with its counts passed through.
 
@@ -863,7 +849,6 @@ class TestLazyEqualA2A(unittest.TestCase):
             payload, [TestLazyEqualA2A._ROWS], [TestLazyEqualA2A._ROWS],  # pylint: disable=W0212
             _VirtualEpGroup(0, 1), allow_pending=allow_pending)
 
-    @arg_mark(**_CPU_MARKS)
     def test_issue_puts_the_exchange_on_the_comm_stream(self):
         """The split-free call runs on the comm stream, not on the caller's.
 
@@ -893,7 +878,6 @@ class TestLazyEqualA2A(unittest.TestCase):
              "exit@comm"],
             f"unexpected issue trace: {trace}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_wait_is_the_callers_decision(self):
         """Independent work fits between the issue and the wait.
 
@@ -920,7 +904,6 @@ class TestLazyEqualA2A(unittest.TestCase):
                         f"received={received.flatten().tolist()}, "
                         f"payload={payload.flatten().tolist()}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_repeated_waits_order_the_consumer_stream_once(self):
         """Waiting twice is the same as waiting once (idempotent handle).
 
@@ -939,7 +922,6 @@ class TestLazyEqualA2A(unittest.TestCase):
                          f"the consumer stream was ordered {trace.count('wait:event2->compute')} "
                          f"times, trace={trace}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_squeeze_keeps_the_exchange_pending(self):
         """The expert-index squeeze is a view and must not force the wait.
 
@@ -964,7 +946,6 @@ class TestLazyEqualA2A(unittest.TestCase):
         self.assertTrue(torch.equal(received, payload.squeeze(-1)),
                         f"received={received.tolist()}, payload={payload.squeeze(-1).tolist()}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_the_comm_stream_and_events_are_created_once(self):
         """One stream and two events serve every exchange of the process.
 
@@ -986,7 +967,6 @@ class TestLazyEqualA2A(unittest.TestCase):
                          {rank: ["equal"] for rank in range(_EP_SIZE)},
                          "every rank must have issued exactly one exchange")
 
-    @arg_mark(**_CPU_MARKS)
     def test_lazy_output_and_gradient_are_bit_identical_to_the_ragged_path(self):
         """The lazy exchange moves the rows the ragged one moves, forward and back.
 
@@ -1026,7 +1006,6 @@ class TestEqualA2AGuard(unittest.TestCase):
                 mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", knob):
             return ep_collectives._equal_a2a_rows(payload, send_counts, recv_counts, group)
 
-    @arg_mark(**_CPU_MARKS)
     def test_uniform_plan_matching_the_payload_is_accepted(self):
         """The balanced-router shape is the case the knob exists for.
 
@@ -1040,7 +1019,6 @@ class TestEqualA2AGuard(unittest.TestCase):
                     self._rows([row_count // 4] * 4, [row_count // 4] * 4, row_count),
                     row_count // 4, f"a uniform {row_count}-row payload must be accepted")
 
-    @arg_mark(**_CPU_MARKS)
     def test_knob_off_is_never_accepted(self):
         """With the knob off the guard must not select the fast path at all.
 
@@ -1051,7 +1029,6 @@ class TestEqualA2AGuard(unittest.TestCase):
         self.assertIsNone(self._rows([3, 3], [3, 3], 6, knob="0"),
                           "HP_EP_EQUAL_A2A=0 must keep the ragged path")
 
-    @arg_mark(**_CPU_MARKS)
     def test_uneven_plan_is_rejected(self):
         """Any per-peer count that differs keeps the ragged path.
 
@@ -1064,7 +1041,6 @@ class TestEqualA2AGuard(unittest.TestCase):
         self.assertIsNone(self._rows([3, 3], [3, 4], 6),
                           "an uneven receive count must keep the ragged path")
 
-    @arg_mark(**_CPU_MARKS)
     def test_unequal_send_and_receive_counts_are_rejected(self):
         """The split-free call needs the receive buffer to be the input's size.
 
@@ -1076,7 +1052,6 @@ class TestEqualA2AGuard(unittest.TestCase):
         self.assertIsNone(self._rows([3, 3], [2, 2], 6),
                           "uniform but different send/receive counts must keep the ragged path")
 
-    @arg_mark(**_CPU_MARKS)
     def test_payload_disagreeing_with_the_counts_is_rejected(self):
         """Uniform counts are not enough: the payload must hold them.
 
@@ -1090,7 +1065,6 @@ class TestEqualA2AGuard(unittest.TestCase):
         self.assertIsNone(self._rows([3, 3], [3, 3], 12),
                           "a 12-row payload does not match 3 rows per peer")
 
-    @arg_mark(**_CPU_MARKS)
     def test_mismatched_count_lengths_are_rejected(self):
         """The counts must describe the group, not a shorter or longer one.
 
@@ -1103,7 +1077,6 @@ class TestEqualA2AGuard(unittest.TestCase):
         self.assertIsNone(self._rows([], [], 0),
                           "an empty plan must be rejected")
 
-    @arg_mark(**_CPU_MARKS)
     def test_gloo_backend_is_rejected(self):
         """A backend without a ragged all-to-all keeps its padded path.
 
@@ -1114,7 +1087,6 @@ class TestEqualA2AGuard(unittest.TestCase):
         self.assertIsNone(self._rows([3, 3], [3, 3], 6, backend=_GLOO),
                           "gloo must keep the padded path")
 
-    @arg_mark(**_CPU_MARKS)
     def test_non_contiguous_payload_is_rejected(self):
         """The split-free call needs a contiguous payload; anything else keeps today's path.
 
@@ -1134,7 +1106,6 @@ class TestEqualA2AKnob(unittest.TestCase):
         with mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", raw):
             return ep_collectives._equal_a2a_mode()
 
-    @arg_mark(**_CPU_MARKS)
     def test_default_is_off(self):
         """The module-level default keeps the fast path disabled.
 
@@ -1154,7 +1125,6 @@ class TestEqualA2AKnob(unittest.TestCase):
                          ep_collectives._EQUAL_A2A_OFF,  # pylint: disable=W0212
                          "an unset knob must resolve to the off mode")
 
-    @arg_mark(**_CPU_MARKS)
     def test_values_resolve_to_their_modes(self):
         """``0`` / ``1`` / ``eager`` (with surrounding whitespace) are the valid values.
 
@@ -1169,7 +1139,6 @@ class TestEqualA2AKnob(unittest.TestCase):
                 self.assertEqual(self._mode(raw), expected,
                                  f"HP_EP_EQUAL_A2A={raw!r} must resolve to {expected}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_invalid_values_are_rejected(self):
         """A typo fails loudly instead of silently leaving the fast path off.
 

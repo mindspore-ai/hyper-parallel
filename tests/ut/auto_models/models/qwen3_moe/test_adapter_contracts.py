@@ -55,7 +55,6 @@ import unittest
 import unittest.mock
 from types import SimpleNamespace
 
-
 import torch
 from torch import nn
 
@@ -83,7 +82,6 @@ from hyper_parallel.models.qwen3_moe.adapter.distributed import (
 from hyper_parallel.models.qwen3_moe.adapter.distributed import (
     expert_parallel as adapter_expert_parallel,
 )
-from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeSubMesh
 
 _REPLACEMENT_NAMES = (
@@ -110,8 +108,6 @@ _MESH_FAMILY = frozenset({"mesh", "tp_mesh", "cp_mesh", "ep_mesh"})
 class TestLegacyEntryPointsRemoved(unittest.TestCase):
     """M5 gate: the legacy Qwen files and generic-surface branches are gone."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_legacy_model_modules_are_deleted(self):
         """``qwen3_moe_fusions`` / ``qwen3_moe_attention_common`` no longer exist.
 
@@ -123,16 +119,12 @@ class TestLegacyEntryPointsRemoved(unittest.TestCase):
             importlib.util.find_spec("hyper_parallel.models.components")
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_whole_block_sparse_moe_replacement_is_gone(self):
         """``replace_qwen3_moe_sparse_moe`` is a deliberate breaking removal."""
         self.assertFalse(hasattr(adapter_replacements, "replace_qwen3_moe_sparse_moe"))
         from hyper_parallel.models.qwen3_moe import adapter
         self.assertFalse(hasattr(adapter, "replace_qwen3_moe_sparse_moe"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_generic_ep_surface_has_no_qwen3_branch(self):
         """The qwen3moe archetype leaves the generic recipes/registry/exports."""
         self.assertFalse(hasattr(ep_compute, "qwen3moe_ep_compute_fn"))
@@ -142,8 +134,6 @@ class TestLegacyEntryPointsRemoved(unittest.TestCase):
         from hyper_parallel.distributed import expert_parallel
         self.assertFalse(hasattr(expert_parallel, "qwen3moe_ep_compute_fn"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_generic_cp_surface_has_no_qwen3_branch(self):
         """The async Qwen3 wrappers leave the generic CP surface."""
         from hyper_parallel.distributed import context_parallel
@@ -158,8 +148,6 @@ class TestLegacyEntryPointsRemoved(unittest.TestCase):
 class TestReplacementFactoryContracts(unittest.TestCase):
     """``@module_replacement`` factories: mark, signature, single home."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_replacement_mark_and_signature(self):
         """Each factory carries the replacement mark and the exact signature."""
         for name in _REPLACEMENT_NAMES:
@@ -175,8 +163,6 @@ class TestReplacementFactoryContracts(unittest.TestCase):
                     self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
                     self.assertIs(param.default, inspect.Parameter.empty)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_adapter_package_surface_exports_the_factories(self):
         """The adapter package surface exports the replacement objects."""
         from hyper_parallel.models.qwen3_moe import adapter
@@ -188,8 +174,6 @@ class TestReplacementFactoryContracts(unittest.TestCase):
 class TestAdapterHomeContracts(unittest.TestCase):
     """Single-home pins: attention contract and lazy spec providers."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_attention_contract_lives_in_the_adapter(self):
         """The mask/cache contract and the function-form forward are callables."""
         self.assertTrue(callable(adapter_attention.run_qwen3_moe_flash_attention))
@@ -197,8 +181,6 @@ class TestAdapterHomeContracts(unittest.TestCase):
         # the function-form forward keeps the historical contract
         self.assertTrue(callable(adapter_attention.qwen3_moe_flash_attention_forward))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_adapter_spec_providers_are_wired(self):
         """The registered qwen3_moe spec resolves its providers lazily."""
         from hyper_parallel.models.registry import get_model_adapter
@@ -212,8 +194,6 @@ class TestAdapterHomeContracts(unittest.TestCase):
 class TestCpWrapperContracts(unittest.TestCase):
     """Fused ``@inner_wrapper`` CP wrappers: mark, signature, validation."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_inner_wrapper_mark_and_signature(self):
         """Each wrapper declares the full wrapper context and returns a request."""
         for name in _CP_WRAPPER_NAMES:
@@ -238,8 +218,6 @@ class TestCpWrapperContracts(unittest.TestCase):
                     "_ForwardRewriteRequest",
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_wrappers_require_active_cp_mesh(self):
         """cp_mesh None or size 1 fails fast before any forward is touched."""
         for name in _CP_WRAPPER_NAMES:
@@ -252,8 +230,6 @@ class TestCpWrapperContracts(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "requires an active CP mesh"):
                     wrapper(nn.Module(), None, None, size_one, None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_wrappers_require_flash_attention_forward_first(self):
         """A target without the fused attention forward is rejected."""
         cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
@@ -270,8 +246,6 @@ class TestCpWrapperContracts(unittest.TestCase):
                     getattr(adapter_context_parallel, name)(target, None, None, cp_mesh, None)
         self.assertIs(target.forward.__func__, original_forward.__func__)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ulysses_wrapper_validates_head_counts(self):
         """Pure Ulysses requires config head counts divisible by the CP degree."""
         cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
@@ -283,8 +257,6 @@ class TestCpWrapperContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible"):
             wrapper(target, None, None, cp_mesh, None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_wrappers_return_rewrite_requests_without_mutating_forward(self):
         """The adapter wrappers never assign ``target.forward`` (05 §15.2.3).
 
@@ -337,8 +309,6 @@ def _hf_structure_attention():
 class TestAsyncCpWrapperContracts(unittest.TestCase):
     """Async (HF-structure) ``@inner_wrapper`` CP wrappers at their M5 home."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_inner_wrapper_mark_and_signature(self):
         """Each async wrapper declares the wrapper context (+ ulysses_degree)."""
         expected_params = {
@@ -368,8 +338,6 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
                     "_ForwardRewriteRequest",
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_wrappers_require_active_cp_mesh(self):
         """cp_mesh None or size 1 fails fast before any forward is touched."""
         for name in _ASYNC_CP_WRAPPER_NAMES:
@@ -383,8 +351,6 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "requires an active CP mesh"):
                     wrapper(nn.Module(), None, None, size_one, None, *extra)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_wrappers_require_hf_attention_structure(self):
         """A target without q_proj/k_proj/v_proj/q_norm/k_norm is rejected."""
         cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
@@ -406,8 +372,6 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
                         target, None, None, cp_mesh, None
                     )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_ulysses_wrapper_validates_head_counts(self):
         """Async Pure Ulysses requires head counts divisible by the CP degree."""
         cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
@@ -417,8 +381,6 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible"):
             wrapper(target, None, None, cp_mesh, None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_cp_expands_2d_padding_mask(self):
         """A HuggingFace padding mask should become a local causal mask."""
         query = torch.zeros(2, 2, 3, 4)
@@ -437,8 +399,6 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
         self.assertFalse(mask[0, :, :, -1].any())
         self.assertFalse(mask[1, :, :, -2:].any())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_wrappers_return_rewrite_requests_without_mutating_forward(self):
         """M5: the async wrappers return a request and never assign forward.
 
@@ -473,8 +433,6 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
 class TestEpFactoryContract(unittest.TestCase):
     """``@local_compute`` EP factory at its single adapter home."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_local_compute_mark_and_signature(self):
         """qwen3moe_ep_compute_fn declares module + mesh family, keyword-only."""
         factory = adapter_expert_parallel.qwen3moe_ep_compute_fn
@@ -497,8 +455,6 @@ class TestEpFactoryContract(unittest.TestCase):
         self.assertIs(parameters[-2].default, False)
         self.assertIs(parameters[-1].default, False)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ep_factory_validates_ep_mesh(self):
         """Calling the factory without an ep_mesh fails with the teaching error."""
         with self.assertRaisesRegex(ValueError, "built without an ep_mesh"):
@@ -537,8 +493,6 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
             )
         return stub, output, weights
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_none_mask_uses_cached_compressed_causal_mask(self):
         """mask=None selects sparse_mode=2 with the cached 2048 compressed mask."""
         query = torch.randn(1, 2, 4, 8)
@@ -557,8 +511,6 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
         self.assertIsNone(weights)
         self.assertTrue(torch.equal(output, query.transpose(1, 2).contiguous()))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_bool_mask_is_inverted_and_sliced(self):
         """A Transformers-convention bool mask is inverted (True = blocked) for the
         Ascend kernel, sliced to the key length, and selects sparse_mode=0."""
@@ -575,8 +527,6 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
         # is_causal default + self-attention length match adds next_tockens=0
         self.assertEqual(call["next_tockens"], 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_float_mask_is_cast_without_inversion(self):
         """A float (additive-style) mask is cast to bool WITHOUT inversion."""
         query = torch.randn(1, 2, 4, 8)
@@ -589,8 +539,6 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
             call["atten_mask"], float_mask.bool()
         ))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_next_tockens_requires_causal_self_attention(self):
         """next_tockens=0 is withheld for cross-attention or is_causal=False."""
         query = torch.randn(1, 2, 2, 8)

@@ -19,8 +19,6 @@ from unittest import mock
 
 from torch import nn
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.codegen.planner_overlay import (
     CodegenShardingPlanner,
     use_codegen_planner_overlay,
@@ -45,8 +43,6 @@ class TestPlannerCombinationBoundaries(unittest.TestCase):
                 raise RuntimeError("stop")
         self.assertIs(model_builder._instantiate_fsdp2, original)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_root_backtrack_scatters_to_each_parameter_owner(self):
         """Keep unknown owners explicit in the codegen overlay.
 
@@ -62,8 +58,6 @@ class TestPlannerCombinationBoundaries(unittest.TestCase):
         self.assertEqual(groups["visual.stem"], [("visual.stem.weight", ParamRole.REPLICATED)])
         self.assertEqual(groups["visual.neck"], [("visual.neck.weight", ParamRole.REPLICATED)])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_replicated_fallback_uses_relative_paths_and_yields_to_override(self):
         """Keep replicated fallback codegen-only and respect overrides.
 
@@ -86,8 +80,6 @@ class TestPlannerCombinationBoundaries(unittest.TestCase):
         self.assertFalse(spec.is_boundary)
         self.assertTrue(all(value.is_replicate() for value in spec.params["weight"].values()))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_megatron_swiglu_leaves_merge_upward(self):
         """Interpret Megatron SwiGLU leaves only in codegen.
 
@@ -103,8 +95,6 @@ class TestPlannerCombinationBoundaries(unittest.TestCase):
         self.assertEqual(planner._infer_boundary_type("model.mlp.linear_fc1", fc1), "unknown")
         self.assertEqual(planner._infer_boundary_type("model.mlp.linear_fc2", fc2), "unknown")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_overlay_upgrades_and_restores_only_the_codegen_build(self):
         """Scope the planner factory override to codegen.
 
@@ -124,8 +114,6 @@ class TestPlannerCombinationBoundaries(unittest.TestCase):
 class TestModelShardingRules(unittest.TestCase):
     """Model-owned policies cover multimodal and Kimi-specific parameters."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_kimi_special_parameters_are_replicated(self):
         """Cover Kimi special parameters in its model adapter.
 
@@ -144,8 +132,6 @@ class TestModelShardingRules(unittest.TestCase):
             "A_log", "dt_bias", "q_a_proj", "output_attn_res_proj",
         }.issubset(replicated))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_kimi_sparse_gate_classifies_as_router(self):
         """Assign Kimi sparse gates their codegen-only router role.
 

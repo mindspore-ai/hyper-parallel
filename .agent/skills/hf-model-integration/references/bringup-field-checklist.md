@@ -98,13 +98,20 @@ When the repository pins a newer `transformers` than any cluster env offers:
   `PYTHONPATH` by design; assert the import path instead
   (`python -c "import hyper_parallel; print(hyper_parallel.__file__)"`).
 
+- For recipes with dynamic `_target_` factories, run the Trainer's existing
+  configuration validator before device admission when those imports can
+  run without initializing an accelerator. Use the launcher's selected
+  Python interpreter and ordered import overlays. Confirm the overridden
+  symbols resolve to their expected implementation files and record file
+  digests alongside the recipe and source manifest.
+
 ## 4. HF-native first: registration is optional
 
 An unregistered HF-native family builds through `HyperAutoModelForCausalLM`
 exactly like a registered one — every adapter-spec consumer tolerates a
 missing spec — so a fresh bring-up needs **no registration at all**:
 correctness comes from the unmodified HF forward, and the generic kit under
-`examples/training_demo/hf_text_bringup/` (builder, recipe, data, launcher)
+`.agent/examples/hf_text_bringup/` (builder, recipe, data, launcher)
 runs any local HF causal-LM directory as-is. Register a family only when it
 needs a provider (replacements, CP/EP wrappers, sharding rules, recompute
 policy); `models/kimi_linear/adapter/registration.py` shows the minimal
@@ -121,7 +128,7 @@ against the HF forward on device.
 | `prepare_vlm_synthetic.py` (one level up) | deterministic synthetic image-text pairs in the Omni conversation schema, for the VLM path |
 | `run_hf_text.sh` | single-node launcher; site specifics come from the environment, never from edits; `RECIPE` selects another YAML for what overrides refuse (an optimizer `_target_`) |
 | `run_hf_text_dist.sh` | **multi-node** launcher: ssh fan-out, rendezvous, all-or-nothing admission guard across every node, release verification after the run; `DRYRUN=1` prints the plan without launching |
-| `judge_equivalence.py` | the S3 verdict over the runtime's structured evidence (`model_integration.mode=runtime`: exact per step, inputs checked); trainer text logs are a labelled fallback judged at six printed digits |
+| `judge_equivalence.py` | S3 verdict over structured runtime evidence when the selected trainer supports it. Otherwise compare labelled trainer logs at their printed precision. |
 | `reproduce/` | rerunning recorded bring-ups: `reproduce.sh <model> <stage>` pins each recorded run's options (`DRYRUN=1` prints them), `parity_check.py` is the S2 parity through the training path with buffers compared, `adamw_recipe.py` derives the optimizer-attribution recipe, `reference_results.md` lists what each stage recorded and which records predate fixes |
 
 The multimodal path uses the repository's existing VLM facade
@@ -158,7 +165,7 @@ under a multimodal class): the script retries on a suffix-plus-shape
 pairing, which stays rename-agnostic — a genuinely absent entry or a
 reshaped one still fails to pair, so the pin does not weaken. A family that
 needs a stronger pin in CI can wrap the same comparison in a fixture test
-(`tests/ut/tools/test_released_layout.py` shows the pattern on a tiny
+(`.agent/tests/tools/test_released_layout.py` shows the pattern on a tiny
 model).
 
 A fourth class is the **declared-ignored subtree**: a release legitimately
@@ -296,7 +303,8 @@ acceptance for any model it flags.
 - **Do not key occupancy checks to known launcher names.** Scheduler-dispatched
   jobs (a custom worker spawning per-die training scripts) match neither
   `torchrun` nor `pretrain`; judge occupancy by foreign users holding device
-  file descriptors or per-die HBM, never by command-line patterns alone.
+  file descriptors, accelerator process rows, and per-die HBM. Treat a live
+  device process as busy even when allocated memory is below the HBM threshold.
 - **Positive-control the idle probe before trusting it**: run it once against
   a node known to be busy and confirm it reports busy. A probe validated only
   on idle nodes can fail open — two independent broken signals (a too-narrow
@@ -306,13 +314,22 @@ acceptance for any model it flags.
   churn by the minute: a node idle at survey time can be claimed before
   submission (observed twice in one afternoon). `scripts/node_guard.sh pre`
   is the executable form — run it as the launch wrapper's first statement;
-  it fails closed on unparsable telemetry, and `node_guard.sh self-test`
+  it fails closed on unparseable telemetry, and `node_guard.sh self-test`
   keeps the positive controls (including the fixed-width busy fixture).
+  For a cross-platform export, verify LF line endings and run the self-test on
+  the actual launcher staged for the target OS before requesting devices.
   Abort instead of queuing on any busy signal; when every authorized node is
   busy, back off and re-probe later rather than expanding beyond the
   authorized set. For a multi-node job, every node passes the guard or
   nothing starts. After the job, `node_guard.sh post` verifies release —
   own processes and device memory — before the node is declared free.
+- **Verify the benchmark's occupancy interval.** Prefer an exclusive scheduler
+  allocation where available. For shared-device launches, record the admitted
+  device scope, measurement timestamps, and release check. If another process
+  appears, compare its device assignment and start time with the measurement or
+  failure window. Mark an overlapping run as contended and keep its receipts
+  for diagnosis. Repeat on verified idle devices before using the outcome for
+  a performance or capacity decision.
 - **Choose the node by measured idleness, not by a priority list.** A
   hand-written order sends every job to the same machine — the one most
   likely still warm from the last job — and it encodes the occupancy of the

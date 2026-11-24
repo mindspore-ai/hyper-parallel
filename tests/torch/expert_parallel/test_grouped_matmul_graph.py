@@ -25,11 +25,12 @@ from tests.common.mark_utils import arg_mark
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("dtype", ["fp32", "bf16"])
-def test_grouped_runtime_loads(dtype):
+@pytest.mark.parametrize("case_name", ["test_grouped_runtime_loads", "test_grouped_experts_runtime_loads"])
+def test_grouped_runtime_loads(dtype: str, case_name: str) -> None:
     """
     Feature: Grouped GEMM runtime expert loads.
     Description: Replay native forward/dgrad/wgrad with empty and changing groups.
     Expectation: Graph and eager tensors agree exactly for every load pattern.
     """
     worker = str(Path(__file__).with_name("_test_grouped_matmul_graph.py"))
-    torchrun_case(file_name=worker, case_name=f"test_grouped_runtime_loads[{dtype}]", num_proc=1)
+    torchrun_case(file_name=worker, case_name=f"{case_name}[{dtype}]", num_proc=1)

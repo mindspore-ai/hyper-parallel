@@ -86,7 +86,14 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
 
 
 def create_offline_distributed_setup(config: Any) -> DistributedSetup:
-    """Project YAML parallel settings into a process-group-free setup."""
+    """Project YAML parallel settings into a process-group-free setup.
+
+    Args:
+        config: Trainer configuration describing compute and FSDP parallel degrees.
+
+    Returns:
+        A setup with named logical dense and expert meshes, without communication groups.
+    """
     topology_spec = ParallelTopologySpec.from_config(config)
     layout = resolve_parallel_layout(
         topology_spec,
@@ -98,6 +105,11 @@ def create_offline_distributed_setup(config: Any) -> DistributedSetup:
     )
     mesh_context = MeshContext.from_layout(layout)
     mesh_context.device_mesh = topology
+    if topology_spec.ep_size > 1:
+        mesh_context.fsdp_moe_mesh = LogicalDeviceMesh(
+            mesh_dim_names=("edp", "ep"),
+            mesh_shape=(topology.size() // topology_spec.ep_size, topology_spec.ep_size),
+        )
     return DistributedSetup.from_config(
         config,
         mesh_context=mesh_context,

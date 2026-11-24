@@ -13,6 +13,21 @@ same node in consecutive runs.
 
 ### Compute bottlenecks (high Cube, Vector, or FlashAttention share)
 
+For attention launch fan-out across many independent short windows, batch
+equal-sized windows into one SDPA invocation. Confirm that each window keeps
+its original positions, causal policy, and output order. Validate outputs,
+input and weight gradients, and heterogeneous fallbacks. Use explicit
+sequence boundaries with a verified variable-length kernel for unequal
+windows. Measure end-to-end improvement after verifying the launch reduction.
+
+For a hot square causal mask, compare explicit masking with the backend's
+implicit causal dispatch before replacing the kernel. Verify the actual
+shapes, scale, forward and backward paths. The plain implicit option requires
+one complete unpadded sequence per row and full causal attention, with a
+verified backend contract. Preserve padding, segment boundaries and local
+attention windows through a compatible mask or variable-length representation.
+Use a full numerical gate and an unprofiled same-workload repeat for retention.
+
 | Technique | Applicable scenario | Counterexample or constraint |
 |---|---|---|
 | Replace an operator chain with a fused implementation | Chains of small operators, fragmented postprocessing, or AI CPU fallback | Unsupported head counts, dtypes, or shapes cause per-call fallback and remove the benefit. See `fused-ops.md`. |
@@ -38,12 +53,74 @@ same node in consecutive runs.
 | Row or block chunking | One operator creates oversized intermediate tensors | Too many chunks expose fixed overhead. Sweep the chunk size. |
 | Reuse outputs or use in-place operations cautiously | The affected tensor is known not to be cached | In-place mutation of a cached tensor is rejected by strict selective activation checkpointing checks. |
 
+If the peak contains full-vocabulary logits or FP32 cross-entropy buffers,
+test the model family's supported chunked linear cross-entropy path. Preserve
+pre-shifted targets, ignored positions and global token weighting. Check the
+loss and gradients of hidden states and head weights at representative shapes.
+Log the peak allocation and complete-step throughput at fixed work first.
+Test reduced rematerialization at fixed work. Use a separate acceptance
+series when the reclaimed capacity enables a larger workload.
+If the peak comes from FP32 cross-entropy intermediates, first keep the full
+vocabulary projection and test token-wise blocks of the existing FP32 loss.
+Return the complete logits gradient to the original head backward so that the
+weight-gradient GEMM keeps its accumulation order. A fused loss kernel is
+another candidate. Test it with the actual logits shape and dtype, including
+representative low-loss targets, ignored positions, and the scaled upstream
+gradient. Hold target alignment, reduction and token normalization fixed.
+Compare gradients after the cast to the logits dtype and record peak workspace
+and separate forward/backward timings. Close scalar loss alone can hide
+gradient differences after rounding.
+
+Before testing a smaller loss tile, calculate which tensors are live at the
+same time from the local shard shape and storage dtypes. Include the complete
+logits gradient returned to the head and any layout or collective buffers
+that overlap the loss tile. Compare that estimate with capacity after optimizer
+state initialization, then measure full-step memory on the target runtime. Compare
+the source and candidate on the same inputs and run an independent performance
+benchmark. Record workspace savings separately from step speed. Exercising a
+longer context establishes capacity for that workload and requires its own
+qualification before use as an accepted result.
+
+After a memory-saving head change, test reduced replay at the same physical
+microbatch shape. The allocation peak can move from the output head to saved
+decoder activations. If the new replay policy exceeds capacity, record the
+first failing operator, phase, request size, and allocated and reserved
+memory. Keep the last validated policy and use that evidence to choose the
+next allocation to investigate.
+
 ### Device-idle or optimizer bottlenecks
 
 | Technique | Applicable scenario | Counterexample or constraint |
 |---|---|---|
 | Optimizer-state offload | Optimizer states dominate device memory | Include Host transfer costs during the update phase. |
 | Improve scheduling or Host dispatch | High device-idle (`Free`) share or launch gaps | Use profiling to distinguish Host dispatch delays from waits. |
+
+### Input-pipeline stalls
+
+If stalls align with batch acquisition, measure exposed wait at the trainer's
+consumer boundary by update and rank. Check whether CPU decoding, tokenization,
+or collation limits the producer before increasing data-loader worker count.
+Compare worker count and prefetch depth at fixed model, packing, and workload.
+Track Host memory, multiprocessing overhead, and the slowest consumer ranks.
+Check the ordered input tensors, labels, and packed geometry at the trainer
+boundary. Confirm throughput on matching unprofiled windows. On two equivalent
+nodes, run both variants on each node and reverse their order across nodes to
+check whether the result survives node and run-order effects.
+
+Verify that the model-specific training loop actually uses the configured
+prefetcher. Time iterator wait separately from position construction and device
+transfer. When a rank-local loader reads ahead, checkpoint the consumed batch's
+cursor and preserve the collective sequence of distributed loaders.
+
+After prefetch reduces iterator wait, profile batch preparation on the training
+thread. For packed multimodal inputs, repeated segment geometry can make
+position construction a cache candidate. Check the pinned model implementation
+for every input that affects positions, such as modality order, grid dimensions,
+padding, and packed segment boundaries. Bound the cache, reuse only immutable
+outputs, and use the original path for unsupported layouts. Compare cached
+positions directly against recomputed tensors during the correctness gate.
+Measure end-to-end benefit on representative input geometry and record the
+cache hit rate when comparing workloads.
 
 ## Automated tuning
 

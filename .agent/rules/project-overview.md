@@ -14,9 +14,9 @@ HyperParallel — distributed parallel library for Ascend NPU + Nvidia GPU, on P
 Canonical shortlist for always-on context. Full patterns:
 `.agent/rules/distributed.md`. Do **not** duplicate long explanations in agents/skills.
 
-- The `platform/` abstraction layer and the MindSpore backend are gone — use native Torch APIs
+- Use native Torch APIs directly
 - Pipeline uses native Torch tensor, autograd, and distributed APIs
-- DFunction imports Torch directly; never reintroduce Platform or MindSpore dispatch
+- DFunction imports Torch directly; do not introduce a framework-dispatch abstraction
 - `layout.is_partial()` is a **method**, not a property — must call with parentheses
 - `handle.wait()` must be called before accessing async collective output
 - `reduce_partial()` must be called before `redistribute()` when layout has partial state

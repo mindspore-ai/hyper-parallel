@@ -22,14 +22,11 @@ from safetensors.torch import save_file
 from torch import nn
 
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import HuggingFaceCheckpointer
-from tests.common.mark_utils import arg_mark
 
 
 class TestExternalHFTargets(unittest.TestCase):
     """Keep externally loaded tables intact in both pretrained loaders."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_external_parameters_and_source_keys_are_excluded(self):
         """Feature: external host table materialization.
 
@@ -56,8 +53,6 @@ class TestExternalHFTargets(unittest.TestCase):
                     torch.testing.assert_close(model.weight, torch.tensor([2., 3.]), rtol=0, atol=0)
                     torch.testing.assert_close(model.external.weight, torch.full((4, 2), 7.), rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_external_target_must_exist(self):
         """Feature: external target ownership validation.
 

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import lcm
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -38,6 +39,7 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
             *,
             include_position_ids: bool = True,
             include_image_sequence_start: bool = True,
+            compress_ratios: "list[int] | None" = None,
     ) -> None:
         """Configure fields already supplied by the selected batch runtime.
 
@@ -46,12 +48,28 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
                 require this; ``TextParallelBatch`` already owns them.
             include_image_sequence_start: Build the local decoder image insertion
                 offset. Text-only batches do not need this field.
+            compress_ratios: Every active model compression ratio (for example
+                ``[1, 2]``). The graph boundary prepares per-ratio compressed-key
+                metadata and validates document alignment from this list; eager
+                never reads it. The set must cover every nonzero
+                ``v41_compress_ratios`` entry of the model configuration.
         """
         self.include_position_ids = include_position_ids
         self.include_image_sequence_start = include_image_sequence_start
+        for ratio in compress_ratios or ():
+            if isinstance(ratio, bool) or not isinstance(ratio, int):
+                raise ValueError(f"compress_ratios entries must be ints, got {ratio!r}")
+            if ratio < 0:
+                raise ValueError(f"compress_ratios entries must be nonnegative, got {ratio}")
+        self.compress_ratios = tuple(int(ratio) for ratio in compress_ratios or ())
 
     def prepare_graph_inputs(self, model_inputs: Mapping[str, Any]) -> dict[str, Any]:
-        """Build an isolated packing-only representation at the graph boundary.
+        """Build an isolated packing representation with compressed-key metadata.
+
+        This seam is the graph-mode twin of eager's in-forward preparation: the
+        per-ratio compressed-key minima are rebuilt from every batch's real
+        boundaries here, outside capture, and enter the graph as pytree tensors
+        that the in-graph attention consumes exactly like eager does.
 
         Eager FSDP also rebuilds pytrees, so its inputs must retain real document
         boundaries. Only the compiler receives this prepared metadata copy.
@@ -62,7 +80,22 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
         packed = GraphPackedSequence(
             source.cu_seq_lens, source.local_query_start,
             source.local_query_length, source.global_sequence_length,
-        ).prepare(device, ())
+        )
+        ratios = tuple(sorted({ratio for ratio in self.compress_ratios if ratio > 0}))
+        if ratios:
+            packed = packed.prepare(device, ratios)
+            alignment = lcm(*ratios)
+            misaligned = [boundary for boundary in packed.document_boundaries() if boundary % alignment]
+            if misaligned:
+                raise ValueError(
+                    "graph-mode DSA compression requires every packed document boundary "
+                    f"to be a multiple of {alignment} (lcm of compress ratios {list(ratios)}); "
+                    f"misaligned boundaries: {misaligned[:8]}. Pad documents at the packing "
+                    "boundary (per-doc alignment) so eager and the graph share one shape policy"
+                )
+        else:
+            packed = packed.prepare(device, ())
+        object.__setattr__(packed, "_packing_alignment", lcm(*ratios) if ratios else 0)  # pylint: disable=protected-access
         packed.prepare_packing_geometry(device)
         inputs["packed_seq_params"] = packed
         return inputs

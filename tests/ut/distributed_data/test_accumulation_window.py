@@ -32,7 +32,6 @@ from hyper_parallel.distributed_data.batch_sampler import _ReaderPlanInput
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
-from tests.common.mark_utils import arg_mark
 
 
 class _Mesh:
@@ -104,7 +103,6 @@ class _GatedDataset:
 class TestAccumulationWindow(unittest.TestCase):
     """Verify joint planning without changing optimizer sample membership."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_stops_at_optimizer_and_epoch_boundaries(self) -> None:
         """Feature: Bounded accumulation windows.
         Description: Plan 22 micro-batches with accumulation ten and a three-round window.
@@ -133,7 +131,6 @@ class TestAccumulationWindow(unittest.TestCase):
                     self.assertEqual(batches, [list(range(start, start + 2)) for start in range(0, 44, 2)])
                     self.assertEqual(counts, [3, 3, 3, 1, 3, 3, 3, 1, 2, 0])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_incomplete_step_replay_with_repeated_prefetch_hooks(self) -> None:
         """Feature: Checkpoint before an incomplete optimizer step.
         Description: Save after one delivery with zero, one or repeated explicit prefetch requests.
@@ -157,7 +154,6 @@ class TestAccumulationWindow(unittest.TestCase):
                     restored.load_state_dict(saved)
                     self.assertEqual([_ids(batch) for batch in restored], [[0, 1], *expected])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_end_checkpoint_waits_for_complete_optimizer_step(self) -> None:
         """Feature: Complete-step cursor across several balancing windows.
         Description: Inspect progress after the first window and after the full ten-round step.
@@ -178,7 +174,6 @@ class TestAccumulationWindow(unittest.TestCase):
             restored.load_state_dict(saved)
             self.assertEqual(_ids(next(restored)), [20, 21])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_size_configuration(self) -> None:
         """Feature: Window configuration.
         Description: Reject invalid sizes and consume windows larger than accumulation ten.
@@ -194,7 +189,6 @@ class TestAccumulationWindow(unittest.TestCase):
             self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 0)
             self.assertNotIn("window_plans", state)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_joint_plan_reduces_sum_of_round_makespans(self) -> None:
         """Feature: Balancing across micro-batches.
         Description: Reassign two rounds with rank costs (9, 1), (9, 1) as (9, 9), (1, 1).
@@ -214,7 +208,6 @@ class TestAccumulationWindow(unittest.TestCase):
         self.assertEqual(planner.last_balance_decision["original_objective"], 18)
         self.assertEqual(planner.last_balance_decision["accepted_objective"], 10)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_next_window_read_overlaps_all_current_micro_batches(self) -> None:
         """Feature: Two-window source buffering.
         Description: Block the next optimizer window after the current window's first batch is delivered.
@@ -257,7 +250,6 @@ class TestAccumulationWindow(unittest.TestCase):
                         [_ids(batch) for batch in restored], [list(range(i, i + 2)) for i in range(0, 18, 2)],
                     )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_completed_prefetch_is_bounded_and_excluded_from_checkpoint(self) -> None:
         """Feature: Bounded speculative source progress.
         Description: Finish the next window read before consuming the current window.
@@ -282,7 +274,6 @@ class TestAccumulationWindow(unittest.TestCase):
             restored.load_state_dict(state)
             self.assertEqual(_ids(next(restored)), [6, 7])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_next_window_failure_preserves_current_window(self) -> None:
         """Feature: Speculative source failures.
         Description: Fail the next-window read while the current window is still being delivered.
@@ -314,7 +305,6 @@ class TestAccumulationWindow(unittest.TestCase):
                     loader.close()
                 self.assertFalse(dataset.thread.is_alive())
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_prefetch_with_persistent_workers_and_new_epoch(self) -> None:
         """Feature: Persistent Dataset workers with window prefetch.
         Description: Load windows across epochs and restart an incomplete step with one persistent worker.
@@ -333,7 +323,6 @@ class TestAccumulationWindow(unittest.TestCase):
                     restored.load_state_dict(state)
                     self.assertEqual([_ids(batch) for batch in restored], expected)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_thread_binds_device_before_reading(self) -> None:
         """Feature: Rank-local device context for speculative reads.
         Description: Read three windows with a mocked nonzero CUDA device.
@@ -371,7 +360,6 @@ class TestAccumulationWindow(unittest.TestCase):
         self.assertIn((read_threads[1], torch.device("cuda:3")), bindings)
         self.assertFalse(read_threads[1].is_alive())
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_thread_device_failure_reaches_consumer(self) -> None:
         """Feature: Source thread initialization failures.
         Description: Fail device selection before any source read begins.
@@ -388,7 +376,6 @@ class TestAccumulationWindow(unittest.TestCase):
             self.assertIs(failure.exception, error)
             self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_nonpersistent_workers_exit_normally_after_future_reads(self) -> None:
         """Feature: Forked workers in the window reader.
         Description: Recreate Dataset workers for every source window on the background thread.

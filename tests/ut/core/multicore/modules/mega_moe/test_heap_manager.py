@@ -39,7 +39,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     _workspace_allocation_specs,
 )
 from hyper_parallel.core.multicore.shmem import _lifecycle
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeHeapManager(unittest.TestCase):
@@ -72,8 +71,6 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         tensors = tuple(torch.empty(item.target.shape, dtype=item.target.dtype) for item in kwargs["replacements"])
         return _lifecycle._RestartResult(tensors, {})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_source_and_receive_growth_commit_together_and_reuse(self) -> None:
         """Feature: Automatic MegaMoe token storage.
 
@@ -101,8 +98,6 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                     self.assertEqual(restart.call_count, 1)
                 self.assertEqual(manager.epoch, 1)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_budget_failure_preserves_committed_source_and_receive_capacity(self) -> None:
         """Feature: Automatic MegaMoe token storage.
 
@@ -122,8 +117,6 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.assertIs(workspace.routed_buffer, original)
                 self.assertEqual(manager.epoch, 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_growth_falls_back_to_required_rows_within_heap_budget(self) -> None:
         """Feature: Automatic MegaMoe token storage.
 
@@ -143,8 +136,6 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.assertEqual(workspace.routed_slots, 34048)
                 self.assertEqual(manager.heap_bytes, manager.heap_limit)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_growth_rejects_an_active_pull_lease_before_replacement(self) -> None:
         """Feature: Automatic MegaMoe token storage.
 
@@ -221,8 +212,6 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             dtype=torch.bfloat16,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_reservations_define_layout_and_roll_back_failed_additions(self) -> None:
         """Align aggregate reservations and roll back only a failed identity-based addition."""
         reservations = (
@@ -455,8 +444,6 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         self.assertEqual(manager.growth_records[-1]["stages_ms"], stages)
         self.assertEqual(manager.growth_records[-1]["total_ms"], 125.0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_capacity_fast_path_and_explicit_limit_fallback(self) -> None:
         """Feature: receive capacity budgeting.
         Description: Keep the sufficient-capacity path and fall back to minimum rows within the heap limit.
@@ -558,8 +545,6 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "restart the process"), manager.access():
             self.fail("A failed SHMEM Heap allowed another operation")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_local_restart_failures_do_not_publish_business_state(self) -> None:
         """Feature: Local restart result commit.
         Description: Inject validation and binding defects after the underlying SHMEM restart.

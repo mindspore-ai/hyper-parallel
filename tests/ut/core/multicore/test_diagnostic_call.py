@@ -23,7 +23,6 @@ from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall
 from hyper_parallel.core.multicore.diagnostics.common.session import (
     _activate_session, _deactivate_session, _reset_active_session_for_test,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class TestDiagnosticCall(unittest.TestCase):
@@ -33,8 +32,6 @@ class TestDiagnosticCall(unittest.TestCase):
         """Release diagnostic state after failed assertions."""
         _reset_active_session_for_test()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_call_exposes_complete_neutral_arguments(self):
         """Feature: MegaKernel diagnostics.
         Description: The shared ABI must not be owned by either tool.
@@ -48,8 +45,6 @@ class TestDiagnosticCall(unittest.TestCase):
         self.assertFalse(hasattr(call, "profile_buffer"))
         self.assertFalse(hasattr(call, "diagnostic_buffer_override"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_native_failure_cancels_only_the_selected_call(self):
         """Feature: MegaKernel diagnostics.
         Description: Do not complete a failed native launch.
@@ -63,8 +58,6 @@ class TestDiagnosticCall(unittest.TestCase):
         cancel.assert_called_once_with()
         complete.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_capture_failure_cancels_the_selected_call(self):
         """Feature: MegaKernel diagnostics.
         Description: Release tool-owned state when capture completion raises.
@@ -80,8 +73,6 @@ class TestDiagnosticCall(unittest.TestCase):
                 pass
         cancel.assert_called_once_with()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dispatch_calls_only_the_active_session(self):
         """Feature: MegaKernel diagnostics.
         Description: A new tool can implement the interface without modifying this adapter.
@@ -102,8 +93,6 @@ class TestDiagnosticCall(unittest.TestCase):
         finally:
             _deactivate_session(session)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_no_session_never_inspects_diagnostic_metadata(self):
         """Feature: MegaKernel diagnostics.
         Description: Even malformed diagnostic-only metadata cannot affect ordinary execution.

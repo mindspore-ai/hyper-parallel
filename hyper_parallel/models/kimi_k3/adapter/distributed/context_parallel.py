@@ -37,11 +37,6 @@ from hyper_parallel.distributed.context_parallel.mla_context_parallel import pre
 from hyper_parallel.distributed.context_parallel.gated_mla_context_parallel import gated_mla_forward
 from hyper_parallel.distributed.context_parallel.gated_mla_backward_overlap import gated_mla_output_projection_request
 from hyper_parallel.models.kimi_k3.adapter.mla import KimiMLAAttention
-from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (
-    KimiDeltaAttentionLayerCP,
-    KimiDeltaAttentionLayerP2PCP,
-    KimiDeltaAttentionLayerUlyssesCP,
-)
 
 
 def kimi_delta_attention_cp_forward(
@@ -131,6 +126,11 @@ def kimi_delta_attention_ulysses_cp_wrapper(
         backend: Local KDA implementation: eager, triton or ascendc.
         chunk_size: Tokens per local recurrence chunk.
     """
+    # MLA shares this adapter entry but does not require optional KDA kernels.
+    from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (  # pylint: disable=C0415
+        KimiDeltaAttentionLayerUlyssesCP,
+    )
+
     del mesh, ep_mesh
     return _build_kda_cp_rewrite(
         target_module,
@@ -164,6 +164,11 @@ def kimi_delta_attention_p2p_cp_wrapper(
         backend: Local KDA implementation: eager, triton or ascendc.
         chunk_size: Tokens per local recurrence chunk.
     """
+    # MLA shares this adapter entry but does not require optional KDA kernels.
+    from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (  # pylint: disable=C0415
+        KimiDeltaAttentionLayerP2PCP,
+    )
+
     del mesh, ep_mesh
     return _build_kda_cp_rewrite(
         target_module,
@@ -206,6 +211,11 @@ def kimi_delta_attention_cp_wrapper(
     Returns:
         Atomic forward rewrite with the selected configuration recorded.
     """
+    # MLA shares this adapter entry but does not require optional KDA kernels.
+    from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (  # pylint: disable=C0415
+        KimiDeltaAttentionLayerCP,
+    )
+
     del mesh, ep_mesh
     if not isinstance(ulysses_degree, int) or isinstance(ulysses_degree, bool) or ulysses_degree < 1:
         raise ValueError("ulysses_degree must be a positive integer.")

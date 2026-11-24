@@ -25,7 +25,7 @@
 #
 # Discipline encoded here (each clause cost a real incident):
 #   * probe at launch time, every launch - a scan minutes ago proves nothing;
-#   * judge by foreign USERS and per-die HBM, never by known command names
+#   * check device process rows, foreign USERS and per-die HBM
 #     (scheduler-dispatched jobs match neither torchrun nor pretrain);
 #   * the HBM column is fixed-width: a five-digit used value consumes the
 #     space before the slash ("36004/ 65536" vs "3158 / 65536") - parse with
@@ -51,6 +51,15 @@ hbm_used_list() {  # stdin: npu-smi info text -> one used-MB value per line
     grep -oE "[0-9]+ */ *${HBM_TOTAL_MB}" | grep -oE "^[0-9]+"
 }
 
+device_process_count() {  # stdin: npu-smi info text -> number of process rows
+    awk -F '|' '
+        /Process id/ && /Process memory/ { process_table = 1; next }
+        process_table && $2 ~ /^[[:space:]]*[0-9]+([[:space:]]+[0-9]+)?[[:space:]]*$/ &&
+            $3 ~ /^[[:space:]]*[0-9]+[[:space:]]*$/ { count++ }
+        END { print count + 0 }
+    '
+}
+
 foreign_users() {  # compute-looking processes owned by neither us nor system
     ps -eo user,args --no-headers 2>/dev/null \
         | grep -iE "python|torch|train|experiment|mindspeed|node_worker" \
@@ -72,7 +81,12 @@ case "${MODE}" in
 pre)
     f=$(foreign_users | tr '\n' ',')
     if [ -n "${f}" ]; then echo "BUSY foreign_users=${f%,}"; exit 3; fi
-    smi=$(npu-smi info 2>/dev/null)
+    if ! smi=$(npu-smi info 2>/dev/null); then
+        echo "UNDETERMINED: npu-smi info failed"
+        exit 2
+    fi
+    device_processes=$(printf '%s\n' "${smi}" | device_process_count)
+    if [ "${device_processes}" -gt 0 ]; then echo "BUSY device_processes=${device_processes}"; exit 3; fi
     used=$(printf '%s\n' "${smi}" | hbm_used_list)
     if [ -z "${used}" ]; then
         echo "UNDETERMINED: no '<used>/ ${HBM_TOTAL_MB}' lines parsed - fail closed"
@@ -91,13 +105,22 @@ post)
 self-test)
     # Positive controls: the probe must flag a KNOWN-busy fixture, including
     # the five-digit fixed-width form that once read as idle, and must fail
-    # closed on unparsable input.
+    # closed on unparseable input.
     idle=$(printf '| 0 0 | x | 0 3158 / 65536 |\n| 1 1 | x | 0 2905 / 65536 |\n' | hbm_used_list | sort -rn | head -1)
     busy=$(printf '| 0 0 | x | 0 36004/ 65536 |\n| 1 1 | x | 0 3158 / 65536 |\n' | hbm_used_list | sort -rn | head -1)
     none=$(printf 'no table here\n' | hbm_used_list | head -1)
+    processes=$(printf '%s\n' \
+        '| NPU Chip | Process id | Process name | Process memory(MB) | Process id in container |' \
+        '| 0 0 | 12345 | python | 1031 | NA |' \
+        '| No running processes found in NPU 1 |' | device_process_count)
+    no_processes=$(printf '%s\n' \
+        '| NPU Chip | Process id | Process name | Process memory(MB) |' \
+        '| No running processes found in NPU 0 |' | device_process_count)
     [ "${idle}" = "3158" ] || { echo "FAIL idle-parse got=${idle}"; exit 1; }
     [ "${busy}" = "36004" ] || { echo "FAIL busy-parse (fixed-width trap) got=${busy}"; exit 1; }
     [ -z "${none}" ] || { echo "FAIL none-parse got=${none}"; exit 1; }
+    [ "${processes}" = 1 ] || { echo "FAIL process-parse got=${processes}"; exit 1; }
+    [ "${no_processes}" = 0 ] || { echo "FAIL idle-process-parse got=${no_processes}"; exit 1; }
     echo "SELF-TEST PASS (idle=3158, busy=36004 caught, unparsable empty)"; exit 0 ;;
 *)
     echo "usage: node_guard.sh [pre|post|self-test]"; exit 1 ;;

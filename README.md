@@ -47,52 +47,15 @@ HyperParallel provides distributed parallel acceleration for Ascend SuperPoDs. D
 
 ## 📣 Latest News
 
-- [Oct. 9, 2026]: [moonshotai/Kimi-K2.6 model support](hyper_parallel/models/kimi_k26/recipes/train.yaml)
-- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B model support](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
-
----
-
-## Where to Start
-
-### HyperParallel Model Training
-
-> [HyperParallel Models](hyper_parallel/models/README.md) lets training users configure Hugging Face models, data, optimizers, parallel strategies, and checkpoint saving and restoration through YAML.
->
-> See [Supported Models](#supported-models) for available models and configuration entry points.
-
-### HyperParallel Core
-
-> [HyperParallel Core](docs/api/api_reference.md) provides model authors and framework developers with foundational capabilities, from distributed model construction to training execution and state management.
->
-> **Core capabilities**
->
-> - **Model sharding and parallel composition**: Describe device topology and tensor layouts with DeviceMesh, DTensor, and Shard, and combine FSDP/HSDP, TP, CP, EP, and PP strategies.
-> - **MoE and heterogeneous execution**: Expert sharding, routing, and token dispatch, along with pipeline scheduling, cluster MPMD, and on-chip multicore MPMD.
-> - **Memory and performance optimization**: Activation checkpointing, activation swapping, compute-communication overlap, communication fusion, and automatic parallelism.
-> - **Training and state management**: Optimizers, distributed checkpoints, asynchronous saving, offline format conversion, and deterministic training.
->
-> <details>
-> <summary><strong>Related documentation</strong></summary>
->
-> - **Model sharding**: [DTensor](docs/api/api_reference.md#dtensor-distributed-tensors) · [FSDP/HSDP](docs/guide/fsdp.md) · [TP](docs/guide/tensor_parallel.md)
-> - **Parallel execution**: [CP](docs/guide/context_parallel.md) · [EP / MoE](docs/guide/expert_parallel.md) · [PP / Cluster MPMD](docs/guide/pipeline_parallel.md) · [Multicore MPMD](hyper_parallel/core/multicore/README.md)
-> - **Memory and performance**: [Activation Checkpoint / Swap](docs/guide/activation_checkpoint.md) · [Compute-communication overlap](docs/guide/pipeline_parallel_overlap_b_f.md) · [Communication fusion](docs/guide/fsdp.md#communication-fusion) · [Automatic parallelism](docs/guide/auto_parallel.md)
-> - **Training and state**: [Optimizer](docs/guide/optimizer.md) · [DCP](docs/guide/distributed_checkpoint.md) · [Deterministic debugging](docs/faq.md#3-debug-in-deterministic-mode)
->
-> </details>
->
-> <br>
->
-> <details>
-> <summary><strong>Future Plans</strong></summary>
->
-> </details>
+- [Oct. 15, 2026]: [DeepSeek-V4.1-Flash model support](docs/deepseek_v41_article/README.md)
+- [Oct. 9, 2026]: [moonshotai/Kimi-K2.6 model support](hyper_parallel/models/kimi_k26/README.md)
+- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B model support](examples/training_demo/README.md#full-pretrained-model)
 
 ---
 
 <a id="supported-models"></a>
 
-## Supported Models
+## 🤖 Supported Models
 
 See the [model roadmap](https://github.com/mindspore-ai/hyper-parallel/issues/1305) for detailed capabilities and ongoing work.
 
@@ -110,7 +73,9 @@ See the [model roadmap](https://github.com/mindspore-ai/hyper-parallel/issues/13
 
 ---
 
-## Installation
+<a id="installation"></a>
+
+## 🛠️ Installation
 
 See the [Installation Guide](docs/installation.md) for installation methods, source build options, and environment requirements.
 
@@ -162,14 +127,14 @@ See the [Feature Guides](docs/index.md#feature-guides) for TP, CP, EP, and PP co
 - [API Reference](./docs/api/api_reference.md) — Interfaces organized by feature
 - [FAQ and Troubleshooting](./docs/faq.md) — Common issues and solutions
 - [AI-Assisted Development](./AGENTS.md) — Instructions for AI-assisted development
-- [Contributing](./docs/index.md#contributing) — Development environments, testing standards, and releases
+- [Contributing](CONTRIBUTING.md) — Contribution workflow, testing, review, and releases
 - [Release Notes](./hyper_parallel_v1.0.0_release_notes.md) — Version history
 
 ---
 
 ## 🤝 Join Us
 
-Issues and pull requests are welcome. See the [Contribution Guides](./docs/index.md#contributing) for development environments, testing standards, and the contribution workflow.
+Issues and pull requests are welcome. Start with the [Contribution Guide](CONTRIBUTING.md) for development setup, testing, review, and the community release workflow.
 
 ### Parallel Training System SIG
 

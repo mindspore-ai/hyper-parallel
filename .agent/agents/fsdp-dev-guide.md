@@ -9,71 +9,72 @@ Hard stream/memory rules: `.agent/rules/distributed.md`.
 ## Implementation Structure
 
 1. API entry and module transformation
-- `fully_shard()` validates module input, chooses root modules with
-  `_get_root_modules()`, dynamically extends each root with `HSDPModule`,
-  creates or normalizes the mesh, and initializes one shared scheduler.
-- When `fully_shard()` receives `list[module]`, the roots are treated as one
-  FSDP unit and all roots share the same `hsdp_scheduler`.
-- `HSDPModule.hsdp_init()` constructs a single `HSDPSchedulerV2`.
+   - `fully_shard()` validates module input, chooses root modules with
+     `_get_root_modules()`, dynamically extends each root with `HSDPModule`,
+     creates or normalizes the mesh, and initializes one shared scheduler.
+   - When `fully_shard()` receives `list[module]`, the roots are treated as one
+     FSDP unit and all roots share the same `hsdp_scheduler`.
+   - `HSDPModule.hsdp_init()` constructs a single `HSDPSchedulerV2`.
 
 2. Mesh mode selection
-- `mesh.ndim == 1` means FSDP mode via `FSDPMeshInfo`.
-- `mesh.ndim == 2` means HSDP mode via `HSDPMeshInfo`, with shard dimension `1`
-  and replicate dimension `0`.
-- `replicate_params` are wrapped with `DDPMeshInfo` so they stay replicated and
-  use DDP-style gradient reduction.
+   - `mesh.ndim == 1` means FSDP mode via `FSDPMeshInfo`.
+   - `mesh.ndim == 2` means HSDP mode via `HSDPMeshInfo`, with shard dimension `1`
+     and replicate dimension `0`.
+   - `replicate_params` are wrapped with `DDPMeshInfo` so they stay replicated and
+     use DDP-style gradient reduction.
 
 3. Scheduler and state construction
-- `HSDPSchedulerV2` (single concrete class — no platform subclass) owns
-  config, prefetch lists, scheduler context, and phase transitions, and
-  registers the forward/backward hooks itself.
-- Its `_new_cell_state()` lazily imports and constructs `TorchHSDPStateV2`.
-- `HSDPState` (base) owns the shared shard/unshard/wait/prefetch lifecycle;
-  `TorchHSDPStateV2` adds torch-specific param discovery, mixed precision,
-  and the reduce-scatter / all-reduce staging.
+   - `HSDPSchedulerV2` (single concrete class — no platform subclass) owns
+     config, prefetch lists, scheduler context, and phase transitions, and
+     registers the forward/backward hooks itself.
+   - Its `_new_cell_state()` lazily imports and constructs `TorchHSDPStateV2`.
+   - `HSDPState` (base) owns the shared shard/unshard/wait/prefetch lifecycle;
+     `TorchHSDPStateV2` adds torch-specific param discovery, mixed precision,
+     and the reduce-scatter / all-reduce staging.
 
 4. Parameter discovery and shared-parameter tracking
-- `TorchHSDPStateV2._init_hsdp_params()` deduplicates parameters across all
-  managed modules and wraps each in `TorchHSDPParamV2`.
-- `_get_param_module_infos()` builds `ParamModuleInfo` for every parameter,
-  including shared modules and shared parameter names, so parameter
-  replacement updates every shared reference, not just the first owner.
+   - `TorchHSDPStateV2._init_hsdp_params()` deduplicates parameters across all
+     managed modules and wraps each in `TorchHSDPParamV2`.
+   - `_get_param_module_infos()` builds `ParamModuleInfo` for every parameter,
+     including shared modules and shared parameter names, so parameter
+     replacement updates every shared reference, not just the first owner.
 
 5. Forward path
-- Forward pre-hook calls `_hsdp_forward_pre_hook()`, which does mixed-precision
-  input casting, `lazy_init()`, `unshard()`, and optional forward prefetch.
-- `_forward_pre_hook()` wraps forward inputs through
-  `PostBackwardFunction.apply(...)` so a scheduler callback exists in backward.
-- Forward hook calls `_hsdp_forward_hook()`, which shards when
-  `reshard_after_forward=True` and may cast outputs to `mp_policy.output_dtype`.
+   - Forward pre-hook calls `_hsdp_forward_pre_hook()`, which does mixed-precision
+     input casting, `lazy_init()`, `unshard()`, and optional forward prefetch.
+   - `_forward_pre_hook()` wraps forward inputs through
+     `PostBackwardFunction.apply(...)` so a scheduler callback exists in backward.
+   - Forward hook calls `_hsdp_forward_hook()`, which shards when
+     `reshard_after_forward=True` and may cast outputs to `mp_policy.output_dtype`.
 
 6. Backward path
-- Output hooks trigger `_hsdp_backward_pre_hook()` exactly when backward starts.
-- Backward pre-hook moves the scheduler into `PRE_BACKWARD`, unshards again
-  when needed, and launches backward prefetch.
-- Backward hook calls `hsdp_state.post_backward()`.
-- A root-level callback (`Variable._execution_engine.queue_callback`) plus
-  `root_bp_state` and `_root_backward_hook()` finish remaining staged gradient
-  reductions through `launch_tp_replicate_reduce_and_apply()`.
+   - Output hooks trigger `_hsdp_backward_pre_hook()` exactly when backward starts.
+   - Backward pre-hook moves the scheduler into `PRE_BACKWARD`, unshards again
+     when needed, and launches backward prefetch.
+   - Backward hook calls `hsdp_state.post_backward()`.
+   - A root-level callback (`Variable._execution_engine.queue_callback`) plus
+     `root_bp_state` and `_root_backward_hook()` finish remaining staged gradient
+     reductions through `launch_tp_replicate_reduce_and_apply()`.
 
 7. Gradient reduction and application
-- `post_backward()` first calls `accumulate_unsharded_grad_if_needed()`.
-- `replicate_params` use flattened-mesh DDP-style all-reduce over the full
-  data-parallel mesh.
-- Sharded params use reduce-scatter across the shard dimension, followed by
-  all-reduce across the replicate dimension only in HSDP mode when required.
-- Async outputs are staged in `pre_reduce_scatter_params` / `pre_all_reduce_groups`
-  / `pending_all_reduce_groups` and applied by `launch_tp_replicate_reduce_and_apply()`.
+   - `post_backward()` first calls `accumulate_unsharded_grad_if_needed()`.
+   - `replicate_params` use flattened-mesh DDP-style all-reduce over the full
+     data-parallel mesh.
+   - Sharded params use reduce-scatter across the shard dimension, followed by
+     all-reduce across the replicate dimension only in HSDP mode when required.
+   - Async outputs are staged in `pre_reduce_scatter_params` / `pre_all_reduce_groups`
+     / `pending_all_reduce_groups` and applied by `launch_tp_replicate_reduce_and_apply()`.
 
 8. Reshard and user-facing parameter control
-- `HSDPState.shard()` swaps parameters back to sharded form and frees
-  unsharded storage.
-- `HSDPModule.unshard(async_op=True)` returns `_UnshardHandle`, which waits
-  through `wait_for_unshard()`.
+   - `HSDPState.shard()` swaps parameters back to sharded form and frees
+     unsharded storage.
+   - `HSDPModule.unshard(async_op=True)` returns `_UnshardHandle`, which waits
+     through `wait_for_unshard()`.
 
 ## Runtime Invariants
 
 ### Parameter lifecycle
+
 - Parameter lifecycle depends on `reshard_after_forward`, set by
   `fully_shard(..., reshard_after_forward=...)` and later changeable through
   `HSDPModule.set_reshard_after_forward(...)`.
@@ -109,6 +110,7 @@ FSDP-specific lifecycle details:
   accumulated form until later synchronization.
 
 ### Mixed precision and offload
+
 - `MixedPrecisionPolicy` controls forward input casting, parameter dtype,
   reduction dtype, output dtype, and optional FP32 main-grad application.
 - `CPUOffloadPolicy` changes where sharded params and reduced grads live, so
@@ -118,6 +120,7 @@ FSDP-specific lifecycle details:
   parameters must be materialized before training.
 
 ## Torch-specific behavior
+
 - `HSDPSchedulerV2` tracks root-backward state and defers final gradient
   application to `_root_backward_hook()`.
 - `TorchHSDPStateV2` stages async reduce-scatter and all-reduce outputs in
@@ -130,11 +133,10 @@ FSDP-specific lifecycle details:
   but must not swap it out for a new `nn.Parameter`.
 
 ## Process groups and stream handles
-- Process-group helpers (`create_group`, `split_group`, `get_world_size`,
-  `get_group_local_rank`, `create_sub_groups`) live in
-  `core/fully_shard/utils.py` and share the process-wide cache
-  `EXISTING_COMM_GROUPS` from `platform/platform.py` — the only remaining
-  platform dependency. They are local to fully_shard on purpose.
+
+- Shared process-group helpers and the process-wide `EXISTING_COMM_GROUPS`
+  cache live in `core/utils/communication.py`. Follow the imports in
+  `core/fully_shard/utils.py` for the helpers used by FSDP.
 - The grad-reduce handle (`set_grad_reduce_handle`, `wait_grad_handle`,
   `grad_ready_stream`) is module-scope state in `utils.py`; `hsdp_sync_stream()`
   delegates to `wait_grad_handle()`.
@@ -142,6 +144,7 @@ FSDP-specific lifecycle details:
 ## Debugging And Review Guide
 
 ### First places to inspect
+
 - Entry and control toggles: `core/fully_shard/api.py`
 - Hook ordering and phase transitions: `core/fully_shard/hsdp_scheduler.py`
 - Backward staging and final reduction: `core/fully_shard/state.py`
@@ -149,6 +152,7 @@ FSDP-specific lifecycle details:
 - Comm-fusion staging: `core/fully_shard/param_group.py`
 
 ### Common failure modes
+
 - Unshard/reshard bugs: check `HSDPState.unshard()`, `wait_for_unshard()`,
   `shard()`, and `TorchHSDPParamV2.to_unsharded()` / `to_sharded()`.
 - Shared parameter pointer desync: inspect `ParamModuleInfo`,
@@ -167,6 +171,7 @@ FSDP-specific lifecycle details:
   same cached group.
 
 ### Review priorities
+
 - Parameter replacement must preserve shared-weight consistency across every
   owning module.
 - Hooks must not replace the active `_unsharded_param` object during graph

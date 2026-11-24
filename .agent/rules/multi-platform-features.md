@@ -7,8 +7,7 @@ paths:
 
 # List / Collection APIs
 
-The `platform/` abstraction and the MindSpore backend have been removed; every module is
-Torch-only. What remains of this rule is the list/collection contract.
+Every module uses native Torch APIs. This rule defines the list/collection contract.
 
 When implementing or changing features that accept list/collection inputs (e.g. `fully_shard([m1, m2])`), ensure:
 

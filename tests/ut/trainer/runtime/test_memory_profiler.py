@@ -26,7 +26,6 @@ from unittest.mock import MagicMock, call, patch
 from hyper_parallel.trainer.config.resolver import resolve_component
 from hyper_parallel.trainer.config.training import MemoryConfig
 from hyper_parallel.trainer.runtime.memory_profiler import MemoryProfiler
-from tests.common.mark_utils import arg_mark
 
 
 MODULE = "hyper_parallel.trainer.runtime.memory_profiler"
@@ -60,7 +59,6 @@ class TestMemoryProfiler(unittest.TestCase):
             dp_rank=3,
         )
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_defaults_match_mindspeed_fsdp(self) -> None:
         """Expose the MindSpeed-compatible memory configuration defaults.
 
@@ -81,7 +79,6 @@ class TestMemoryProfiler(unittest.TestCase):
             },
         )
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_disabled_session_does_not_resolve_device(self) -> None:
         """Keep the default disabled configuration free of device side effects.
 
@@ -98,7 +95,6 @@ class TestMemoryProfiler(unittest.TestCase):
         get_device_type_mock.assert_not_called()
         self.assertEqual(profiler.current_step, 0)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_closed_window_records_then_dumps(self) -> None:
         """Record the session-relative closed interval including its end step.
 
@@ -139,7 +135,6 @@ class TestMemoryProfiler(unittest.TestCase):
         makedirs_mock.assert_called_once_with("./memory_snapshot", exist_ok=True)
         self.assertFalse(profiler._history_started)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_equal_boundaries_record_one_complete_step(self) -> None:
         """Record a complete construction or training step with equal boundaries.
 
@@ -173,7 +168,6 @@ class TestMemoryProfiler(unittest.TestCase):
                 self.assertFalse(profiler.enable)
                 self.assertFalse(profiler._session_active)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_unselected_rank_records_without_dump_or_barrier(self) -> None:
         """Record on every rank while restricting independent snapshot files.
 
@@ -200,7 +194,6 @@ class TestMemoryProfiler(unittest.TestCase):
         memory_api._dump_snapshot.assert_not_called()
         makedirs_mock.assert_not_called()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_normal_stop_dumps_partial_window_once(self) -> None:
         """Dump and close history when training ends before the configured boundary.
 
@@ -233,7 +226,6 @@ class TestMemoryProfiler(unittest.TestCase):
         )
         memory_api._dump_snapshot.assert_called_once()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_abort_stops_without_dumping(self) -> None:
         """Release allocator history without filesystem or collective work on errors.
 
@@ -260,7 +252,6 @@ class TestMemoryProfiler(unittest.TestCase):
         makedirs_mock.assert_not_called()
         self.assertFalse(profiler._history_started)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_dump_failure_still_stops_history(self) -> None:
         """Close allocator history even when writing a snapshot fails.
 
@@ -287,7 +278,6 @@ class TestMemoryProfiler(unittest.TestCase):
         )
         self.assertFalse(profiler._history_started)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_record_failure_attempts_history_cleanup(self) -> None:
         """Attempt cleanup when allocator history startup reports a failure.
 
@@ -316,7 +306,6 @@ class TestMemoryProfiler(unittest.TestCase):
         self.assertFalse(profiler._history_started)
         self.assertFalse(profiler._session_active)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_stop_failure_retries_without_masking_error(self) -> None:
         """Retry cleanup when the allocator history disable call fails once.
 
@@ -344,7 +333,6 @@ class TestMemoryProfiler(unittest.TestCase):
         self.assertFalse(profiler._history_started)
         self.assertFalse(profiler._session_active)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_reset_stops_stale_history_without_dump(self) -> None:
         """Release a previous Trainer session before replacing singleton state.
 
@@ -367,7 +355,6 @@ class TestMemoryProfiler(unittest.TestCase):
         )
         memory_api._dump_snapshot.assert_not_called()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_mem_info_is_independent_of_history(self) -> None:
         """Log and reset peak statistics when history snapshots are disabled.
 
@@ -391,7 +378,6 @@ class TestMemoryProfiler(unittest.TestCase):
         self.assertEqual(info_mock.call_args.args[2:5], (4, 2, 3))
         device_api.reset_peak_memory_stats.assert_called_once_with()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_invalid_configuration_fails_before_device_access(self) -> None:
         """Reject invalid scheduling and allocator options at the reset boundary.
 
@@ -413,7 +399,6 @@ class TestMemoryProfiler(unittest.TestCase):
 
         get_device_type_mock.assert_not_called()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_unsupported_device_and_allocator_api_fail_clearly(self) -> None:
         """Report missing accelerator capabilities before model construction.
 
@@ -434,7 +419,6 @@ class TestMemoryProfiler(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "_record_memory_history, _dump_snapshot"):
                 self._reset(MemoryProfiler(), config)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_snapshot_is_owner_readable_with_write_only_npu_backend(self) -> None:
         """Repair the owner-write-only files created by torch-npu.
 
@@ -457,7 +441,6 @@ class TestMemoryProfiler(unittest.TestCase):
             self.assertEqual(snapshot_path.read_bytes(), b"snapshot")
             self.assertEqual(stat.S_IMODE(snapshot_path.stat().st_mode), stat.S_IRUSR | stat.S_IWUSR)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_nested_mapping_resolves_to_memory_config(self) -> None:
         """Resolve the public memory mapping through the typed config resolver.
 

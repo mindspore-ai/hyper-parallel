@@ -1030,7 +1030,8 @@ class GatedDeltaNetUlyssesCP(nn.Module):
     ) -> None:
         """Initialize the shared attention and convolution backend."""
         super().__init__()
-        self.module = module
+        # The target owns this executor, so keep its back-reference outside the module tree.
+        object.__setattr__(self, "module", module)
         backend = backend.lower()
         if backend not in _GDN_BACKENDS:
             raise ValueError(
@@ -1314,7 +1315,8 @@ class GatedDeltaNetP2PCP(nn.Module):
         chunk_size: int = 64,
     ):
         super().__init__()
-        self.module = module
+        # The target owns this executor, so keep its back-reference outside the module tree.
+        object.__setattr__(self, "module", module)
         backend = backend.lower()
         if backend == "ascendc":
             raise NotImplementedError("GDN Ascend C state P2P is not supported; select the pure Ulysses wrapper.")

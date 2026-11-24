@@ -27,7 +27,6 @@ from torch.utils.data import DataLoader
 
 from hyper_parallel.data.omni.build_dataset import build_online_omni_mapping_dataset
 from hyper_parallel.data.omni.omni_transform import OmniDataTransform
-from tests.common.mark_utils import arg_mark
 from tests.ut.data.omni.test_omni_transform import image_bytes
 
 
@@ -46,8 +45,6 @@ class PreparedTransform(OmniDataTransform):
 class TestOmniParquet(unittest.TestCase):
     """Keep Parquet reads lazy and source indices deterministic."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_row_groups_filter_order_bytes_and_pickle(self):
         """Verify random access and worker replay.
 
@@ -82,8 +79,6 @@ class TestOmniParquet(unittest.TestCase):
             row["messages"][0]["content"][0]["image"].putpixel((0, 0), (0, 0, 0))
             self.assertEqual(dataset[0]["messages"][0]["content"][0]["image"].getpixel((0, 0)), (255, 0, 0))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_parquet_split_builder_and_relative_paths(self):
         """Verify explicit split paths.
 
@@ -103,8 +98,6 @@ class TestOmniParquet(unittest.TestCase):
             self.assertEqual(len(train), len(valid))
             self.assertEqual(train[0]["messages"][0]["content"][0]["image"], str(Path(tmp) / "images/a.png"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_no_valid_rows_returns_empty_source(self):
         """Verify the empty-source contract.
 
@@ -122,8 +115,6 @@ class TestOmniParquet(unittest.TestCase):
             self.assertIsNone(dataset)
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_image_decoding_is_deferred_until_getitem(self):
         """Verify lazy media decoding.
 
@@ -142,8 +133,6 @@ class TestOmniParquet(unittest.TestCase):
                     _ = dataset[0]
                 decode.assert_called_once()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_multiple_file_roots_survive_ratio_split(self):
         """Verify file provenance across source composition.
 

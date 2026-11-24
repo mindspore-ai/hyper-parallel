@@ -30,15 +30,6 @@ from hyper_parallel.trainer.config.parallelism import (
     entries_to_module_replacements,
 )
 from hyper_parallel.trainer.config.target import Target
-from tests.common.mark_utils import arg_mark
-
-
-cpu_test = arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 
 
 class _SourceModule(nn.Module):
@@ -52,7 +43,6 @@ class _SourceModule(nn.Module):
 class TestLowPrecisionDtypeScheme(unittest.TestCase):
     """Validation contracts that must fail before an NPU operator is called."""
 
-    @cpu_test
     def test_supported_native_and_fake_schemes(self):
         """W8A8, native W4A8 and fake W4A8 policies retain typed fields."""
         w8a8 = LowPrecisionDtypeScheme()
@@ -78,7 +68,6 @@ class TestLowPrecisionDtypeScheme(unittest.TestCase):
         )
         self.assertEqual(fake_default.block_size, 32)
 
-    @cpu_test
     def test_hifloat_scheme_does_not_apply_mx_block_size_restrictions(self):
         """HiFloat keeps the integer field without MX-only validation."""
         scheme = LowPrecisionDtypeScheme(
@@ -89,7 +78,6 @@ class TestLowPrecisionDtypeScheme(unittest.TestCase):
 
         self.assertEqual(scheme.block_size, 64)
 
-    @cpu_test
     def test_invalid_family_block_and_flag_fail_fast(self):
         """Cross-family formats and malformed MX policies are rejected."""
         with self.assertRaisesRegex(ValueError, "same format family"):
@@ -107,7 +95,6 @@ class TestLowPrecisionDtypeScheme(unittest.TestCase):
 class TestLowPrecisionConfig(unittest.TestCase):
     """Named policy selection and legacy compatibility contracts."""
 
-    @cpu_test
     def test_mapping_catalog_is_typed_resolved_and_serialized(self):
         """YAML-like mappings become typed schemes and round-trip to dictionaries."""
         config = LowPrecisionConfig(
@@ -133,7 +120,6 @@ class TestLowPrecisionConfig(unittest.TestCase):
         self.assertIs(config.resolve_dtype_scheme("fake"), config.dtype_schemes["fake"])
         self.assertEqual(config.to_dict()["dtype_schemes"]["fake"]["block_size"], 32)
 
-    @cpu_test
     def test_catalog_selection_errors_are_explicit(self):
         """A catalog cannot silently fall back when no valid name was selected."""
         config = LowPrecisionConfig(dtype_schemes={"native": LowPrecisionDtypeScheme()})
@@ -147,7 +133,6 @@ class TestLowPrecisionConfig(unittest.TestCase):
                 default_dtype_scheme="missing",
             )
 
-    @cpu_test
     def test_legacy_pairs_resolve_to_typed_policies(self):
         """The three existing format/scaling pairs preserve their behavior."""
         w8a8 = LowPrecisionConfig().resolve_dtype_scheme()
@@ -159,7 +144,6 @@ class TestLowPrecisionConfig(unittest.TestCase):
         self.assertEqual((hif8.weight_format, hif8.act_format), ("hif8", "hif8"))
         self.assertEqual((w8a8.block_size, w4a8.block_size, hif8.block_size), (32, 32, 32))
 
-    @cpu_test
     def test_plan_override_injects_selected_policy_read_only(self):
         """The plan binds one named scheme without exposing mutable context."""
         received = []
@@ -205,7 +189,6 @@ class TestLowPrecisionConfig(unittest.TestCase):
         with self.assertRaises(TypeError):
             received[0]["new_key"] = "not allowed"
 
-    @cpu_test
     def test_low_precision_replacement_is_skipped_when_disabled(self):
         """Absent or disabled low precision leaves the source module unreplaced."""
         @module_replacement
@@ -243,7 +226,6 @@ class TestLowPrecisionConfig(unittest.TestCase):
                 )
                 self.assertEqual(rules, ())
 
-    @cpu_test
     def test_plan_override_policy_requires_low_precision_condition(self):
         """A named policy cannot be attached to an unconditional replacement."""
         @module_replacement

@@ -39,7 +39,6 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
 )
 from hyper_parallel.trainer.config.parallelism import PlanOverride, entries_to_plan_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
-from tests.common.mark_utils import arg_mark
 
 
 # This fixture exercises the installed package's configuration contract, not the
@@ -86,8 +85,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
             group_start = group_end
         return torch.cat(outputs, dim=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_hf_grouped_forward_and_backward_preserve_clamp(self) -> None:
         """
         Feature: Native grouped expert activation clamping.
@@ -127,8 +124,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         for actual, oracle in zip(experts.parameters(), reference.parameters()):
             torch.testing.assert_close(actual.grad, oracle.grad)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_grouped_forward_and_backward_match_clamped_oracle(self) -> None:
         """
         Feature: Model-owned grouped expert activation.
@@ -193,8 +188,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         for actual, oracle in zip(experts.parameters(), reference.parameters()):
             torch.testing.assert_close(actual.grad, oracle.grad)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_ep_nonpositive_limit_matches_unclamped_oracle(self) -> None:
         """
         Feature: Disabled expert activation clamping.
@@ -254,8 +247,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         for actual_parameter, reference_parameter in zip(experts.parameters(), reference.parameters()):
             torch.testing.assert_close(actual_parameter.grad, reference_parameter.grad)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_grouped_bfloat16_rounds_only_after_swiglu(self) -> None:
         """
         Feature: Grouped expert BF16 activation precision.
@@ -281,8 +272,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         old_result = functional.silu(gate) * up
         self.assertNotEqual(actual.item(), old_result.item())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_ep_grouped_path_binds_model_owned_forward(self) -> None:
         """
         Feature: Model-owned grouped EP execution.
@@ -306,8 +295,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         self.assertIs(experts.forward_expert_major.__func__, _deepseek_v41_grouped_expert_forward)
         bind.assert_called_once_with(module, 2, use_grouped_gemm=True, apply_gate=None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_yaml_override_selects_grouped_or_eager_factory(self) -> None:
         """
         Feature: DSV4.1 EP factory selection.
@@ -348,8 +335,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                     module, states, mask, ep_mesh.get_group.return_value, ep_size=2, fix_router=False,
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_yaml_override_requires_active_ep(self) -> None:
         """
         Feature: Conditional EP configuration.
@@ -361,8 +346,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         self.assertEqual(entries_to_plan_overrides([entry], ep_size=1), {})
         self.assertIn("*.mlp", entries_to_plan_overrides([entry], ep_size=2))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_eager_path_retains_source_gate(self) -> None:
         """
         Feature: Eager expert activation compatibility.

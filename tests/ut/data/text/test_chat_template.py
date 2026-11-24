@@ -28,13 +28,11 @@ import os
 import unittest
 from typing import Any
 
-
 from hyper_parallel.data.dataset_logging import DatasetLogger
 from hyper_parallel.data.text import chat_template
 from hyper_parallel.data.online.format import normalize_conversation
 from hyper_parallel.data.text.text_transform import TextConversationTransform
 
-from tests.common.mark_utils import arg_mark
 from tests.ut.data.conftest import (
     FailingSaveTokenizer,
     FakeTokenizer,
@@ -108,8 +106,6 @@ class ToolOnlyThinkingTokenizer(MultiTurnThinkingTokenizer):
 class TestChatTemplateGoldens(unittest.TestCase):
     """Golden encodings preserved by the merged chat template module."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_default_template_golden(self):
         """default: ``Role: content<eos>\n`` per message; loss_mask selects labels."""
         expected_ids = (
@@ -128,8 +124,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
             + _ids("Assistant: Hello!</s>\n"),
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_default_template_requires_loss_mask(self):
         """default: a message without ``loss_mask`` raises KeyError."""
         messages = [{"role": "user", "content": "Hi"}]
@@ -137,8 +131,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         with self.assertRaises(KeyError):
             template.encode_messages(messages)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_logs_first_rendering_once(self):
         """tokenizer: optionally log one raw conversation and its native rendering."""
         template = chat_template.build_chat_template(
@@ -157,8 +149,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         self.assertEqual(output.count("First rendered chat template"), 1)
         self.assertIn("<user>Hi</user>", output)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_forwards_rendering_kwargs(self):
         """tokenizer: use identical native-template kwargs for every incremental rendering."""
         class RecordingTokenizer(FakeTokenizer):
@@ -205,8 +195,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         ])
         self.assertEqual(tokenizer.generation_prompts, [False, False, True])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_forwards_sample_tools(self):
         """tokenizer: forward tool definitions together with static rendering options."""
         class RecordingTokenizer(FakeTokenizer):
@@ -257,8 +245,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         ])
         self.assertEqual(tokenizer.generation_prompts, [False, False, True])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_masks_native_assistant_generation_prefix(self):
         """tokenizer: mask the same assistant prefix that inference pre-fills."""
         class ThinkingTokenizer(FakeTokenizer):
@@ -327,8 +313,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         self.assertEqual(result["labels"][:len(generation_prefix)], [-100] * len(generation_prefix))
         self.assertEqual(result["labels"][len(generation_prefix):], assistant_target)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_multiturn_preserves_all_assistant_targets(self):
         """Mask each new source without masking targets from preceding turns."""
         for turns in (1, 2, 3):
@@ -354,8 +338,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
                 self.assertEqual(result["labels"], expected_labels)
                 self.assertEqual(tokenizer.generation_histories, list(range(2, 2 * turns + 1, 2)))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_multiturn_tools_and_explicit_masks(self):
         """Tool observations stay masked unless explicitly enabled; skipped assistants stay masked."""
         for tool_loss_mask in (0, 1):
@@ -387,8 +369,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
                 self.assertEqual(truncated["input_ids"], result["input_ids"][-80:])
                 self.assertEqual(truncated["labels"], expected_labels[-80:])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_tool_only_turns_keep_bpe_boundaries_and_masks(self):
         """Empty/missing content and reasoning must not lose tool targets when history grows."""
         calls = [{"type": "function", "function": {"name": "lookup", "arguments": {"items": ["x", "y"]}}},
@@ -531,8 +511,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
             with self.subTest(message_count=end):
                 self.assertEqual(template.encode_messages(messages[:end]), reference.encode_messages(messages[:end]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_validates_rendering_kwargs(self):
         """tokenizer: reject Trainer-owned arguments and invalid known reasoning options."""
         invalid_kwargs = (
@@ -558,8 +536,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
                 chat_template_kwargs={"enable_thinking": True},
             )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_chatml_template_golden(self):
         """chatml: ``<|im_start|>role\ncontent<|im_end|>\n``; missing loss_mask defaults by role."""
         expected_segments = [
@@ -581,8 +557,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
             + expected_segments[2],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_llama2_template_golden(self):
         """llama2: ``<<SYS>>``/``[INST]`` format, tool role, unknown role raises."""
         messages = _MESSAGES + [{"role": "tool", "content": "result", "loss_mask": 0}]
@@ -610,8 +584,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
                 [{"role": "narrator", "content": "x", "loss_mask": 0}]
             )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_janus_template_golden(self):
         """Janus: role formats, image seq/emb masks, generation task_type switch."""
         image_content = "<image_placeholder>" * 576
@@ -652,8 +624,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         user_labels = generation["labels"]
         self.assertIn(ord("U"), user_labels)  # "User: ..." prefix keeps loss
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_golden(self):
         """tokenizer: prefix-stable native template with assistant-only default loss."""
         messages = [dict(message) for message in _MESSAGES]
@@ -675,8 +645,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
             [-100] * (len(expected_ids) - len(assistant_segment)) + assistant_segment,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_groups_leading_system_with_user(self):
         """tokenizer: do not render a system-only prefix when deriving loss boundaries."""
         class UserRequiredTokenizer(FakeTokenizer):
@@ -720,8 +688,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         self.assertEqual(result["input_ids"], user_prefix + assistant_segment)
         self.assertEqual(result["labels"], [-100] * len(user_prefix) + assistant_segment)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_rejects_prefix_rewrite(self):
         """tokenizer: structural prefix rewrites raise ValueError."""
         messages = [
@@ -734,8 +700,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prefix"):
             template.encode_messages(messages)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_gpt_oss_terminal_rewrite_golden(self):
         """gpt_oss: trailing ``<|return|>`` rewritten to ``<|end|>`` keeps its label."""
         messages = [
@@ -757,8 +721,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
         rewritten_index = result["input_ids"].index(end_id)
         self.assertEqual(result["labels"][rewritten_index], end_id)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_max_seq_len_keeps_tail(self):
         """All templates truncate from the front, keeping the sequence tail."""
         long_messages = [
@@ -772,8 +734,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
             self.assertEqual(truncated["input_ids"], full["input_ids"][-8:], name)
             self.assertEqual(truncated["labels"], full["labels"][-8:], name)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_save_pretrained_failure_is_swallowed(self):
         """save_pretrained logs and swallows tokenizer save failures."""
         tokenizer = FailingSaveTokenizer()
@@ -784,8 +744,6 @@ class TestChatTemplateGoldens(unittest.TestCase):
             tokenizer.chat_template, template.get_jinja_template()
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_merged_module_surface(self):
         """Pin how the merge resolved the recorded non-behavioral conflicts.
 

@@ -37,7 +37,6 @@ from hyper_parallel.models.replacement import apply_module_replacements, compile
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from hyper_parallel.trainer.config.parallelism import PlanOverride
 from hyper_parallel.trainer.config.resolver import resolve_component
-from tests.common.mark_utils import arg_mark
 
 _VISUAL_RECIPE_RULE = """
 match: "model.vision.blocks.*.attn"
@@ -99,8 +98,6 @@ class TestEncoderRuntime(unittest.TestCase):
         """Evict backend-less cached sub-meshes so later suites rebuild real groups."""
         _DEVICE_MESH_MAP.clear()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_recipe_wrapper_keeps_native_forward_and_backward(self):
         """Feature: recipe-selected ViT wrapper preserves the native path.
 
@@ -118,8 +115,6 @@ class TestEncoderRuntime(unittest.TestCase):
         self.assertTrue(torch.equal(native_output, candidate_output))
         self.assertTrue(torch.equal(pixels.grad, candidate_pixels.grad))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_recipe_matches_all_vision_attention_blocks(self):
         """Feature: one recipe glob covers the released vision block depth.
 
@@ -131,8 +126,6 @@ class TestEncoderRuntime(unittest.TestCase):
         expected = {f"model.vision.blocks.{index}.attn" for index in range(32)}
         self.assertEqual(matched, expected)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_local_image_features_match_native_vision(self):
         """Feature: one-rank active visual encoding.
 
@@ -165,8 +158,6 @@ class TestEncoderRuntime(unittest.TestCase):
         self.assertTrue(torch.allclose(active_grad, pixels.grad, atol=1e-6))
         self.assertTrue(torch.isfinite(anchor))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_text_only_keeps_visual_path_idle(self):
         """Feature: text-only visual runtime mode.
 
@@ -178,8 +169,6 @@ class TestEncoderRuntime(unittest.TestCase):
         self.assertFalse(plan.active)
         self.assertEqual(plan.encode_and_route(batch), ([], None))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_composed_input_matches_previous_batch_sequence(self):
         """The real DeepSeek bridge produces the same plan and packed inputs.
 
@@ -219,8 +208,6 @@ class TestEncoderRuntime(unittest.TestCase):
             else:
                 self.assertEqual(new_value, old_value)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_static_guards_fail_before_group_derivation(self):
         """Feature: static Encoder Parallel fail-fast checks.
 
@@ -245,8 +232,6 @@ class TestEncoderRuntime(unittest.TestCase):
                                    mesh_context=wide_context, model=self.model, spec=spec,
                                    execution_options=options)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_missing_attention_replacement_is_rejected(self):
         """Feature: structural visual attention replacement audit.
 
@@ -262,8 +247,6 @@ class TestEncoderRuntime(unittest.TestCase):
                                    "validate_placement": False},
             )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_partial_image_bundle_fails_preflight(self):
         """Feature: native image bundle validation.
 

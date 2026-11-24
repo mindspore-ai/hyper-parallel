@@ -28,7 +28,6 @@ from hyper_parallel.distributed._builder import fsdp_adapter
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.trainer.config.parser import parse_training_args
-from tests.common.mark_utils import arg_mark
 
 
 def _make_model(tied: bool = False) -> nn.Module:
@@ -51,8 +50,6 @@ class TestFSDPRootWrap(unittest.TestCase):
     def _manager(self, **kwargs) -> FSDP2Manager:
         return FSDP2Manager(FSDP2Config(**kwargs), SimpleNamespace(fsdp_moe_mesh=None, tp_size=1))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_manual_classes_preserve_expert_units(self):
         """Feature: manual wrap. Description: select a parent with EP. Expectation: retain experts."""
         model = _make_model()
@@ -88,8 +85,6 @@ class TestFSDPRootWrap(unittest.TestCase):
         self.assertIs(calls[-1].args[0], model)
         self.assertTrue(all(call.kwargs["mesh"] is dense_mesh for call in calls[1:]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_manual_classes_validate_and_handle_checkpoint_wrapper(self):
         """Feature: class selection. Description: invalid and wrapped inputs. Expectation: safe selection."""
         for names in ("Linear", [""], [7]):

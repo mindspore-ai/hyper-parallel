@@ -21,7 +21,6 @@ import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.distributed_data.schema import SampleKey
-from tests.common.mark_utils import arg_mark
 
 
 class _PinnablePayload:
@@ -39,7 +38,6 @@ class _PinnablePayload:
 class TestPlannedPayload(unittest.TestCase):
     """Verify raw payloads retain native DataLoader memory-pinning behavior."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_planned_reads_pin_nested_payloads(self) -> None:
         """Feature: Raw payload memory pinning.
         Description: Fetch a nested custom pinnable object through the native DataLoader.

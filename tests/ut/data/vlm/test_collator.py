@@ -20,14 +20,11 @@ import torch
 
 from hyper_parallel.data.batching.build_collate_fn import OmniCollator
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch
-from tests.common.mark_utils import arg_mark
 
 
 class TestOmniCollator(unittest.TestCase):
     """Omni collation keeps generic model fields without an allowlist."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_collator_stacks_tokens_and_concatenates_modality_values(self):
         """Collate fixed token fields and variable image rows.
 
@@ -56,8 +53,6 @@ class TestOmniCollator(unittest.TestCase):
             torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_batch_runtime_forwards_unknown_model_fields(self):
         """Forward model-specific fields without a framework allowlist.
 

@@ -27,7 +27,6 @@ from hyper_parallel.components.checkpoint.huggingface_checkpointer import Huggin
 from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
     build_deepseek_v41_checkpoint_mapping,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _native_model():
@@ -53,8 +52,6 @@ def _native_model():
 class TestCheckpointMappingCompatibility(unittest.TestCase):
     """Changes to the V4 family mapping cannot rename V4.1-owned parameters."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ten_native_parameters_load_despite_generalized_v4_rules(self):
         """Feature: V4.1 conversion compatibility across Transformers versions.
 

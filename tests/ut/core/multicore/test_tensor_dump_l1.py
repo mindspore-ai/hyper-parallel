@@ -39,7 +39,6 @@ from hyper_parallel.core.multicore.diagnostics.common.session import _reset_acti
 from hyper_parallel.core.multicore.scheduler.config import TaskAiCoreType, TaskType
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config, serialize_runtime_config
-from tests.common.mark_utils import arg_mark
 
 
 def _captured_l1_dump(values, dtype=torch_float32):
@@ -93,8 +92,6 @@ def _captured_l1_dump(values, dtype=torch_float32):
 class TestL1DumpProtocol(unittest.TestCase):
     """Validate the fixed L1 record ABI and Torch Tensor decoding."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_decodes_captured_record(self):
         """Feature: MegaKernel diagnostics.
         Description: Decodes captured record.
@@ -109,8 +106,6 @@ class TestL1DumpProtocol(unittest.TestCase):
         self.assertEqual(snapshots[0].stored_shape, (2,))
         assert_close(snapshots[0].data, torch_tensor([1.5, -2.0]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_decodes_bfloat16_without_conversion(self):
         """Feature: MegaKernel diagnostics.
         Description: Keep the original bfloat16 dtype when decoding Device payload bytes.
@@ -125,8 +120,6 @@ class TestL1DumpProtocol(unittest.TestCase):
         self.assertEqual(snapshot.data.dtype, torch_bfloat16)
         assert_close(snapshot.data, torch_tensor([1.5, -2.0], dtype=torch_bfloat16))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_record_not_captured_by_device(self):
         """Feature: MegaKernel diagnostics.
         Description: Rejects record not captured by device.
@@ -140,8 +133,6 @@ class TestL1DumpProtocol(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "was not captured"):
             tensor_dump_l1._decode_l1_dump(prepared)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_plans_records_from_graph_sized_runtime(self):
         """Feature: MegaKernel diagnostics.
         Description: Retain dynamic RuntimeConfig arrays while planning task-local views.
@@ -225,8 +216,6 @@ class TestL1DumpExport(unittest.TestCase):
         """Reset the process-local diagnostic session after each test."""
         _reset_active_session_for_test()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_exports_task_files_and_metadata(self):
         """Feature: MegaKernel diagnostics.
         Description: Exports task files and metadata.

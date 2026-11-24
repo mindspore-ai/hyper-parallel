@@ -26,7 +26,6 @@ from torch import nn
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.trainer.base import BaseTrainer
-from tests.common.mark_utils import arg_mark
 
 
 class AuxiliaryModel(nn.Module):
@@ -59,8 +58,6 @@ class AuxiliaryModel(nn.Module):
 class TestTrainerAuxLossScaling(unittest.TestCase):
     """Exercise the actual BaseTrainer microstep and loss aggregation."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_unequal_microbatches_match_weighted_explicit_objective(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.

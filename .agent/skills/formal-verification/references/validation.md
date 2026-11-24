@@ -35,7 +35,7 @@ style checks. For coverage, put the data file outside the repository or clean up
 local coverage output after inspection:
 
 ```bash
-python -m coverage run --branch --include '*/formal-verification/scripts/verify.py' -m pytest --confcutdir=tests/ut/agent tests/ut/agent/formal_verification -q
+python -m coverage run --branch --include '*/formal-verification/scripts/verify.py' -m pytest --confcutdir=.agent/tests/agent .agent/tests/agent/formal_verification -q
 python -m coverage report -m
 ```
 

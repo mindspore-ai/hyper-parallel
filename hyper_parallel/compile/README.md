@@ -40,7 +40,8 @@ pass_config = PassConfig(enable_overlap=True)
 ### Layer 3: Pass Pipeline
 
 ```text
-DeadCodeElimination → CanonicalizeGraph → [AC: ActivationCheckpointPass] → FSDPPass
+DeadCodeElimination → CanonicalizeGraph → [AC: ActivationCheckpointPass]
+    → [Offload: CpuOffloadPass] → FSDPPass → [Bucketing: FsdpBucketingPass]
     → AutoOverlapPass → FsdpOverlapPass → [PP: PpPass] → [Inductor: InductorPass]
 ```
 
@@ -110,6 +111,67 @@ Or drive it directly: `PassConfig(ac_mode="selective", ac_layer_count=8)`.
 Layer selectors require the model to advertise the HuggingFace
 `gradient_checkpointing` marker on a repeated block container (the same
 contract as the eager path).
+
+**CpuOffloadPass** (activation swap, `PassConfig.activation_swap`):
+
+- Reuses the dynamic-graph top-level `activation_swap` configuration:
+  `activation_swap: attention` enables it, `none` (default) disables it.
+  Graph mode does not wrap the live model with the eager `SwapManager`; the
+  pass owns host offload instead, so the two paths never offload twice.
+- Selects saved forward activations produced inside modules named
+  `self_attn` (the same discovery contract as the eager attention swap),
+  skipping collectives/waits, DTensors, non-contiguous values, and tensors
+  below 1 MiB. Aliases are grouped by real storage identity (so replay ops
+  without schema `alias_info`, e.g. `aten._unsafe_view`, are covered); only the
+  storage owner is offloaded and the whole group shares one lifetime. Groups
+  with external/mutating sharers or graph outputs are skipped. In-place writes
+  are read from each node's schema, so ops that return no tensor but mutate a
+  `Tensor(a!)[]` argument (e.g. `aten._foreach_add_`) still mark the written
+  storage unsafe; when the write target cannot be proven (schema-less node or
+  an unresolvable write argument), every tensor argument is marked unsafe
+  instead. Candidates are
+  chosen largest-first under
+  `offload_budget_gb` (default 64 GiB per rank; `0` means unlimited). The
+  budget caps *offloaded activation bytes*, not the pinned host buffer
+  footprint, so size it against the host's free memory. Dynamic shapes are
+  supported: the 1 MiB/budget heuristics use the trace-time size hints without
+  specializing the graph, and unbacked (data-dependent) sizes are skipped.
+- Forward inserts `cpu = ao.offload(gpu)` right after the producer and
+  `ao.wait_tensor(cpu, keepalive=gpu, last_use_of_storage=...)` after the
+  activation's last forward use, so the D2H copy overlaps the remaining
+  forward compute and the GPU storage is released at the wait.
+- Backward inserts `gpu = ao.reload(cpu, device)` plus a wait before the first
+  backward consumer, replays the alias chain on the reloaded tensor and
+  redirects its consumers, and optionally prefetches reloads
+  `offload_prefetch_n_layers` attention regions earlier. The runtime
+  shape/contiguous stride come from the offloaded host tensor, so no symbolic
+  size is baked into the graph.
+- Runs before `FSDPPass` (reload waits are ordinary backward consumers, so
+  FSDP inserts the matching parameter re-gathers).
+- Follows the dynamic incompatibility rules: attention swap cannot combine
+  with activation checkpointing or pipeline parallelism. `InductorPass` keeps
+  the `ao::` transfer ops eager in both `regional` and `full` modes.
+- Requires torch's `torch._functorch._activation_offloading.offload_ops`
+  (private API) and pinned host memory. Enabling the pass without those ops
+  raises instead of silently disabling offload; validate it on the target
+  backend (the UTs exercise the graph rewrite with CPU-safe stand-ins).
+
+```yaml
+activation_swap: attention   # reuse the dynamic-graph setting
+compile:
+  use_joint_graph: true
+  offload_budget_gb: 64.0          # default per-rank host budget; 0 = unlimited
+  offload_prefetch_n_layers: 1
+```
+
+`build_pass_config_from_trainer_config` projects the two graph-only
+`compile.*` knobs (siblings of `max_in_flight_gb`) onto the graph
+`PassConfig`; they can also be set directly on `PassConfig`:
+
+```python
+PassConfig(activation_swap="attention", offload_budget_gb=64.0,
+           offload_prefetch_n_layers=1)
+```
 
 **FSDPPass** (data-parallel, `PassConfig.dp_mode`):
 
@@ -382,6 +444,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b` / `interleaved_1f1b` / `vpp`), including VPP via `pp_chunks > 1`; pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
 | TP (+ SP / LP) | Via `mesh_context` | TP collectives are baked into automodel boundary forwards; graph mode reuses the mesh |
 | Activation checkpoint | Implemented | `ActivationCheckpointPass` (`ac_mode: full` / `selective`); reuses the eager `activation_checkpoint` config (mode, safe-region selection) |
+| Activation offload | Implemented | `CpuOffloadPass`; reuses the dynamic `activation_swap: attention` config, offloads saved attention activations to host with a largest-first budget |
 | PP + HSDP / PP + TP | Planned | HSDP needs a 3-D mesh; TP-in-stage needs per-stage TP collectives in the graph |
 | EP | Planned | — |
 
@@ -414,6 +477,15 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   stages. The interleaved schedule ships boundary values between adjacent
   virtual stages, including the last-stage -> rank-0 wrap edge.
 - **`AutoOverlapPass` is a placeholder no-op** — see the pass note above.
+- **Activation offload is attention-scoped**: `CpuOffloadPass` reuses the
+  dynamic `activation_swap="attention"` contract, so it requires modules named
+  `self_attn` and (matching the eager rule) cannot combine with activation
+  checkpointing or pipeline parallelism. Host transfers are opaque `ao::` ops;
+  regional/full Inductor leaves them eager, so they remain observable but are
+  not fused. The transfer ops live in torch's private
+  `_functorch._activation_offloading` module and use pinned host memory, so the
+  feature is gated on that torch build and must be validated on the target
+  backend (Ascend/Nvidia).
 - **Activation checkpointing shares the eager contract**: the recompute scope
   is the discovered HuggingFace-marker transformer blocks, so a model without
   the `gradient_checkpointing` marker + repeated block container is rejected

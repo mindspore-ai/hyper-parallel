@@ -53,7 +53,6 @@ from hyper_parallel.core.multicore.scheduler.runtime import (
     runtime_config_task_capacity,
     serialize_runtime_config,
 )
-from tests.common.mark_utils import arg_mark
 
 FORMER_TASK_LIMIT = 25600
 
@@ -242,8 +241,6 @@ class TestRuntimeCppReader(unittest.TestCase):
         self.assertEqual(tuple(wire_ids), expected, msg=f"Task ID mismatch: C++={tuple(wire_ids)}, Python={expected}")
         self.assertEqual(len(set(wire_ids)), len(wire_ids), msg=f"Kernel task IDs overlap: C++={tuple(wire_ids)}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_launch_bounds_preserve_native_tiling_and_use_real_storage(self) -> None:
         """Feature: Graph-owned runtime storage validation.
 

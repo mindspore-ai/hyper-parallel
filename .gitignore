@@ -66,8 +66,6 @@ venv/
 
 # tools
 .omo/
-/fm_agent/
-/fm_agent_estimate/
 
 # SAPP-ND generated files
 hyper_parallel/auto_parallel/SAPP-ND/plots/

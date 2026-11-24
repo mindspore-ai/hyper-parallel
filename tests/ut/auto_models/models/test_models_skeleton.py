@@ -32,8 +32,6 @@ import sys
 
 import pytest
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.registry import (
     MODEL_ADAPTER_REGISTRY,
@@ -42,8 +40,6 @@ from hyper_parallel.models.registry import (
 )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-         card_mark="onecard", essential_mark="essential")
 def test_models_import_boundary_subprocess():
     """Importing models must not pull Trainer/Data/components.models."""
     code = (
@@ -75,8 +71,6 @@ def test_models_import_boundary_subprocess():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-         card_mark="onecard", essential_mark="essential")
 def test_lazy_family_discovery():
     """qwen3_moe self-registers on first lookup with the declared identity."""
     spec = get_model_adapter("qwen3_moe")
@@ -85,15 +79,11 @@ def test_lazy_family_discovery():
     assert spec.model_type == "qwen3_moe", "case: model_type"
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-         card_mark="onecard", essential_mark="essential")
 def test_unknown_family_resolves_to_none():
     """No class-name guessing: an unknown model_type finds no adapter."""
     assert get_model_adapter("no_such_family") is None, "case: unknown"
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-         card_mark="onecard", essential_mark="essential")
 def test_register_model_adapter_idempotent_and_conflict():
     """Re-registering the same spec is fine; a conflicting one fails."""
     spec = ModelAdapterSpec(architecture="_M1Arch", model_type="_m1_probe")
@@ -108,8 +98,6 @@ def test_register_model_adapter_idempotent_and_conflict():
         MODEL_ADAPTER_REGISTRY.pop("_m1_probe", None)
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-         card_mark="onecard", essential_mark="essential")
 def test_transformers_registry_facade_is_removed():
     """S5f split: the _transformers.registry compat facade no longer exists.
 

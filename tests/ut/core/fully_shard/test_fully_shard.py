@@ -32,7 +32,6 @@ from torch import nn
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.weak import WeakIdKeyDictionary
 
-
 from hyper_parallel.core.fully_shard.hsdp_param import (
     HSDPParamV2,
     _copy_without_bumping_version,
@@ -62,7 +61,6 @@ from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.distributed._builder.source_shard import _source_infos_for_fully_shard
-from tests.common.mark_utils import arg_mark
 
 
 Tensor = torch.Tensor
@@ -1187,8 +1185,6 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         )
         self.assertIs(result, mock_ddp_mesh_info.return_value)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_state_init_mp_dtypes_initializes_replicate_params_independently(self) -> None:
         """Feature: Replicated parameter precision refresh.
         Description: Initialize a replicated parameter from the shared state precision policy.

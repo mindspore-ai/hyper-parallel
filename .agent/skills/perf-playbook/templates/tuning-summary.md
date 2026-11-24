@@ -38,6 +38,17 @@
 | Device idle (`Free`) | [NOT MEASURED] | [NOT MEASURED] | [FILL] |
 | Optimizer update | [NOT MEASURED] | [NOT MEASURED] | [FILL] |
 
+## Conditional hardware-efficiency investigation
+
+> Include this section only when an actual investigation was performed. State why
+> framework/module/overlap optimization had reached a workload-dependent plateau,
+> or which leading bottleneck required a targeted counter capture. Follow
+> [hierarchical performance diagnosis](../references/hierarchical-performance-diagnosis.md).
+
+| Region / rank / shape | Metric and interval | Achieved value | Matching theoretical peak / source | Empirical ceiling | Coverage / artifact | Interpretation and next experiment |
+|---|---|---|---|---|---|---|
+| [FILL] | [FILL] | [NOT MEASURED] | [FILL] | [NOT MEASURED] | [FILL] | [FILL] |
+
 ## Fixes and additions
 
 - **Bugs fixed:** [FILL]

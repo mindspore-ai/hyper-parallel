@@ -23,15 +23,6 @@ from hyper_parallel.trainer.callbacks.stress_detect_callback import logger as st
 from hyper_parallel.trainer.config import ModelStressDetectConfig, OpStressDetectConfig, StressDetectConfig
 from hyper_parallel.trainer.config.resolver import resolve_config
 from hyper_parallel.trainer.state import TrainerState
-from tests.common.mark_utils import arg_mark
-
-
-_MARK = {
-    "plat_marks": ["cpu_linux", "cpu_macos"],
-    "level_mark": "level0",
-    "card_mark": "onecard",
-    "essential_mark": "essential",
-}
 
 
 CALLBACK_MODULE = "hyper_parallel.trainer.callbacks.stress_detect_callback"
@@ -70,7 +61,6 @@ class TestStressDetectCallback(unittest.TestCase):
             )),
         )
 
-    @arg_mark(**_MARK)
     def test_disabled_by_default_does_not_access_npu(self) -> None:
         """Default configuration must not import or access the optional NPU backend.
 
@@ -87,7 +77,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.npu.synchronize.assert_not_called()
         self.npu.stress_detect.assert_not_called()
 
-    @arg_mark(**_MARK)
     def test_cadence_counts_completed_steps_and_runs_on_nonzero_rank(self) -> None:
         """Run full rounds on nonzero ranks, including after a resumed step count.
 
@@ -107,7 +96,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertEqual(self.npu.mock_calls, expected_calls * 3,
                          f"training work must complete before each round, got={self.npu.mock_calls}")
 
-    @arg_mark(**_MARK)
     def test_success_and_nonfatal_failure_logging(self) -> None:
         """Report failed checks and continue the remaining checks in the round.
 
@@ -135,7 +123,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertIn("unrecognized return status", failures[2].getMessage(),
                       f"unknown status must be identified, got={logs.output}")
 
-    @arg_mark(**_MARK)
     def test_backend_exception_propagates(self) -> None:
         """Preserve errors raised directly by torch_npu instead of suppressing them.
 
@@ -151,7 +138,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertIs(context.exception, error, f"expected the original backend exception, got={context.exception}")
         self.npu.stress_detect.assert_called_once_with(detect_type="aic")
 
-    @arg_mark(**_MARK)
     def test_precision_error_is_logged_before_later_backend_exception(self) -> None:
         """Keep completed fault results when a later detection raises.
 
@@ -179,7 +165,6 @@ class TestStressDetectCallback(unittest.TestCase):
                 self.assertEqual(self.npu.stress_detect.call_args_list, expected,
                                  f"unexpected backend invocation sequence, got={self.npu.stress_detect.call_args_list}")
 
-    @arg_mark(**_MARK)
     def test_sdc_exit_stops_remaining_detections(self) -> None:
         """Exit on the first precision fault before another backend call can run.
 
@@ -200,7 +185,6 @@ class TestStressDetectCallback(unittest.TestCase):
                 self.npu.stress_detect.assert_called_once_with(detect_type="aic")
                 self.assertEqual(len(logs.records), 1, f"expected one precision fault log, got={logs.output}")
 
-    @arg_mark(**_MARK)
     def test_invalid_configuration_rejected_before_backend_access(self) -> None:
         """Reject invalid cadence/count values, including boolean and fractional values.
 
@@ -218,7 +202,6 @@ class TestStressDetectCallback(unittest.TestCase):
                     StressDetectCallback(self._trainer(count=count))
         self.npu.stress_detect.assert_not_called()
 
-    @arg_mark(**_MARK)
     def test_enabled_requires_npu_device(self) -> None:
         """Explicitly enabling detection on CPU/CUDA must fail clearly.
 
@@ -233,7 +216,6 @@ class TestStressDetectCallback(unittest.TestCase):
                     StressDetectCallback(self._trainer())
         self.npu.stress_detect.assert_not_called()
 
-    @arg_mark(**_MARK)
     def test_missing_backend_api_rejected(self) -> None:
         """An older torch_npu without stress_detect must fail at initialization.
 
@@ -245,7 +227,6 @@ class TestStressDetectCallback(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "requires torch.npu.stress_detect"):
                 StressDetectCallback(self._trainer())
 
-    @arg_mark(**_MARK)
     def test_result_logging_can_be_called_independently(self) -> None:
         """Report individual results without accessing the NPU or a Trainer.
 
@@ -259,7 +240,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertEqual(len(logs.output), 2, f"expected one log per return code, got={logs.output}")
         self.npu.stress_detect.assert_not_called()
 
-    @arg_mark(**_MARK)
     def test_yaml_settings_resolve_into_callback(self) -> None:
         """Resolve the dedicated stress detection section and schedule a detection round.
 
@@ -284,7 +264,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertEqual(self.npu.stress_detect.call_args_list, [call(detect_type="hccs")] * 3,
                          f"expected the configured HCCS mode, got={self.npu.stress_detect.call_args_list}")
 
-    @arg_mark(**_MARK)
     def test_omitted_section_defaults_to_disabled_and_serializes_separately(self) -> None:
         """Keep stress settings separate from training, including when YAML omits them.
 
@@ -309,7 +288,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertFalse(any(key.startswith("stress_detect") for key in serialized["training"]),
                          f"stress settings must not be part of training, got={serialized['training']}")
 
-    @arg_mark(**_MARK)
     def test_all_runs_each_type_after_precision_failure(self) -> None:
         """Report precision failure without suppressing remaining checks or the HCCS round.
 
@@ -327,7 +305,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertEqual(self.npu.stress_detect.call_args_list, expected,
                          f"all must run two checks per type, got={self.npu.stress_detect.call_args_list}")
 
-    @arg_mark(**_MARK)
     def test_all_logs_each_type(self) -> None:
         """Identify AIC and HCCS results separately in all mode.
 
@@ -345,7 +322,6 @@ class TestStressDetectCallback(unittest.TestCase):
             "hardware precision failure" in line and "detect_type=hccs" in line for line in logs.output),
                         f"missing HCCS failure result, got={logs.output}")
 
-    @arg_mark(**_MARK)
     def test_precision_failure_raises_when_configured(self) -> None:
         """Stop the training step when an enabled policy receives a precision failure.
 
@@ -360,7 +336,6 @@ class TestStressDetectCallback(unittest.TestCase):
                 callback.on_step_end(TrainerState(global_step=10))
         self.assertEqual(len(logs.records), 1, f"expected one precision error, got={logs.output}")
 
-    @arg_mark(**_MARK)
     def test_exit_policy_does_not_raise_for_execution_failure(self) -> None:
         """The SDC exit policy must not treat execution failures as precision faults.
 
@@ -375,7 +350,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertEqual([record.levelname for record in logs.records], ["WARNING", "WARNING"],
                          f"non-precision failures must remain warnings, got={logs.output}")
 
-    @arg_mark(**_MARK)
     def test_invalid_exit_policy_rejected(self) -> None:
         """Require a boolean exit policy for directly constructed configurations.
 
@@ -388,7 +362,6 @@ class TestStressDetectCallback(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exit_training_on_sdc.*boolean"):
                     OpStressDetectConfig(exit_training_on_sdc=value)
 
-    @arg_mark(**_MARK)
     def test_invalid_detection_type_rejected(self) -> None:
         """Reject unknown modes before accessing the NPU backend.
 
@@ -403,7 +376,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.get_device_type.assert_not_called()
         self.npu.stress_detect.assert_not_called()
 
-    @arg_mark(**_MARK)
     def test_model_stress_entry_is_reserved_but_cannot_be_enabled(self) -> None:
         """Accept a disabled model-level entry and fail early when it is enabled.
 
@@ -432,7 +404,6 @@ class TestStressDetectCallback(unittest.TestCase):
         self.get_device_type.assert_not_called()
         self.npu.stress_detect.assert_not_called()
 
-    @arg_mark(**_MARK)
     def test_invalid_model_interval_rejected(self) -> None:
         """Validate the reserved model interval independently of operation settings.
 

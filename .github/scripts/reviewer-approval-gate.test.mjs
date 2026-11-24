@@ -17,13 +17,16 @@ import {
   CHECK_CONTEXT, GitHubClient, POLICY_PATH, evaluate_reviews,
   permits_auto_merge, policy_blob_sha, reconcile, validate_policy,
 } from './reviewer-approval-gate.mjs';
+import { PASS_LABELS, STATUS_CONTEXT, TTL_MS } from './ci-label-expiry.mjs';
+
+const NOW = Date.parse('2026-11-12T00:00:00Z');
 
 const POLICY = {
   repository: 'example/repo', base_branches: ['master'], auto_merge: true,
 };
 const RULES = [
   { type: 'required_status_checks', parameters: {
-    required_status_checks: [{ context: CHECK_CONTEXT, integration_id: 15368 }],
+    required_status_checks: [CHECK_CONTEXT, STATUS_CONTEXT].map(context => ({ context, integration_id: 15368 })),
   } },
   { type: 'pull_request', parameters: { dismiss_stale_reviews_on_push: true, required_approving_review_count: 1 } },
 ];
@@ -32,6 +35,7 @@ function pull(overrides = {}) {
   return {
     number: 1, state: 'open', draft: false, user: { login: 'contributor' },
     head: { sha: 'head-sha' }, base: { ref: 'master', sha: 'base-sha' }, requested_reviewers: [],
+    labels: [{ name: PASS_LABELS[0] }],
     ...overrides,
   };
 }
@@ -55,10 +59,13 @@ class FakeGitHub {
     this.policy_sha = 'policy-sha';
     this.saved_status = undefined;
     this.fresh_pull = undefined;
+    this.label_events = [{ id: 1, event: 'labeled', label: { name: PASS_LABELS[0] },
+      created_at: new Date(NOW - 1000).toISOString() }];
   }
 
   list_pulls() { return this.pulls; }
   get_reviews() { return this.reviews; }
+  get_label_events() { return this.label_events; }
   latest_status() { return this.saved_status; }
   publish(sha, state, description) {
     const status = { sha, state, description };
@@ -77,8 +84,8 @@ class FakeGitHub {
   }
 }
 
-function run_live(client, policy = POLICY) {
-  return reconcile(client, policy, { write: true, policy_sha: 'policy-sha' });
+function run_live(client, policy = POLICY, options = {}) {
+  return reconcile(client, policy, { write: true, policy_sha: 'policy-sha', now: () => NOW, ...options });
 }
 
 test('two requested reviewers may approve while a third is still requested', () => {
@@ -213,12 +220,18 @@ test('auto-merge requires this check from GitHub Actions and stale approval dism
   const wrong_source = structuredClone(RULES);
   wrong_source[0].parameters.required_status_checks[0].integration_id = null;
   assert.equal(permits_auto_merge(wrong_source), false);
+  const missing_ci = structuredClone(RULES);
+  missing_ci[0].parameters.required_status_checks.pop();
+  assert.equal(permits_auto_merge(missing_ci), false);
+  const wrong_ci_source = structuredClone(RULES);
+  wrong_ci_source[0].parameters.required_status_checks[1].integration_id = null;
+  assert.equal(permits_auto_merge(wrong_ci_source), false);
   assert.equal(permits_auto_merge([...RULES, { type: 'merge_queue' }]), false);
 });
 
 test('dry-run has no writes, even when every reviewer has approved', () => {
   const client = new FakeGitHub();
-  assert.equal(reconcile(client, POLICY).reports[0].ready, true);
+  assert.equal(reconcile(client, POLICY, { now: () => NOW }).reports[0].ready, true);
   assert.deepEqual(client.statuses, []);
   assert.deepEqual(client.merges, []);
 });
@@ -333,6 +346,100 @@ test('GitHub API adapter fetches every page and passes JSON without a shell', ()
   assert.equal(JSON.parse(calls[1].options.input).context, CHECK_CONTEXT);
   assert.ok(calls[1].args.includes('--input'));
   assert.equal(calls[1].options.shell, undefined);
+  assert.equal(client.get_label_events(1).length, 2);
+  assert.ok(calls[2].args.includes('repos/example/repo/issues/1/events?per_page=100'));
+  assert.ok(calls[2].args.includes('--paginate'));
+});
+
+test('fresh CI is checked before publishing approval success and again before enabling auto-merge', () => {
+  const client = new FakeGitHub();
+  const actions = [];
+  client.get_label_events = () => { actions.push('check-ci'); return client.label_events; };
+  client.publish = (sha, state, description) => {
+    actions.push(state);
+    return FakeGitHub.prototype.publish.call(client, sha, state, description);
+  };
+  client.enable_auto_merge = () => actions.push('enable-auto-merge');
+  assert.equal(run_live(client).errors, 0);
+  assert.deepEqual(actions, ['pending', 'check-ci', 'success', 'check-ci', 'enable-auto-merge']);
+});
+
+test('expired CI keeps the approval gate pending even when auto-merge was already enabled', () => {
+  for (const auto_merge of [null, { enabled_at: '2026-11-11T00:00:00Z' }]) {
+    const client = new FakeGitHub([pull({ auto_merge })]);
+    client.saved_status = { state: 'success' };
+    client.label_events[0].created_at = new Date(NOW - TTL_MS).toISOString();
+    const result = run_live(client);
+    assert.equal(result.errors, 0);
+    assert.equal(result.reports[0].ready, false);
+    assert.equal(result.reports[0].ci_valid, false);
+    assert.ok(client.statuses.every(status => status.state === 'pending'));
+    assert.deepEqual(client.merges, []);
+  }
+});
+
+test('missing CI labels block auto-merge and a renewed label restores eligibility', () => {
+  const client = new FakeGitHub([pull({ labels: [] })]);
+  assert.equal(run_live(client).reports[0].ready, false);
+  assert.deepEqual(client.merges, []);
+  client.pulls[0].labels = [{ name: PASS_LABELS[0] }];
+  assert.equal(run_live(client).reports[0].ci_valid, true);
+  assert.deepEqual(client.merges, [1]);
+});
+
+test('unverifiable CI events revoke earlier approval success and never enable auto-merge', () => {
+  for (const unreadable of [false, true]) {
+    const client = new FakeGitHub();
+    client.saved_status = { state: 'success' };
+    client.label_events = [];
+    if (unreadable) client.get_label_events = () => { throw new Error('CI events unavailable'); };
+    assert.equal(run_live(client).errors, 1);
+    assert.equal(client.statuses.at(-1).state, 'error');
+    assert.deepEqual(client.merges, []);
+  }
+});
+
+test('CI expiring during branch-rule reads prevents the subsequent auto-merge request', () => {
+  const client = new FakeGitHub();
+  client.label_events[0].created_at = new Date(NOW - TTL_MS).toISOString();
+  let clock = NOW - 1;
+  client.api = path => {
+    if (path.startsWith('rules/')) clock = NOW;
+    return FakeGitHub.prototype.api.call(client, path);
+  };
+  assert.equal(run_live(client, POLICY, { now: () => clock }).errors, 1);
+  assert.equal(client.statuses.at(-1).state, 'error');
+  assert.deepEqual(client.merges, []);
+});
+
+test('a head change after approval success cannot enable auto-merge for an unchecked head', () => {
+  const client = new FakeGitHub();
+  client.publish = (sha, state, description) => {
+    if (state === 'success') client.fresh_pull = pull({ head: { sha: 'new-head' } });
+    return FakeGitHub.prototype.publish.call(client, sha, state, description);
+  };
+  assert.equal(run_live(client).errors, 1);
+  assert.equal(client.statuses.at(-1).state, 'error');
+  assert.deepEqual(client.merges, []);
+});
+
+test('a fresh PR cannot enable auto-merge while a sibling sharing its head has expired CI', () => {
+  const client = new FakeGitHub([pull(), pull({ number: 2 })]);
+  client.get_label_events = number => number === 1 ? client.label_events :
+    [{ ...client.label_events[0], created_at: new Date(NOW - TTL_MS).toISOString() }];
+  assert.equal(run_live(client).errors, 0);
+  assert.ok(client.statuses.every(status => status.state !== 'success'));
+  assert.deepEqual(client.merges, []);
+});
+
+test('reviewer reconciliation observes label updates and the shared CI checker', () => {
+  const workflow = readFileSync(new URL('../workflows/reviewer-approval-gate.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /^      - labeled$/m);
+  assert.match(workflow, /^      - unlabeled$/m);
+  assert.match(workflow, /workflows: \[Reviewer approval signal, Label Gate Check\]/);
+  assert.match(workflow, /\.github\/scripts\/ci-label-expiry\.mjs/);
+  const tests = readFileSync(new URL('../workflows/reviewer-approval-tests.yml', import.meta.url), 'utf8');
+  assert.equal(tests.match(/\.github\/scripts\/ci-label-expiry\*\.mjs/g).length, 2);
 });
 
 test('auto-merge command pins the head and does not bypass branch rules', () => {

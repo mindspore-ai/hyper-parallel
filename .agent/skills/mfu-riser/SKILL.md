@@ -23,6 +23,9 @@ and broader candidate scopes. Fusion-only sessions can use the original v1 contr
 
 ## Entry requirements and fixed measurement protocol
 
+Run the experiment controller on Linux. It uses advisory file locks to serialize
+updates and process groups to clean up distributed workers on timeout.
+
 Obtain the reproducible initial state, dataset, launch command, device set, complete
 training-step count, target, and budget. An initial state can be a checkpoint or a
 declared random initialization. Reuse information already available in the task context.
@@ -42,6 +45,12 @@ substitute guessed values for measurements.
 - Treat fixed routing as a declared performance workload. Preserve the model
   architecture, logical Top-K and token semantics in that workload. Changes to
   training policy use the acceptance criteria for that policy.
+
+Set `rsi_mode` to `acceptance` by default or `continuous` when requested. Every
+task also delivers the [RSI improvement report](../autoresearch/references/experience-consolidation.md).
+Review useful lessons autonomously; users need not request consolidation again.
+Reuse existing experience, improve it in place when warranted, and keep
+deployment-specific facts outside the repository.
 
 ## Iteration workflow
 
@@ -95,6 +104,7 @@ python .agent/skills/mfu-riser/scripts/mfu_riser.py init --run-dir /path/to/new-
 python .agent/skills/mfu-riser/scripts/mfu_riser.py trial --run-dir /path/to/new-run --plan /path/to/plan.json
 python .agent/skills/mfu-riser/scripts/mfu_riser.py status --run-dir /path/to/new-run
 python .agent/skills/mfu-riser/scripts/mfu_riser.py report --run-dir /path/to/new-run
+python .agent/skills/mfu-riser/scripts/mfu_riser.py finalize --run-dir /path/to/new-run
 ```
 
 `trial` executes one proposal. **The Agent using this skill drives the complete loop**;
@@ -107,6 +117,8 @@ describes how to change an authorized capacity setting or replay a screened winn
 records to audit all-rank inputs, scalar trajectories, and independently derived work,
 then export measurement samples. It lists uncovered checks explicitly and does not
 replace module-gradient or fusion-engagement acceptance.
+
+For an authorized global batch sweep, [estimate accumulation scaling](references/planner.md#decision-process) from matched completed trial receipts before scheduling the next capacity probe.
 
 `recover` performs trial-specific cleanup and records an interrupted trial as `crash`
 before allowing another experiment. Failed cleanup leaves the trial pending. The best
@@ -121,6 +133,10 @@ Artifacts include `REPORT.md`, `controller.json`, append-only `history.jsonl`, a
 trial's `context.json`, `source.tar.gz`, stage logs, `measurement.json`, profiling JSON
 and HTML, raw acceptance evidence, and `result.json`. Reports distinguish local operator
 speedups, end-to-end gains, unmet targets, and pending numerical acceptance.
+`RSI_REPORT.html`, `RSI_REPORT.md`, and `rsi/report.json` separately describe
+repository improvements, reused experience, tests, and deferred lessons.
+After target confirmation or budget exhaustion, complete `finalize_learning`
+before delivery; a performance pass alone does not close the learning task.
 
 The controller does not include a cluster-specific SSH or torchrun launcher. Reuse the
 project launcher and implement the contract adapter on first integration. Missing

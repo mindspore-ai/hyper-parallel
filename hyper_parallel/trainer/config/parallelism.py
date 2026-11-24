@@ -38,6 +38,7 @@ from hyper_parallel.models.replacement import (
     MethodReplacementSpec,
     ModuleReplacementFactory,
     ModuleReplacementSpec,
+    ModuleReplacementRequest,
     method_replacement,
     module_replacement,
 )
@@ -369,6 +370,22 @@ class PlanOverride:
         if meta.kind not in ("local_compute", "inner_wrapper"):
             raise TypeError(f"unsupported forward target metadata kind {meta.kind!r}")
 
+    def _serialized_replacement(self):
+        """Serialize only the replacement action, independently of layout fields."""
+        implementation_config = _serialize_config_value(self.replace.implementation)
+        implementation_value = (
+            implementation_config["_target_"]
+            if isinstance(implementation_config, dict) and set(implementation_config) == {"_target_"}
+            else implementation_config
+        )
+        action = {"kind": self.replace.kind, "implementation": implementation_value}
+        if self.replace.kind == "module":
+            if self.replace.source_type is not None:
+                action["source_type"] = self.replace.source_type
+            if self.replace.exact_type:
+                action["exact_type"] = True
+        return action
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize the public declaration."""
         result: dict[str, Any] = {"match": self.match}
@@ -377,19 +394,7 @@ class PlanOverride:
         if self.low_precision_dtype_scheme is not None:
             result["low_precision_dtype_scheme"] = self.low_precision_dtype_scheme
         if self.replace is not None:
-            implementation_config = _serialize_config_value(self.replace.implementation)
-            implementation_value = (
-                implementation_config["_target_"]
-                if isinstance(implementation_config, dict) and set(implementation_config) == {"_target_"}
-                else implementation_config
-            )
-            action = {"kind": self.replace.kind, "implementation": implementation_value}
-            if self.replace.kind == "module":
-                if self.replace.source_type is not None:
-                    action["source_type"] = self.replace.source_type
-                if self.replace.exact_type:
-                    action["exact_type"] = True
-            result["replace"] = action
+            result["replace"] = self._serialized_replacement()
         for name in ("region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst", "tp_divide_attrs"):
             value = getattr(self, name)
             default_forward_dispatch = (
@@ -400,6 +405,17 @@ class PlanOverride:
             if value is not None and not default_forward_dispatch:
                 result[name] = _serialize_config_value(value)
         return result
+
+    def _validate_override_match(self):
+        """Reject method-only and empty declarations before creating a boundary."""
+        if self.replace is not None and self.replace.kind == "method" and (
+                self.match.rpartition(".")[2] != "forward"):
+            raise ValueError("non-forward method replacements do not create planner boundaries")
+
+        if not self.match:
+            raise ValueError(
+                "plan_overrides entry is missing 'match' (an fqn or "
+                "fqn glob such as '*.self_attn' or '*.mlp')")
 
     def to_override(self) -> "tuple[str, Any]":
         """Desugar to a ``(match, ModuleShardingSpec)`` plan_overrides entry.
@@ -417,14 +433,7 @@ class PlanOverride:
             ModuleShardingSpec,
         )
 
-        if self.replace is not None and self.replace.kind == "method" and (
-                self.match.rpartition(".")[2] != "forward"):
-            raise ValueError("non-forward method replacements do not create planner boundaries")
-
-        if not self.match:
-            raise ValueError(
-                "plan_overrides entry is missing 'match' (an fqn or "
-                "fqn glob such as '*.self_attn' or '*.mlp')")
+        self._validate_override_match()
         implementation = self.replace.implementation if self.replace is not None else None
         meta = getattr(implementation.callable, "_injection_meta", None) if implementation is not None else None
         spec = ModuleShardingSpec(
@@ -634,6 +643,42 @@ def entries_to_method_replacements(
     return tuple(rules)
 
 
+def entries_to_module_replacement_requests(
+    entries: List[PlanOverride], *, low_precision_enabled: bool = False,
+    low_precision_config: Optional[LowPrecisionConfig] = None,
+) -> tuple[ModuleReplacementRequest, ...]:
+    """Preserve public family identity and explicit parameters through desugaring.
+
+    Args:
+        entries: Value passed to this operation.
+    """
+    effective = low_precision_config if low_precision_enabled else None
+    result = []
+    for entry_index, entry in enumerate(entries):
+        if entry.replace is None or entry.replace.kind != "module":
+            continue
+        if entry.when == "low_precision" and not low_precision_enabled:
+            continue
+        _validate_replacement_entry(entry, effective)
+        target = entry.replace.implementation
+        baseline = target.requested_target if isinstance(target, ReplacementTarget) else target.callable
+        arguments = {name: value for name, value in target._kwargs.items()  # pylint: disable=protected-access
+                     if name not in {"module", "module_fqn", "context"}}
+        if isinstance(target, ReplacementTarget):
+            arguments.update(target.selectors)
+        if entry.when == "low_precision":
+            # Legacy policy-bearing closures remain on the explicit compatibility path.
+            continue
+        result.append(ModuleReplacementRequest(
+            match=(entry.match,) if isinstance(entry.match, str) else tuple(entry.match),
+            target=baseline, kwargs=arguments, origin="user",
+            declaration_id=f"plan_override:{entry_index}:replace",
+            module_type=_import_module_type(entry.replace.source_type) if entry.replace.source_type else None,
+            exact_type=entry.replace.exact_type,
+        ))
+    return tuple(result)
+
+
 def entries_to_module_replacements(
     entries: List[PlanOverride],
     *,
@@ -755,6 +800,26 @@ def _merge_plan_override(overrides: dict[str, Any], match: str, spec: Any) -> No
         previous.region_dispatch = spec.region_dispatch
 
 
+def _validate_override_transport(entry):
+    """Validate YAML module-selection transport separately from placement lowering."""
+    if isinstance(entry.match, list) and (
+        entry.replace is None or entry.replace.kind != "module" or _has_sharding_action(entry)
+    ):
+        raise ValueError(
+            "plan_overrides match lists are supported only for replace.kind='module' "
+            "entries; use separate string matches for sharding actions"
+        )
+    if entry.replace is not None and entry.replace.kind == "module" and entry.when not in (
+        None,
+        "low_precision",
+    ):
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} uses replace.kind='module' and "
+            "does not support 'when' values other than 'low_precision' "
+            "(module replacements are not conditioned on parallel topology)"
+        )
+
+
 def entries_to_plan_overrides(
         entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
         sequence_parallel: bool = False,
@@ -784,22 +849,7 @@ def entries_to_plan_overrides(
                 entry.match.rpartition(".")[2] != "forward"):
             _validate_when(entry)
             continue
-        if isinstance(entry.match, list) and (
-            entry.replace is None or entry.replace.kind != "module" or _has_sharding_action(entry)
-        ):
-            raise ValueError(
-                "plan_overrides match lists are supported only for replace.kind='module' "
-                "entries; use separate string matches for sharding actions"
-            )
-        if entry.replace is not None and entry.replace.kind == "module" and entry.when not in (
-            None,
-            "low_precision",
-        ):
-            raise ValueError(
-                f"plan_overrides match={entry.match!r} uses replace.kind='module' and "
-                "does not support 'when' values other than 'low_precision' "
-                "(module replacements are not conditioned on parallel topology)"
-            )
+        _validate_override_transport(entry)
         _validate_when(entry)
         if entry.when is not None:
             active = {
@@ -846,17 +896,20 @@ def normalize_distributed_setup_overrides(
             False,
         )
     )
-    if low_precision_enabled and not any(
+    distributed_setup._hp_legacy_low_precision_targets = any(  # pylint: disable=protected-access
         entry.replace is not None and entry.replace.kind == "module" and (
             entry.when == "low_precision"
             or getattr(entry.replace.implementation, "low_precision_dtype_scheme", None) is not None
         )
         for entry in entries
-    ):
-        raise ValueError(
-            "low_precision is enabled but no low-precision module replacement "
-            "is configured"
+    )
+    if not distributed_setup._hp_legacy_low_precision_targets:  # pylint: disable=protected-access
+        distributed_setup.module_replacement_requests = entries_to_module_replacement_requests(
+            entries, low_precision_enabled=low_precision_enabled,
+            low_precision_config=getattr(distributed_setup, "low_precision_config", None),
         )
+    else:
+        distributed_setup.module_replacement_requests = None
     distributed_setup.module_replacements = entries_to_module_replacements(
         entries,
         low_precision_enabled=low_precision_enabled,

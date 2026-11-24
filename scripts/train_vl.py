@@ -14,14 +14,20 @@
 # ============================================================================
 """Vision-language training entry point for the AutoModel workflow."""
 
-from hyper_parallel.codegen.train_sidecar import run_training_with_codegen
+import sys
+
+from hyper_parallel.codegen.train_sidecar import start_codegen_sidecar
+from hyper_parallel.trainer.config import TrainerConfig
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
 
 
 def main() -> None:
     """Resolve configured components and execute vision-language training."""
-    run_training_with_codegen(parse_training_args, VLMTrainer)
+    config: TrainerConfig = parse_training_args()
+    start_codegen_sidecar(config._yaml_path, sys.argv[2:])  # pylint: disable=protected-access
+    trainer = VLMTrainer(config)
+    trainer.train()
 
 
 if __name__ == "__main__":

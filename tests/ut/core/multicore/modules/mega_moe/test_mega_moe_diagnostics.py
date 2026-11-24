@@ -21,14 +21,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.diagnostics import _mega_moe
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.scheduler.config import TaskDescC, TaskSplitValue, TaskType
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeDiagnostics(unittest.TestCase):
     """Keep business-specific diagnostic rules outside generic tool tests."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mega_moe_uses_graph_names_and_expert_owners(self):
         """Feature: MegaKernel diagnostics.
         Description: Keep MegaMoe display semantics without a second task-matching table.
