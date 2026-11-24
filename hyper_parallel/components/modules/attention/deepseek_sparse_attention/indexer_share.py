@@ -45,16 +45,12 @@ def resolve_index_share_plan(config: Any) -> IndexSharePlan:
 
     Args:
         config: Model config with num_hidden_layers and optional dsa_indexer_types,
-            dsa_index_topk_freq, dsa_index_skip_topk_offset, dsa_index_share_loss,
-            and index_share_for_mtp_iteration. Explicit roles take precedence over
-            frequency and offset.
+            dsa_index_topk_freq, dsa_index_skip_topk_offset, and dsa_index_share_loss.
+            Explicit roles take precedence over frequency and offset.
     """
     loss_mode = getattr(config, "dsa_index_share_loss", "served")
     if loss_mode not in ("leader", "served"):
         raise ValueError("dsa_index_share_loss must be 'leader' or 'served'")
-    share_mtp_iteration = getattr(config, "index_share_for_mtp_iteration", False)
-    if not isinstance(share_mtp_iteration, bool):
-        raise ValueError("index_share_for_mtp_iteration must be a boolean")
     count = getattr(config, "num_hidden_layers", 0)
     if type(count) is not int or count < 0:
         raise ValueError("num_hidden_layers must be a nonnegative integer")
@@ -134,14 +130,12 @@ def install_indexer_share(model: nn.Module) -> None:
     layers = getattr(decoder, "layers", ())
     if len(layers) != len(plan.leaders):
         raise ValueError("Indexer sharing requires the complete decoder layer stack")
-    mtp_share_enabled = getattr(decoder.config, "index_share_for_mtp_iteration", False)
     for layer in layers:
         attentions = [
             module for module in layer.modules()
-            if hasattr(module, "index_share_plan") and hasattr(module, "index_share_for_mtp_iteration")
+            if hasattr(module, "index_share_plan")
         ]
-        if any(module.index_share_plan != plan
-               or module.index_share_for_mtp_iteration != mtp_share_enabled for module in attentions):
+        if any(module.index_share_plan != plan for module in attentions):
             raise ValueError("Decoder attention layers must use the same Indexer Share plan as the model config")
     if getattr(decoder, "_hp_index_share_hook", None) is None:
         decoder._hp_index_share_hook = decoder.register_forward_pre_hook(  # pylint: disable=protected-access

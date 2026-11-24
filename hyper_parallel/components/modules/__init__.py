@@ -32,7 +32,7 @@ if TYPE_CHECKING:
         GatedMultiLatentAttention, GatedMultiLatentAttentionModule,
     )
     from hyper_parallel.components.modules.common.mtp import (
-        MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
+        MTPLayer, MultiTokenPrediction, MTPOutput, MTPIndexShareContext, build_mtp,
     )
     from hyper_parallel.components.modules.attention.deepseek_sparse_attention import (
         CPDeepseekSparseAttentionModule, DeepseekSparseAttention, DeepseekSparseAttentionModule,
@@ -87,6 +87,7 @@ _EXPORT_TO_MODULE = {
     "MTPLayer": "common.mtp",
     "MultiTokenPrediction": "common.mtp",
     "MTPOutput": "common.mtp",
+    "MTPIndexShareContext": "common.mtp",
     "DeepseekSparseAttention": "attention.deepseek_sparse_attention",
     "DeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",
     "CPDeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",

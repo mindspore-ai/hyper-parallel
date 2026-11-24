@@ -29,7 +29,7 @@ from hyper_parallel.components.modules.attention.deepseek_sparse_attention impor
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import (
     IndexShareContext, resolve_index_share_plan,
 )
-from hyper_parallel.components.modules import DeepseekSparseAttention, MTPLayer, MultiTokenPrediction
+from hyper_parallel.components.modules import DeepseekSparseAttention
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention import install_indexer_share
 from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention.cp_deepseek_sparse_attention import (
@@ -124,21 +124,6 @@ class Stack(nn.Module):
         return hidden
 
 
-class MTPDecoder(nn.Module):
-    """Return the hidden states from a DSA-backed MTP decoder block."""
-
-    def __init__(self, layer_idx, *, share_mtp_indexer=True):
-        super().__init__()
-        self.attn = DeepseekSparseAttention(config=config(
-            layer_idx=layer_idx, mtp_num_layers=2,
-            index_share_for_mtp_iteration=share_mtp_indexer,
-        ))
-
-    def forward(self, hidden_states, **kwargs):
-        output, _ = self.attn(hidden_states, **kwargs)
-        return output
-
-
 class TestIndexerShare(unittest.TestCase):
     """Validate the new behavior without importing NPU kernels."""
 
@@ -162,7 +147,6 @@ class TestIndexerShare(unittest.TestCase):
                         {"dsa_index_share_loss": "sum"}, {"dsa_index_share_topk_offload": True},
                         {"dsa_indexer_types": None, "dsa_index_topk_freq": 0},
                         {"dsa_indexer_types": None, "dsa_index_skip_topk_offset": -1},
-                        {"index_share_for_mtp_iteration": 1},
                         {"layer_idx": None}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 DeepseekSparseAttention(config=config(**options))
@@ -248,55 +232,6 @@ class TestIndexerShare(unittest.TestCase):
             self.assertEqual(index.call_count, 3)
             self.assertEqual(loss.call_count, 3)
             self.assertTrue(all(layer.indexer is not None for layer in model.layers))
-
-    def test_mtp_iterations_share_parameters_but_compute_separate_selections(self) -> None:
-        model = MultiTokenPrediction([
-            MTPLayer(16, MTPDecoder(3)),
-            MTPLayer(16, MTPDecoder(4)),
-        ])
-        first = model.layers[0].mtp_block.attn
-        second = model.layers[1].mtp_block.attn
-        self.assertIs(first.indexer, second.indexer)
-        self.assertNotIn("indexer", second._modules)
-        self.assertFalse(second._owns_indexer)
-        self.assertEqual(sum("indexer.wq_b.weight" in name for name in model.state_dict()), 1)
-
-        reference = MultiTokenPrediction([
-            MTPLayer(16, MTPDecoder(3, share_mtp_indexer=False)),
-            MTPLayer(16, MTPDecoder(4, share_mtp_indexer=False)),
-        ])
-        reference.load_state_dict(model.state_dict(), strict=False)
-        reference_first = reference.layers[0].mtp_block.attn
-        reference_second = reference.layers[1].mtp_block.attn
-        reference_second.indexer.load_state_dict(first.indexer.state_dict())
-
-        tokens = torch.tensor([[0, 1, 2, 3, 4]])
-        embedding = nn.Embedding(8, 16)
-        with kernels() as (index, _, _):
-            hidden = torch.randn(1, 5, 16)
-            output = model(hidden, tokens, embedding=embedding)
-            expected = reference(hidden, tokens, embedding=embedding)
-            torch.testing.assert_close(output.hidden_states, expected.hidden_states)
-            sum(state.square().mean() for state in output.hidden_states).backward()
-            sum(state.square().mean() for state in expected.hidden_states).backward()
-
-        self.assertEqual(index.call_count, 4)
-        self.assertEqual([call.args[0].shape[1] for call in index.call_args_list], [4, 3, 4, 3])
-        for name, parameter in first.indexer.named_parameters():
-            self.assertIsNotNone(parameter.grad)
-            expected_gradient = dict(reference_first.indexer.named_parameters())[name].grad
-            expected_gradient = expected_gradient + dict(reference_second.indexer.named_parameters())[name].grad
-            torch.testing.assert_close(parameter.grad, expected_gradient)
-
-    def test_mtp_indexers_remain_independent_when_disabled(self) -> None:
-        model = MultiTokenPrediction([
-            MTPLayer(16, MTPDecoder(3, share_mtp_indexer=False)),
-            MTPLayer(16, MTPDecoder(4, share_mtp_indexer=False)),
-        ])
-        first = model.layers[0].mtp_block.attn
-        second = model.layers[1].mtp_block.attn
-        self.assertIsNot(first.indexer, second.indexer)
-        self.assertTrue(second._owns_indexer)
 
     def test_parallel_sharing_preserves_existing_family_support(self) -> None:
         for topology in ({"tp_size": 2}, {"cp_size": 2}, {"tp_size": 2, "cp_size": 2},

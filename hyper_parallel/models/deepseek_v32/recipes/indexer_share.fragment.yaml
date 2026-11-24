@@ -9,7 +9,6 @@ model:
     dsa_index_skip_topk_offset: 0
     dsa_index_share_loss: served
     dsa_index_share_topk_offload: false
-    index_share_for_mtp_iteration: false # true ties Indexer parameters across MTP depths
     dsa_loss_coeff: 0.1
     dsa_dense_warm_up: false
     freeze_DSA: false

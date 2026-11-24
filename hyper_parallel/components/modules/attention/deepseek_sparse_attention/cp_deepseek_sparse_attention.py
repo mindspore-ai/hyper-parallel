@@ -39,6 +39,7 @@ class CPSparseAttentionSequenceMetadata(SparseAttentionSequenceMetadata):
     """CP kernel segments and optional ranges into the flattened global key bank."""
 
     key_ranges: tuple[tuple[int, int], ...] = ()
+    is_packed: bool = False
 
 
 def _split_packed_prefixes(
@@ -125,6 +126,7 @@ def build_cp_sequence_metadata(
         packed["actual_seq_len"] = actual_seq_len
     queries, keys = resolve_packed_sequence_lengths(packed, total, total)
     compact = cp_size > 1 and queries is not None
+    is_packed = queries is not None
     if queries is None:
         queries = keys = [(row + 1) * global_length for row in range(batch_size)]
     if len(queries) != len(keys):
@@ -143,7 +145,7 @@ def build_cp_sequence_metadata(
         local_key[-1] if key_ranges else (cp_rank + 1) * local_seq_len,
         torch.tensor(local_query, dtype=torch.int32, device=device),
         torch.tensor(local_key, dtype=torch.int32, device=device),
-        key_ranges,
+        key_ranges, is_packed,
     )
 
 
@@ -249,6 +251,10 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         Returns:
             The same states with gathered and selected key banks.
         """
+        if inputs.mtp_topk_indices is not None:
+            # The consumer reads the first step's already gathered KV bank and
+            # indices; issuing another sequence gather would break KVShare.
+            return inputs
         index_states, attention_states = self.prepare_key_bank(
             inputs.index_states, inputs.attention_states, inputs.metadata,
         )

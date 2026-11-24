@@ -224,6 +224,10 @@ optimizer:
         factory = Mock(side_effect=AssertionError("disabled MTP must not build layers"))
         self.assertIsNone(build_mtp(layer_factory=factory))
         self.assertIsNone(build_mtp(0, layer_factory=factory))
+        with self.assertRaisesRegex(ValueError, "MTP IndexShare cannot be enabled"):
+            build_mtp(layer_factory=factory, index_share_for_mtp_iteration=True)
+        with self.assertRaisesRegex(ValueError, "MTP IndexShare cannot be enabled"):
+            build_mtp(0, layer_factory=factory, index_share_for_mtp_iteration=True)
         factory.assert_not_called()
 
     def test_factory_matches_explicit_layer_list(self) -> None:
