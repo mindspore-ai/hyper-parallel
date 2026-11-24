@@ -22,6 +22,7 @@ import math
 from typing import Any
 
 import torch
+import torch.distributed._functional_collectives as funcol
 from torch import nn
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
@@ -31,6 +32,7 @@ from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
 from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
 from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
+from hyper_parallel.distributed.module_binding import ParallelBinding
 
 
 @dataclass(frozen=True)
@@ -264,9 +266,10 @@ def _deepseek_v32_dense_attention(
         indexer_stats = dsa_dense_indexer_lse(
             index_query, index_key, weights, query_lengths=query_lengths, key_lengths=key_lengths,
         )
-        teacher_query, teacher_key, teacher_qrope, teacher_krope, maximum, total = prepare_indexer_teacher(
+        teacher_query, teacher_key, teacher_qrope, teacher_krope, maximum, total = module.prepare_teacher(
             query.flatten(0, 1), key.flatten(0, 1),
             query_rope.flatten(0, 1), key_rope.flatten(0, 1), maximum, total,
+            dense=True,
         )
         loss = dsa_dense_indexer_kl_loss(
             index_query, index_key, weights, teacher_query, teacher_key,
@@ -286,6 +289,98 @@ class DeepseekSparseAttentionModule(nn.Module):
     assumed to be the standard causal mask created by Transformers; padding,
     custom attention masks, dropout, and KV cache are not supported.
     """
+
+    def bind_parallel(self, binding: ParallelBinding) -> None:
+        """Borrow the model's existing TP group for teacher assembly."""
+        mesh = binding.mesh_binding.mesh_context.device_mesh
+        names = getattr(mesh, "mesh_dim_names", None)
+        if self._tp_size > 1 or (isinstance(names, (list, tuple)) and "tp" in names):
+            tp = binding.mesh_binding.axis_mesh("tp")
+            bound_size = tp.size()
+            if self._tp_size not in (1, bound_size):
+                raise ValueError(
+                    f"Sparse-attention TP size {self._tp_size} does not match bound mesh size {bound_size}"
+                )
+            self._tp_size = bound_size
+            self._tp_group = tp.get_group() if bound_size > 1 else None
+
+    def _gather_tp(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+        """Concatenate one head shard across the borrowed TP group."""
+        if self._tp_size == 1:
+            return tensor
+        if self._tp_group is None:
+            raise RuntimeError("parallel DeepSeek sparse attention must be bound before forward")
+        gathered = funcol.all_gather_tensor(tensor.contiguous(), dim, self._tp_group)
+        return funcol.wait_tensor(gathered)
+
+    def gather_teacher_heads(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        query_rope: torch.Tensor,
+        key_rope: torch.Tensor,
+        maximum: torch.Tensor,
+        total: torch.Tensor,
+        *,
+        dense: bool,
+    ) -> tuple[torch.Tensor, ...]:
+        """Assemble the global-head detached teacher expected by the fused KL op."""
+        query = self._gather_tp(query, 1)
+        query_rope = self._gather_tp(query_rope, 1)
+        if dense:
+            key = self._gather_tp(key, 1)
+            key_rope = self._gather_tp(key_rope, 1)
+        stats_dim = 0 if dense else 2
+        maximum = self._gather_tp(maximum, stats_dim)
+        total = self._gather_tp(total, stats_dim)
+        return query, key, query_rope, key_rope, maximum, total
+
+    def prepare_teacher(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        query_rope: torch.Tensor,
+        key_rope: torch.Tensor,
+        maximum: torch.Tensor,
+        total: torch.Tensor,
+        *,
+        dense: bool,
+    ) -> tuple[torch.Tensor, ...]:
+        """Prepare full-head detached operands for the indexer KL."""
+        teacher = prepare_indexer_teacher(query, key, query_rope, key_rope, maximum, total)
+        return self.gather_teacher_heads(*teacher, dense=dense)
+
+    def _align_tokens(self, tensor: torch.Tensor, dim: int, tokens: int) -> torch.Tensor:
+        """Gather sequence-sharded metadata when attention inputs are TP-gathered."""
+        local = tensor.shape[dim]
+        if local == tokens:
+            return tensor
+        if local * self._tp_size != tokens:
+            raise ValueError("Position length must match local or TP-gathered tokens")
+        return self._gather_tp(tensor, dim % tensor.ndim)
+
+    def prepare_positions(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Align position tables with the tokens consumed by attention."""
+        if position_embeddings is None:
+            return None
+        cosine, sine = position_embeddings
+        return tuple(self._align_tokens(table, -2, hidden_states.shape[1]) for table in (cosine, sine))
+
+    def prepare_position_ids(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Align optional position IDs with TP-gathered attention tokens."""
+        if position_ids is None:
+            return None
+        if position_ids.ndim != 2:
+            raise ValueError("position_ids must have BS layout")
+        return self._align_tokens(position_ids, -1, hidden_states.shape[1])
 
     def _initialize_dimensions(self, module: nn.Module | None) -> None:
         """Read main-attention and indexer dimensions from a source or config."""
@@ -421,6 +516,7 @@ class DeepseekSparseAttentionModule(nn.Module):
                 self.linear_qkv.weight.copy_(torch.cat((q_a.weight, kv_a.weight), dim=0))
                 if self.linear_qkv.bias is not None:
                     self.linear_qkv.bias.copy_(torch.cat((q_a.bias, kv_a.bias), dim=0))
+        self.linear_qkv._is_hf_initialized = True  # pylint: disable=protected-access
         for name in ("q_a_layernorm", "kv_a_layernorm", "q_b_proj"):
             setattr(self, name, getattr(module, name))
         if module.kv_b_proj.bias is not None:
@@ -437,7 +533,7 @@ class DeepseekSparseAttentionModule(nn.Module):
             "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim", "qk_head_dim", "index_head_dim",
             "num_index_heads", "index_topk", "scaling", "rotary_interleaved", "index_rotary_interleaved",
             "dsa_loss_coeff", "freeze_dsa", "dsa_dense_warm_up",
-            "_q_latent_output_size", "_kv_latent_output_size",
+            "_q_latent_output_size", "_kv_latent_output_size", "_tp_size", "_tp_group",
         )
         for name in fields:
             setattr(self, name, getattr(module, name))
@@ -464,7 +560,7 @@ class DeepseekSparseAttentionModule(nn.Module):
             dense_warmup: None follows the mutable training stage; bool pins it.
         """
         super().__init__()
-        del module_fqn, context
+        del module_fqn
         if (config is None) == (module is None):
             raise ValueError("DeepSeek-V3.2 sparse attention requires exactly one of config or module")
         if not isinstance(kv_cp_size, int) or isinstance(kv_cp_size, bool) or kv_cp_size < 1:
@@ -472,6 +568,8 @@ class DeepseekSparseAttentionModule(nn.Module):
         if kv_cp_strategy != "allgather":
             raise ValueError("DeepSeek sparse attention supports only kv_cp_strategy='allgather'")
         self._config_initialization = module is None or getattr(module, "_config_initialization", False)
+        self._tp_size = (context or {}).get("tp_size", 1)
+        self._tp_group = None
         self.kv_cp_size, self.kv_cp_strategy = kv_cp_size, kv_cp_strategy
         self.cp_comm_overlap = cp_comm_overlap
         self._dense_warmup_override = dense_warmup
@@ -654,8 +752,9 @@ class DeepseekSparseAttentionModule(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        query_tnd, key_tnd, q_rot_tnd, k_rot_tnd, maximum, total = prepare_indexer_teacher(
+        query_tnd, key_tnd, q_rot_tnd, k_rot_tnd, maximum, total = self.prepare_teacher(
             query_tnd, key_tnd, q_rot_tnd, k_rot_tnd, *softmax_stats,
+            dense=False,
         )
         aux_loss = dsa_kl_loss(
             *index_states, query_tnd, key_tnd,
@@ -751,12 +850,13 @@ class DeepseekSparseAttentionModule(nn.Module):
     ) -> tuple[torch.Tensor, None]:
         """Run causal or packed sparse attention while retaining the Transformers output ABI."""
         use_dense = self.use_dense_attention()
+        position_ids = self.prepare_position_ids(hidden_states, position_ids)
         metadata = self.preflight_attention(
             hidden_states, attention_mask, past_key_values, position_ids, actual_seq_len, kwargs,
             use_dense=use_dense,
         )
         inputs = self.prepare_attention_inputs(
-            hidden_states, position_embeddings, metadata, use_dense=use_dense,
+            hidden_states, self.prepare_positions(hidden_states, position_embeddings), metadata, use_dense=use_dense,
         )
         inputs = self.exchange_attention(inputs)
         output = self.run_attention(
