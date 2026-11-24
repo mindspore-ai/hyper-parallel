@@ -26,6 +26,7 @@ from torch.distributed.device_mesh import DeviceMesh as TorchMesh
 from torch.distributed.tensor import DTensor as TorchDTensor
 from torch.distributed.tensor import Replicate as TorchReplicate
 from torch.distributed.tensor import Shard as TorchShard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor as HyperDTensor
@@ -118,10 +119,20 @@ def to_torch_view(
     local = value.to_local().detach()
     key = (torch_mesh, tuple(placements), tuple(value.shape), tuple(stride), local.dtype)
     specification = detached_spec_cache.get(key) if detached_spec_cache is not None else None
+    if specification is None and local.device.type != mesh.device_type:
+        # from_local moves offloaded storage to the mesh device. Checkpoint
+        # writes must instead reach the original CPU shard without a copy.
+        specification = DTensorSpec(
+            mesh=torch_mesh,
+            placements=tuple(placements),
+            tensor_meta=TensorMeta(torch.Size(value.shape), tuple(stride), local.dtype),
+        )
+        if detached_spec_cache is not None:
+            detached_spec_cache[key] = specification
     if specification is not None:
         if torch_mesh.get_coordinate() is None:
             local = local.new_empty(0)
-        # Clipping needs no autograd bridge. Use Torch's internal constructor
+        # Detached views need no autograd bridge. Use Torch's internal constructor
         # only for detached, same-layout aliases; never retain gradient views.
         return TorchDTensor(local.view_as(local), specification, requires_grad=False)
     result = TorchDTensor.from_local(

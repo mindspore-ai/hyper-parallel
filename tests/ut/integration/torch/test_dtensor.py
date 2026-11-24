@@ -40,8 +40,10 @@ from hyper_parallel.integration.torch import dtensor as compatibility
 
 
 def _reference(local: torch.Tensor) -> MagicMock:
+    """Describe a Hyper tensor while retaining the supplied local storage."""
     reference = MagicMock(spec=HyperDTensor)
     reference.shape = (4, 3)
+    reference.device_mesh.device_type = "cpu"
     reference.placements = (Shard(0),)
     reference.to_local.return_value = local
     reference.layout = MagicMock()
@@ -259,6 +261,34 @@ class TestTorchLayoutCompatibility(unittest.TestCase):
             compatibility.to_torch_view(value)
         self.assertEqual(factory.call_args.kwargs["shape"], (4, 3))
         self.assertEqual(factory.call_args.kwargs["stride"], (3, 1))
+
+    def test_offloaded_checkpoint_view_keeps_cpu_storage(self):
+        """An accelerator mesh must not move an offloaded shard to the accelerator."""
+        local = torch.zeros(2, 3, requires_grad=True)
+        value = _reference(local)
+        value.device_mesh.device_type = "cuda"
+        value.device_mesh.mesh = torch.tensor([0, 1])
+        value.device_mesh.mesh_dim_names = ("dp",)
+        mesh = MagicMock(spec=TorchMesh)
+        mesh.device_type = "cuda"
+        mesh.ndim = 1
+        mesh.get_coordinate.return_value = [0]
+        spec_cache = {}
+        with (
+            patch.object(TorchMesh, "from_group", return_value=mesh),
+            patch.object(TorchDTensor, "from_local", side_effect=AssertionError("Factory would move CPU storage")),
+        ):
+            for _ in range(2):
+                view = compatibility.to_torch_view(value, detached_spec_cache=spec_cache)
+                self.assertEqual(view.shape, (4, 3))
+                self.assertEqual(view.placements, (TorchShard(0),))
+                self.assertIs(view.device_mesh, mesh)
+                self.assertEqual(view.to_local().device.type, "cpu")
+                self.assertEqual(view.to_local().data_ptr(), local.data_ptr())
+                self.assertFalse(view.requires_grad)
+                view.to_local().fill_(7)
+                torch.testing.assert_close(local, torch.full_like(local, 7), rtol=0, atol=0)
+        self.assertEqual(len(spec_cache), 1)
 
     def test_torch_view_cache_reuses_only_mesh_not_gradient_storage(self):
         """Fresh gradients share a mesh descriptor but retain their own live storage."""
