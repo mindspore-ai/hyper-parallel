@@ -19,7 +19,7 @@ import unittest
 import torch
 
 from hyper_parallel.core.shard.ops import dsa_cp_fold as fold
-from hyper_parallel.core.context_parallel.dynamic_pairing import paired_owners
+from hyper_parallel.core.shard.ops.tnd_kv_plan import plan_tnd_kv
 
 
 def attention(query: Any, key: Any, value: Any, indices: Any, scale: Any, **kwargs: Any) -> Any:
@@ -45,12 +45,12 @@ def attention(query: Any, key: Any, value: Any, indices: Any, scale: Any, **kwar
 class TestInputPairing(unittest.TestCase):
     """Validate pairing metadata, natural prefixes and saved backward layouts."""
 
-    def test_empty_document_padding_does_not_change_pairing(self):
-        """Empty documents and repeated padding ends must leave assignments unchanged."""
-        cost = (0.75, 71.8, 5.4, 0.2, 0.7)
+    def test_empty_document_padding_does_not_change_compact_plan(self):
+        """Empty documents and repeated ends must leave consumer interval plans unchanged."""
         short = (52, 110, 206, 612, 4096, 8192)
         padded = (0, 0) + short + (8192,) * 1024
-        self.assertEqual(paired_owners(short, 4, 2048, cost), paired_owners(padded, 4, 2048, cost))
+        queries = ((2048, 3072), (7168, 8192))
+        self.assertEqual(plan_tnd_kv(short, 8192, queries), plan_tnd_kv(padded, 8192, queries))
 
     def test_forward_backward_and_plan_lifetime(self):
         """Interleaved noncompact calls retain their own backward permutation."""
