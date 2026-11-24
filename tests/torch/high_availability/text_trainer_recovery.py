@@ -72,7 +72,7 @@ def prepare_assets(directory: Path) -> Path:
     }
     raw["dataset"]["model_assets"]["tokenizer"].update(
         pretrained_model_name_or_path=str(model_path), local_files_only=True, vocab_size=1024, eod_token_id=1023)
-    raw["worker_recovery"] = {"enable_worker_reboot": True}
+    raw["high_availability"] = {"worker_recovery": {"enable": True}}
     path = directory / "trainer.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return path

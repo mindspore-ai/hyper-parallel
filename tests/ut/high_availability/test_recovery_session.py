@@ -24,7 +24,7 @@ import torch
 
 from hyper_parallel import DeviceMesh, Shard, distribute_tensor
 from hyper_parallel.core.distributed_checkpoint import standard_planner
-from hyper_parallel.high_availability.config import RecoveryConfig
+from hyper_parallel.high_availability.config import WorkerRecoveryConfig
 from hyper_parallel.high_availability.group_registry import (
     GroupDescriptor, GroupRegistry, is_recovery_bootstrapping, is_recovery_enabled, is_recovery_reboot,
 )
@@ -44,7 +44,7 @@ class TestRecoverySession(unittest.TestCase):
         self.session = RecoverySession.__new__(RecoverySession)
         self.session.rank = self.session.local_rank = 1
         self.session.world_size = 2
-        self.session.config = RecoveryConfig(True, "127.0.0.1")
+        self.session.config = WorkerRecoveryConfig(True, "127.0.0.1")
         self.session.sdk = MagicMock()
         self.session.npu = MagicMock()
         self.session.npu.stop_device.return_value = None
@@ -978,7 +978,7 @@ class TestProcessorBootstrap(unittest.TestCase):
                         ), \
                         patch("hyper_parallel.high_availability.recovery_session.importlib.import_module",
                               side_effect=modules.__getitem__):
-                    session = RecoverySession(RecoveryConfig(True, "127.0.0.1", 18000))
+                    session = RecoverySession(WorkerRecoveryConfig(True, "127.0.0.1", 18000))
                     with self.assertRaisesRegex(RuntimeError, "startup failed"):
                         session.initialize()
                     sdk.tft_destroy_processor.assert_called_once()
@@ -1010,7 +1010,7 @@ class TestProcessorBootstrap(unittest.TestCase):
                                   create=True), \
                             patch("hyper_parallel.high_availability.recovery_session.importlib.import_module",
                                   side_effect=modules.__getitem__):
-                        session = RecoverySession(RecoveryConfig(True, "127.0.0.1", 18000))
+                        session = RecoverySession(WorkerRecoveryConfig(True, "127.0.0.1", 18000))
                         session.initialize()
                         self.assertEqual(session.rank, 13 if initialized else 9)
                         self.assertEqual(session.world_size, 32 if initialized else 16)
@@ -1038,7 +1038,7 @@ class TestProcessorBootstrap(unittest.TestCase):
                     patch("hyper_parallel.high_availability.recovery_session.dist.get_world_size", return_value=16), \
                     patch("hyper_parallel.high_availability.recovery_session.importlib.import_module") as import_module:
                 with self.assertRaisesRegex(RuntimeError, "LOCAL_RANK"):
-                    RecoverySession(RecoveryConfig(True, "127.0.0.1", 18000))
+                    RecoverySession(WorkerRecoveryConfig(True, "127.0.0.1", 18000))
                 import_module.assert_not_called()
 
     def test_taskd_controller_is_not_started_or_destroyed_by_rank_zero(self):
@@ -1057,16 +1057,30 @@ class TestProcessorBootstrap(unittest.TestCase):
                 patch("hyper_parallel.high_availability.recovery_session.dist.reinit_process_group", create=True), \
                 patch("hyper_parallel.high_availability.recovery_session.importlib.import_module",
                       side_effect=modules.__getitem__):
-            session = RecoverySession(RecoveryConfig(True))
+            session = RecoverySession(WorkerRecoveryConfig(True))
             session.initialize()
             sdk.tft_start_processor.assert_called_once_with("192.168.1.2", 18001)
             sdk.tft_init_controller.assert_not_called()
             session.close()
             sdk.tft_destroy_controller.assert_not_called()
 
+    def test_taskd_controller_rejects_explicit_rank_zero_endpoint(self):
+        """Reject competing Controller owners before initializing either SDK component."""
+        for rank in (0, 3):
+            with self.subTest(rank=rank), patch.dict("os.environ", {"MINDX_TASK_ID": "test-job"}):
+                session = RecoverySession.__new__(RecoverySession)
+                session.config = WorkerRecoveryConfig(True, "127.0.0.1", 18000)
+                session.rank = rank
+                session._processor_initialized = False
+                session.sdk = MagicMock()
+                with self.assertRaisesRegex(ValueError, "TaskD-managed Controller.*conflicts"):
+                    session.initialize()
+                session.sdk.tft_init_controller.assert_not_called()
+                session.sdk.tft_init_processor.assert_not_called()
+
     def test_taskd_endpoint_requires_valid_deployment_metadata(self):
         session = RecoverySession.__new__(RecoverySession)
-        session.config = RecoveryConfig(True)
+        session.config = WorkerRecoveryConfig(True)
         for environment in ({}, {"MASTER_ADDR": "host", "TTP_PORT": "abc"},
                             {"MASTER_ADDR": "host", "TTP_PORT": "65536"}):
             with self.subTest(environment=environment), patch.dict("os.environ", environment, clear=True):
@@ -1096,7 +1110,7 @@ class TestProcessorBootstrap(unittest.TestCase):
                         ), \
                         patch("hyper_parallel.high_availability.recovery_session.importlib.import_module",
                               side_effect=modules.__getitem__):
-                    session = RecoverySession(RecoveryConfig(True, "127.0.0.1", 18000))
+                    session = RecoverySession(WorkerRecoveryConfig(True, "127.0.0.1", 18000))
                     session.initialize()
                     sdk.tft_init_processor.assert_called_once_with(rank, 8, False, False, "", False, True, False)
                     sdk.tft_start_processor.assert_called_once_with("127.0.0.1", 18000)

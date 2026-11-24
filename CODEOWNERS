@@ -26,6 +26,8 @@
 /hyper_parallel/core/shard/ @yangzhenzhang02
 /hyper_parallel/core/shard/ops/ @davidhe91
 
+# The maintainers of hyper_parallel/high_availability.
+/hyper_parallel/high_availability/ @zhangbuxue @xiaoyuxing-010818
 
 # The maintainers of hyper_parallel/compile.
 /hyper_parallel/compile/ @kisnwangg @yu-chen-code

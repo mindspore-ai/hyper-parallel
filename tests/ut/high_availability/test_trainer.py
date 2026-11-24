@@ -29,7 +29,7 @@ from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
-from hyper_parallel.trainer.runtime.process_recovery import (
+from hyper_parallel.trainer.runtime.worker_recovery import (
     _train_recoverable,
     _build_train_state,
     recovery_constructor,
@@ -211,10 +211,23 @@ class TestTrainerReentry(unittest.TestCase):
                     return body()
 
                 session.run = _run
-                with patch("hyper_parallel.trainer.runtime.process_recovery.memory_profiler", memory):
+                with patch("hyper_parallel.trainer.runtime.worker_recovery.memory_profiler", memory):
                     self.assertEqual(_train_recoverable(base, base, session, lambda trainer: "done"), "done")
                 self.assertEqual(profiler.load_state_dict.call_count, int(enabled))
                 self.assertEqual(memory.load_state_dict.call_count, int(enabled))
+
+    def test_constructor_skips_disabled_worker_recovery(self) -> None:
+        """Disabled worker recovery initializes the Trainer without a session."""
+        trainer = SimpleNamespace()
+        config = SimpleNamespace(
+            high_availability=SimpleNamespace(worker_recovery=SimpleNamespace(enable=False))
+        )
+        initialize = MagicMock()
+        with patch("hyper_parallel.trainer.runtime.worker_recovery.RecoverySession") as factory:
+            recovery_constructor(initialize)(trainer, config)
+        initialize.assert_called_once_with(trainer, config)
+        factory.assert_not_called()
+        self.assertIsNone(trainer.recovery)
 
     def test_constructor_leaves_checkpoint_cleanup_to_train_binding(self) -> None:
         """Feature: Bind the recovery session during Trainer construction.
@@ -228,9 +241,11 @@ class TestTrainerReentry(unittest.TestCase):
                     trainer = SimpleNamespace()
                     checkpoint = MagicMock(spec=CheckpointerCallback)
                     checkpoint.checkpointer = MagicMock()
-                    config = SimpleNamespace(worker_recovery=SimpleNamespace(enable_worker_reboot=True))
-                    with patch("hyper_parallel.trainer.runtime.process_recovery.validate_recovery_config"), \
-                            patch("hyper_parallel.trainer.runtime.process_recovery.RecoverySession") as factory:
+                    config = SimpleNamespace(
+                        high_availability=SimpleNamespace(worker_recovery=SimpleNamespace(enable=True))
+                    )
+                    with patch("hyper_parallel.trainer.runtime.worker_recovery.validate_recovery_config"), \
+                            patch("hyper_parallel.trainer.runtime.worker_recovery.RecoverySession") as factory:
                         session = factory.return_value
 
                         def _initialize(
@@ -477,7 +492,7 @@ class TestTrainerReentry(unittest.TestCase):
                 error = ValueError("preparation failed")
                 original = MagicMock()
                 run = recovery_train_loop(original)
-                with patch("hyper_parallel.trainer.runtime.process_recovery._train_recoverable", side_effect=error):
+                with patch("hyper_parallel.trainer.runtime.worker_recovery._train_recoverable", side_effect=error):
                     with self.assertRaises(RuntimeError if cleanup_failure else ValueError) as caught:
                         run(trainer)
                 if cleanup_failure:
@@ -498,7 +513,7 @@ class TestTrainerReentry(unittest.TestCase):
         base = SimpleNamespace(recovery=session, abort_profilers=MagicMock())
         trainer = SimpleNamespace(base=base)
         run = recovery_train_loop(MagicMock())
-        with patch("hyper_parallel.trainer.runtime.process_recovery._train_recoverable", return_value=None):
+        with patch("hyper_parallel.trainer.runtime.worker_recovery._train_recoverable", return_value=None):
             with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
                 run(trainer)
         base.abort_profilers.assert_not_called()

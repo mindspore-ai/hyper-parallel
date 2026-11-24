@@ -23,7 +23,7 @@ from typing import Any, List, Literal, Optional
 
 from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
-from hyper_parallel.high_availability.config import RecoveryConfig
+from hyper_parallel.high_availability.config import HighAvailabilityConfig
 from hyper_parallel.components.ops.catalog import builtin_registry
 
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
@@ -81,7 +81,7 @@ class TrainerConfig:
     packed_sequence: Optional[Any] = None
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
-    worker_recovery: Optional[RecoveryConfig] = None
+    high_availability: HighAvailabilityConfig = field(default_factory=HighAvailabilityConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     model_integration: ModelIntegrationConfig = field(default_factory=ModelIntegrationConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)

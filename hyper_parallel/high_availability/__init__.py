@@ -17,13 +17,13 @@
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-from hyper_parallel.high_availability.config import RecoveryConfig
+from hyper_parallel.high_availability.config import WorkerRecoveryConfig
 
 if TYPE_CHECKING:
     from hyper_parallel.high_availability.recovery_session import RecoverySession
     from hyper_parallel.high_availability.recovery_state import TrainState
 
-__all__ = ["RecoveryConfig", "RecoverySession", "TrainState"]
+__all__ = ["WorkerRecoveryConfig", "RecoverySession", "TrainState"]
 
 
 def __getattr__(name):  # pylint: disable=invalid-name

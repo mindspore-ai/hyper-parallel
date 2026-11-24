@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.distributed_checkpoint import standard_planner
-from hyper_parallel.high_availability.config import RecoveryConfig
+from hyper_parallel.high_availability.config import WorkerRecoveryConfig
 from hyper_parallel.high_availability.model_recovery import ModelRecoveryAdapter
 from hyper_parallel.high_availability.group_registry import GroupRegistry
 from hyper_parallel.high_availability.recovery_state import ModelOptimizerState, TrainState
@@ -52,11 +52,11 @@ class RecoverySession:
     Worker restart remains owned by the existing launcher/TaskD Agent.
     """
 
-    def __init__(self, config: RecoveryConfig) -> None:
+    def __init__(self, config: WorkerRecoveryConfig) -> None:
         """Validate the Ascend runtime and allocate process-local recovery bookkeeping."""
         self.config = config
-        if not config.enable_worker_reboot:
-            raise ValueError("enable_worker_reboot must be true to construct a RecoverySession")
+        if not config.enable:
+            raise ValueError("enable must be true to construct a RecoverySession")
         self.rank = dist.get_rank() if dist.is_initialized() else int(os.environ["RANK"])
         self.world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ["WORLD_SIZE"])
         # Reads LOCAL_RANK from the environment without requiring an initialized default process group.
@@ -130,6 +130,11 @@ class RecoverySession:
     def _controller_endpoint(self) -> tuple[str, int]:
         """Resolve TaskD deployment metadata without using a worker's local Pod IP."""
         if self.config.controller_ip:
+            if os.getenv("MINDX_TASK_ID"):
+                raise ValueError(
+                    "TaskD-managed Controller (MINDX_TASK_ID is set) conflicts with rank-zero Controller hosting; "
+                    "remove controller_ip/controller_port or disable TaskD Controller hosting in the deployment"
+                )
             return self.config.controller_ip, self.config.controller_port
         names = ("PROCESSOR_ADDR", "CONTROLLER_ADDR", "TTP_ADDR", "MASTER_ADDR")
         address = next((os.environ[name] for name in names

@@ -37,22 +37,24 @@ When deploying across nodes, the physical placement of replicas determines which
 
 #### Controller Hosted by Rank 0
 
-Add `worker_recovery` at the top level of the Trainer YAML. Replace the example IP with a rank 0 address that the other workers can reach.
+Add `high_availability` at the top level of the Trainer YAML and configure its `worker_recovery` section. Replace the example IP with a rank 0 address that the other workers can reach.
 
 ```yaml
-worker_recovery:
-  enable_worker_reboot: true
-  controller_ip: "192.168.1.10"
-  controller_port: 8000
+high_availability:
+  worker_recovery:
+    enable: true
+    controller_ip: "192.168.1.10"
+    controller_port: 8000
 ```
 
-`enable_worker_reboot` defaults to `false`. When `controller_ip` is set, `controller_port` defaults to `8000`. This mode requires the Controller on rank 0 to remain available during recovery.
+`enable` defaults to `false`. When `controller_ip` is set, `controller_port` defaults to `8000`. This mode requires the Controller on rank 0 to remain available during recovery.
 
 #### Controller Hosted by TaskD
 
 ```yaml
-worker_recovery:
-  enable_worker_reboot: true
+high_availability:
+  worker_recovery:
+    enable: true
 ```
 
 The deployment starts the Controller and Agent and supplies the Controller address and port. HyperParallel checks `PROCESSOR_ADDR`, `CONTROLLER_ADDR`, `TTP_ADDR`, and `MASTER_ADDR` in that order and reads the port from `TTP_PORT`. Set these variables before loading the TaskD or MindIO shared libraries.
@@ -207,7 +209,7 @@ The data loader and each object in `replica_providers` must implement `state_dic
 | `high_availability/recovery_state.py` | Binds model and optimizer tensors and captures and restores training metadata. |
 | `high_availability/replica_transport.py` | Mirrors metadata and transfers recovery tensors in chunks. |
 | `high_availability/validation.py` | Defines recovery checks for configuration, materialized models, and state providers. |
-| `trainer/runtime/process_recovery.py` | Invokes configuration checks before Trainer construction, registers progress, loaders, and callbacks, and connects the session to training. |
+| `trainer/runtime/worker_recovery.py` | Invokes configuration checks before Trainer construction, registers progress, loaders, and callbacks, and connects the session to training. |
 
 ## Validation and Troubleshooting
 
