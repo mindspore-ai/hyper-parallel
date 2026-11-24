@@ -47,7 +47,6 @@ Ported from the static-graph implementation (MindFormers ``dsa_lb_stage1``,
 ``training_graph/transformer/dsa/utils.py``); the chunk convention is the same one the
 generic head-tail flash-attention load balance in ``context_parallel.py`` uses.
 """
-from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -57,6 +56,7 @@ from typing import Any, Callable, Iterator, Optional, Sequence, Tuple
 import numpy as np
 
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.shard.ops.tnd_kv_plan import plan_tnd_kv
 
 platform = get_platform()
 
@@ -255,21 +255,13 @@ def _index_tensor(values: Sequence[int], ref):
 @lru_cache(maxsize=256)
 def _compact_plan(ends, full_len, rank, shards, pairs):
     """Host-only active-document intervals and compact cumulative lengths."""
-    if (not ends or ends[-1] != full_len or any(a > b for a, b in zip((0,) + ends, ends))
-            or full_len % (2 * shards)):
-        raise ValueError("Compact TND KV requires monotonic document ends covering the folded full sequence.")
-    ends = tuple(dict.fromkeys(end for end in ends if end > 0))
+    if full_len % (2 * shards):
+        raise ValueError("Compact TND KV requires a complete folded sequence.")
     width = full_len // (2 * shards)
     chunks = pairs[rank] if pairs is not None else (2 * rank, 2 * shards - 1 - 2 * rank)
-    result = []
-    for chunk in chunks:
-        start, stop = chunk * width, (chunk + 1) * width
-        first, last = bisect_right(ends, start), bisect_left(ends, stop)
-        origin = ends[first - 1] if first else 0
-        selected = tuple(min(end, stop) for end in ends[first:last + 1])
-        result.append(((origin, stop), tuple(end - start for end in selected),
-                       tuple(end - origin for end in selected)))
-    return tuple(result)
+    queries = tuple((chunk * width, (chunk + 1) * width) for chunk in chunks)
+    return tuple((block.key_interval, block.query_ends, block.key_ends)
+                 for block in plan_tnd_kv(ends, full_len, queries))
 
 
 def _current_compact_plan(full_len, rank, shards):
