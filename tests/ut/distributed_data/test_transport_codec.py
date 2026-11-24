@@ -21,11 +21,11 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.distributed_data.api import DistributedDatasetConfig
-from hyper_parallel.distributed_data.schema import SampleKey
-from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.distributed_data.model_batch import TensorFieldSpec
-from hyper_parallel.distributed_data.transport import (
+from hyper_parallel.data.distributed.api import DistributedDatasetConfig
+from hyper_parallel.data.distributed.schema import SampleKey
+from hyper_parallel.data.distributed.topology import DataTopology
+from hyper_parallel.data.distributed.model_batch import TensorFieldSpec
+from hyper_parallel.data.distributed.transport import (
     DataGroups,
     DataPlaneTransport,
     ModelParallelTransport,
@@ -168,14 +168,14 @@ class TestDataPlaneTransport(unittest.TestCase):
             return work
 
         with (
-            patch("hyper_parallel.distributed_data.transport._control_backend", return_value="hccl"),
+            patch("hyper_parallel.data.distributed.transport._control_backend", return_value="hccl"),
             patch(
-                "hyper_parallel.distributed_data.transport._require_control_device", return_value=torch.device("cpu"),
+                "hyper_parallel.data.distributed.transport._require_control_device", return_value=torch.device("cpu"),
             ),
-            patch("hyper_parallel.distributed_data.transport.dist.get_world_size", return_value=2),
-            patch("hyper_parallel.distributed_data.transport.dist.all_gather_into_tensor", side_effect=gather),
+            patch("hyper_parallel.data.distributed.transport.dist.get_world_size", return_value=2),
+            patch("hyper_parallel.data.distributed.transport.dist.all_gather_into_tensor", side_effect=gather),
             patch.object(torch.Tensor, "cpu", new=cpu),
-            patch("hyper_parallel.distributed_data.transport.pickle.loads", wraps=pickle.loads) as decode,
+            patch("hyper_parallel.data.distributed.transport.pickle.loads", wraps=pickle.loads) as decode,
         ):
             pending = transport.begin_all_gather_object(values[0])
             work.wait.assert_not_called()
@@ -217,12 +217,12 @@ class TestDataPlaneTransport(unittest.TestCase):
         Expectation: The control group is reused for payload exchange.
         """
         with (
-                patch("hyper_parallel.distributed_data.transport.dist.is_available", return_value=True),
-                patch("hyper_parallel.distributed_data.transport.dist.is_initialized", return_value=True),
-                patch("hyper_parallel.distributed_data.transport.dist.get_world_size", return_value=2),
-                patch("hyper_parallel.distributed_data.transport.dist.get_rank", return_value=0),
-                patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="hccl") as get_backend,
-                patch("hyper_parallel.distributed_data.transport.dist.new_group", return_value="gloo") as new_group,
+                patch("hyper_parallel.data.distributed.transport.dist.is_available", return_value=True),
+                patch("hyper_parallel.data.distributed.transport.dist.is_initialized", return_value=True),
+                patch("hyper_parallel.data.distributed.transport.dist.get_world_size", return_value=2),
+                patch("hyper_parallel.data.distributed.transport.dist.get_rank", return_value=0),
+                patch("hyper_parallel.data.distributed.transport.dist.get_backend", return_value="hccl") as get_backend,
+                patch("hyper_parallel.data.distributed.transport.dist.new_group", return_value="gloo") as new_group,
         ):
             groups = create_data_groups(
                 self._two_rank_topology(),
@@ -266,11 +266,11 @@ class TestDataPlaneTransport(unittest.TestCase):
         Expectation: Both groups use HCCL-compatible accelerator communication.
         """
         with (
-                patch("hyper_parallel.distributed_data.transport.dist.is_available", return_value=True),
-                patch("hyper_parallel.distributed_data.transport.dist.is_initialized", return_value=True),
-                patch("hyper_parallel.distributed_data.transport.dist.get_world_size", return_value=2),
-                patch("hyper_parallel.distributed_data.transport.dist.get_rank", return_value=0),
-                patch("hyper_parallel.distributed_data.transport.dist.new_group", side_effect=["control", "payload"])
+                patch("hyper_parallel.data.distributed.transport.dist.is_available", return_value=True),
+                patch("hyper_parallel.data.distributed.transport.dist.is_initialized", return_value=True),
+                patch("hyper_parallel.data.distributed.transport.dist.get_world_size", return_value=2),
+                patch("hyper_parallel.data.distributed.transport.dist.get_rank", return_value=0),
+                patch("hyper_parallel.data.distributed.transport.dist.new_group", side_effect=["control", "payload"])
                 as new_group,
         ):
             groups = create_data_groups(
@@ -317,7 +317,7 @@ class TestDataPlaneTransport(unittest.TestCase):
             output.copy_(input_tensor)
 
         with patch(
-                "hyper_parallel.distributed_data.transport.dist.all_to_all_single",
+                "hyper_parallel.data.distributed.transport.dist.all_to_all_single",
                 side_effect=fake_all_to_all,
         ):
             received = transport.exchange_prepared(prepared)
@@ -343,7 +343,7 @@ class TestDataPlaneTransport(unittest.TestCase):
             work.wait.side_effect = lambda: output.copy_(source)
             return work
 
-        with patch("hyper_parallel.distributed_data.transport.dist.all_to_all_single", side_effect=exchange):
+        with patch("hyper_parallel.data.distributed.transport.dist.all_to_all_single", side_effect=exchange):
             pending = transport.begin_exchange_prepared(prepared)
             work.wait.assert_not_called()
             self.assertIs(pending.prepared, prepared)
@@ -412,11 +412,11 @@ class TestModelParallelTransport(unittest.TestCase):
                 batch = {"nested": [torch.tensor(offsets, dtype=torch.int32), "causal", None],
                          "input_ids": torch.arange(4).reshape(1, 4)}
                 wire = []
-                with patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"), \
-                        patch("hyper_parallel.distributed_data.transport.dist.broadcast_object_list") as objects, \
-                        patch("hyper_parallel.distributed_data.transport.broadcast_control_object") as serialized, \
-                        patch("hyper_parallel.distributed_data.transport.pickle.dumps") as pickle_dump, \
-                        patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast:
+                with patch("hyper_parallel.data.distributed.transport.dist.get_backend", return_value="gloo"), \
+                        patch("hyper_parallel.data.distributed.transport.dist.broadcast_object_list") as objects, \
+                        patch("hyper_parallel.data.distributed.transport.broadcast_control_object") as serialized, \
+                        patch("hyper_parallel.data.distributed.transport.pickle.dumps") as pickle_dump, \
+                        patch("hyper_parallel.data.distributed.transport.dist.broadcast") as broadcast:
                     broadcast.side_effect = lambda tensor, wire=wire, **_: wire.append(tensor.clone())
                     sender.broadcast(batch)
                     self.assertEqual(len(wire), 3 if offsets else 2)
@@ -449,8 +449,8 @@ class TestModelParallelTransport(unittest.TestCase):
                  "empty": torch.empty(0, dtype=torch.int64), "offsets": torch.tensor([0, 3]),
                  "count": torch.tensor(3), "weight": torch.tensor([0.5, 1.0])}
         wire = []
-        with patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"), \
-                patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast:
+        with patch("hyper_parallel.data.distributed.transport.dist.get_backend", return_value="gloo"), \
+                patch("hyper_parallel.data.distributed.transport.dist.broadcast") as broadcast:
             broadcast.side_effect = lambda tensor, **_: wire.append(tensor.clone())
             sent = self._transport(0, spec).broadcast(batch)
             self.assertEqual(len(wire), 4)
@@ -470,8 +470,8 @@ class TestModelParallelTransport(unittest.TestCase):
         """
         spec = {"x": TensorFieldSpec((4,), torch.float32)}
         wire = []
-        with patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"), \
-                patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast:
+        with patch("hyper_parallel.data.distributed.transport.dist.get_backend", return_value="gloo"), \
+                patch("hyper_parallel.data.distributed.transport.dist.broadcast") as broadcast:
             broadcast.side_effect = lambda tensor, **_: wire.append(tensor.clone())
             self.assertIsNone(self._transport(0, spec).broadcast(None))
             self.assertEqual(wire[0].tolist(), [0])
@@ -494,8 +494,8 @@ class TestModelParallelTransport(unittest.TestCase):
         for batch in batches:
             with self.subTest(batch=batch):
                 wire = []
-                with patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"), \
-                        patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast:
+                with patch("hyper_parallel.data.distributed.transport.dist.get_backend", return_value="gloo"), \
+                        patch("hyper_parallel.data.distributed.transport.dist.broadcast") as broadcast:
                     broadcast.side_effect = lambda tensor, wire=wire, **_: wire.append(tensor.clone())
                     with self.assertRaises(ValueError):
                         self._transport(0, spec).broadcast(batch)
@@ -521,7 +521,7 @@ class TestModelParallelTransport(unittest.TestCase):
         topology = DataTopology.from_layout((1,), ("dp",), (0,), 0, dp_dim_names=("dp",))
         transport = ModelParallelTransport(topology, DataGroups((0,), None, None, None, 0, False))
         batch = {"caption": "dynamic value"}
-        with patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast:
+        with patch("hyper_parallel.data.distributed.transport.dist.broadcast") as broadcast:
             self.assertIs(transport.broadcast(batch), batch)
             broadcast.assert_not_called()
 

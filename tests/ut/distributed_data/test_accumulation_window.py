@@ -27,12 +27,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, WorkloadCost
-from hyper_parallel.distributed_data import build_distributed_dataloader
-from hyper_parallel.distributed_data.batch_sampler import _ReaderPlanInput
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from hyper_parallel.distributed_data.schema import SampleKey
-from hyper_parallel.distributed_data.transport import DataPlaneTransport
+from hyper_parallel.data.distributed import DistributedDatasetConfig, SampleMetadata, WorkloadCost
+from hyper_parallel.data.distributed import build_distributed_dataloader
+from hyper_parallel.data.distributed.batch_sampler import _ReaderPlanInput
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.schema import SampleKey
+from hyper_parallel.data.distributed.transport import DataPlaneTransport
 from tests.common.mark_utils import arg_mark
 
 
@@ -354,7 +354,7 @@ class TestAccumulationWindow(unittest.TestCase):
         module = Mock()
         module.stream.side_effect = lambda _: nullcontext()
         module.set_device.side_effect = record_device
-        with patch("hyper_parallel.distributed_data.api._create_device_prefetcher", return_value=None), patch.object(
+        with patch("hyper_parallel.data.distributed.api._create_device_prefetcher", return_value=None), patch.object(
                 torch, "cuda", module,
         ), patch.object(DataLoader, "__iter__", check_device), _loader(
                 samples=[{"id": i} for i in range(18)], accumulation=3, device="cuda:3",
@@ -377,7 +377,7 @@ class TestAccumulationWindow(unittest.TestCase):
         error = RuntimeError("source device binding failed")
         module = Mock()
         module.set_device.side_effect = error
-        with patch("hyper_parallel.distributed_data.api._create_device_prefetcher", return_value=None), patch.object(
+        with patch("hyper_parallel.data.distributed.api._create_device_prefetcher", return_value=None), patch.object(
                 torch, "cuda", module,
         ), _loader(samples=[{"id": i} for i in range(18)], accumulation=3, device="cuda:3") as loader:
             with self.assertRaises(RuntimeError) as failure:

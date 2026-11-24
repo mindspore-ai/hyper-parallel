@@ -28,16 +28,16 @@ import torch
 from hyper_parallel.data.parallel.batch_sampler import (
     sampler_state_for_load,
 )
-from hyper_parallel.distributed_data.balance_logging import logger as balance_logger
-from hyper_parallel.distributed_data.data_constructor import PackingDataConstructor
-from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
-from hyper_parallel.distributed_data.device_prefetch import DevicePrefetchedStep, DeviceStepPrefetcher, _record_stream
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
-from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.distributed_data.native_source import NativeWindowSource, PreparedWindow as _PreparedWindow
-from hyper_parallel.distributed_data.process_data import DataRequest, create_data_worker
-from hyper_parallel.distributed_data.transport import (
+from hyper_parallel.data.distributed.balance_logging import logger as balance_logger
+from hyper_parallel.data.distributed.data_constructor import PackingDataConstructor
+from hyper_parallel.data.distributed.batch_sampler import BatchSamplerReader
+from hyper_parallel.data.distributed.device_prefetch import DevicePrefetchedStep, DeviceStepPrefetcher, _record_stream
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.metadata import PlannedSampleLoader
+from hyper_parallel.data.distributed.topology import DataTopology
+from hyper_parallel.data.distributed.native_source import NativeWindowSource, PreparedWindow as _PreparedWindow
+from hyper_parallel.data.distributed.process_data import DataRequest, create_data_worker
+from hyper_parallel.data.distributed.transport import (
     DataGroups,
     DataPlaneTransport,
     ModelParallelTransport,

@@ -310,8 +310,8 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
         event = Mock()
         module.Event.return_value = event
         with patch.object(torch, "cuda", module), patch(
-                "hyper_parallel.distributed_data.api._create_device_prefetcher", return_value=None,
-        ), patch("hyper_parallel.distributed_data.distributed_dataloader._record_stream") as record, _loader(
+                "hyper_parallel.data.distributed.api._create_device_prefetcher", return_value=None,
+        ), patch("hyper_parallel.data.distributed.distributed_dataloader._record_stream") as record, _loader(
                 accumulation=10, samples=[{"id": i} for i in range(12)], device="cuda:3",
         ) as loader:
             loader.prefetch()
@@ -343,8 +343,8 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                 module = Mock()
                 module.stream.side_effect = lambda _: nullcontext()
                 with patch.object(torch, "cuda", module), patch(
-                        "hyper_parallel.distributed_data.api._create_device_prefetcher", return_value=None,
-                ), patch("hyper_parallel.distributed_data.distributed_dataloader._record_stream"), _loader(
+                        "hyper_parallel.data.distributed.api._create_device_prefetcher", return_value=None,
+                ), patch("hyper_parallel.data.distributed.distributed_dataloader._record_stream"), _loader(
                         metadata_mode=metadata_mode, accumulation=accumulation,
                         samples=[{"id": i} for i in range(size)], device="cuda:3",
                 ) as loader:
@@ -423,8 +423,8 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
         module = Mock()
         module.stream.side_effect = lambda _: nullcontext()
         with patch.object(torch, "cuda", module), patch(
-                "hyper_parallel.distributed_data.api._create_device_prefetcher", return_value=None,
-        ), patch("hyper_parallel.distributed_data.distributed_dataloader._record_stream"), _loader(
+                "hyper_parallel.data.distributed.api._create_device_prefetcher", return_value=None,
+        ), patch("hyper_parallel.data.distributed.distributed_dataloader._record_stream"), _loader(
                 accumulation=3, samples=[{"id": i} for i in range(2)], device="cuda:3",
         ) as loader:
             self.assertEqual(_ids(next(loader)), [0, 1])
@@ -447,7 +447,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
         error = RuntimeError("device binding failed")
         module = Mock()
         module.set_device.side_effect = error
-        with patch("hyper_parallel.distributed_data.api._create_device_prefetcher", return_value=None), patch.object(
+        with patch("hyper_parallel.data.distributed.api._create_device_prefetcher", return_value=None), patch.object(
                 torch, "cuda", module,
         ), _loader(accumulation=3, device="cuda:3") as loader:
             with self.assertRaises(RuntimeError) as caught:

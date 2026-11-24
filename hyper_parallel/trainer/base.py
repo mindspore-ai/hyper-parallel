@@ -126,8 +126,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hyper_parallel.data.text.chat_template import ChatTemplate
-    from hyper_parallel.distributed_data import BalancingAlgorithm, CostModel
-    from hyper_parallel.distributed_data.schema import SampleMetadata
+    from hyper_parallel.data.distributed import BalancingAlgorithm, CostModel
+    from hyper_parallel.data.distributed.schema import SampleMetadata
 
 
 def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfig:

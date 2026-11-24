@@ -25,7 +25,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.distributed_data import DistributedDatasetConfig
+from hyper_parallel.data.distributed import DistributedDatasetConfig
 from tests.common.mark_utils import arg_mark
 from tests.ut.distributed_data.test_accumulation_window import _GatedDataset, _ids, _loader
 
@@ -110,8 +110,8 @@ class _Accelerator:
     def installed(self) -> object:
         """Replace only device mechanics, keeping actual loading and planning."""
         with patch.object(torch, "cuda", self.module), patch(
-                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=self.pin,
-        ), patch("hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=self.move):
+                "hyper_parallel.data.distributed.device_prefetch._pin_memory", side_effect=self.pin,
+        ), patch("hyper_parallel.data.distributed.device_prefetch._move_to_device", side_effect=self.move):
             yield
 
     def pin(self, batch: object) -> object:
@@ -141,7 +141,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             with self.subTest(depth=depth), accelerator.installed(), _loader(
                     samples=dataset, window=2, accumulation=2, device="cuda:0",
                     device_prefetch_depth=depth, use_data_process=False,
-            ) as loader, patch("hyper_parallel.distributed_data.distributed_dataloader.create_data_worker") as spawn:
+            ) as loader, patch("hyper_parallel.data.distributed.distributed_dataloader.create_data_worker") as spawn:
                 loader.prefetch()
                 loader.wait_for_prefetch()
                 self.assertEqual(dataset.reads, [])
@@ -172,7 +172,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
         with accelerator.installed(), _loader(
                 accumulation=3, device="cuda:0", device_prefetch_depth=2,
         ) as loader, patch.object(loader, "_broadcast_batch", new=accelerator.broadcast), patch(
-                "hyper_parallel.distributed_data.transport.dist.all_reduce",
+                "hyper_parallel.data.distributed.transport.dist.all_reduce",
                 side_effect=AssertionError("H2D prefetch must not coordinate model peers"),
         ):
             loader.prefetch()
@@ -282,7 +282,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
         with accelerator.installed(), _loader(
                 accumulation=3, device="cuda:0", device_prefetch_depth=4,
         ) as loader, patch(
-                "hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=stage,
+                "hyper_parallel.data.distributed.device_prefetch._move_to_device", side_effect=stage,
         ), patch.object(loader, "_broadcast_batch", new=accelerator.broadcast):
             loader.prefetch()
             loader.wait_for_prefetch()

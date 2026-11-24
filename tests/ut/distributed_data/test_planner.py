@@ -19,9 +19,9 @@ from collections import Counter
 from typing import Optional
 from unittest.mock import patch
 
-from hyper_parallel.distributed_data.balancing_algorithm import LPTBalancingAlgorithm
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from hyper_parallel.distributed_data.schema import (
+from hyper_parallel.data.distributed.balancing_algorithm import LPTBalancingAlgorithm
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.schema import (
     SampleKey,
     SampleMetadata,
     WorkloadCost,

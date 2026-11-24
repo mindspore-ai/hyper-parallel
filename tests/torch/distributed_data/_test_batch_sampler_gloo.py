@@ -39,12 +39,12 @@ from hyper_parallel.data.batching.build_dataloader import build_dataloader as bu
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch, TextParallelBatch
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter
 from hyper_parallel.data.parallel import build_dataset_batch_sampler, create_dataloader_parallel_context
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     DistributedDatasetConfig, SampleMetadata, TensorFieldSpec, WorkloadCost, build_distributed_dataloader,
     collate_indexed_text_sequences, pack_indexed_text_samples, split_packed_text_sample,
     build_local_balancing_dataloader,
 )
-from hyper_parallel.distributed_data.balance_logging import logger as balance_logger
+from hyper_parallel.data.distributed.balance_logging import logger as balance_logger
 from hyper_parallel.trainer.config.target import Target
 
 

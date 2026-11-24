@@ -31,9 +31,9 @@ import torch
 from hyper_parallel.components.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from hyper_parallel.data.batching.build_dataloader import FixedBatchDataLoader
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
-from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
-from hyper_parallel.distributed_data.topology import DataTopology
+from hyper_parallel.data.distributed import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+from hyper_parallel.data.distributed.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.data.distributed.topology import DataTopology
 from tests.common.mark_utils import arg_mark
 from tests.ut.distributed_data.test_batch_sampler import _legacy_loader_state
 

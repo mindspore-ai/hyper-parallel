@@ -27,11 +27,11 @@ from unittest.mock import Mock, PropertyMock, patch
 import torch
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
-from hyper_parallel.distributed_data.batch_sampler import _ReaderPlanInput
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from hyper_parallel.distributed_data.schema import DistributedPackingPlan, SampleKey, WorkloadCost
-from hyper_parallel.distributed_data.transport import DataPlaneTransport
+from hyper_parallel.data.distributed import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+from hyper_parallel.data.distributed.batch_sampler import _ReaderPlanInput
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.schema import DistributedPackingPlan, SampleKey, WorkloadCost
+from hyper_parallel.data.distributed.transport import DataPlaneTransport
 from tests.common.mark_utils import arg_mark
 
 
@@ -263,9 +263,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     "metadata_fn": lambda _: SampleMetadata(1),
                 }
                 with patch.object(torch, "cuda", accelerator), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                        "hyper_parallel.data.distributed.device_prefetch._pin_memory", side_effect=lambda value: value,
                 ), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=move,
+                        "hyper_parallel.data.distributed.device_prefetch._move_to_device", side_effect=move,
                 ):
                     with build_distributed_dataloader(
                             list(range(6)), _StandaloneMesh(),
@@ -494,7 +494,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         ):
             metadata_mode = "metadata" in options or isinstance(dataset, Dataset)
             with self.subTest(dataset=type(dataset).__name__), patch(
-                    "hyper_parallel.distributed_data.api.create_data_groups",
+                    "hyper_parallel.data.distributed.api.create_data_groups",
             ) as groups:
                 with self.assertRaisesRegex(ValueError, "Metadata mode requires batch_sampler"):
                     build_distributed_dataloader(

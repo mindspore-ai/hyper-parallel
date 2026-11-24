@@ -41,7 +41,7 @@ from hyper_parallel.trainer.runtime.process_recovery import (
 )
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.distributed_data import DistributedDataLoader
+from hyper_parallel.data.distributed import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
 
 logger = create_logger(__name__)

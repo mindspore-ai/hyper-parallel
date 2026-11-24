@@ -18,11 +18,11 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     BackboneFlopsConfig, CausalAttentionCostModel, DefaultCostModel, SampleKey, SampleMetadata, WorkloadCost,
 )
-from hyper_parallel.distributed_data.cost_model import resolve_cost_model
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.cost_model import resolve_cost_model
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
 
 
 def _backbone_config() -> BackboneFlopsConfig:

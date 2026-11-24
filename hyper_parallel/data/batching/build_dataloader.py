@@ -41,7 +41,7 @@ from hyper_parallel.data.parallel.batch_sampler import (
     get_sampler_checkpoint_state, has_torchdata_state, sampler_optimizer_step_progress, sampler_state_for_load,
 )
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     BalancingAlgorithm,
     CostModel,
     DistributedDatasetConfig,

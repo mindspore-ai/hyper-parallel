@@ -123,8 +123,8 @@ def inline_data_worker(monkeypatch: pytest.MonkeyPatch) -> None:
         workers.append(worker)
         return worker
 
-    monkeypatch.setattr("hyper_parallel.distributed_data.distributed_dataloader.create_data_worker", create)
-    monkeypatch.setattr("hyper_parallel.distributed_data.packed_balancing.create_data_worker", create)
+    monkeypatch.setattr("hyper_parallel.data.distributed.distributed_dataloader.create_data_worker", create)
+    monkeypatch.setattr("hyper_parallel.data.distributed.packed_balancing.create_data_worker", create)
     yield
     for worker in workers:
         worker.close()

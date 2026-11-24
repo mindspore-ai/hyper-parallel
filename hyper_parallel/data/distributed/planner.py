@@ -22,14 +22,14 @@ from copy import copy
 from itertools import chain
 from typing import Any
 
-from hyper_parallel.distributed_data.balancing_algorithm import (
+from hyper_parallel.data.distributed.balancing_algorithm import (
     BalancingAlgorithm,
     FeasibleLPTBalancingAlgorithm,
     LPTBalancingAlgorithm,
     resolve_balancing_algorithm,
 )
-from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model
-from hyper_parallel.distributed_data.schema import (
+from hyper_parallel.data.distributed.cost_model import CostModel, resolve_cost_model
+from hyper_parallel.data.distributed.schema import (
     DistributedPackingPlan,
     OversizedPolicy,
     PackingBinPlan,

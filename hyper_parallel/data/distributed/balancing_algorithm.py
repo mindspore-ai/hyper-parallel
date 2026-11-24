@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from hyper_parallel.distributed_data.schema import (
+from hyper_parallel.data.distributed.schema import (
     PackingConstraints,
     SampleKey,
     SampleMetadata,

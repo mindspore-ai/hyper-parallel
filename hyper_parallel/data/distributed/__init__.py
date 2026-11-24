@@ -14,27 +14,27 @@
 # ============================================================================
 """Dataset Reader, Planner, and Data Constructor distributed data pipeline."""
 
-from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataloader
-from hyper_parallel.distributed_data.balance_logging import format_balance_stats, log_balance_stats
-from hyper_parallel.distributed_data.balancing_algorithm import (
+from hyper_parallel.data.distributed.api import DistributedDatasetConfig, build_distributed_dataloader
+from hyper_parallel.data.distributed.balance_logging import format_balance_stats, log_balance_stats
+from hyper_parallel.data.distributed.balancing_algorithm import (
     BalancingAlgorithm,
     FeasibleLPTBalancingAlgorithm,
     LPTBalancingAlgorithm,
 )
-from hyper_parallel.distributed_data.cost_model import (
+from hyper_parallel.data.distributed.cost_model import (
     BackboneFlopsConfig, CausalAttentionCostModel, CostModel, DefaultCostModel,
 )
-from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
-from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
-from hyper_parallel.distributed_data.external_step import ExternalStepSource
-from hyper_parallel.distributed_data.model_batch import TensorFieldSpec
-from hyper_parallel.distributed_data.indexed_text import (
+from hyper_parallel.data.distributed.data_constructor import default_collate_fn, default_pack_fn
+from hyper_parallel.data.distributed.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.data.distributed.external_step import ExternalStepSource
+from hyper_parallel.data.distributed.model_batch import TensorFieldSpec
+from hyper_parallel.data.distributed.indexed_text import (
     collate_indexed_text_sequences,
     pack_indexed_text_samples,
     split_packed_text_sample,
 )
-from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
-from hyper_parallel.distributed_data.schema import (
+from hyper_parallel.data.distributed.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
+from hyper_parallel.data.distributed.schema import (
     DistributedPackingPlan,
     PackingBinPlan,
     PackingConstraints,

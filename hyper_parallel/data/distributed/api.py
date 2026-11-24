@@ -74,35 +74,35 @@ from typing import Any, Literal
 
 import torch
 
-from hyper_parallel.distributed_data.batch_sampler import (
+from hyper_parallel.data.distributed.batch_sampler import (
     BatchSamplerReader,
     preserve_sample,
     validate_native_sampler,
 )
-from hyper_parallel.distributed_data.data_constructor import (
+from hyper_parallel.data.distributed.data_constructor import (
     PackingDataConstructor,
     default_collate_fn,
     default_pack_fn,
 )
-from hyper_parallel.distributed_data.device_prefetch import _create_device_prefetcher, _resolve_device
-from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
-from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm
-from hyper_parallel.distributed_data.cost_model import CausalAttentionCostModel, CostModel
-from hyper_parallel.distributed_data.model_batch import TensorFieldSpec
-from hyper_parallel.distributed_data.indexed_text import (
+from hyper_parallel.data.distributed.device_prefetch import _create_device_prefetcher, _resolve_device
+from hyper_parallel.data.distributed.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.data.distributed.balancing_algorithm import BalancingAlgorithm
+from hyper_parallel.data.distributed.cost_model import CausalAttentionCostModel, CostModel
+from hyper_parallel.data.distributed.model_batch import TensorFieldSpec
+from hyper_parallel.data.distributed.indexed_text import (
     _validate_pad_token_id,
     collate_indexed_text_sequences,
     pack_indexed_text_samples,
     split_packed_text_sample,
 )
-from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
-from hyper_parallel.distributed_data.external_step import ExternalStepSource
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
-from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
-from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
-from hyper_parallel.distributed_data.dataset_reader import _validate_worker_options
-from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.distributed_data.transport import (
+from hyper_parallel.data.distributed.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
+from hyper_parallel.data.distributed.external_step import ExternalStepSource
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner, OversizedPolicy
+from hyper_parallel.data.distributed.schema import PackingConstraints, SampleMetadata
+from hyper_parallel.data.distributed.metadata import PlannedSampleLoader
+from hyper_parallel.data.distributed.dataset_reader import _validate_worker_options
+from hyper_parallel.data.distributed.topology import DataTopology
+from hyper_parallel.data.distributed.transport import (
     DataPlaneTransport,
     ModelParallelTransport,
     create_data_groups,

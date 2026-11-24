@@ -26,14 +26,14 @@ import torch
 
 from hyper_parallel.data.batching.build_dataloader import build_dataloader as build_trainer_dataloader
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     DistributedDatasetConfig,
     SampleKey,
     SampleMetadata,
     build_distributed_dataloader,
 )
-from hyper_parallel.distributed_data.api import _normalize_dataloader_kwargs
-from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
+from hyper_parallel.data.distributed.api import _normalize_dataloader_kwargs
+from hyper_parallel.data.distributed.metadata import PlannedSampleLoader
 from hyper_parallel.trainer.config import DataLoaderConfig
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_component
 from tests.common.mark_utils import arg_mark
@@ -119,7 +119,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         for metadata_mode in (False, True):
             for supplied in (None, {}):
                 with self.subTest(metadata_mode=metadata_mode, supplied=supplied), patch(
-                        "hyper_parallel.distributed_data.metadata.DataLoader",
+                        "hyper_parallel.data.distributed.metadata.DataLoader",
                 ) as dataloader_type:
                     with self._checkpoint_loader(self._config(metadata_mode=metadata_mode), dataloader_kwargs=supplied):
                         forwarded = dataloader_type.call_args.kwargs
@@ -150,7 +150,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         """
         for supplied in ({}, self._execution_options()):
             with self.subTest(supplied=tuple(supplied)), patch(
-                    "hyper_parallel.distributed_data.metadata.DataLoader",
+                    "hyper_parallel.data.distributed.metadata.DataLoader",
             ) as dataloader_type:
                 with self._trainer_loader(supplied):
                     forwarded = dataloader_type.call_args.kwargs
@@ -166,7 +166,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         """
         for name in ("num_workers", "pin_memory", "prefetch_factor", "persistent_workers"):
             with self.subTest(name=name), patch(
-                    "hyper_parallel.distributed_data.metadata.DataLoader",
+                    "hyper_parallel.data.distributed.metadata.DataLoader",
             ) as dataloader_type:
                 with self.assertRaisesRegex(ValueError, "configure DataLoader execution options on dataloader"):
                     self._trainer_loader({}, {name: self._execution_options()[name]})
@@ -178,7 +178,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         Expectation: Normalized options reach PyTorch without changing sample routing.
         """
         supplied = self._execution_options()
-        with patch("hyper_parallel.distributed_data.metadata.DataLoader") as dataloader_type:
+        with patch("hyper_parallel.data.distributed.metadata.DataLoader") as dataloader_type:
             build_distributed_dataloader(
                 self._samples(),
                 _StandaloneMesh(),
@@ -207,7 +207,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         samples = self._samples()
         metadata = [_metadata_fn(sample) for sample in samples]
         supplied = self._execution_options()
-        with patch("hyper_parallel.distributed_data.metadata.DataLoader") as dataloader_type:
+        with patch("hyper_parallel.data.distributed.metadata.DataLoader") as dataloader_type:
             build_distributed_dataloader(
                 samples,
                 _StandaloneMesh(),

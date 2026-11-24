@@ -20,8 +20,8 @@ from itertools import product
 from threading import current_thread
 from unittest.mock import Mock, patch
 
-from hyper_parallel.distributed_data.balance_logging import logger
-from hyper_parallel.distributed_data.schema import WorkloadCost
+from hyper_parallel.data.distributed.balance_logging import logger
+from hyper_parallel.data.distributed.schema import WorkloadCost
 from tests.common.mark_utils import arg_mark
 from tests.ut.distributed_data.test_accumulation_window import _ids, _loader
 
@@ -106,7 +106,7 @@ class TestNativeBalanceLogging(unittest.TestCase):
         Expectation: No balancing report is formatted or emitted, and samples are still delivered.
         """
         with self.assertNoLogs(logger.name, level="INFO"), patch(
-                "hyper_parallel.distributed_data.native_source.format_balance_stats",
+                "hyper_parallel.data.distributed.native_source.format_balance_stats",
         ) as formatter, _loader(accumulation=3) as loader:
             self.assertEqual([_ids(batch) for batch in loader], [list(range(i, i + 2)) for i in range(0, 44, 2)])
             formatter.assert_not_called()
@@ -118,7 +118,7 @@ class TestNativeBalanceLogging(unittest.TestCase):
         Expectation: Native loading does not format balancing diagnostics.
         """
         with patch.object(logger, "isEnabledFor", return_value=False), patch(
-                "hyper_parallel.distributed_data.native_source.format_balance_stats",
+                "hyper_parallel.data.distributed.native_source.format_balance_stats",
         ) as formatter, _loader(accumulation=3, log_balance=True) as loader:
             self.assertTrue(list(loader))
             formatter.assert_not_called()

@@ -1,5 +1,7 @@
 # Distributed sample balancing
 
+Import the distributed loader and its configuration from `hyper_parallel.data.distributed`.
+
 This PyTorch data path separates Dataset Readers, planning, and Data
 Constructors, inspired by MegaScale-Data. Step membership belongs to the
 upstream producer, not to a metadata read-ahead window.
@@ -144,7 +146,7 @@ Setting `DistributedDatasetConfig.repack_sequences=True` selects built-in text
 repacking and defaults to normalized causal Attention square costs, including new PAD.
 
 ```python
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,
@@ -374,7 +376,7 @@ dataloader:
 ```
 
 Direct API users can set `DistributedDatasetConfig(..., log_balance=True)`.
-Reports use INFO level on `hyper_parallel.distributed_data.balance_logging`;
+Reports use INFO level on `hyper_parallel.data.distributed.balance_logging`;
 the Trainer enables INFO by default. Setting the logger to INFO without enabling
 `log_balance` does not emit balancing reports.
 
@@ -591,7 +593,7 @@ dataloader:
   cost_model:
     _target_: my_training.cost.SampleCost  # user-provided factory
   balancing_algorithm:
-    _target_: hyper_parallel.distributed_data.FeasibleLPTBalancingAlgorithm
+    _target_: hyper_parallel.data.distributed.FeasibleLPTBalancingAlgorithm
     objective: makespan
     max_repair_pairs: 64
 ```
@@ -715,9 +717,9 @@ PAD ID is not passed to custom callbacks; bind their own parameters explicitly.
 Custom-callback mode retains `DefaultCostModel(model_config)` unless a cost model
 is supplied.
 
-The [Qwen3 repacking recipe](../../examples/training_demo/qwen3/train_balanced.yaml)
+The [Qwen3 repacking recipe](../../../examples/training_demo/qwen3/train_balanced.yaml)
 uses HP TextTrainer and the existing Qwen3 adapter. Its
-[packed Dataset](../../examples/training_demo/qwen3/packed_dataset.py) reads a
+[packed Dataset](../../../examples/training_demo/qwen3/packed_dataset.py) reads a
 Hugging Face Dataset saved with `save_to_disk`, containing `input_ids`,
 pre-shifted `labels`, and `cu_seqlens`. It exposes these boundaries as
 `cu_seq_lens` to the shared repacker. Dense document attention consumes the
@@ -938,7 +940,7 @@ This setting takes precedence over the collator declaration. Pure DP needs no
 layout; arbitrary varying Python field sets are not supported by tensor-only MP.
 
 ```python
-from hyper_parallel.distributed_data import TensorFieldSpec
+from hyper_parallel.data.distributed import TensorFieldSpec
 
 model_batch_spec = {
     "input_ids": TensorFieldSpec((1, 262144), torch.int64),
@@ -1177,7 +1179,7 @@ implementation uses Linux process groups to clean up nested workers.
 - Python imports the training entry point in the new interpreter. Put training
   setup and execution (including distributed initialization and loader iteration)
   inside a function called under `if __name__ == "__main__":`. The
-  [text training example](../../examples/training_demo/train_text.py) shows this pattern.
+  [text training example](../../../examples/training_demo/train_text.py) shows this pattern.
 - Pass a re-iterable source or an unstarted DataLoader with CPU-only callbacks.
   When the environment provides `dill`, callbacks may be lambdas or closures.
   With standard-library `pickle`, define callbacks and source classes at the top

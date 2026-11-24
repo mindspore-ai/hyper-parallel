@@ -65,7 +65,7 @@ application defines metadata extraction and packing.
 from contextlib import closing
 from itertools import islice
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,
@@ -185,7 +185,7 @@ Both policies are optional builder arguments. Omitting `cost_model` constructs
 refines feasible pack pairs within a fixed work budget. Neither callback needs communication or H2D code.
 
 ```python
-from hyper_parallel.distributed_data import FeasibleLPTBalancingAlgorithm
+from hyper_parallel.data.distributed import FeasibleLPTBalancingAlgorithm
 
 loader = build_distributed_dataloader(
     None, mesh, config, device=device,

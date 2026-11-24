@@ -26,10 +26,10 @@ from unittest.mock import Mock, patch
 import psutil
 import torch
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     CausalAttentionCostModel, DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader,
 )
-from hyper_parallel.distributed_data.process_data import _serialize_source, create_data_worker
+from hyper_parallel.data.distributed.process_data import _serialize_source, create_data_worker
 from tests.common.mark_utils import arg_mark
 
 
@@ -58,7 +58,7 @@ def _exit_with_open_loader(pid_file: Path) -> None:
     raise SystemExit(17)
 
 
-@patch("hyper_parallel.distributed_data.packed_balancing.create_data_worker", create_data_worker)
+@patch("hyper_parallel.data.distributed.packed_balancing.create_data_worker", create_data_worker)
 class TestPackedBalancingPrefetch(unittest.TestCase):
     """Exercise the public loader across a real CPU process boundary."""
 
@@ -68,7 +68,7 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
         Description: Serialize an importable callback and a local callback without dill.
         Expectation: The importable callback round-trips and the local callback reports the requirement.
         """
-        with patch("hyper_parallel.distributed_data.process_data._SOURCE_PICKLE", pickle):
+        with patch("hyper_parallel.data.distributed.process_data._SOURCE_PICKLE", pickle):
             self.assertEqual(pickle.loads(_serialize_source((SampleMetadata,))), (SampleMetadata,))
             with self.assertRaisesRegex(TypeError, "importable module"):
                 _serialize_source((lambda sample: sample,))

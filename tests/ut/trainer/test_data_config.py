@@ -22,7 +22,7 @@ import yaml
 from torch.utils.data import default_collate
 
 from hyper_parallel.data.batching import FixedBatchDataLoader, build_dataloader
-from hyper_parallel.distributed_data import DistributedDataLoader, WorkloadCost
+from hyper_parallel.data.distributed import DistributedDataLoader, WorkloadCost
 from hyper_parallel.trainer.config.data import DataLoaderConfig
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_component
 

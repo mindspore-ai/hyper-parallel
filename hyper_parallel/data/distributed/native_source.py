@@ -27,10 +27,10 @@ from typing import Any, Union
 from hyper_parallel.data.parallel.batch_sampler import (
     get_sampler_checkpoint_state, has_torchdata_state, sampler_optimizer_step_progress,
 )
-from hyper_parallel.distributed_data.balance_logging import format_balance_stats, logger as balance_logger
-from hyper_parallel.distributed_data.batch_sampler import _ReaderPlanInput
-from hyper_parallel.distributed_data.schema import DistributedPackingPlan, SampleKey, SampleMetadata
-from hyper_parallel.distributed_data.transport import DataPlaneTransport, PreparedPayloadExchange
+from hyper_parallel.data.distributed.balance_logging import format_balance_stats, logger as balance_logger
+from hyper_parallel.data.distributed.batch_sampler import _ReaderPlanInput
+from hyper_parallel.data.distributed.schema import DistributedPackingPlan, SampleKey, SampleMetadata
+from hyper_parallel.data.distributed.transport import DataPlaneTransport, PreparedPayloadExchange
 
 _PlanControl = Union[DistributedPackingPlan, tuple[DistributedPackingPlan, ...], None]
 

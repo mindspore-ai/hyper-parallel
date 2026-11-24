@@ -30,15 +30,15 @@ from hyper_parallel.data.batching.build_dataloader import (
 )
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.data.text.build_dataset import _build_dataloader_context
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
-from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
-from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
-from hyper_parallel.distributed_data.balancing_algorithm import (
+from hyper_parallel.data.distributed import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+from hyper_parallel.data.distributed.batch_sampler import BatchSamplerReader
+from hyper_parallel.data.distributed.metadata import PlannedSampleLoader
+from hyper_parallel.data.distributed.balancing_algorithm import (
     FeasibleLPTBalancingAlgorithm,
     LPTBalancingAlgorithm,
     resolve_balancing_algorithm,
 )
-from hyper_parallel.distributed_data.schema import SampleKey
+from hyper_parallel.data.distributed.schema import SampleKey
 from hyper_parallel.trainer.config.target import Target
 from tests.common.mark_utils import arg_mark
 
@@ -657,7 +657,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         )
         self.assertEqual(dataset.reads, [])
         with dataloaders[0] as loader, patch(
-                "hyper_parallel.distributed_data.transport.DataPlaneTransport.exchange_prepared",
+                "hyper_parallel.data.distributed.transport.DataPlaneTransport.exchange_prepared",
                 side_effect=AssertionError("Offline metadata must bypass payload exchange"),
         ):
             batches = list(loader)

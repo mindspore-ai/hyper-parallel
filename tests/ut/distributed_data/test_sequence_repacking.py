@@ -26,12 +26,12 @@ from torch.nn import functional
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.data.batching.build_dataloader import build_dataloader
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     DistributedDatasetConfig, SampleKey, SampleMetadata, WorkloadCost, build_distributed_dataloader,
     build_local_balancing_dataloader, collate_indexed_text_sequences,
     pack_indexed_text_samples, split_packed_text_sample,
 )
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
 from tests.common.mark_utils import arg_mark
 
 
@@ -101,7 +101,7 @@ class TestSequenceRepacking(unittest.TestCase):
             (padded, 9, [0, 4, 9, 12], 50, 9),
             (_record([4, 5]), None, [0, 4, 9, 12], 50, 0),
         )
-        logger = "hyper_parallel.distributed_data.balance_logging"
+        logger = "hyper_parallel.data.distributed.balance_logging"
         for record, pad_id, boundaries, cost, fill_id in cases:
             for log_balance in (False, True):
                 with self.subTest(pad_id=pad_id, boundaries=boundaries, log_balance=log_balance):
@@ -140,7 +140,7 @@ class TestSequenceRepacking(unittest.TestCase):
         with build_distributed_dataloader(
             [record], _MESH, DistributedDatasetConfig(seq_len=12, local_batch_size=1, pad_token_id=9),
             batch_sampler=sampler, metadata_fn=_metadata, device="cpu", cost_model=lambda item: item.cost,
-        ) as loader, self.assertNoLogs("hyper_parallel.distributed_data.balance_logging"):
+        ) as loader, self.assertNoLogs("hyper_parallel.data.distributed.balance_logging"):
             batch = next(loader)
         for field, expected in record.items():
             torch.testing.assert_close(batch[0][field], expected, rtol=0, atol=0)
@@ -158,7 +158,7 @@ class TestSequenceRepacking(unittest.TestCase):
             DistributedDatasetConfig(seq_len=12, local_batch_size=1, repack_sequences=True, log_balance=True),
             batch_sampler=sampler, metadata_fn=_metadata, device="cpu", collate_fn=tuple,
             cost_model=lambda _: WorkloadCost(llm=7),
-        ) as loader, self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+        ) as loader, self.assertLogs("hyper_parallel.data.distributed.balance_logging", level="INFO") as logs:
             batch = next(loader)
         self.assertIsInstance(batch, tuple)
         self.assertEqual(batch[0]["cu_seq_lens"].tolist(), [0, 4, 12])
@@ -394,7 +394,7 @@ class TestSequenceRepacking(unittest.TestCase):
                 attention_mode="dense", reset_position_ids=True,
             )
             with loaders[0] as loader:
-                with self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+                with self.assertLogs("hyper_parallel.data.distributed.balance_logging", level="INFO") as logs:
                     model, loss = batch_adapter(loader)
             self.assertIn("original=50, candidate=50", logs.output[0])
             self.assertIn("samples=2, cost=50, padding=3", logs.output[0])
@@ -434,6 +434,6 @@ class TestSequenceRepacking(unittest.TestCase):
                     data_config={"seq_length": 12}, cost_model=supplied,
                 )
                 with loaders[0] as loader:
-                    with self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+                    with self.assertLogs("hyper_parallel.data.distributed.balance_logging", level="INFO") as logs:
                         next(loader)
                 self.assertIn(f"original={expected}, candidate={expected}", logs.output[0])
