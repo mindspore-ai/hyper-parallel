@@ -37,8 +37,6 @@ def validate_sparse_attention_family(*, config: Any, module: nn.Module | None, c
     if cp_size is not None and member.arguments.get("kv_cp_size", 1) != cp_size:
         raise ValueError("kv_cp_size must equal the job cp_size")
     config = config if module is None else module.config
-    if context.get("sequence_parallel", False):
-        raise ValueError("DeepSeek sparse attention does not support sequence parallelism")
     if member.axis_sizes["pp"] > 1:
         raise ValueError("DeepSeek sparse attention does not support pipeline parallelism")
     heads = getattr(module, "num_heads", getattr(config, "num_attention_heads", None))
@@ -49,8 +47,6 @@ def validate_sparse_attention_family(*, config: Any, module: nn.Module | None, c
 def sparse_attention_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
     """Declare every owned parameter and external token port without name fallbacks."""
     del module_fqn, member
-    if context.sequence_parallel:
-        raise ValueError("DeepSeek sparse attention does not support sequence parallelism")
     placements = {axis: Replicate() for axis in context.mesh_dim_names if axis in context.axis_sizes}
     column_names = ("q_b_proj", "kv_b_proj")
     replica_names = (
@@ -77,23 +73,23 @@ def sparse_attention_sharding(*, module: nn.Module, module_fqn: str, member: Any
     tokens = dict(placements)
     if context.axis_sizes["cp"] > 1:
         tokens["cp"] = Shard(1)
-    output = dict(tokens)
+    if context.axis_sizes["tp"] > 1 and context.sequence_parallel:
+        tokens["tp"] = Shard(1)
+    compute_input, output = dict(tokens), dict(tokens)
     if context.axis_sizes["tp"] > 1:
+        compute_input["tp"] = Replicate()
         output["tp"] = Partial()
     return ModuleShardingSpec(
-        params=params, in_src={"hidden_states": dict(tokens)}, in_dst={"hidden_states": dict(tokens)},
+        params=params, in_src={"hidden_states": dict(tokens)}, in_dst={"hidden_states": compute_input},
         out_src={"output": output}, out_dst={"output": dict(tokens)},
         out_names=("output", "attention_weights"), is_boundary=True,
     )
 
 
 def validate_sparse_attention_layout(*, module: nn.Module, sharding: Any, context: Any) -> None:
-    """Validate the final overridden contract, including the unsupported SP boundary."""
+    """Validate the declared token and projection layouts after recipe overrides."""
     expected = sparse_attention_sharding(module=module, module_fqn="", member=None, context=context)
     validate_tp_boundary(sharding, expected, name="DeepSeek sparse attention")
-    for field, port in (("in_src", "hidden_states"), ("out_dst", "output")):
-        if getattr(sharding, field)[port].get("tp", Replicate()) != Replicate():
-            raise ValueError("DeepSeek sparse attention does not support SP token-port overrides")
     if tuple(sharding.out_names or ()) != tuple(expected.out_names):
         raise ValueError("Sparse-attention output names must preserve the declared return contract")
 
@@ -102,7 +98,7 @@ def sparse_attention_parallel_spec(*, module: nn.Module, member: Any) -> Paralle
     """Declare shared algorithm stages and validate layouts outside local computation."""
     del module, member
     return ParallelModuleSpec(
-        "attention.deepseek_sparse_attention.local",
+        "attention.deepseek_sparse_attention.local", binding_kind="mesh",
         stages={
             "preflight_attention": (
                 "hidden_states", "attention_mask", "past_key_values", "position_ids",
