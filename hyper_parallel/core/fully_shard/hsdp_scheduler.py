@@ -16,6 +16,7 @@
 import functools
 import inspect
 from collections import deque
+from itertools import chain
 from typing import Any, Callable, List, Mapping, Optional, ParamSpec, Tuple, TypeVar, Union
 
 import torch
@@ -73,6 +74,7 @@ class HSDPSchedulerContext:
     """Share scheduler and backward-pipeline state within one HSDP module tree."""
 
     def __init__(self) -> None:
+        """Initialize bookkeeping and communication queues for a module tree."""
         self.is_last_backward: bool = True
         self.root_module = None
         # Compile tracing may enter the root more than once; initialize shared
@@ -80,13 +82,14 @@ class HSDPSchedulerContext:
         self.lazy_init_done: bool = False
         self.root_bp_state = False
         self.post_backward_final_callback_queued = False
+        self.defer_grad_finalize = False
         # all_hsdp_schedulers (for one module tree structure), deduplicated at
         # registration time because ``fully_shard`` may be given a module list
         # whose modules share one scheduler.
         self.all_hsdp_schedulers = []
         # Parameter FQNs are initialized once after all schedulers share this context.
         self._param_fqn_initialized = False
-        # Each queue entry belongs to one non-fused unit, including empty units.
+        # Each queue entry normally belongs to one non-fused unit, including empty units.
         # Configuration and queues are shared by the entire module tree.
         self.reduce_interval: int = 1
         self.pre_reduce_scatter_params = deque()
@@ -95,6 +98,15 @@ class HSDPSchedulerContext:
         self.pre_all_reduce_groups = deque()
         self.pending_all_reduce_groups = []
         self.param_group_comm_ctx = ParamGroupCommCtx()
+
+    def merge_reduce_scatter_tail(self) -> None:
+        """Keep the last two entries in one batch for the next PP backward."""
+        if len(self.pre_reduce_scatter_params) < 2:
+            return
+        params = self.pre_reduce_scatter_params.pop()
+        groups = self.pre_all_reduce_groups.pop()
+        self.pre_reduce_scatter_params[-1].extend(params)
+        self.pre_all_reduce_groups[-1].extend(groups)
 
 
 class HSDPSchedulerV2:
@@ -266,8 +278,42 @@ class HSDPSchedulerV2:
             raise ValueError(f"requires_grad_sync should be a bool, got {type(requires_grad_sync)}")
         self.hsdp_state.set_requires_grad_sync(requires_grad_sync)
 
-    # pylint: disable=W0613
-    def _hsdp_forward_pre_hook(self, cell, args, kwargs):
+    def lazy_init(self) -> None:
+        """Register the module tree and initialize its sharded states once."""
+        if self.scheduler_ctx.defer_grad_finalize and self.scheduler_ctx.reduce_interval != 1:
+            raise ValueError("Deferred gradient finalization requires reduce_interval=1")
+        if self.scheduler_ctx.lazy_init_done:
+            return
+        # HSDPModule imports the scheduler to implement its public API.
+        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=import-outside-toplevel
+        # Share the root context and register each unit's module name once.
+        if self.scheduler_ctx.root_module is None:
+            tree_ctx = self.scheduler_ctx
+            tree_ctx.root_module = self.cell
+            registered_schedulers = set()
+            for module_name, module in tree_ctx.root_module.named_modules():
+                if not isinstance(module, HSDPModule):
+                    continue
+                submod_scheduler = module.hsdp_scheduler
+                if submod_scheduler is None or submod_scheduler in registered_schedulers:
+                    continue
+                registered_schedulers.add(submod_scheduler)
+                if submod_scheduler.scheduler_ctx is not tree_ctx:
+                    if submod_scheduler.scheduler_ctx.root_module is not None:
+                        raise ValueError("HSDP scheduler already belongs to another initialized module tree")
+                    submod_scheduler.scheduler_ctx = tree_ctx
+                    submod_scheduler.hsdp_state.scheduler_ctx = tree_ctx
+                    if submod_scheduler.hsdp_state.param_group is not None:
+                        submod_scheduler.hsdp_state.param_group.comm_ctx = tree_ctx.param_group_comm_ctx
+                submod_scheduler._is_root = submod_scheduler is self  # pylint: disable=protected-access
+                submod_scheduler.hsdp_state.module_name = module_name
+                tree_ctx.all_hsdp_schedulers.append(submod_scheduler)
+        # Initialize parameter names and reset sharded state.
+        self._init_params_fqn()
+        self._lazy_init_all_states()
+        self.scheduler_ctx.lazy_init_done = True
+
+    def _hsdp_forward_pre_hook(self, unused_cell, args, kwargs):
         """Forward pre hook to unsharded parameter for forward process."""
         logger.debug("hook=forward_pre enter module=%s", self.hsdp_state)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
@@ -275,35 +321,8 @@ class HSDPSchedulerV2:
             return args, kwargs
         if self.scheduler_ctx.root_bp_state:
             self._disable_forward_prefetch_for_recompute()
-        if self.scheduler_ctx.root_module is None:
-            tree_ctx = self.scheduler_ctx
-            tree_ctx.root_module = self.cell
-            registered_schedulers = set()
-            for module_name, module in tree_ctx.root_module.named_modules():
-                from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
-                if isinstance(module, HSDPModule):
-                    submod_scheduler = module.hsdp_scheduler
-                    if submod_scheduler is None or id(submod_scheduler) in registered_schedulers:
-                        continue
-                    registered_schedulers.add(id(submod_scheduler))
-                    if submod_scheduler.scheduler_ctx is not tree_ctx:
-                        if submod_scheduler.scheduler_ctx.root_module is not None:
-                            raise ValueError(
-                                "HSDP scheduler already belongs to another initialized module tree"
-                            )
-                        submod_scheduler.scheduler_ctx = tree_ctx
-                        submod_scheduler.hsdp_state.scheduler_ctx = tree_ctx
-                        if submod_scheduler.hsdp_state.param_group is not None:
-                            submod_scheduler.hsdp_state.param_group.comm_ctx = tree_ctx.param_group_comm_ctx
-                    submod_scheduler._is_root = submod_scheduler is self  # pylint: disable=protected-access
-                    submod_scheduler.hsdp_state.module_name = module_name
-                    tree_ctx.all_hsdp_schedulers.append(submod_scheduler)
-
+        self.lazy_init()
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
-        if self._is_root and not self.scheduler_ctx.lazy_init_done:
-            self._init_params_fqn()
-            self._lazy_init_all_states()
-            self.scheduler_ctx.lazy_init_done = True
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(cast_fp_tensor, self.mp_policy.param_dtype)
             args = apply_to_tensors(cast_fn, args)
@@ -384,10 +403,9 @@ class HSDPSchedulerV2:
         """Backward pre hook to unsharded parameter for backward process."""
         logger.debug("hook=backward_pre enter module=%s", self.hsdp_state)
         self.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
-        if self.reshard_after_forward:
-            with profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
-                logger.debug("hook=backward_pre action=unshard module=%s", self.hsdp_state)
-                self.hsdp_state.unshard()
+        with profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
+            logger.debug("hook=backward_pre action=unshard module=%s", self.hsdp_state)
+            self.hsdp_state.unshard()
         for prefetch_cell in self.backward_prefetch_cells:
             prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
             with profiler_record(f"pre_backward prefetch:"
@@ -406,7 +424,9 @@ class HSDPSchedulerV2:
         self.scheduler_state = FSDPSchedulerState.BACKWARD
         with profiler_record(f"post_backward:{self.hsdp_state.module_name}"):
             logger.debug("hook=backward_hook action=post_backward module=%s", self.hsdp_state)
-            self.hsdp_state.post_backward()
+            # An empty root would consume a child's tail without issuing its own work.
+            if not self.scheduler_ctx.defer_grad_finalize or self.hsdp_state.hsdp_params:
+                self.hsdp_state.post_backward()
         if self._fsdp_group_post_pending is not None:
             self._fsdp_group_post_pending.clear()
 
@@ -555,23 +575,49 @@ class HSDPSchedulerV2:
 
     @_dynamo_disable
     def _root_backward_hook(self):
-        """Drain gradient communication and finish backward for all states."""
+        """Finish backward for all states and let PP finalize deferred gradients."""
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
-        for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+        context = self.scheduler_ctx
+        for hsdp_scheduler in context.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
-            hsdp_scheduler._backward_hook()
+            if context.defer_grad_finalize:
+                hsdp_scheduler._launch_remaining_backward_reductions()
+            else:
+                hsdp_scheduler._backward_hook()
             hsdp_scheduler._finalize_unused_prefetches()
             hsdp_scheduler.scheduler_state = None
+            hsdp_scheduler._restore_forward_prefetch_after_recompute()
         self.scheduler_ctx.root_bp_state = False
-        with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
-            logger.debug(
-                "hook=root_backward_hook action=final_reduce module=%s",
-                self.hsdp_state,
-            )
-            self._finalize_comm_fusion_reductions()
-            self._finalize_per_param_reductions()
-            self._apply_reduced_gradients()
+        if not context.defer_grad_finalize:
+            with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
+                logger.debug(
+                    "hook=root_backward_hook action=final_reduce module=%s",
+                    self.hsdp_state,
+                )
+                self._finalize_gradients()
         self.scheduler_ctx.post_backward_final_callback_queued = False
+
+    def _launch_remaining_backward_reductions(self) -> None:
+        """Launch reductions for units without an autograd post-backward hook."""
+        if self.scheduler_state == FSDPSchedulerState.BACKWARD:
+            return
+        if self._fsdp_group_post_pending is not None:
+            self._fsdp_group_post_pending.clear()
+        state = self.hsdp_state
+        if not state.hsdp_params:
+            return
+        state.accumulate_grads_in_reduce_dtype_and_reshard()
+        if not state.reduce_grads:
+            return
+        if any(
+            param.reduce_scatter_comm_ctx.reduce_scatter_output is not None
+            and (param.unsharded_param.grad is not None or param.unsharded_accumulated_grad_data is not None)
+            for param in state.hsdp_params
+        ):
+            # Keep the full gradient on the parameter until the previous RS releases its slot.
+            return
+        state.issue_reduce_scatter_for_current_module()
+        self.scheduler_ctx.merge_reduce_scatter_tail()
 
     def _finalize_unused_prefetches(self) -> None:
         """Wait and release this scheduler's unused all-gathers after backward.
@@ -660,33 +706,74 @@ class HSDPSchedulerV2:
     def _finalize_per_param_reductions(self) -> None:
         """Drain the module-tree-local comm_fusion=False RS/AR queues."""
         # A fused root may own non-fused children, so always drain the tree queues.
+        self.flush_reduce_scatter()
+        self.wait_all_reduce()
+
+    def flush_reduce_scatter(self) -> None:
+        """Consume this tree's old shards and submit their replica reductions."""
         while self.scheduler_ctx.pre_reduce_scatter_params:
             last_all_reduce_groups = self.hsdp_state._wait_prev_reduce_scatter()
             self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce()
-            self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
+            self.hsdp_state.issue_prev_fused_all_reduce(last_all_reduce_groups)
+
+    def wait_all_reduce(self) -> None:
+        """Wait for replica reductions already submitted in this tree."""
         self.hsdp_state.wait_and_split_all_reduce_work_groups()
 
-    def _apply_reduced_gradients(self) -> None:
+    def launch_pending_reduce_scatter(self) -> None:
+        """Release occupied slots and submit full gradients left by the root hook."""
+        context = self.scheduler_ctx
+        direct_params = chain.from_iterable(context.pre_reduce_scatter_params)
+        replica_params = (param for groups in context.pre_all_reduce_groups for group in groups
+                          for param in group.hsdp_params)
+        blocked_params = {
+            param for param in chain(direct_params, replica_params)
+            if param.unsharded_param.grad is not None or param.unsharded_accumulated_grad_data is not None
+        }
+        if not blocked_params:
+            return
+        pending = []
+        for scheduler in context.all_hsdp_schedulers:
+            state = scheduler.hsdp_state
+            if state.reduce_grads and any(param in blocked_params for param in state.hsdp_params):
+                pending.append(state)
+        if not pending:
+            return
+        self.flush_reduce_scatter()
+        for state in pending:
+            state.issue_reduce_scatter_for_current_module()
+            context.merge_reduce_scatter_tail()
+
+    def _finalize_gradients(self) -> None:
+        """Finish all reductions and apply their completed results."""
+        if self.scheduler_ctx.defer_grad_finalize:
+            self.launch_pending_reduce_scatter()
+        self._finalize_comm_fusion_reductions()
+        self._finalize_per_param_reductions()
+        self.apply_reduced_gradients()
+
+    def apply_reduced_gradients(self) -> None:
         """Apply pending reduced gradients after communication completes."""
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             hsdp_state = hsdp_scheduler.hsdp_state
             if hsdp_state is None:
                 continue
+            fused = hsdp_state.comm_fusion_policy.enable_comm_fusion
             need_synchronize = False
             for hsdp_param in hsdp_state.hsdp_params:
-                reduced_grad = hsdp_param.all_reduce_comm_ctx.all_reduce_output
-                if reduced_grad is None:
+                all_reduce_output = hsdp_param.all_reduce_comm_ctx.all_reduce_output
+                reduced_grad = all_reduce_output
+                if reduced_grad is None and fused:
+                    # The fused wait publishes its ready shard here. The per-parameter
+                    # wait already consumes its shard directly or submits replica AR.
                     reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
                 if reduced_grad is None:
                     continue
-                if hsdp_state.comm_fusion_policy.enable_comm_fusion:
-                    hsdp_param.all_reduce_source_replicate_grad_inplace(
-                        reduced_grad,
-                        hsdp_state.reduce_op_type,
-                    )
                 need_synchronize = hsdp_param.apply_reduced_grad(reduced_grad) or need_synchronize
-                hsdp_param.clear_all_reduce_output()
-                hsdp_param.clear_reduce_scatter_output()
+                if all_reduce_output is not None:
+                    hsdp_param.clear_all_reduce_output()
+                else:
+                    hsdp_param.clear_reduce_scatter_output()
             hsdp_state._sync_current_stream_if_needed(need_synchronize)
 
     @_dynamo_disable

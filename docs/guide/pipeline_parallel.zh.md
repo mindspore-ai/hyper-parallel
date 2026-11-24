@@ -76,22 +76,31 @@ losses = schedule.run(local_batch)
 
 ---
 
-## PP+FSDP 集成
-
-PP stage 内部可以使用 FSDP 进行参数切分，进一步降低单卡内存占用：
+## PP+FSDP/HSDP 集成
 
 ```python
-from hyper_parallel import PipelineStage, Schedule1F1B, fully_shard, init_device_mesh
+from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B, fully_shard, init_device_mesh
 
-mesh = init_device_mesh("npu", (pp_size, dp_size), mesh_dim_names=("pp", "dp"))
-
-# 每个 PP stage 内部应用 FSDP
-for stage_model in split_models:
-    fully_shard(stage_model, mesh=mesh["dp"])
-
-# PipelineStage 支持 MetaStep 集成 FSDP
-stage = PipelineStage(stage_model, stage_index, stage_num=pp_size)
+mesh = init_device_mesh(
+    "npu", (pp_size, replicate_size, shard_size),
+    mesh_dim_names=("pp", "replicate", "shard"),
+)
+parameter_mesh = mesh["replicate", "shard"]  # FSDP 使用 mesh["shard"]。
+stages = []
+for stage_index, stage_model in local_model_chunks:
+    fully_shard(stage_model, mesh=parameter_mesh)
+    stage_model.set_reshard_after_forward(True)  # 正向后释放完整参数。
+    stage_model.set_reshard_after_backward(True)  # 反向后释放完整参数。
+    stage_model.set_requires_gradient_sync(True)  # 每个反向微批次执行 ReduceScatter。
+    stages.append(PipelineStage(
+        stage_model, stage_index, total_stage_num, device=device,
+        group=mesh["pp"].get_group(), mesh=mesh["pp"],
+    ))
+# 每个 Stage 在最后一次反向同步复制维度的梯度。
+schedule = ScheduleInterleaved1F1B(stages, micro_batch_num=8)
 ```
+
+ZeRO 配置组合和支持范围见 [PP+FSDP/HSDP 集成](pipeline_parallel.md#ppfsdphsdp-integration)。
 
 ---
 

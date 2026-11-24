@@ -58,6 +58,7 @@ def _make_prefetch_scheduler(hsdp_params=(), all_gather_buckets=None, scheduler_
     if scheduler_ctx is not None:
         scheduler.scheduler_ctx = scheduler_ctx
     scheduler.scheduler_ctx.all_hsdp_schedulers.append(scheduler)
+    scheduler._backup_forward_fetch = None
     scheduler.hsdp_state = SimpleNamespace(
         hsdp_params=list(hsdp_params),
         param_group=(
@@ -71,7 +72,7 @@ def _make_prefetch_scheduler(hsdp_params=(), all_gather_buckets=None, scheduler_
     scheduler._finalize_comm_fusion_reductions = MagicMock()
     scheduler._finalize_per_param_reductions = MagicMock()
 
-    scheduler._apply_reduced_gradients = MagicMock()
+    scheduler.apply_reduced_gradients = MagicMock()
     return scheduler
 
 
@@ -561,7 +562,7 @@ class TestRootBackwardCallback(unittest.TestCase):
                 child._backward_hook.assert_called_once_with()
                 scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
                 scheduler._finalize_per_param_reductions.assert_called_once_with()
-                scheduler._apply_reduced_gradients.assert_called_once_with()
+                scheduler.apply_reduced_gradients.assert_called_once_with()
 
     def test_unused_prefetch_wait_failure_preserves_work(self) -> None:
         """A failed wait preserves the work and prevents final gradient application."""
@@ -580,7 +581,7 @@ class TestRootBackwardCallback(unittest.TestCase):
         self.assertEqual(scheduler.scheduler_state, FSDPSchedulerState.BACKWARD)
         param.free_unsharded_param.assert_not_called()
         scheduler._backward_hook.assert_called_once_with()
-        scheduler._apply_reduced_gradients.assert_not_called()
+        scheduler.apply_reduced_gradients.assert_not_called()
 
     def test_unused_prefetch_releases_only_temporary_storage(self) -> None:
         """Completed unused gathers release full buffers without changing shards."""
@@ -635,7 +636,7 @@ class TestRootBackwardCallback(unittest.TestCase):
         child._backward_hook.assert_called_once_with()
         scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
         scheduler._finalize_per_param_reductions.assert_called_once_with()
-        scheduler._apply_reduced_gradients.assert_called_once_with()
+        scheduler.apply_reduced_gradients.assert_called_once_with()
 
 
 class TestRecomputeForwardPrefetchGuard(unittest.TestCase):

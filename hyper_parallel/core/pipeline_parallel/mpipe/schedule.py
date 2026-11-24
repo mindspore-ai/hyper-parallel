@@ -195,6 +195,9 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
             raise ValueError(
                 f"overflow_mode must be 'full' or 'min', got {overflow_mode!r}"
             )
+        stages = self._check_stages(stages)
+        if any(stage.all_hsdp_schedulers for stage in stages):
+            raise ValueError("MPipe does not support HSDP pipeline stages")
         self._overflow_mode = overflow_mode
         # ``preprocess_module`` is the resolved block to transpose (first T text
         # layers, the visual tower, or a param-free identity for dataload-only).

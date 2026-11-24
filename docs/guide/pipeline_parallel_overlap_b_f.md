@@ -267,6 +267,66 @@ The [PP+EP overlap example](../../examples/torch/pp_overlap/pp_overlap_moe_examp
 
 ---
 
+## HSDP gradient overlap
+
+In full backward, HSDP launches ReduceScatter as each unit finishes computing its
+parameter gradients. The next unit's backward or a later pipeline step can overlap
+the reduction. With split backward, the pipeline launches reductions as a batch
+after weight-gradient computation finishes.
+
+Consecutive backwards on one chunk normally wait for the previous tail after the
+first gradient-synchronizing unit computes its gradients. For a forward or a
+backward on another chunk, PP takes the previous tail and consumes it after that
+step computes.
+
+A custom `OVERLAP_B_F` callback can run backward then forward on the same stage.
+To reuse its full parameters during forward, add the corresponding schedulers to
+`PipelineContext.fsdp_comm_controller.retained_backward_units` for the duration of
+both calls. The forward then has a window to overlap the backward tail reduction.
+
+This example uses one HSDP unit per stage. For different stages it runs concurrently
+when both stages already have their full parameters. The callback owns the collective
+order and stream dependencies and joins both paths before returning.
+
+```python
+import torch
+from hyper_parallel.core.pipeline_parallel import CommComputeOverlap, MetaStepType
+
+stage_by_index = {stage.stage_index: stage for stage in stages}
+overlap = CommComputeOverlap()
+
+def execute_overlap(step, context):
+    backward, forward = step.sub_steps
+    backward_stage = stage_by_index[backward.stage_index]
+    forward_stage = stage_by_index[forward.stage_index]
+    backward_unit = backward_stage.all_hsdp_schedulers[0]
+    forward_unit = forward_stage.all_hsdp_schedulers[0]
+    retained_units = context.fsdp_comm_controller.retained_backward_units
+
+    def run_backward():
+        torch.accelerator.set_device_index(device)
+        context.schedule._exec_step(backward, context.arg_mbs, context.kwarg_mbs, context.losses)
+
+    def run_forward():
+        torch.accelerator.set_device_index(device)
+        context.schedule.execute_fwd_leaf(forward, context.arg_mbs, context.kwarg_mbs, context.losses)
+
+    if backward_stage is forward_stage:
+        retained_units.add(backward_unit)
+        run_backward()
+        run_forward()
+        retained_units.remove(backward_unit)
+    elif backward_unit.hsdp_state.is_shard or forward_unit.hsdp_state.is_shard:
+        run_backward()
+        run_forward()
+    else:
+        overlap.run(fwd_fn=run_forward, bwd_fn=run_backward)
+
+schedule.register_custom_function(MetaStepType.OVERLAP_B_F, execute_overlap)
+```
+
+---
+
 ## 8. Native Torch Synchronization Hooks
 
 `_SyncHookFunction` in `core/pipeline_parallel/_sync_hook.py` directly subclasses

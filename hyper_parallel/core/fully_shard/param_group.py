@@ -819,9 +819,30 @@ class HSDPParamGroup:
                 async_op=async_op,
             )
 
+    def _sum_source_replica_gradients(self) -> None:
+        """Sum completed shard gradients over replicated source axes."""
+        views_by_group = {}
+        for bucket in self.reduce_scatter_buckets:
+            output = bucket.reduce_scatter_output
+            for param, offset, numel in zip(bucket.hsdp_params, bucket.param_offsets, bucket.layout.param_numels):
+                group = param.get_source_replicate_process_group()
+                if group is not None:
+                    key = (group, output.dtype, output.device)
+                    views_by_group.setdefault(key, []).append(output.narrow(0, offset, numel))
+
+        for (group, _, _), views in views_by_group.items():
+            if len(views) == 1:
+                dist.all_reduce(views[0], op=dist.ReduceOp.SUM, group=group, async_op=False)
+            else:
+                packed = torch.cat(views)
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=group, async_op=False)
+                for view, reduced in zip(views, packed.split([view.numel() for view in views])):
+                    view.copy_(reduced)
+
     def wait_reduce_scatter_and_issue_all_reduce(self, async_op: bool = True) -> None:
         """Wait all RS buckets and launch the resulting HSDP all-reduces."""
         self._wait_reduce_scatter_buckets()
+        self._sum_source_replica_gradients()
         # Step1: get fianal reduce_scatter output
         if not self.requires_all_reduce:
             # if set_requires_all_reduce is False, accmu grad into reduce_partial_ouptut.
@@ -942,11 +963,8 @@ class AllReduceParamGroup:
 
     Numerical-correctness constraints (each is load-bearing, do not "simplify"):
 
-    - The all-reduce always uses SUM, never AVG. The buffer is padded for
-      alignment, and averaging would divide by a world size that the zero
-      padding does not participate in.
-    - AVG is therefore reconstructed manually in ``wait_and_split_grads`` by
-      dividing by ``replicate_world_size`` after the collective.
+    - The all-reduce uses SUM. For AVG, ``wait_and_split_grads`` divides the
+      fused buffer by ``replicate_world_size`` before exposing parameter views.
     - The buffer is zero-initialized so the padding regions contribute nothing
       to the SUM.
 
@@ -1034,7 +1052,7 @@ class AllReduceParamGroup:
             hsdp_param.reduce_partial_output = None
 
     def issue_async_allreduce(self) -> None:
-        """Launch SUM all-reduce; AVG division is applied when splitting."""
+        """Launch SUM all-reduce and leave AVG scaling to the wait path."""
         if self.fused_buffer is None:
             raise RuntimeError("Fused buffer not allocated.")
         self.all_reduce_handle = dist.all_reduce(
@@ -1045,13 +1063,18 @@ class AllReduceParamGroup:
         )
 
     def wait_and_split_grads(self) -> None:
-        """Wait all-reduce and expose per-parameter context views."""
+        """Wait all-reduce, apply AVG scaling if needed, and expose parameter views."""
         if self.all_reduce_handle is not None:
             self.all_reduce_handle.wait()
             self.all_reduce_handle = None
+        if self.fused_buffer is not None and self.reduce_op == dist.ReduceOp.AVG and self.replicate_world_size > 1:
+            self.fused_buffer.div_(self.replicate_world_size)
         for index, hsdp_param in enumerate(self.hsdp_params):
             reduced_grad = self.get_param_grad_view(index, hsdp_param.sharded_size)
-            if self.reduce_op == dist.ReduceOp.AVG and self.replicate_world_size > 1:
-                reduced_grad.div_(self.replicate_world_size)
-            hsdp_param.all_reduce_comm_ctx.all_reduce_output = reduced_grad
+            context = hsdp_param.all_reduce_comm_ctx
+            if context.all_reduce_output is None:
+                context.all_reduce_output = reduced_grad
+            else:
+                # Deferred finalization can deliver several results for one parameter.
+                context.all_reduce_output.add_(reduced_grad)
         self.fused_buffer = None

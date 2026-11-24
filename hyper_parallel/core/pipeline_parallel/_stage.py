@@ -64,10 +64,108 @@ class PipelineStageBase:
         self.stage_num = stage_num
         self.fwd_outputs_cache = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
-        self._trainable_params = None
+        self._pp_autograd_params = None
+        self._pending_autograd_params = []
         self._dw_cache = {}
         self._reentrant_frames = {}
-        self._has_sharded_params = any(isinstance(module, HSDPModule) for module in submodule.modules())
+        # Discover the units before first forward, when their shards can still be on meta.
+        self.all_hsdp_schedulers = list(dict.fromkeys(
+            module.hsdp_scheduler for module in submodule.modules()
+            if isinstance(module, HSDPModule) and module.hsdp_scheduler is not None
+        ))
+        if self.all_hsdp_schedulers:
+            if not isinstance(submodule, HSDPModule) or submodule.hsdp_scheduler is None:
+                raise ValueError("A pipeline stage containing HSDP units must have an HSDPModule root")
+            if not has_backward:
+                raise ValueError("HSDP pipeline stages require backward execution")
+            scheduler = submodule.hsdp_scheduler
+            root = scheduler.scheduler_ctx.root_module
+            if scheduler.cell is not submodule or (root is not None and root is not submodule):
+                raise ValueError("An HSDP parameter-management unit must belong to exactly one pipeline stage")
+        self.fsdp_comm_controller = None
+        self._after_forward_chunk = None
+        self.retain_backward_graph = False
+
+    def _configure_fsdp_forward(self) -> None:
+        """Apply user residency settings while protecting graphs awaiting dw."""
+        if self.fsdp_comm_controller is None:
+            return
+        for scheduler in self.all_hsdp_schedulers:
+            reshard_after_forward = (
+                self.fsdp_comm_controller.user_settings[scheduler]["reshard_after_forward"]
+                and not self.fsdp_comm_controller.dx_microbatches[self.stage_index]
+            )
+            if self.fsdp_comm_controller.current_settings[scheduler]["reshard_after_forward"] != reshard_after_forward:
+                scheduler.set_reshard_after_forward(reshard_after_forward)
+                self.fsdp_comm_controller.current_settings[scheduler]["reshard_after_forward"] = reshard_after_forward
+
+    def _configure_fsdp_backward(self, micro_index: int) -> None:
+        """Configure a gradient-producing backward without consuming old communication."""
+        if self.fsdp_comm_controller is None:
+            return
+        if micro_index not in range(self.fsdp_comm_controller.micro_batch_num):
+            raise ValueError(f"Invalid backward microbatch {micro_index}")
+        if micro_index in self.fsdp_comm_controller.completed_microbatches[self.stage_index]:
+            raise RuntimeError(f"Stage {self.stage_index} already completed backward for microbatch {micro_index}")
+        is_last_backward = (
+            len(self.fsdp_comm_controller.completed_microbatches[self.stage_index])
+            == self.fsdp_comm_controller.micro_batch_num - 1
+        )
+        for scheduler in self.all_hsdp_schedulers:
+            requires_gradient_sync = (
+                is_last_backward
+                or self.fsdp_comm_controller.user_settings[scheduler]["requires_gradient_sync"]
+            )
+            reshard_after_backward = (
+                self.fsdp_comm_controller.user_settings[scheduler]["reshard_after_backward"]
+                and not (self.fsdp_comm_controller.dx_microbatches[self.stage_index] - {micro_index})
+                and scheduler not in self.fsdp_comm_controller.retained_backward_units
+            )
+            settings = self.fsdp_comm_controller.current_settings[scheduler]
+            if settings["requires_gradient_sync"] != requires_gradient_sync:
+                scheduler.set_requires_grad_sync(requires_gradient_sync)
+                settings["requires_gradient_sync"] = requires_gradient_sync
+            if settings["requires_all_reduce"] != is_last_backward:
+                scheduler.set_requires_all_reduce(is_last_backward)
+                settings["requires_all_reduce"] = is_last_backward
+            if settings["reshard_after_backward"] != reshard_after_backward:
+                scheduler.set_reshard_after_backward(reshard_after_backward)
+                settings["reshard_after_backward"] = reshard_after_backward
+
+    def _configure_fsdp_input_backward(self, micro_index: int) -> None:
+        """Protect split-backward graphs and disable every gradient communication action."""
+        if self.fsdp_comm_controller is None:
+            return
+        if micro_index not in range(self.fsdp_comm_controller.micro_batch_num):
+            raise ValueError(f"Invalid input-backward microbatch {micro_index}")
+        if (
+            micro_index in self.fsdp_comm_controller.dx_microbatches[self.stage_index]
+            or micro_index in self.fsdp_comm_controller.completed_microbatches[self.stage_index]
+        ):
+            raise RuntimeError(f"Stage {self.stage_index} already started backward for microbatch {micro_index}")
+        self.fsdp_comm_controller.dx_microbatches[self.stage_index].add(micro_index)
+        for scheduler in self.all_hsdp_schedulers:
+            settings = self.fsdp_comm_controller.current_settings[scheduler]
+            if settings["requires_gradient_sync"]:
+                scheduler.set_requires_grad_sync(False)
+                settings["requires_gradient_sync"] = False
+            if settings["requires_all_reduce"]:
+                scheduler.set_requires_all_reduce(False)
+                settings["requires_all_reduce"] = False
+            if settings["reshard_after_backward"]:
+                scheduler.set_reshard_after_backward(False)
+                settings["reshard_after_backward"] = False
+
+    def _finish_backward(self, micro_index: int) -> None:
+        """Finish deferred launches after this stage's full backward returns."""
+        if self.fsdp_comm_controller is None:
+            return
+        self.fsdp_comm_controller.finish_backward(self.stage_index, micro_index)
+
+    def check_weight_backward_complete(self) -> None:
+        """Require all split-backward graphs to be consumed at the end of a run."""
+        if self._dw_cache:
+            raise RuntimeError(f"Stage {self.stage_index} has unconsumed weight-backward graphs")
 
     def clear_cache(self) -> None:
         """clear cache."""
@@ -108,6 +206,7 @@ class PipelineStageBase:
     def forward_one_chunk(self, micro_index: int, args: Optional[tuple] = None,
                           kwargs: Optional[dict] = None) -> Any:
         """Execution a forward function."""
+        self._configure_fsdp_forward()
         if self.is_first_stage:
             composite_args = args
         else:
@@ -116,16 +215,29 @@ class PipelineStageBase:
             else:
                 raise RuntimeError(f"The exec order is wrong. The corresponding forward calculation \
                                     is executed before the Receive operation. micro is {micro_index}.")
-        composite_kwargs = kwargs or {}
+        out = self._forward_with_checkpoint(micro_index, composite_args, kwargs or {})
+        if self.all_hsdp_schedulers:
+            self._capture_full_parameters()
+        out_tuple = out if isinstance(out, tuple) else (out,)
+        self.fwd_cache[micro_index] = out_tuple
+        self.fwd_outputs_cache[micro_index] = out_tuple
+        if self.is_last_stage:
+            self.last_stage_outputs = out
+        if self._after_forward_chunk is not None:
+            self._after_forward_chunk(self.stage_index, micro_index)
+        return out
+
+    def _forward_with_checkpoint(self, micro_index: int, args, kwargs: dict) -> Any:
+        """Collect checkpoint frames created during the microbatch's forward."""
         # The scope also catches direct checkpoint() calls inside forward, not
         # only checkpoint wrappers registered as children of the stage module.
-        if self._has_sharded_params:
+        if self.all_hsdp_schedulers:
             scope = recompute_handle_collector_ctx()
         else:
-            scope = reentrant_checkpoint_scope(self._get_trainable_params)
+            scope = reentrant_checkpoint_scope(self._get_pp_autograd_params)
         with scope as frames:
             try:
-                out = self.submodule(*composite_args, **composite_kwargs)
+                out = self.submodule(*args, **kwargs)
             except BaseException:
                 for frame in frames:
                     if isinstance(frame, ReentrantCheckpointHandle):
@@ -134,11 +246,6 @@ class PipelineStageBase:
         reentrant_frames = tuple(frame for frame in frames if isinstance(frame, ReentrantCheckpointHandle))
         if reentrant_frames:
             self._reentrant_frames[micro_index] = reentrant_frames
-        out_tuple = out if isinstance(out, tuple) else (out,)
-        self.fwd_cache[micro_index] = out_tuple
-        self.fwd_outputs_cache[micro_index] = out_tuple
-        if self.is_last_stage:
-            self.last_stage_outputs = out
         return out
 
     @staticmethod
@@ -173,12 +280,38 @@ class PipelineStageBase:
                        if recv_info.requires_grad]
         self.bwd_cache[micro_index] = input_grads
 
-    def _get_trainable_params(self):
-        """Return the stable parameter tuple used to partition dx and dw."""
-        if self._trainable_params is None:
-            self._trainable_params = tuple({id(param): param for param in self.submodule.parameters()
-                                            if param.requires_grad}.values())
-        return self._trainable_params
+    def _capture_full_parameters(self) -> None:
+        """Record the parameter objects installed by HSDP forward hooks."""
+        if self._pp_autograd_params is None:
+            hsdp_params = [
+                param for scheduler in self.all_hsdp_schedulers for param in scheduler.hsdp_state.hsdp_params
+            ]
+            managed = {param.sharded_param for param in hsdp_params}
+            managed.update(getattr(param, "unsharded_param", None) for param in hsdp_params)
+            self._pp_autograd_params = tuple(
+                param for param in self.submodule.parameters() if param.requires_grad and param not in managed
+            )
+            self._pending_autograd_params = [param for param in hsdp_params if param.sharded_param.requires_grad]
+
+        if self._pending_autograd_params:
+            pending = []
+            full_parameters = []
+            for param in self._pending_autograd_params:
+                full_param = getattr(param, "unsharded_param", None)
+                if full_param is None:
+                    pending.append(param)
+                else:
+                    full_parameters.append(full_param)
+            self._pp_autograd_params += tuple(full_parameters)
+            self._pending_autograd_params = pending
+
+    def _get_pp_autograd_params(self) -> tuple[torch.nn.Parameter, ...]:
+        """Return the parameter leaves used by the stage's split backward."""
+        if self._pp_autograd_params is None and not self.all_hsdp_schedulers:
+            self._pp_autograd_params = tuple(dict.fromkeys(
+                param for param in self.submodule.parameters() if param.requires_grad
+            ))
+        return self._pp_autograd_params or ()
 
     def _release_reentrant(self, micro_index):
         """Discard per-microbatch replay graphs even after a failed backward."""
@@ -195,25 +328,24 @@ class PipelineStageBase:
     def _reentrant_backward(self, micro_index, phase):
         """Use public autograd targets while keeping the original output graph for dw."""
         outputs, grad_tensors = self._dw_cache[micro_index]
-        if getattr(self, "retain_backward_graph", False):
+        if self.retain_backward_graph:
             raise ValueError("Reentrant PP does not support retain_backward_graph: frames cannot be replayed "
                              "after the first backward. Disable reentrant checkpointing for this stage.")
         if phase == "full":
-            if not self._has_sharded_params:
+            if not self.all_hsdp_schedulers:
                 self._bind_reentrant(micro_index, "dw")
             torch.autograd.backward(outputs, grad_tensors=grad_tensors)
             return
         inputs = []
         if phase != "dw":
             inputs = [info.buffer for info in self.args_recv_info[micro_index] if info.requires_grad]
-        if self._has_sharded_params:
-            raise ValueError("Reentrant PP split with FSDP/HSDP is unsupported: parameter identity "
-                             "changes across forward and backward.")
+        if self.all_hsdp_schedulers:
+            raise ValueError("Reentrant PP split with FSDP/HSDP is unsupported")
         self._bind_reentrant(micro_index, phase)
         if phase == "dw":
             # The zero-element trigger traverses closure-only checkpoint nodes
             # without adding fake edges to real parameters (which fire hooks on None).
-            roots = [*self._get_trainable_params(), *(
+            roots = [*self._get_pp_autograd_params(), *(
                 frame.backward_trigger for frame in self._reentrant_frames[micro_index]
             )]
             inputs = list({id(root): root for root in roots}.values())
@@ -232,6 +364,7 @@ class PipelineStageBase:
         """
         if not self._has_backward:
             return
+        self._configure_fsdp_backward(micro_index)
         recv_args = []
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
@@ -244,8 +377,11 @@ class PipelineStageBase:
         if not local_output:
             # Nothing to backprop through (e.g. all forward outputs detached).
             self._release_reentrant(micro_index)
+            if not self.is_first_stage:
+                self._populate_bwd_cache(micro_index)
             self._clear_recv_buffer(self.grad_recv_info, micro_index)
             self._clear_recv_buffer(self.args_recv_info, micro_index)
+            self._finish_backward(micro_index)
             return
 
         grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
@@ -253,6 +389,7 @@ class PipelineStageBase:
             try:
                 self._dw_cache[micro_index] = (local_output, grad_tensors)
                 self._reentrant_backward(micro_index, "full")
+                self._finish_backward(micro_index)
                 if not self.is_first_stage:
                     self._populate_bwd_cache(micro_index)
             finally:
@@ -262,9 +399,9 @@ class PipelineStageBase:
             return
         # MPipe owner-backward shares the tower's all-gather node across micro
         # graphs, so freeing it on the first backward breaks the later ones.
-        retain_graph = getattr(self, "retain_backward_graph", False)
         torch.autograd.backward(local_output, grad_tensors=grad_tensors,
-                                retain_graph=retain_graph)
+                                retain_graph=self.retain_backward_graph)
+        self._finish_backward(micro_index)
 
         if not self.is_first_stage:
             self._populate_bwd_cache(micro_index)
@@ -274,6 +411,16 @@ class PipelineStageBase:
     def backward_input_one_chunk(self, micro_index: int) -> None:
         """Compute input gradients and retain only the graph state needed by dw."""
         if not self._has_backward or self.is_first_stage:
+            return
+
+        self._configure_fsdp_input_backward(micro_index)
+        input_values = [
+            recv_info.buffer for recv_info in self.args_recv_info[micro_index] if recv_info.requires_grad
+        ]
+        if not input_values:
+            # Preserve the original graph; dw will execute one full backward.
+            self._dw_cache[micro_index] = None
+            self.bwd_cache[micro_index] = []
             return
 
         recv_args = []
@@ -299,17 +446,11 @@ class PipelineStageBase:
                 self._clear_recv_buffer(self.args_recv_info, micro_index)
                 raise
             return
-        input_values = [
-            recv_info.buffer
-            for recv_info in self.args_recv_info[micro_index]
-            if recv_info.requires_grad
-        ]
-
         _, param_groups = stage_backward_input(
             local_output,
             list(grad_tensors),
             input_values,
-            iter(self._get_trainable_params()),
+            iter(self._get_pp_autograd_params()),
         )
         self._dw_cache[micro_index] = param_groups
         self._populate_bwd_cache(micro_index)
@@ -323,6 +464,14 @@ class PipelineStageBase:
             return
         if micro_index not in self._dw_cache:
             raise RuntimeError(f"stage: {self.stage_index} micro_{micro_index} dw called before dx.")
+        if self._dw_cache[micro_index] is None:
+            self._dw_cache.pop(micro_index)
+            self.backward_one_chunk(micro_index)
+            if self.fsdp_comm_controller is not None:
+                self.fsdp_comm_controller.dx_microbatches[self.stage_index].remove(micro_index)
+            return
+
+        self._configure_fsdp_backward(micro_index)
 
         if micro_index in self._reentrant_frames:
             try:
@@ -335,8 +484,12 @@ class PipelineStageBase:
                     self.fwd_outputs_cache.pop(micro_index, None)
             return
 
-        param_groups = self._dw_cache.pop(micro_index)
-        stage_backward_weight(iter(self._get_trainable_params()), param_groups)
+        stage_backward_weight(iter(self._get_pp_autograd_params()), self._dw_cache[micro_index])
+        if self.fsdp_comm_controller is not None:
+            self.fsdp_comm_controller.reduce_dw_gradients(self.stage_index)
+            self.fsdp_comm_controller.dx_microbatches[self.stage_index].remove(micro_index)
+            self.fsdp_comm_controller.completed_microbatches[self.stage_index].add(micro_index)
+        self._dw_cache.pop(micro_index)
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
         if self.is_last_stage:
