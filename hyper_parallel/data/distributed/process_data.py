@@ -40,8 +40,8 @@ import torch
 import torch.distributed as dist
 from torch.utils._import_utils import import_dill
 
-from hyper_parallel.distributed_data.balance_logging import logger as balance_logger
-from hyper_parallel.distributed_data.transport import DataGroups, DataPlaneTransport
+from hyper_parallel.data.distributed.balance_logging import logger as balance_logger
+from hyper_parallel.data.distributed.transport import DataGroups, DataPlaneTransport
 
 _SOURCE_PICKLE = import_dill() or pickle
 _REPLY_TIMEOUT = 300

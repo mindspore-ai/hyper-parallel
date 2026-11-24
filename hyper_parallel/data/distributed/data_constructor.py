@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from hyper_parallel.distributed_data.schema import PackingBinPlan, SampleKey
+from hyper_parallel.data.distributed.schema import PackingBinPlan, SampleKey
 
 
 def default_pack_fn(samples: Sequence[Any], seq_len: int) -> tuple[Any, ...]:

@@ -17,7 +17,7 @@
 from collections.abc import Mapping
 from typing import Any
 
-from hyper_parallel.distributed_data.schema import SampleMetadata, WorkloadCost
+from hyper_parallel.data.distributed.schema import SampleMetadata, WorkloadCost
 
 
 def vlm_sample_metadata(sample: Mapping[str, Any]) -> SampleMetadata:

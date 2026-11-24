@@ -27,9 +27,9 @@ from typing import Any, Iterator, Mapping, Sequence
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.distributed_data.model_batch import ModelBatchLayout
-from hyper_parallel.distributed_data.schema import SampleKey
-from hyper_parallel.distributed_data.topology import DataTopology
+from hyper_parallel.data.distributed.model_batch import ModelBatchLayout
+from hyper_parallel.data.distributed.schema import SampleKey
+from hyper_parallel.data.distributed.topology import DataTopology
 
 
 @dataclass

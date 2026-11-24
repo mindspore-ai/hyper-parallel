@@ -22,8 +22,8 @@ from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Any
 
-from hyper_parallel.distributed_data.schema import DistributedPackingPlan, SampleKey, SampleMetadata, WorkloadCost
-from hyper_parallel.distributed_data.transport import DataPlaneTransport, PayloadExchangeWork
+from hyper_parallel.data.distributed.schema import DistributedPackingPlan, SampleKey, SampleMetadata, WorkloadCost
+from hyper_parallel.data.distributed.transport import DataPlaneTransport, PayloadExchangeWork
 
 
 @dataclass(frozen=True)

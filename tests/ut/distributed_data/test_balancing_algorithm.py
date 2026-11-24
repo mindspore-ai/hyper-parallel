@@ -19,14 +19,14 @@ import unittest
 from collections import Counter
 from unittest.mock import patch
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     CausalAttentionCostModel, FeasibleLPTBalancingAlgorithm, LPTBalancingAlgorithm,
 )
-from hyper_parallel.distributed_data.balancing_algorithm import (
+from hyper_parallel.data.distributed.balancing_algorithm import (
     _AssignmentBin, _WindowLPT, resolve_balancing_algorithm,
 )
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from hyper_parallel.distributed_data.schema import PackingConstraints, SampleKey, SampleMetadata, WorkloadCost
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.schema import PackingConstraints, SampleKey, SampleMetadata, WorkloadCost
 
 
 def _full_pair(scale: int = 1) -> tuple:

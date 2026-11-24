@@ -23,8 +23,8 @@ from typing import Any
 
 import torch.distributed as dist
 
-from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.distributed_data.transport import (
+from hyper_parallel.data.distributed.topology import DataTopology
+from hyper_parallel.data.distributed.transport import (
     DataGroups, _create_data_plane_process_groups, all_gather_control_object,
 )
 

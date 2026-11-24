@@ -20,7 +20,7 @@ from unittest.mock import Mock
 import numpy as np
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,

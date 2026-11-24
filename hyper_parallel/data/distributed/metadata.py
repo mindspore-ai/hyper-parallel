@@ -23,8 +23,8 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from hyper_parallel.distributed_data.schema import SampleKey
-from hyper_parallel.distributed_data.dataset_reader import (
+from hyper_parallel.data.distributed.schema import SampleKey
+from hyper_parallel.data.distributed.dataset_reader import (
     _build_worker_options,
     _identity,
 )

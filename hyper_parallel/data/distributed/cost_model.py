@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from hyper_parallel.distributed_data.schema import SampleMetadata, WorkloadCost
+from hyper_parallel.data.distributed.schema import SampleMetadata, WorkloadCost
 
 
 class CostModel(Protocol):

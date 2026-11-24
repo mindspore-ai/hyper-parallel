@@ -20,6 +20,7 @@ templates), ``online`` (mapping/iterable raw sources), ``indexed``
 (``.idx``/``.bin`` datasets and the native helpers), ``batching``
 (collators, dataloaders, get-batch),
 ``parallel`` (DP samplers and CP/TP batch distribution),
+``distributed`` (distributed sample planning, balancing, and loading),
 ``omni`` (image/video/audio data with its own facade), and
 ``tools`` (offline preparation). Shared constants live in
 ``data.constants``; dataset logging in ``data.dataset_logging``.

@@ -23,8 +23,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from hyper_parallel.data.parallel.batch_sampler import sampler_optimizer_step_progress
-from hyper_parallel.distributed_data.schema import SampleKey, SampleMetadata
-from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
+from hyper_parallel.data.distributed.schema import SampleKey, SampleMetadata
+from hyper_parallel.data.distributed.metadata import PlannedSampleLoader
 
 
 def validate_native_sampler(sampler: Any, *, data_rank: int, dp_size: int, local_batch_size: int) -> None:

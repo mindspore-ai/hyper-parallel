@@ -21,21 +21,21 @@ from contextlib import ExitStack, suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from hyper_parallel.distributed_data.balance_logging import log_balance_stats
-from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm, resolve_balancing_algorithm
-from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model
-from hyper_parallel.distributed_data.device_prefetch import (
+from hyper_parallel.data.distributed.balance_logging import log_balance_stats
+from hyper_parallel.data.distributed.balancing_algorithm import BalancingAlgorithm, resolve_balancing_algorithm
+from hyper_parallel.data.distributed.cost_model import CostModel, resolve_cost_model
+from hyper_parallel.data.distributed.device_prefetch import (
     DeviceStepPrefetcher, _create_device_prefetcher, _resolve_device,
 )
-from hyper_parallel.distributed_data.external_source import ExternalStepProducer, LocalBatch
-from hyper_parallel.distributed_data.locality import _create_locality_groups
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from hyper_parallel.distributed_data.process_data import DataRequest, create_data_worker
-from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
-from hyper_parallel.distributed_data.transport import DataGroups, DataPlaneTransport
+from hyper_parallel.data.distributed.external_source import ExternalStepProducer, LocalBatch
+from hyper_parallel.data.distributed.locality import _create_locality_groups
+from hyper_parallel.data.distributed.planner import DynamicPackingPlanner
+from hyper_parallel.data.distributed.process_data import DataRequest, create_data_worker
+from hyper_parallel.data.distributed.schema import PackingConstraints, SampleMetadata
+from hyper_parallel.data.distributed.transport import DataGroups, DataPlaneTransport
 
 if TYPE_CHECKING:
-    from hyper_parallel.distributed_data.api import DistributedDatasetConfig
+    from hyper_parallel.data.distributed.api import DistributedDatasetConfig
 
 
 class LocalBalancingDataLoader(Iterator[Any]):

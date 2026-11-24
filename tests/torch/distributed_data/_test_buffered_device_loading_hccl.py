@@ -25,7 +25,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.utils.data import DataLoader
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     CausalAttentionCostModel, DistributedDatasetConfig, SampleMetadata, TensorFieldSpec, WorkloadCost,
     build_distributed_dataloader,
 )

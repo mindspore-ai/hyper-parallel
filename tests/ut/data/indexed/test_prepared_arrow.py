@@ -47,7 +47,7 @@ from hyper_parallel.data.parallel import DataLoaderParallelContext
 from hyper_parallel.data.text.build_dataset import build_indexed_text_dataset
 from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
 from hyper_parallel.data.tools.io import IndexedDatasetBuilder
-from hyper_parallel.distributed_data import WorkloadCost
+from hyper_parallel.data.distributed import WorkloadCost
 from hyper_parallel.trainer.config.resolver import resolve_config
 
 

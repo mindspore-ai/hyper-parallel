@@ -23,14 +23,14 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     CausalAttentionCostModel,
     DistributedDatasetConfig,
     SampleMetadata,
     WorkloadCost,
     build_distributed_dataloader,
 )
-from hyper_parallel.distributed_data.transport import DataPlaneTransport
+from hyper_parallel.data.distributed.transport import DataPlaneTransport
 from tests.common.mark_utils import arg_mark
 
 
@@ -101,7 +101,7 @@ class TestExternalStepSource(unittest.TestCase):
         Expectation: Only delivery advances the source, on the caller.
         """
         source = _Source()
-        with patch("hyper_parallel.distributed_data.packed_balancing.create_data_worker") as spawn, closing(
+        with patch("hyper_parallel.data.distributed.packed_balancing.create_data_worker") as spawn, closing(
                 _build(source, use_data_process=False),
         ) as loader:
             loader.prefetch_plan()
@@ -121,7 +121,7 @@ class TestExternalStepSource(unittest.TestCase):
         """
         for depth in (0, 2):
             with self.subTest(depth=depth), patch(
-                    "hyper_parallel.distributed_data.packed_balancing._create_locality_groups",
+                    "hyper_parallel.data.distributed.packed_balancing._create_locality_groups",
             ) as groups, self.assertRaisesRegex(ValueError, "device_prefetch_depth requires a native batch_sampler"):
                 _build(_Source(), device_prefetch_depth=depth)
             groups.assert_not_called()
@@ -153,7 +153,7 @@ class TestExternalStepSource(unittest.TestCase):
         source = _Source()
         loader = _build(source)
         try:
-            with self.assertNoLogs("hyper_parallel.distributed_data.balance_logging", level="INFO"):
+            with self.assertNoLogs("hyper_parallel.data.distributed.balance_logging", level="INFO"):
                 expected = list(loader)
             self.assertEqual(expected, [[({"id": 0, "tokens": 4},)], [({"id": 1, "tokens": 5},)]])
             loader.set_epoch(1)
@@ -239,9 +239,9 @@ class TestExternalStepCallbacks(unittest.TestCase):
                     )
 
                 with patch.object(torch, "cuda", accelerator), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=pin,
+                        "hyper_parallel.data.distributed.device_prefetch._pin_memory", side_effect=pin,
                 ), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=move,
+                        "hyper_parallel.data.distributed.device_prefetch._move_to_device", side_effect=move,
                 ), closing(build_distributed_dataloader(
                         None, _Mesh(), DistributedDatasetConfig(
                             seq_len=8, local_batch_size=2, communication_backend="gloo",
@@ -310,7 +310,7 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 pack_fn=_pack, collate_fn=list,
                 cost_model=lambda metadata: WorkloadCost(llm=metadata.cost.llm * 10),
         )) as loader:
-            with self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+            with self.assertLogs("hyper_parallel.data.distributed.balance_logging", level="INFO") as logs:
                 batch = next(loader)
             self.assertEqual(batch[0]["input_ids"].tolist(), [0, 1, 1, 2])
             stats = dict(loader.last_balance_stats)
@@ -336,7 +336,7 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 metadata_fn=lambda sample: sample["metadata"], pack_fn=_pack, collate_fn=list,
                 cost_model=CausalAttentionCostModel(),
         )) as loader:
-            with self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+            with self.assertLogs("hyper_parallel.data.distributed.balance_logging", level="INFO") as logs:
                 next(loader)
             stats = loader.last_balance_stats
             for layout in ("before", "after"):
