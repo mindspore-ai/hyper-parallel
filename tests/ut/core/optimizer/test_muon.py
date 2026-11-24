@@ -284,6 +284,42 @@ def test_muon_pad_ns_inputs_uses_fallback_only_without_real_inputs() -> None:
     torch.testing.assert_close(inputs[1], torch.zeros_like(reference))
 
 
+def test_muon_gather_reuses_owner_slot_with_column_shards() -> None:
+    """Feature: Reusable pipeline storage for owner NS inputs.
+
+    Description: Gather column shards with padding and unpack only the owner's matrix into reusable storage.
+    Expectation: Reused storage contains the next gather and never aliases the raw gather buffer.
+    """
+    layout = ParamLayoutSpec(tensor_ndim=2, shard_axes=((0, 1),), replicate_mesh_dims=())
+    group = MagicMock()
+    local = torch.arange(6, dtype=torch.bfloat16).view(3, 2)
+    gather_buffers, owner_buffers = {}, {}
+
+    def gather(output, packed, *, group):  # pylint: disable=unused-argument
+        """Return a copy of the local shard for each rank."""
+        output.copy_(packed.repeat(2))
+
+    with patch("hyper_parallel.core.optimizer.muon_shard.dist") as dist:
+        dist.get_world_size.return_value = 2
+        dist.all_gather_into_tensor.side_effect = gather
+        first, skipped = fused_allgather_dtensor_params(
+            [local, local], [group], layout,
+            buffer_cache=gather_buffers, keep_indices={0}, owner_buffer_cache=owner_buffers,
+        )
+        torch.testing.assert_close(first, local.repeat(1, 2), rtol=0, atol=0)
+        assert skipped is None, f"Unowned input should be empty, got {skipped}"
+        second, = fused_allgather_dtensor_params(
+            [local + 1], [group], layout,
+            buffer_cache=gather_buffers, keep_indices={0}, owner_buffer_cache=owner_buffers,
+        )
+
+    torch.testing.assert_close(second, (local + 1).repeat(1, 2), rtol=0, atol=0)
+    assert first.data_ptr() == second.data_ptr(), f"Owner buffer was replaced: {first.data_ptr()}, {second.data_ptr()}"
+    assert all(tmp.data_ptr() != second.data_ptr() for tmp in gather_buffers.values()), (
+        f"Owner buffer {second.data_ptr()} aliases a raw gather buffer"
+    )
+
+
 @pytest.mark.parametrize("mode", ["legacy", "vanilla"])
 @pytest.mark.parametrize("nesterov", [False, True])
 @pytest.mark.parametrize("momentum", [0.0, 0.95, (0.7, 0.9)])

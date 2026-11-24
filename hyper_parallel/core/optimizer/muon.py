@@ -18,7 +18,7 @@
 import math
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from itertools import chain, groupby
 import logging
@@ -40,6 +40,7 @@ from hyper_parallel.core.optimizer.muon_shard import (
     build_param_shard_metadata_for_group,
     chunk_update_by_layout,
     fused_allgather_dtensor_params,
+    get_or_alloc_buffer,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,11 +107,19 @@ _LocalBatches = Deque[List[torch.nn.Parameter]]
 
 
 @dataclass
-class _BroadcastShardBatch:
-    """Retain cross-stream tensors until the broadcast and apply have finished."""
+class _ShardPipelineBuffers:
+    """Scratch storage owned by the communication stream for one pipeline run."""
 
-    gathered: _GatheredShardBatch
-    updates: Dict[torch.nn.Parameter, torch.Tensor]
+    gather: Dict = field(default_factory=dict)
+    owner_slots: Tuple[Dict, Dict] = field(default_factory=lambda: ({}, {}))
+    broadcast: Dict = field(default_factory=dict)
+
+
+@dataclass
+class _BroadcastShardBatch:
+    """Broadcast outputs waiting to be consumed by the apply stream."""
+
+    batch: _ShardBatch
     packed: _PackedShardUpdates
     works: List[dist.Work]
 
@@ -566,13 +575,16 @@ class Muon(BaseDistributedOptimizer):
             for batch_idx, params in enumerate(batches):
                 yield _ShardBatch(group_idx, assignment, params, batch_idx == len(batches) - 1)
 
-    def _prepare_shard_batch(self, batch: _ShardBatch, backend: Any, stream: Any) -> _GatheredShardBatch:
+    def _prepare_shard_batch(
+            self, batch: _ShardBatch, backend: Any, stream: Any, buffers: _ShardPipelineBuffers, slot: int,
+    ) -> _GatheredShardBatch:
         """Produce this batch's momentum and gathered inputs on the communication stream."""
         with backend.stream(stream), torch.profiler.record_function("muon.pipeline.gather"):
             ns_inputs = self._update_muon_momentum(self.param_groups[batch.group_idx], batch.params)
             gathered, coords = self._gather_shard_inputs(
                 batch.params, ns_inputs, batch.assignment, self._shard_compute_coord[batch.group_idx],
-                buffer_cache=None, fallback_dtype=torch.bfloat16,
+                buffer_cache=buffers.gather, fallback_dtype=torch.bfloat16,
+                owner_buffer_cache=buffers.owner_slots[slot],
             )
             ready = backend.Event()
             ready.record(stream)
@@ -598,10 +610,33 @@ class Muon(BaseDistributedOptimizer):
         comm_stream, apply_stream = self._shard_pipeline_streams[device]
         comm_stream.wait_stream(compute_stream)
         apply_stream.wait_stream(compute_stream)
-        current = self._prepare_shard_batch(first, backend, comm_stream)
+        buffers = _ShardPipelineBuffers()
+        try:
+            apply_done = self._run_shard_pipeline(
+                chain((first, second), batches), backend, compute_stream, comm_stream, apply_stream,
+                broadcaster, local_batches, device, buffers,
+            )
+        except Exception:
+            # The caller still owns the scratch storage while queued work drains.
+            backend.synchronize(device)
+            raise
+        compute_stream.wait_event(apply_done)
+        # The allocator can reuse these communication-stream buffers as soon as this run returns.
+        comm_stream.wait_event(apply_done)
+
+    def _run_shard_pipeline(
+            self, batches: Iterator[_ShardBatch], backend: Any, compute_stream: Any, comm_stream: Any,
+            apply_stream: Any, broadcaster: AsyncReplicateBroadcaster,
+            local_batches: Dict[_LocalQueueKey, _LocalBatches],
+            device: torch.device, buffers: _ShardPipelineBuffers,
+    ) -> Any:
+        """Enqueue the stages while keeping the collective order identical across ranks."""
+        first = next(batches)
+        current = self._prepare_shard_batch(first, backend, comm_stream, buffers, 0)
         self._run_local_batch(first.group_idx, local_batches.get((first.group_idx, device)))
         previous = None
-        for following in chain((second,), batches, (None,)):
+        apply_done = None
+        for index, following in enumerate(chain(batches, (None,))):
             with torch.profiler.record_function("muon.pipeline.ns"):
                 compute_stream.wait_event(current.ready)
                 batch = current.batch
@@ -612,44 +647,53 @@ class Muon(BaseDistributedOptimizer):
                 ns_done.record(compute_stream)
 
             if previous is not None:
-                local_group = previous.gathered.batch.group_idx
+                local_group = previous.batch.group_idx
                 # The next shard NS is already queued on the compute stream.
                 # Independent local work can cover the rest of the older broadcast.
                 self._run_local_batch(local_group, local_batches.get((local_group, device)))
-                self._retire_shard_batch(previous, backend, apply_stream, broadcaster)
-                previous = None
+                apply_done = self._apply_pipeline_batch(previous, backend, apply_stream, compute_stream, broadcaster)
 
             # Put the next gather ahead of this broadcast on the communication
             # stream so the next NS can run while this broadcast is in flight.
-            prefetched = self._prepare_shard_batch(following, backend, comm_stream) if following else None
+            # At this point the target owner buffer's previous broadcast pack is already queued.
+            prefetched = self._prepare_shard_batch(
+                following, backend, comm_stream, buffers, (index + 1) % 2,
+            ) if following else None
             with backend.stream(comm_stream), torch.profiler.record_function("muon.pipeline.broadcast"):
                 comm_stream.wait_event(ns_done)
+                if apply_done is not None:
+                    comm_stream.wait_event(apply_done)
                 pg = batch.assignment.shard_pgs[0]
-                packed = self._pack_shard_updates(batch.params, updates, current.compute_coords, (dist.get_rank(pg),))
+                packed = self._pack_shard_updates(
+                    batch.params, updates, current.compute_coords, (dist.get_rank(pg),), buffers.broadcast,
+                )
                 works = self._launch_shard_axis_broadcasts(packed, pg, 0, ())
-            previous = _BroadcastShardBatch(current, updates, packed, works)
-            del packed, works
+            previous = _BroadcastShardBatch(batch, packed, works)
             current = prefetched
 
         self._run_local_batch(batch.group_idx, local_batches.get((batch.group_idx, device)))
-        self._retire_shard_batch(previous, backend, apply_stream, broadcaster)
+        return self._apply_pipeline_batch(previous, backend, apply_stream, compute_stream, broadcaster)
 
-    def _retire_shard_batch(
+    def _apply_pipeline_batch(
             self,
             pending: _BroadcastShardBatch,
             backend: Any,
             stream: Any,
+            compute_stream: Any,
             broadcaster: AsyncReplicateBroadcaster,
-    ) -> None:
-        """Bound the memory window while keeping apply independent of the next NS."""
-        batch = pending.gathered.batch
+    ) -> Any:
+        """Make the apply event the release point for the broadcast slot."""
+        batch = pending.batch
         with backend.stream(stream), torch.profiler.record_function("muon.pipeline.apply"):
             for work in pending.works:
                 work.wait()
             self._apply_shard_updates(pending.packed, self.param_groups[batch.group_idx], batch.assignment)
-        stream.synchronize()
-        if batch.last_in_assignment:
+            done = backend.Event()
+            done.record(stream)
+        if batch.last_in_assignment and batch.assignment.is_replicated:
+            compute_stream.wait_event(done)
             broadcaster.flush_group(batch.assignment)
+        return done
 
     def _run_post_update_fn(
             self,
@@ -866,6 +910,7 @@ class Muon(BaseDistributedOptimizer):
             buffer_cache: Optional[Dict],
             fallback_dtype: Optional[torch.dtype] = None,
             overlap_work: Optional[Callable[[], None]] = None,
+            owner_buffer_cache: Optional[Dict] = None,
     ) -> Tuple[Dict[torch.nn.Parameter, torch.Tensor], Dict[torch.nn.Parameter, Tuple[int, ...]]]:
         """Gather a fused buffer and retain only locally assigned NS inputs."""
         shard_sizes, local_coords, shard_pgs, _ = self._get_shard_info(hsdp_assign)
@@ -893,6 +938,7 @@ class Muon(BaseDistributedOptimizer):
             buffer_cache=buffer_cache,
             keep_indices=my_indices,
             while_gathering=overlap_work,
+            owner_buffer_cache=owner_buffer_cache,
         )
         return {p: full_input for p, full_input in zip(params, gathered_list)
                 if full_input is not None}, param_compute_coord
@@ -908,9 +954,7 @@ class Muon(BaseDistributedOptimizer):
         for params in self._group_by_shape(list(gathered_inputs)).values():
             for batch in self._split_into_memory_safe_batches(params, shard_size=shard_size):
                 updates = self._compute_batched_ns_updates(batch, gathered_inputs, group)
-                for param in batch:
-                    my_updates[param] = updates[param].contiguous()
-                del updates
+                my_updates.update(updates)
         return my_updates
 
     def _process_shard_params(
@@ -1341,6 +1385,7 @@ class Muon(BaseDistributedOptimizer):
             my_updates: Dict[torch.nn.Parameter, torch.Tensor],
             param_compute_coord: Dict[torch.nn.Parameter, Tuple[int, ...]],
             local_coords: Tuple[int, ...],
+            buffer_cache: Optional[Dict] = None,
     ) -> _PackedShardUpdates:
         """Pack BF16 updates into one aligned buffer per compute owner."""
         device = to_local_if_dtensor(params[0].data).device
@@ -1349,7 +1394,8 @@ class Muon(BaseDistributedOptimizer):
             coord_groups[param_compute_coord[p]].append(p)
 
         alignment_elements = 256  # 512 bytes in BF16
-        packed: _PackedShardUpdates = {}
+        offsets_by_coord = {}
+        sizes = []
         for coord, coord_params in coord_groups.items():
             param_offsets = []
             total_padded_numel = 0
@@ -1359,10 +1405,22 @@ class Muon(BaseDistributedOptimizer):
                 param_offsets.append((p, total_padded_numel, actual_numel, padded_numel))
                 total_padded_numel += padded_numel
 
-            pack_buffer = torch.empty(total_padded_numel, dtype=torch.bfloat16, device=device)
+            offsets_by_coord[coord] = param_offsets
+            sizes.append(total_padded_numel)
+
+        if buffer_cache is None:
+            buffers = (torch.empty(size, dtype=torch.bfloat16, device=device) for size in sizes)
+        else:
+            total_size = sum(sizes)
+            buffer = get_or_alloc_buffer(buffer_cache, device, total_size, torch.bfloat16, device)
+            buffers = buffer[:total_size].split(sizes)
+
+        packed: _PackedShardUpdates = {}
+        for (coord, param_offsets), pack_buffer in zip(offsets_by_coord.items(), buffers):
             if coord == local_coords:
                 for p, offset, actual_numel, padded_numel in param_offsets:
-                    pack_buffer[offset:offset + actual_numel].copy_(my_updates[p].reshape(-1))
+                    update = my_updates[p]
+                    pack_buffer[offset:offset + actual_numel].view(update.shape).copy_(update)
                     if padded_numel > actual_numel:
                         pack_buffer[offset + actual_numel:offset + padded_numel].zero_()
             packed[coord] = pack_buffer, [(p, offset, count) for p, offset, count, _ in param_offsets]

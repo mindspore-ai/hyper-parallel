@@ -31,7 +31,7 @@ import torch_npu
 import torch.distributed as dist
 from torch import nn
 
-from hyper_parallel import DTensor, Shard, SkipDTensorDispatch, init_device_mesh, distribute_tensor
+from hyper_parallel import DTensor, Replicate, Shard, SkipDTensorDispatch, init_device_mesh, distribute_tensor
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.optimizer import get_hyper_optimizer
@@ -333,21 +333,31 @@ def test_muon_e2e_full_shard_8p():
     _run_sharding_parity_case(_shard_full_8p)
 
 
-def _make_overlap_optimizer(mesh, group_count, overlap):
-    """Create one sharded matrix and one independent local matrix in each group."""
+def _make_overlap_optimizer(mesh, group_count, overlap, replica_count):
+    """Create shard owners and independent local work in each group."""
     model = nn.ParameterList()
+    groups = []
     for index in range(group_count):
         initial = torch.arange(32, device="npu", dtype=torch.float32).view(8, 4) * 0.01 + index
-        model.append(nn.Parameter(distribute_tensor(initial, mesh, (Shard(0),))))
-        model.append(nn.Parameter(initial[:4].clone()))
-    groups = [{"params": [model[index], model[index + 1]]} for index in range(0, len(model), 2)]
-    return model, Muon(groups, lr=_LR, weight_decay=_WEIGHT_DECAY, fsdp_overlap=overlap)
+        placement = (Shard(index % 2),)
+        if replica_count is not None:
+            placement = (Replicate(), *placement)
+        params = [
+            nn.Parameter(distribute_tensor(initial, mesh, placement)),
+            nn.Parameter(distribute_tensor(initial + 0.5, mesh, placement)),
+            nn.Parameter(initial[:4].clone()),
+        ]
+        model.extend(params)
+        groups.append({"params": params})
+    return model, Muon(
+        groups, lr=_LR, weight_decay=_WEIGHT_DECAY, fsdp_overlap=overlap, hsdp_replica_count=replica_count,
+    )
 
 
-def _assert_overlap_trajectory(mesh, group_count):
+def _assert_overlap_trajectory(mesh, group_count, replica_count=None):
     """Compare overlap with serial execution and verify the intended path ran."""
-    reference, serial = _make_overlap_optimizer(mesh, group_count, False)
-    candidate, overlap = _make_overlap_optimizer(mesh, group_count, True)
+    reference, serial = _make_overlap_optimizer(mesh, group_count, False, replica_count)
+    candidate, overlap = _make_overlap_optimizer(mesh, group_count, True, replica_count)
     with patch.object(torch.profiler, "record_function", wraps=torch.profiler.record_function) as scopes:
         for step in range(3):
             gradients = _full_grads(step, reference)
@@ -368,13 +378,25 @@ def _assert_overlap_trajectory(mesh, group_count):
 def test_muon_e2e_fsdp_overlap_2p():
     """Feature: Muon single-axis FSDP communication and computation overlap.
 
-    Description: Compare serial Muon with a single communication batch and a two-batch pipeline on two NPUs.
+    Description: Compare serial Muon with one, two, and four batches on two NPUs, including scratch reuse.
     Expectation: Both schedules run their intended overlap paths and update parameters identically to serial Muon.
     """
     init_dist()
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2,), mesh_dim_names=("dp",))
-    for group_count in (1, 2):
+    for group_count in (1, 2, 4):
         _assert_overlap_trajectory(mesh, group_count)
+
+
+def test_muon_e2e_hsdp_overlap_4p():
+    """Feature: Replica broadcasts consume completed writes from the apply stream.
+
+    Description: Compare four-batch pipelining with serial Muon on a 2 x 2 HSDP mesh.
+    Expectation: Sharded weights and replica copies match the serial path exactly.
+    """
+    init_dist()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("replicate", "shard"))
+    with torch.npu.stream(torch.npu.Stream()):
+        _assert_overlap_trajectory(mesh, 4, replica_count=2)
 
 
 def test_muon_e2e_hybrid_shard_replicate_8p():

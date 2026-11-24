@@ -46,6 +46,14 @@ def test_muon_e2e_fsdp_overlap_2p():
     ])
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_muon_e2e_hsdp_overlap_4p():
+    """Check replica synchronization across the pipeline's apply stream on four NPUs."""
+    parallel_run([
+        TorchCase(_TEST_MUON_E2E, "test_muon_e2e_hsdp_overlap_4p", None, 4),
+    ])
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_muon_e2e_hybrid_shard_replicate_8p():
     """
