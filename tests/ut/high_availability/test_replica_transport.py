@@ -286,14 +286,20 @@ class TestDirectDeviceTransport(unittest.TestCase):
         source = torch.arange(15, dtype=torch.float32).reshape(3, 5).t()
         original = source.clone()
         pointer = source.data_ptr()
-        staged = source.detach().contiguous()
+        staged_sizes = []
         sent = []
-        with patch.object(torch.Tensor, "to", return_value=staged) as move, \
+
+        def stage(block, *, device):
+            self.assertEqual(device, transport.device)
+            staged_sizes.append(block.numel())
+            return block.clone()
+
+        with patch.object(torch.Tensor, "to", stage), \
                 patch("hyper_parallel.high_availability.replica_transport._TRANSFER_CHUNK_BYTES", 16), \
                 patch("hyper_parallel.high_availability.replica_transport.dist.send",
                       side_effect=lambda tensor, **kwargs: sent.append(tensor.clone())) as send:
             transport._send_tensor(source, 1, "repair-group")
-        move.assert_called_once_with(device=transport.device)
+        self.assertEqual(staged_sizes, [4, 4, 4, 3])
         self.assertEqual([tensor.numel() for tensor in sent], [4, 4, 4, 3])
         torch.testing.assert_close(torch.cat(sent), original.contiguous().view(-1))
         self.assertEqual(source.data_ptr(), pointer)

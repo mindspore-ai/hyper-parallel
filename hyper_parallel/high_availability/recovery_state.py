@@ -26,6 +26,7 @@ from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.swap_optimizer_base import SwapOptimizer
 from hyper_parallel.high_availability.validation import validate_recovery_state_providers
+from hyper_parallel.models.external_state import get_model_external_state
 
 
 def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -60,6 +61,7 @@ class ModelOptimizerState:
     def __init__(self, model: torch.nn.Module, optimizer: Any) -> None:
         """Bind persistent local parameters and every supported optimizer leaf."""
         self.model = model
+        self.external_state = get_model_external_state(model)
         self.parameters = dict(model.named_parameters())
         self.buffers = dict(model.named_buffers())
         self.extra_modules = {name: module for name, module in model.named_modules()
@@ -71,8 +73,11 @@ class ModelOptimizerState:
         self._swap_leaves = {index: leaf for index, leaf in enumerate(self.leaves) if isinstance(leaf, SwapOptimizer)}
         self.leaves = [self._swap_leaves[index].optimizer if index in self._swap_leaves else leaf
                        for index, leaf in enumerate(self.leaves)]
-        if not self.leaves or any(not isinstance(leaf, (AdamW, Muon)) for leaf in self.leaves):
-            raise ValueError("process recovery supports HyperParallel AdamW and Muon leaves only")
+        sparse = self.external_state.sparse_optimizer if self.external_state is not None else None
+        if not self.leaves or any(not isinstance(leaf, (AdamW, Muon))
+                                  and not (leaf is sparse and isinstance(leaf, torch.optim.SparseAdam))
+                                  for leaf in self.leaves):
+            raise ValueError("process recovery supports HyperParallel AdamW/Muon and Host Engram SparseAdam only")
         self.names = {}
         for name, parameter in self.parameters.items():
             self.names[id(parameter)] = name
@@ -155,6 +160,8 @@ class ModelOptimizerState:
         items += [("optimizer_swap", tuple((index, swap.config.packed_swap, swap.config.min_numel,
                                               swap.config.state_keys) for index, swap in self._swap_leaves.items()))]
         items += [("extra_modules", tuple(self.extra_modules))]
+        if self.external_state is not None:
+            items += [("external_state", self.external_state.recovery_schema())]
         return hashlib.sha256(repr(items).encode()).hexdigest()
 
     def _optimizer_state(self, index: int, parameter: torch.nn.Parameter) -> Mapping[str, Any]:

@@ -522,6 +522,9 @@ def _materialize_and_load_model(
     if is_recovery_bootstrapping():
         # Peers are parked in MindIO. Only allocate persistent local shards;
         # repair installs their values before the first model collective.
+        external = get_model_external_state(model)
+        if external is not None:
+            external.materialize_for_recovery()
         return model
     if not is_meta_device:
         return model

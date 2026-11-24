@@ -167,18 +167,33 @@ class ReplicaTransport:
         self._wait(dist.barrier(group=self.group, async_op=True))
 
     def _send_tensor(self, tensor: torch.Tensor, destination: int, group: Any = None) -> None:
-        flat = tensor.detach().to(device=self.device).contiguous().view(-1)
+        """Send live storage with at most one CPU-to-device staging block."""
+        flat = tensor.detach().contiguous().view(-1)
         chunk = max(1, _TRANSFER_CHUNK_BYTES // tensor.element_size())
         for start in range(0, flat.numel(), chunk):
-            dist.send(flat[start:start + chunk], dst=destination, group=group)
+            # Host tables can exceed device memory; stage only the current block.
+            dist.send(
+                flat[start:start + chunk].to(device=self.device),
+                dst=destination,
+                group=group,
+            )
 
     @torch.no_grad()
     def _receive_tensor(self, tensor: torch.Tensor, source: int, group: Any = None) -> None:
-        flat = torch.empty(tensor.numel(), dtype=tensor.dtype, device=self.device)
+        """Receive bounded device blocks and write them into the original destination storage."""
+        target = tensor if tensor.is_contiguous() else torch.empty_like(tensor, memory_format=torch.contiguous_format)
+        flat = target.view(-1)
         chunk = max(1, _TRANSFER_CHUNK_BYTES // tensor.element_size())
+        staging = (torch.empty(min(chunk, flat.numel()), dtype=tensor.dtype, device=self.device)
+                   if tensor.device != self.device else None)
         for start in range(0, flat.numel(), chunk):
-            dist.recv(flat[start:start + chunk], src=source, group=group)
-        tensor.copy_(flat.view(tensor.shape))
+            destination = flat[start:start + chunk]
+            block = destination if staging is None else staging[:destination.numel()]
+            dist.recv(block, src=source, group=group)
+            if staging is not None:
+                destination.copy_(block)
+        if target is not tensor:
+            tensor.copy_(target)
 
     def send(self, destination: int, step: int, group: Any = None) -> None:
         """Send metadata, then the donor's current device tensors, never a stored weight copy.
