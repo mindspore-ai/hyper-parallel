@@ -303,8 +303,10 @@ class Muon(BaseDistributedOptimizer):
             post_update_fn: Optional callback applied after a parameter update.
             fsdp_overlap: Overlap computation and communication on a single
                 CUDA or NPU shard axis. Independent local batches can fill
-                additional communication windows. Set consistently on all ranks. Custom
-                momentum and post-update callbacks use the serial schedule.
+                additional communication windows. Set consistently on all ranks.
+                Reshape and NS transform callbacks may run in a different order
+                across parameters. Custom momentum and post-update callbacks
+                use the serial schedule.
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
@@ -444,9 +446,7 @@ class Muon(BaseDistributedOptimizer):
         """Submit shard and independent local batches in one schedule."""
         assignments: Iterable[_AssignmentEntry] = self._step_assignments()
         local_batches: Dict[_LocalQueueKey, _LocalBatches] = {}
-        if self.fsdp_overlap and all(callback is None for callback in (
-                self.momentum_update_fn, self.post_update_fn, self.reshape_fn, self.ns_transform_fn,
-        )):
+        if self.fsdp_overlap and self.momentum_update_fn is None and self.post_update_fn is None:
             assignments, local_batches = self._plan_overlap_batches(assignments)
         self._process_no_comm_params(local_batches)
 

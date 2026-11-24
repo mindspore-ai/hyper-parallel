@@ -23,7 +23,7 @@ computed in the same worker.
 """
 # pylint: disable=W0611,C0413,C0412,W0613,W0612
 import os
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -333,7 +333,7 @@ def test_muon_e2e_full_shard_8p():
     _run_sharding_parity_case(_shard_full_8p)
 
 
-def _make_overlap_optimizer(mesh, group_count, overlap, replica_count):
+def _make_overlap_optimizer(mesh, group_count, overlap, replica_count, **callbacks):
     """Create shard owners and independent local work in each group."""
     model = nn.ParameterList()
     groups = []
@@ -347,17 +347,21 @@ def _make_overlap_optimizer(mesh, group_count, overlap, replica_count):
             nn.Parameter(distribute_tensor(initial + 0.5, mesh, placement)),
             nn.Parameter(initial[:4].clone()),
         ]
+        params[-1].model_name = f"local.{index}"
+        for param in params[:-1]:
+            param.model_name = None
         model.extend(params)
         groups.append({"params": params})
     return model, Muon(
         groups, lr=_LR, weight_decay=_WEIGHT_DECAY, fsdp_overlap=overlap, hsdp_replica_count=replica_count,
+        **callbacks,
     )
 
 
-def _assert_overlap_trajectory(mesh, group_count, replica_count=None):
+def _assert_overlap_trajectory(mesh, group_count, replica_count=None, **callbacks):
     """Compare overlap with serial execution and verify the intended path ran."""
-    reference, serial = _make_overlap_optimizer(mesh, group_count, False, replica_count)
-    candidate, overlap = _make_overlap_optimizer(mesh, group_count, True, replica_count)
+    reference, serial = _make_overlap_optimizer(mesh, group_count, False, replica_count, **callbacks)
+    candidate, overlap = _make_overlap_optimizer(mesh, group_count, True, replica_count, **callbacks)
     with patch.object(torch.profiler, "record_function", wraps=torch.profiler.record_function) as scopes:
         for step in range(3):
             gradients = _full_grads(step, reference)
@@ -369,6 +373,13 @@ def _assert_overlap_trajectory(mesh, group_count, replica_count=None):
                     torch.testing.assert_close(actual.to_local(), expected.to_local(), rtol=0, atol=0)
                 else:
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                if callbacks:
+                    expected_momentum = serial.state[expected]["momentum_buffer"]
+                    actual_momentum = overlap.state[actual]["momentum_buffer"]
+                    if isinstance(expected_momentum, DTensor):
+                        expected_momentum = expected_momentum.to_local()
+                        actual_momentum = actual_momentum.to_local()
+                    torch.testing.assert_close(actual_momentum, expected_momentum, rtol=0, atol=0)
     stages = {invocation.args[0] for invocation in scopes.call_args_list}
     assert "muon.pipeline.local_ns" in stages, f"local NS missing with {group_count} groups: {stages}"
     used_pipeline = "muon.pipeline.gather" in stages
@@ -385,6 +396,27 @@ def test_muon_e2e_fsdp_overlap_2p():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2,), mesh_dim_names=("dp",))
     for group_count in (1, 2, 4):
         _assert_overlap_trajectory(mesh, group_count)
+
+    def split_local_matrix(_name, tensor):
+        """Treat each half of the local matrix as an independent NS input."""
+        return list(tensor.chunk(2, dim=0))
+
+    def restore_local_matrix(updates, output):
+        """Join the updates of the two logical matrices."""
+        output.copy_(torch.cat(updates, dim=0))
+
+    reshape = Mock(wraps=split_local_matrix)
+    restore = Mock(wraps=restore_local_matrix)
+
+    def transform(_name, tensor):
+        """Exercise restoration from separately allocated NS inputs."""
+        return NSInputTransform(tensors=[part.clone() for part in tensor.chunk(2, dim=0)], restore=restore)
+
+    _assert_overlap_trajectory(mesh, 2, reshape_fn=reshape)
+    _assert_overlap_trajectory(mesh, 2, ns_transform_fn=transform)
+    expected_calls = 2 * 2 * 3  # Local matrices in both schedules across three steps.
+    assert reshape.call_count == expected_calls, f"Expected {expected_calls} reshape calls, got {reshape.call_count}"
+    assert restore.call_count == expected_calls, f"Expected {expected_calls} restore calls, got {restore.call_count}"
 
 
 def test_muon_e2e_hsdp_overlap_4p():
