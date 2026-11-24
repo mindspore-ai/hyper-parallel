@@ -18,14 +18,16 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+    _configure_router_statistics,
     deepseek_v41_ep_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
@@ -260,6 +262,29 @@ class TestModalityRouterBalance(unittest.TestCase):
         for rate in (-1, float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "router_bias_update_rate"):
                 make_router(rate)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_bias_statistics_use_dp_axes_from_tp_submesh_root(self) -> None:
+        """Feature: MoE expert-bias synchronization.
+
+        Description: Configure the router from a TP-only compute-region mesh.
+        Expectation: Bias uses root DP plus TP, and the auxiliary loss uses TP.
+        """
+        dp = Mock()
+        dp.size.return_value = 4
+        dp.get_group.return_value = "dp-group"
+        tp = Mock(spec=DeviceMesh)
+        tp.size.return_value = 2
+        tp.get_group.return_value = "tp-group"
+        tp.root_mesh = MagicMock()
+        tp.root_mesh.mesh_dim_names = ("dp", "cp", "tp")
+        tp.root_mesh.__getitem__.side_effect = {"dp": dp}.__getitem__
+        gate = SimpleNamespace()
+
+        sequence_groups = _configure_router_statistics(gate, tp, tp, None)
+
+        self.assertEqual(sequence_groups, ("tp-group",))
+        self.assertEqual(gate.expert_bias_update_groups, ("dp-group", "tp-group"))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_tp_ep_metadata_alignment_and_bias_statistics_domain(self) -> None:
