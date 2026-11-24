@@ -40,6 +40,7 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.pipeline import partition_model
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
@@ -802,6 +803,10 @@ def apply_model_infrastructure(
         _apply_parameter_freezing(model, freeze_config)
 
     _apply_model_method_replacements(model, distributed_setup, low_precision_config)
+
+    pipeline_config = getattr(distributed_setup, "pipeline_config", None)
+    if pipeline_config is not None and not graph_mode_requested:
+        partition_model(model, mesh, pipeline_config, distributed_setup.pipeline_chunk_index)
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(

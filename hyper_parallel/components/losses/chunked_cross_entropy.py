@@ -278,6 +278,24 @@ class ChunkedCausalLMLoss(nn.Module):
         mesh = getattr(distributed_setup, "mesh_context", None)
         return int(getattr(mesh, name, 1))
 
+    def _validate_parallel_topology(self, distributed_setup: Any, *, has_pipeline_partition: bool) -> None:
+        """Require locally available targets and an owned terminal head for chunked loss."""
+        if not self.labels_are_shifted and self._parallel_size(distributed_setup, "cp_size") > 1:
+            raise NotImplementedError(
+                "Raw-label chunked loss requires CP1; shift global labels before CP partitioning instead"
+            )
+        tp_size = self._parallel_size(distributed_setup, "tp_size")
+        pp_size = self._parallel_size(distributed_setup, "pp_size")
+        loss_parallel = bool(
+            getattr(getattr(distributed_setup, "mesh_context", None), "loss_parallel", False)
+        )
+        if tp_size != 1 or (pp_size != 1 and not has_pipeline_partition) or loss_parallel:
+            raise NotImplementedError(
+                "ChunkedCausalLMLoss requires tp_size=1, pp_size=1 or a model-owned pipeline partition, "
+                f"and loss_parallel=false; got tp_size={tp_size}, "
+                f"pp_size={pp_size}, loss_parallel={loss_parallel}"
+            )
+
     def bind_model(self, model: nn.Module, distributed_setup: Any = None) -> None:
         """Bind the registered model-family Chunk Loss forward adapter.
 
@@ -301,21 +319,10 @@ class ChunkedCausalLMLoss(nn.Module):
                 f"ignore_index={IGNORE_INDEX}, got {self.ignore_index}"
             )
 
-        if not self.labels_are_shifted and self._parallel_size(distributed_setup, "cp_size") > 1:
-            raise NotImplementedError(
-                "Raw-label chunked loss requires CP1; shift global labels before CP partitioning instead"
-            )
-        tp_size = self._parallel_size(distributed_setup, "tp_size")
-        pp_size = self._parallel_size(distributed_setup, "pp_size")
-        loss_parallel = bool(
-            getattr(getattr(distributed_setup, "mesh_context", None), "loss_parallel", False)
-        )
-        if tp_size != 1 or pp_size != 1 or loss_parallel:
-            raise NotImplementedError(
-                "ChunkedCausalLMLoss currently requires tp_size=1, pp_size=1, "
-                f"and loss_parallel=false; got tp_size={tp_size}, "
-                f"pp_size={pp_size}, loss_parallel={loss_parallel}"
-            )
+        partition = getattr(model, "_hp_pipeline_partition", None)
+        self._validate_parallel_topology(distributed_setup, has_pipeline_partition=partition is not None)
+        if partition is not None and not partition.is_last:
+            return
 
         if getattr(model, "supports_chunked_loss", False):
             head = getattr(model, "lm_head", None)

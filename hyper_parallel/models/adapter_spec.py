@@ -153,6 +153,7 @@ class ModelAdapterSpec:
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
+    pipeline_parallel: Optional[Callable[..., Any]] = None
     checkpoint_export: Optional[Callable[..., tuple[dict[str, Any], bool]]] = None
     codegen: Optional[Callable[..., Any]] = None
     sharding: Optional[Callable[..., Any]] = None

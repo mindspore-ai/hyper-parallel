@@ -173,6 +173,7 @@ class VLMTrainer:
             device=self.base.device,
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
+            **({"mpipe": True} if config.pipeline.schedule == "mpipe" else {}),
         )
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
@@ -291,20 +292,29 @@ class VLMTrainer:
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step in range(num_micro_steps):
-            self.base.model_reshard(micro_step, num_micro_steps)
-            self.base.configure_fsdp_gradient_sync(
-                micro_step,
-                num_micro_steps,
-            )
-            self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            loss, loss_dict = self.forward_backward_step(
-                data_iterator,
-            )
+        if getattr(self.base.model, "_hp_pipeline_partition", None) is not None:
+            # Full MPipe transpose distributes microbatches round-robin within the PP group.
+            def _read_microbatch(index: int) -> tuple[dict, dict]:
+                return self.base.get_batch(data_iterator, mpipe_owner=index % self.base.mesh.pp_size)
 
-            total_loss += loss.item()
-            for loss_name, loss_value in loss_dict.items():
-                total_loss_dict[loss_name] += loss_value.item()
+            # map propagates loader exhaustion to _train_epoch when the final step is incomplete.
+            batches = map(_read_microbatch, range(num_micro_steps))
+            total_loss, total_loss_dict = self.base.pipeline_forward_backward(batches, num_micro_steps)
+        else:
+            for micro_step in range(num_micro_steps):
+                self.base.model_reshard(micro_step, num_micro_steps)
+                self.base.configure_fsdp_gradient_sync(
+                    micro_step,
+                    num_micro_steps,
+                )
+                self.base.begin_fsdp_runtime_diagnostics(micro_step)
+                loss, loss_dict = self.forward_backward_step(
+                    data_iterator,
+                )
+
+                total_loss += loss.item()
+                for loss_name, loss_value in loss_dict.items():
+                    total_loss_dict[loss_name] += loss_value.item()
 
         total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
         self.base.step_optimizers_and_schedulers()

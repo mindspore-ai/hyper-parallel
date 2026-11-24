@@ -320,3 +320,88 @@ plan_overrides:
 融合直接继承源 experts 的 `swiglu_limit`：gate 只裁剪上界，up 裁剪正负两侧；
 路由权重仍由外层在第二次 GMM 后应用一次。设置 `fused: false` 可回到现有非融合
 MXFP8 路径。融合使用算子内部的激活计算精度，FP8 结果与非融合路径不保证逐位一致。
+
+## 纯文本 Trainer 的流水线并行
+
+在使用原生专家的 eager 文本训练配置中，下面的设置把 40 层 DS4.1 切到两个 PP rank。
+第一个 stage 持有词嵌入和第 0–21 层，第二个持有第 22–39 层、末尾归一化和 LM head。
+层号从 0 开始。省略 `split_points` 时，各 stage 按层数均分。
+
+```yaml
+accelerator:
+  pp_size: 2
+pipeline:
+  schedule: 1f1b
+  split_points: [22]
+```
+
+同一 DP 副本的各 stage 使用相同的确定性样本顺序。应使用 `TextParallelBatch` 和可重复读取的数据源，
+让两端取得对应的 token、位置、packed 文档边界和监督标签。每步的 microbatch 数来自
+`global_batch_size / (micro_batch_size × dp_size)`。调度可选 `1f1b`、`gpipe` 或 `interleaved_1f1b`。
+
+跨段传输包括残差、mHC 混合状态以及后续层仍会读取的 CSA2 KV、Indexer key、Top-K 和候选块。
+Engram 与所属层放在同一 stage。使用 Host Engram 时，该 stage 的 CPU owner 保存表权重和 SparseAdam 状态。
+按第 22 层切分时两张表都在首段，改为 `split_points: [10]` 则两个 stage 各持有一张表。
+尾段计算 token 加权损失，所有 stage 使用全局梯度范数裁剪。
+模型参数沿用原始层号，可从同一个 HF checkpoint 加载。
+
+上述文本调度要求未绑定的输入输出权重，并关闭 DSpark。含视觉塔的训练使用下文的 MPipe 配置。
+本页生产配方的 Packed MegaMoe 要求 PP1。使用 PP 时选择原生 ModalityMoE，
+由 module family 提供分片声明，移除旧配方中针对这些原生模块的手写布局覆盖。
+文本配置使用上述 TextParallelBatch。
+
+### 交错 1F1B
+
+同一物理 rank 可按轮转顺序执行多个虚拟 stage。下面的配置将 40 层分成四段。
+rank 0 执行 L0–9、L20–29，rank 1 执行 L10–19、L30–39。一个 microbatch 按
+rank 0 → rank 1 → rank 0 → rank 1 依次经过四段。每个 rank 给本地各段复用同一 microbatch。
+
+```yaml
+accelerator:
+  pp_size: 2
+pipeline:
+  schedule: interleaved_1f1b
+  virtual_stages_per_rank: 2
+  split_points: [10, 20, 30]
+```
+
+交错调度默认每个 rank 两段。省略 `split_points` 时按全部虚拟 stage 均分层；
+手工切分时填写 `pp_size × virtual_stages_per_rank − 1` 个全局层号。
+改变虚拟段数不会改变数据并行度或每个优化器步的有效 token 数。
+训练中保存和恢复使用 DCP（`checkpoint.save_ckpt: true`）。当前 HF 导出只汇总单个物理 stage 的权重，
+因此 eager PP 配置需使用 `checkpoint.save_hf_weights: false`。
+
+### 图文 VLMTrainer 的 MPipe
+
+在已能单卡训练的 DS4.1 图文配置上保留 ViT、aligner 和 OmniPackingLoader，使用
+`OmniParallelBatch` 与 DS4.1 的 runtime input adapter。下面是两张卡的并行设置。
+使用模型原生专家；从本页的多卡 VLM 配方裁剪时，同时移除 MegaMoe 和 encoder parallel 专用的 ViT attention 替换。
+独立 encoder parallel、TP、CP 和 decoder DP 均关闭，两个 rank 共同训练一个模型副本。
+
+```yaml
+accelerator:
+  pp_size: 2
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  encoder_parallel:
+    enabled: false
+fsdp_config:
+  dp_shard_size: 1
+  edp_shard_size: 1
+pipeline:
+  schedule: mpipe
+  split_points: [10, 22, 30]
+```
+
+每个 PP rank 持有一份 ViT 和 aligner，按 microbatch 序号轮转执行视觉前向。
+每个 rank 的 loader 按相同顺序推进；本轮 owner 广播 decoder 所需的 token、监督标签和图像布局。
+MPipe 将视觉特征交给第一个 decoder stage，在那里按图像位置插入 embedding。
+示例中 rank 0 持有 L0–9、L22–29，rank 1 持有 L10–21、L30–39。
+两个调度都支持每卡三个或更多虚拟 stage。例如设置 `virtual_stages_per_rank: 3` 并移除上述
+`split_points`，调度器会轮转执行六个自动均分的 decoder stage。自定义六段时需填写五个切点。
+
+使用可训练视觉塔时，调度器在每个优化器步开始同步权重；远端 owner 回传视觉特征和重算输入，
+视觉反向和优化器更新集中在第一个 stage。两者均冻结时只回传特征。
+在模型配置中通过 `freeze_config: ["model.vision", "model.aligner"]` 可冻结两者。

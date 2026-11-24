@@ -64,7 +64,8 @@ class ChainedOptimizer:
         self.chained_optimizers = list(optimizers.values())
         self.optimizers_keys = list(optimizers.keys())
         self.model = model
-        self.flatten = flatten  # not flatten adamw, flatten for multi-optimizer
+        # DCP must distinguish parameter-group membership on disjoint pipeline stages.
+        self.flatten = flatten or getattr(model, "_hp_pipeline_partition", None) is not None
         self._is_multi_optimizer = flatten
         self.model_param_by_optimizer_param: Dict[
             torch.nn.Parameter, torch.nn.Parameter

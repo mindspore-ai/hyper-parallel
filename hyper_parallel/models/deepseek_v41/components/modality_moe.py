@@ -188,8 +188,8 @@ class ModalityMoEModule(nn.Module):
 def _validate(*, config: Any, module: nn.Module | None, context: Any, member: Any) -> None:
     """Compose parallel child families only for declared token ownership and supported pipeline scope."""
     del config, module
-    if member.axis_sizes["pp"] > 1:
-        raise NotImplementedError("V4.1 modality MoE currently requires PP=1")
+    if member.axis_sizes["pp"] > 1 and not context.get("eager_pipeline", False):
+        raise NotImplementedError("V4.1 modality MoE requires an eager pipeline partition for PP > 1")
     if member.axis_sizes["tp"] > 1 and (member.axis_sizes["ep"] == 1 or not context.get("sequence_parallel", False)):
         raise ValueError("V4.1 TP requires sequence parallelism and TP-extend-EP with EP>1")
 

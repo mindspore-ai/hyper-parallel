@@ -288,6 +288,13 @@ def _load_expert_parallel():
     return modality_moe
 
 
+def _load_pipeline():
+    """Load the model-owned stage protocol without importing the model eagerly."""
+    from hyper_parallel.models.deepseek_v41.pipeline import get_pipeline_spec  # pylint: disable=C0415
+
+    return get_pipeline_spec()
+
+
 def _load_validation_spec():
     """Return model-owned parity and self-consistency declarations lazily."""
     from hyper_parallel.models.deepseek_v41.validation.model_validation_spec import (  # pylint: disable=C0415
@@ -315,6 +322,7 @@ MODEL_SPEC = ModelAdapterSpec(
     fsdp_wrap_modules=get_fsdp_wrap_modules,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
     fsdp_execution_order=get_fsdp_execution_order,
+    pipeline_parallel=_load_pipeline,
     recompute=build_recompute_policy,
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,

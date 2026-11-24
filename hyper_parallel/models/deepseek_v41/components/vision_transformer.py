@@ -45,6 +45,55 @@ from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.replacement import module_replacement
 
 
+def encode_image_features(vision: nn.Module, aligner: nn.Module, pixel_values: torch.Tensor,
+                          image_patch_offsets: torch.Tensor, image_vit_grid_hw: torch.Tensor,
+                          image_llm_grid_hw: torch.Tensor, image_batch_indices: torch.Tensor,
+                          image_token_starts: torch.Tensor) -> list[tuple[int, int, int, int, torch.Tensor]]:
+    """Encode each image independently and retain its global decoder placement.
+
+    Args:
+        vision: Native ViT.
+        aligner: Projector into decoder hidden width.
+        pixel_values: Concatenated image patches.
+        image_patch_offsets: Patch boundaries for each image.
+        image_vit_grid_hw: ViT grid heights and widths.
+        image_llm_grid_hw: Decoder grid heights and widths.
+        image_batch_indices: Sample index of each image.
+        image_token_starts: First decoder token of each image span.
+    """
+    if vision is None or aligner is None:
+        raise ValueError("received image inputs but V4.1 vision is disabled")
+    image_count = image_vit_grid_hw.shape[0]
+    required_shapes = {
+        "image_patch_offsets": image_patch_offsets.numel() == image_count + 1,
+        "image_llm_grid_hw": image_llm_grid_hw.shape == image_vit_grid_hw.shape,
+        "image_batch_indices": image_batch_indices.numel() == image_count,
+        "image_token_starts": image_token_starts.numel() == image_count,
+    }
+    invalid = [name for name, valid in required_shapes.items() if not valid]
+    if invalid:
+        raise ValueError(f"inconsistent V4.1 image metadata: {', '.join(invalid)}")
+    if pixel_values.ndim != 4:
+        raise ValueError("pixel_values must have shape [total_patches, 3, patch, patch]")
+    image_records = []
+    for image_index in range(image_count):
+        patch_start = int(image_patch_offsets[image_index])
+        patch_end = int(image_patch_offsets[image_index + 1])
+        vit_height, vit_width = (int(value) for value in image_vit_grid_hw[image_index])
+        llm_height, llm_width = (int(value) for value in image_llm_grid_hw[image_index])
+        batch_index = int(image_batch_indices[image_index])
+        token_start = int(image_token_starts[image_index])
+        vision_features = vision(pixel_values[patch_start:patch_end], vit_height, vit_width)
+        image_features = aligner(vision_features, vit_height, vit_width)
+        if image_features.shape[0] != llm_height * llm_width:
+            raise ValueError(
+                f"aligner/image-token count mismatch for image {image_index}: "
+                f"{image_features.shape[0]} versus {llm_height * llm_width}"
+            )
+        image_records.append((batch_index, token_start, llm_height, llm_width, image_features))
+    return image_records
+
+
 def _vision_cos_sin(
         grid_height: int,
         grid_width: int,

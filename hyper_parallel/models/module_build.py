@@ -109,6 +109,7 @@ def build_module_context(
     result["loss_parallel"] = bool(getattr(mesh, "loss_parallel", False))
     result["mesh_dim_names"] = tuple(getattr(getattr(mesh, "device_mesh", None), "mesh_dim_names", ()) or ())
     result["mesh"] = mesh
+    result["eager_pipeline"] = getattr(distributed_setup, "pipeline_config", None) is not None and result["pp"]
     result["model_spec"] = model_spec
     result["module_replacement_requests"] = getattr(distributed_setup, "module_replacement_requests", None)
     result["module_replacements"] = getattr(distributed_setup, "module_replacements", None)

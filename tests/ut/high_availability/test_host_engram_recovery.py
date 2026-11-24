@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import torch
 
+from hyper_parallel.components.modules.engram.host_state import HostEngramState
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.core.optimizer.adamw import AdamW
@@ -30,7 +31,6 @@ from hyper_parallel.high_availability.replica_topology import ReplicaTopology, m
 from hyper_parallel.high_availability.replica_transport import DeviceMetadataBank, ReplicaTransport
 from hyper_parallel.high_availability.validation import validate_recovery_model
 from hyper_parallel.models._transformers.model_builder import _materialize_and_load_model
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
 
 
 def _build_host_model(ep_rank=0, ep_size=1, mesh=None, materialize=True, fp32_main=False):
@@ -43,7 +43,7 @@ def _build_host_model(ep_rank=0, ep_size=1, mesh=None, materialize=True, fp32_ma
     )
     model.embed.weight = torch.nn.Parameter(torch.empty(8 // ep_size, 4, device="meta"))
     model.embed.bind_planned_shard(ep_rank=ep_rank, ep_size=ep_size, ep_group=object())
-    external = DeepseekV41HostState(model, {"embed": model.embed}, mesh)
+    external = HostEngramState(model, {"embed": model.embed}, mesh)
     model._hp_external_state = external
     if materialize:
         external.materialize_for_recovery()

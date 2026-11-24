@@ -224,6 +224,7 @@ class MeshContext:
     ep_rank: int = 0
     sequence_parallel: bool = False
     loss_parallel: bool = False
+    pp_mesh: Any = None
 
     @classmethod
     def from_layout(cls, layout: ParallelLayout) -> "MeshContext":
@@ -321,27 +322,14 @@ class MeshContext:
             )
 
         init_backend = dist.is_initialized()
-        stage_rank_start = 0
-        if init_backend and self.pp_size > 1:
-            stage_rank_start = (dist.get_rank() // dense_world_size) * dense_world_size
-        stage_rank_list = tuple(
-            range(stage_rank_start, stage_rank_start + dense_world_size)
-        )
         device_mesh_kwargs = {
             "device_type": device_type,
             "mesh_shape": (self.dp_size, self.cp_size, self.tp_size),
             "mesh_dim_names": ("dp", "cp", "tp"),
             "init_backend": init_backend,
         }
-        if init_backend:
-            device_mesh_kwargs["rank_list"] = stage_rank_list
-        self.device_mesh = _init_topology_mesh(device_mesh_kwargs)
+        self.device_mesh = self._stage_mesh(device_mesh_kwargs)
 
-        dense_rank_list = (
-            tuple(self.device_mesh.rank_list)
-            if hasattr(self.device_mesh, "rank_list")
-            else None
-        )
         dense_mesh_kwargs = {
             "device_type": device_type,
             "mesh_shape": (
@@ -352,19 +340,23 @@ class MeshContext:
             "mesh_dim_names": ("fsdp_replicate", "fsdp_shard", "tp"),
             "init_backend": init_backend,
         }
-        if init_backend and dense_rank_list is not None:
-            dense_mesh_kwargs["rank_list"] = dense_rank_list
-        self.fsdp_non_moe_mesh = _init_topology_mesh(dense_mesh_kwargs)
+        self.fsdp_non_moe_mesh = self._stage_mesh(dense_mesh_kwargs)
         _validate_dense_tp_rank_layout(self.device_mesh, self.fsdp_non_moe_mesh)
+        self._build_expert_parallel_mesh(device_type, init_backend)
 
-        self._build_expert_parallel_mesh(device_type, init_backend, dense_rank_list)
+    def _stage_mesh(self, kwargs: dict[str, Any]) -> Any:
+        """Create every stage's group in the same order before selecting the local tile."""
+        if not kwargs["init_backend"] or self.pp_size == 1:
+            return _init_topology_mesh(kwargs)
+        names = kwargs["mesh_dim_names"]
+        root = _init_topology_mesh({
+            **kwargs, "mesh_shape": (self.pp_size, *kwargs["mesh_shape"]), "mesh_dim_names": ("pp", *names),
+        })
+        if self.pp_mesh is None:
+            self.pp_mesh = root["pp"]
+        return root[names]
 
-    def _build_expert_parallel_mesh(
-        self,
-        device_type: str,
-        init_backend: bool,
-        dense_rank_list: Optional[Tuple[int, ...]],
-    ) -> None:
+    def _build_expert_parallel_mesh(self, device_type: str, init_backend: bool) -> None:
         """Build the expert-parallel FSDP mesh when expert parallelism is enabled."""
         self.fsdp_moe_mesh = None
         if self.ep_size <= 1:
@@ -398,9 +390,7 @@ class MeshContext:
             "mesh_dim_names": expert_mesh_names,
             "init_backend": init_backend,
         }
-        if init_backend and dense_rank_list is not None:
-            expert_mesh_kwargs["rank_list"] = dense_rank_list
-        self.fsdp_moe_mesh = _init_topology_mesh(expert_mesh_kwargs)
+        self.fsdp_moe_mesh = self._stage_mesh(expert_mesh_kwargs)
 
 
 def _validate_dense_tp_rank_layout(device_mesh: Any, fsdp_non_moe_mesh: Any) -> None:
@@ -439,6 +429,8 @@ class DistributedSetup:
     # construction and sharding consume one resolved policy object.
     low_precision_config: Any = None
     fp32_main_params: bool = False
+    pipeline_config: Any = None
+    pipeline_chunk_index: int = 0
 
     @classmethod
     def from_config(
@@ -454,6 +446,10 @@ class DistributedSetup:
         Returns:
             Setup with common model-build policies populated.
         """
+        pipeline_config = getattr(config, "pipeline", None)
+        compile_config = getattr(config, "compile", None)
+        if compile_config is not None and compile_config.selects_graph_compiler():
+            pipeline_config = None
         return cls(
             mesh_context=mesh_context,
             strategy_config=config.fsdp_config if strategy_enabled else None,
@@ -461,4 +457,5 @@ class DistributedSetup:
                 getattr(config, "training", None), "low_precision", None
             ),
             fp32_main_params=config.optimizer.fp32_main_params,
+            pipeline_config=pipeline_config,
         )

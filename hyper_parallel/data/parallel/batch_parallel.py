@@ -416,30 +416,7 @@ class TPBatchBroadcaster:
             parallel_batch = self._move_mapping_to_device(cp_local_batch)
             return parallel_batch
 
-        is_source = self.parallel_context.tp_rank == source_rank
-        if is_source:
-            parallel_batch = self._move_mapping_to_device(cp_local_batch)
-            metadata = []
-            for name, value in parallel_batch.items():
-                if torch.is_tensor(value):
-                    metadata.append((name, tuple(value.shape), value.dtype, None))
-                else:
-                    metadata.append((name, None, None, value))
-        else:
-            parallel_batch = {}
-            metadata = None
-        object_list = [metadata]
-        dist.broadcast_object_list(
-            object_list, group=self.parallel_context.tp_group, group_src=source_rank, device=self.device
-        )
-        for name, shape, dtype, value in object_list[0]:
-            if shape is None:
-                parallel_batch[name] = value
-                continue
-            if not is_source:
-                parallel_batch[name] = torch.empty(shape, dtype=dtype, device=self.device)
-            dist.broadcast(parallel_batch[name], group=self.parallel_context.tp_group, group_src=source_rank)
-        return parallel_batch
+        return broadcast_batch_mapping(cp_local_batch, self.parallel_context.tp_group, source_rank, self.device)
 
     def _move_mapping_to_device(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Transfer Omni tensors without changing their native dtypes."""
@@ -447,3 +424,40 @@ class TPBatchBroadcaster:
             field: value.to(self.device, non_blocking=True) if torch.is_tensor(value) else value
             for field, value in batch.items()
         }
+
+
+def broadcast_batch_mapping(batch: Mapping[str, Any] | None, group: dist.ProcessGroup,
+                            source_rank: int, device: Any) -> dict[str, Any]:
+    """Broadcast heterogeneous decoder fields from their owner to a process group.
+
+    Args:
+        batch: Mapping at the source rank.
+        group: Consumer process group.
+        source_rank: Source index within the group.
+        device: Target tensor device.
+    """
+    is_source = dist.get_rank(group) == source_rank
+    if is_source:
+        parallel_batch = {name: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+                          for name, value in batch.items()}
+        metadata = []
+        for name, value in parallel_batch.items():
+            if torch.is_tensor(value):
+                metadata.append((name, tuple(value.shape), value.dtype, None))
+            else:
+                metadata.append((name, None, None, value))
+    else:
+        parallel_batch = {}
+        metadata = None
+    object_list = [metadata]
+    dist.broadcast_object_list(
+        object_list, group=group, group_src=source_rank, device=device
+    )
+    for name, shape, dtype, value in object_list[0]:
+        if shape is None:
+            parallel_batch[name] = value
+            continue
+        if not is_source:
+            parallel_batch[name] = torch.empty(shape, dtype=dtype, device=device)
+        dist.broadcast(parallel_batch[name], group=group, group_src=source_rank)
+    return parallel_batch

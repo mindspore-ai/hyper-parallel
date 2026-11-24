@@ -24,6 +24,8 @@ from hyper_parallel.distributed.mesh import LogicalDeviceMesh
 from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
 from hyper_parallel.models.deepseek_v41.components.modality_moe import ModalityMoE
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
+from hyper_parallel.models.pipeline import PipelineConfig
+from tests.common.mark_utils import arg_mark
 
 
 class TestModalityMoE(unittest.TestCase):
@@ -71,6 +73,28 @@ class TestModalityMoE(unittest.TestCase):
             if parameter.requires_grad:
                 self.assertIsNotNone(parameter.grad, name)
                 self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_pipeline_preparation_requires_eager_partition(self) -> None:
+        """Feature: Native modality MoE in eager pipeline stages.
+        Description: Prepare PP2 with and without an eager configuration, then add TP2.
+        Expectation: Only the configured PP2 build with a supported TP layout succeeds.
+        """
+        mesh = SimpleNamespace(pp_size=2)
+        setup = SimpleNamespace(mesh_context=mesh)
+        config = SimpleNamespace(hidden_size=8, intermediate_size=16, num_hidden_layers=2,
+                                 num_local_experts=4, num_experts_per_tok=2, initializer_range=0.02,
+                                 swiglu_limit=1.5, scoring_func="sigmoid", routed_scaling_factor=1.0,
+                                 router_aux_loss_coef=0.0, router_bias_update_rate=0.0, v41_vision_enabled=True)
+        model = torch.nn.Sequential(ModalityMoE(config=config, use_grouped_gemm=False))
+        with self.assertRaisesRegex(NotImplementedError, "eager pipeline partition"):
+            prepare_model_components(model, build_module_context(setup))
+        setup.pipeline_config = PipelineConfig(schedule="interleaved_1f1b")
+        prepare_model_components(model, build_module_context(setup))
+        mesh.tp_size = 2
+        with self.assertRaisesRegex(ValueError, "TP requires sequence parallelism"):
+            other = torch.nn.Sequential(ModalityMoE(config=config, use_grouped_gemm=False))
+            prepare_model_components(other, build_module_context(setup))
 
     def test_parallel_children_own_expert_transport_and_router_statistics(self) -> None:
         """EP preparation retains class-owned sibling protocols without a whole-MoE forward callback."""
