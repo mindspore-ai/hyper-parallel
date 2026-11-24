@@ -27,6 +27,7 @@ from hyper_parallel import DTensor, DeviceMesh, SkipDTensorDispatch, init_device
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy
+from hyper_parallel.integration.torch.dtensor import to_torch_view
 from tests.torch.utils import init_dist
 
 
@@ -89,6 +90,11 @@ def _build_fsdp_model(model: nn.Module) -> nn.Module:
     for hsdp_param in model.hsdp_scheduler.hsdp_state.hsdp_params:
         assert hsdp_param.sharded_param.device.type == "cpu", "Expected CPU-offloaded sharded parameter"
         assert hsdp_param.sharded_param.to_local().device.type == "cpu", "Expected local shard on CPU"
+        checkpoint_local = to_torch_view(hsdp_param.sharded_param).to_local()
+        assert checkpoint_local.device.type == "cpu", "Checkpoint view moved the offloaded shard"
+        assert checkpoint_local.data_ptr() == hsdp_param.sharded_param.to_local().data_ptr(), (
+            "Checkpoint view must share the offloaded parameter storage"
+        )
         assert hsdp_param._sharded_param_data.device.type == "cpu", "Expected communication storage on CPU"
     return model
 
