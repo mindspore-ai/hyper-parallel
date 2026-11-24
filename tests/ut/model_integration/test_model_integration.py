@@ -36,10 +36,10 @@ from hyper_parallel.components.modules.attention.compressed_sparse_attention2.co
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
     CSA2Indexer,
 )
-from hyper_parallel.models.deepseek_v41.adapter.validation import (
+from hyper_parallel.models.deepseek_v41.validation import (
     shared_state_trace as shared_state_trace_module,
 )
-from hyper_parallel.models.deepseek_v41.adapter.validation.shared_state_trace import (
+from hyper_parallel.models.deepseek_v41.validation.shared_state_trace import (
     begin_shared_state_trace,
     finish_shared_state_trace,
 )
@@ -80,7 +80,7 @@ from hyper_parallel.tools.model_integration.integration_validator import (
     validate_state_invariants,
 )
 from hyper_parallel.models.adapter_spec import RecomputePolicy
-from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (
+from hyper_parallel.models.deepseek_v41.validation.model_validation_spec import (
     _run_native_module_parity,
 )
 from hyper_parallel.models.validation_spec import (
@@ -582,7 +582,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 return SimpleNamespace(returncode=7, stdout="", stderr="crashed")
 
             with mock.patch(
-                "hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec.subprocess.run",
+                "hyper_parallel.models.deepseek_v41.validation.model_validation_spec.subprocess.run",
                 side_effect=_failed_process,
             ):
                 report = _run_native_module_parity(context)

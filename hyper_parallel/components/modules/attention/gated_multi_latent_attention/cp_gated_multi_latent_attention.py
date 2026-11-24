@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 # Model-owned gate math and CP scheduling use native Torch.
 import torch
@@ -45,6 +45,20 @@ class CPGatedMLAOutputState:
 
 class CPGatedMultiLatentAttentionModule(CPMultiLatentAttentionModule, GatedMultiLatentAttentionModule):
     """Use shared MLA forward with NoPE/gate math and gated CP stage overrides."""
+
+    def __init__(self, *, module: torch.nn.Module | None = None, config: Any = None,
+                 module_fqn: str = "", context: Any = None,
+                 strategy: str = "expanded_ulysses", overlap: bool = False,
+                 ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
+                 rotary_fn: Callable | None = None, attention_interface: Callable | None = None,
+                 fuse_latent_qkv: bool = True, source_contract: str = "tuple") -> None:
+        """Preserve the source result protocol in addition to ordinary gated MLA CP options."""
+        super().__init__(module=module, config=config, module_fqn=module_fqn, context=context,
+                         strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
+                         rotary_fn=rotary_fn, attention_interface=attention_interface, fuse_latent_qkv=fuse_latent_qkv)
+        if source_contract not in ("tuple", "tensor"):
+            raise ValueError("Gated MLA source_contract must be tuple or tensor")
+        self.source_contract = source_contract
 
     def prepare_output_projection(self) -> None:
         """Install the existing gated output derivative inside its managed Linear."""

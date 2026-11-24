@@ -37,7 +37,12 @@ def validate_mla_family(*, config: Any, module: nn.Module | None, context: Any, 
     config = config if module is None else module.config
     if config is None:
         raise ValueError("MLA requires source configuration")
+    if (member.family.name == "multi_latent_attention"
+            and (getattr(module, "use_output_gate", False) or isinstance(getattr(module, "g_proj", None), nn.Module))):
+        raise ValueError("Output-gated MLA sources require the gated MLA family")
     options = member.arguments
+    if options.get("key_expansion_layout", "bsnd") not in ("bsnd", "bnsd"):
+        raise ValueError("key_expansion_layout must be bsnd or bnsd")
     if not isinstance(options.get("overlap", False), bool):
         raise TypeError("MLA overlap must be boolean")
     if options.get("strategy", "expanded_ulysses") not in ("expanded_ulysses", "latent_kv_head"):
@@ -46,6 +51,8 @@ def validate_mla_family(*, config: Any, module: nn.Module | None, context: Any, 
     if exchange not in ("all_gather", "all_to_all_v"):
         raise ValueError("kv_exchange must be all_gather or all_to_all_v")
     cp, tp = member.axis_sizes["cp"], member.axis_sizes["tp"]
+    if config.q_lora_rank is None and cp > 1 and options.get("overlap", False):
+        raise NotImplementedError("Direct-query MLA CP currently requires overlap=False")
     degree = options.get("ulysses_degree")
     degree = cp if degree is None else degree
     if not isinstance(degree, int) or isinstance(degree, bool) or degree < 1:
@@ -67,16 +74,17 @@ def _validate_mla_topology(config, cp, tp, degree, exchange):
         if tp > 1 and cp != degree:
             raise ValueError("MLA KV AllGather and hybrid CP currently require TP1")
 
+
 def mla_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
     """Own all MLA parameters and declare the actual external token layout."""
     del module_fqn, member
     placements = {axis: Replicate() for axis in context.mesh_dim_names if axis in context.axis_sizes}
     # Every supported parameter has an explicit role. A new/quantized projection
     # must declare its layout instead of silently inheriting Replicate.
-    columns = {f"{name}.{suffix}" for name in ('q_b_proj', 'kv_b_proj', 'g_proj')
+    columns = {f"{name}.{suffix}" for name in ('q_proj', 'q_b_proj', 'kv_b_proj', 'g_proj')
                   for suffix in ("weight", "bias")}
-    replicated = {f"{name}.{suffix}" for name in ('linear_qkv', 'q_a_layernorm', 'kv_a_layernorm')
-                  for suffix in ("weight", "bias")}
+    replicated_modules = ('linear_qkv', 'q_a_proj', 'kv_a_proj_with_mqa', 'q_a_layernorm', 'kv_a_layernorm')
+    replicated = {f"{name}.{suffix}" for name in replicated_modules for suffix in ("weight", "bias")}
     roles = {**dict.fromkeys(columns, Shard(0)), **dict.fromkeys(replicated, Replicate()),
              "o_proj.weight": Shard(1), "o_proj.bias": Replicate()}
     params = {}
@@ -120,14 +128,18 @@ def mla_local_parallel_spec(*, module: nn.Module, member: Any) -> ParallelModule
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     strategy: str = "expanded_ulysses", overlap: bool = False,
-    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather", fuse_latent_qkv: bool = True,
+    use_fused_norm: bool | None = None, use_fused_rotary_pos_emb: bool = True,
+    key_expansion_layout: str = "bsnd", use_nope: bool | None = None,
 ) -> nn.Module:
     """Consume family-only options; the saved request retains them for CP preparation."""
     # Resolve after family registration; concrete members import this module's layout validators.
     implementation = import_module('.multi_latent_attention', __package__).MultiLatentAttentionModule
 
     del module_fqn, context, strategy, overlap, ulysses_degree, kv_exchange
-    return implementation(config=config, module=module)
+    return implementation(config=config, module=module, fuse_latent_qkv=fuse_latent_qkv,
+                          use_fused_norm=use_fused_norm, use_fused_rotary_pos_emb=use_fused_rotary_pos_emb,
+                          key_expansion_layout=key_expansion_layout, use_nope=use_nope)
 
 
 @module_replacement
@@ -135,7 +147,9 @@ def MultiLatentAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Any = None, mesh: Any = None,
     strategy: str = "expanded_ulysses", overlap: bool = False,
-    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather", fuse_latent_qkv: bool = True,
+    use_fused_norm: bool | None = None, use_fused_rotary_pos_emb: bool = True,
+    key_expansion_layout: str = "bsnd", use_nope: bool | None = None,
 ) -> nn.Module:
     """Build the MLA member from dimensions or a supported source module.
 
@@ -145,6 +159,11 @@ def MultiLatentAttention(  # pylint: disable=invalid-name
         module_fqn: Source path supplied by model replacement.
         context: Logical build constraints. Topology selects the local or CP implementation.
         mesh: Optional existing job mesh used by the shared layout planner.
+        fuse_latent_qkv: Pack latent down projections; False preserves independent source NS matrices.
+        use_fused_norm: Explicit public RMSNorm backend for latent Q/KV norms; None retains source children.
+        use_fused_rotary_pos_emb: Use NPU fused RoPE; False preserves source eager rounding.
+        key_expansion_layout: Shared K broadcast axes, selecting the BF16 backward reduction order.
+        use_nope: Disable rotation explicitly; None preserves source or config metadata.
         strategy: Expanded QKV Ulysses or shared latent-KV communication.
         overlap: Enable existing forward and supported backward scheduling.
         ulysses_degree: CP head-parallel factor; the remaining factor partitions queries.
@@ -155,7 +174,10 @@ def MultiLatentAttention(  # pylint: disable=invalid-name
     """
     return build_family(MultiLatentAttention, config=config, module=module,
                         module_fqn=module_fqn, context=context, mesh=mesh,
-                        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange)
+                        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
+                        fuse_latent_qkv=fuse_latent_qkv, use_fused_norm=use_fused_norm,
+                        use_fused_rotary_pos_emb=use_fused_rotary_pos_emb,
+                        key_expansion_layout=key_expansion_layout, use_nope=use_nope)
 
 
 register_module_family(ModuleFamily(

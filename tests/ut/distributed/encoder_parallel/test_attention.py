@@ -25,7 +25,7 @@ from hyper_parallel.distributed.encoder_parallel.attention import (
     current_encoder_attention_context,
 )
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderSegment, EncoderWorkItem
-from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41EncoderParallelAttention
+from hyper_parallel.models.deepseek_v41.components.vision_transformer import DeepseekV41EncoderParallelAttention
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionAttention
 
 
@@ -61,9 +61,9 @@ class TestEncoderAttention(unittest.TestCase):
         actual.sum().backward()
         self.assertTrue(torch.allclose(expected_grad, target.grad))
 
-    @patch("hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.ulysses_seq_to_head",
+    @patch("hyper_parallel.models.deepseek_v41.components.vision_transformer.ulysses_seq_to_head",
            side_effect=lambda tensor, **kwargs: tensor)
-    @patch("hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.ulysses_head_to_seq",
+    @patch("hyper_parallel.models.deepseek_v41.components.vision_transformer.ulysses_head_to_seq",
            side_effect=lambda tensor, **kwargs: tensor)
     def test_segments_do_not_cross_attend(self, unused_head_to_seq, unused_seq_to_head):
         """Feature: segmented Encoder-CP attention.

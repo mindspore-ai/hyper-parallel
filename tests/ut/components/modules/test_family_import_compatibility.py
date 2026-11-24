@@ -20,7 +20,6 @@ import unittest
 import torch
 
 from examples.torch.module_family.config import GateConfig
-
 from hyper_parallel.components.modules.module_family import get_module_family
 from tests.common.mark_utils import arg_mark
 
@@ -36,7 +35,7 @@ class TestFamilyImportCompatibility(unittest.TestCase):
         """
         entries = (
             ("common.rms_norm", ("RMSNorm", "OffsetRMSNorm")),
-            ("swiglu_mlp_family", ("SwiGLUMLP",)),
+            ("common.swiglu_mlp", ("SwiGLUMLP",)),
             ("moe.shared_expert", ("SharedExpert",)),
             ("common.rotary_embedding", ("RotaryEmbedding",)),
             ("common.spatial_merge_projector", ("SpatialMergeProjector",)),
@@ -62,7 +61,7 @@ class TestFamilyImportCompatibility(unittest.TestCase):
         public = importlib.import_module("hyper_parallel.components.modules")
         for name, cls, factory in (
             ("common.rms_norm", "RMSNormModule", "RMSNorm"),
-            ("swiglu_mlp_family", "SwiGLUMLPModule", "SwiGLUMLP"),
+            ("common.swiglu_mlp", "SwiGLUMLPModule", "SwiGLUMLP"),
             ("moe.shared_expert", "SharedExpertModule", "SharedExpert"),
             ("moe.router", "GateModule", "Gate"),
         ):

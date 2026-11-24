@@ -36,10 +36,10 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.distributed import ShardingPlanner, apply_sharding_plan
 from hyper_parallel.distributed.mesh import MeshContext
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import (
     DeepseekV41MegaMoeExperts,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     deepseek_v41_megamoe_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (

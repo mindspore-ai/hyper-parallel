@@ -16,17 +16,17 @@
 
 import unittest
 
-from hyper_parallel.models.deepseek_v41.adapter.data.processor import (
+from hyper_parallel.models.deepseek_v41.dataset_preprocessing.processor import (
     DeepseekV41Processor,
 )
-from hyper_parallel.models.deepseek_v41.adapter.data.transform_fn import (
+from hyper_parallel.models.deepseek_v41.dataset_preprocessing.transform_fn import (
     DeepseekV41PretrainTransform,
     build_deepseek_v41_omni_transform,
 )
-from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import (
     build_parameter_sharding_rules,
 )
-from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (
+from hyper_parallel.models.deepseek_v41.validation.model_validation_spec import (
     get_validation_spec,
 )
 
@@ -35,6 +35,7 @@ class TestDeepseekV41OmniTransform(unittest.TestCase):
     """Validate topology-neutral packed sequence alignment."""
 
     @staticmethod
+
     def _processor() -> DeepseekV41Processor:
         """Build the smallest processor contract needed by the transform."""
         return DeepseekV41Processor(
@@ -47,6 +48,7 @@ class TestDeepseekV41OmniTransform(unittest.TestCase):
             vision_max_n_token=1,
             image_token_id=3,
         )
+
 
     def test_builder_retains_cross_topology_alignment(self) -> None:
         """Keep the configured packing alignment in the resolved transform."""

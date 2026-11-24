@@ -14,32 +14,31 @@
 # ============================================================================
 """Packed linear-attention sample isolation and layout regression tests."""
 
+import unittest
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
-from types import SimpleNamespace
-import unittest
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import (
-    PackedDocumentInfo, PackedSequenceInfo, resolve_packed_sequence,
-)
+from hyper_parallel.components.functional.gated_delta_net import chunk_gated_delta_rule
 from hyper_parallel.components.functional.linear_attention_convolution import (
     packed_causal_conv1d,
 )
-from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import (
-    packed_eager,
-)
 from hyper_parallel.components.modules.attention.kimi_delta_attention import KimiDeltaAttention
-from hyper_parallel.components.functional.gated_delta_net import chunk_gated_delta_rule
+from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import (
+    PackedDocumentInfo,
+    PackedSequenceInfo,
+    packed_eager,
+    resolve_packed_sequence,
+)
+from hyper_parallel.data.batching.packed_sequence_dataset_adapter import PackedSequenceDatasetAdapter
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
-from hyper_parallel.models.qwen3_5.adapter.data.runtime import Qwen35PackedRuntime
-from hyper_parallel.models.kimi_k3.adapter.data.runtime import KimiK3PackedRuntime
-from hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder import qwen3_5_linear_attention_decoder_wrapper
 from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
+from hyper_parallel.distributed.context_parallel.wrappers import packed_linear_decoder_wrapper
 from tests.common.mark_utils import arg_mark
 
 
@@ -245,17 +244,17 @@ class TestLinearAttentionPacked(unittest.TestCase):
         context = RuntimeInputContext((1, 8), {"cp": 1, "tp": 1}, {"cp": 2, "tp": 2},
                                       {"sequence_parallel": True})
         batch = {"cu_seq_lens": torch.tensor([0, 11, 16])}
-        runtime = Qwen35PackedRuntime()
+        runtime = PackedSequenceDatasetAdapter()
         inputs = runtime.build_runtime_inputs(batch=batch, context=context)
-        other = KimiK3PackedRuntime().build_runtime_inputs(batch=batch, context=context)
+        other = PackedSequenceDatasetAdapter().build_runtime_inputs(batch=batch, context=context)
         self.assertEqual(inputs["packed_sequence_info"], other["packed_sequence_info"])
         self.assertEqual(inputs["packed_sequence_info"].local_offsets, (0, 3, 8))
         decoder = Decoder()
         parameters = {name: id(parameter) for name, parameter in decoder.named_parameters()}
-        _commit_forward_rewrite(qwen3_5_linear_attention_decoder_wrapper(decoder, None, None, None, None))
+        _commit_forward_rewrite(packed_linear_decoder_wrapper(decoder, None, None, None, None))
         values = torch.randn(1, 8, 4, requires_grad=True)
         family = SimpleNamespace(resolved=SimpleNamespace(family=SimpleNamespace(name="gated_delta_net")))
-        target = "hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.get_family_build_info"
+        target = "hyper_parallel.distributed.context_parallel.wrappers.get_family_build_info"
         with patch(target, return_value=family):
             decoder(values, **inputs).sum().backward()
         self.assertIs(decoder.linear_attn.seen, inputs["packed_sequence_info"])

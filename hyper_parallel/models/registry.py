@@ -28,14 +28,15 @@ registry. This module is a Models-shared mechanism (adjust doc §7.2):
 
 Importing this module must not import Trainer/Data or any concrete model
 package. Family registrations are discovered automatically by directory
-convention: ``models/<family>/adapter/registration.py`` existing (and
-self-registering on import) is all a new family needs — this module is
-never edited when a family is added. Discovery itself is a filesystem scan
-(no imports); the family's registration module is imported lazily on first
-lookup.
+convention: ``models/<family>/<family>_spec.py`` exports ``MODEL_SPEC``.
+Discovery scans files without importing model packages and lazily imports
+the selected spec on first lookup. The legacy ``adapter/registration.py``
+provider remains a fallback for families whose migration is not complete.
 """
 
+import ast
 import importlib
+import importlib.util
 import logging
 from collections import OrderedDict
 from functools import lru_cache
@@ -178,8 +179,7 @@ def _normalize_family_key(name: str) -> str:
 
 
 def _discover_family_providers() -> Dict[str, str]:
-    """Scan ``models/*/adapter/registration.py`` once (filesystem only — no
-    family code is imported)."""
+    """Discover root model specs once, retaining legacy registration fallback without importing providers."""
     global _DISCOVERED_PROVIDERS  # pylint: disable=global-statement
     if _DISCOVERED_PROVIDERS is None:
         providers = {}
@@ -242,6 +242,8 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
     """
     spec = MODEL_ADAPTER_REGISTRY.get(model_type)
     if spec is None:
+        spec = next((item for item in MODEL_ADAPTER_REGISTRY.values() if item.architecture == model_type), None)
+    if spec is None:
         canonical = _FAMILY_ALIASES.get(_normalize_family_key(model_type))
         if canonical is not None:
             spec = MODEL_ADAPTER_REGISTRY.get(canonical)
@@ -263,6 +265,9 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
                     raise ValueError(f"conflicting canonical MODEL_SPEC for {declared.model_type!r}")
                 register_model_adapter(declared)
             spec = MODEL_ADAPTER_REGISTRY.get(model_type)
+            if spec is None:
+                spec = next((item for item in MODEL_ADAPTER_REGISTRY.values()
+                             if item.architecture == model_type), None)
         if spec is None:
             canonical = _FAMILY_ALIASES.get(key)
             if canonical is not None:
@@ -289,3 +294,54 @@ def resolve_model_adapter(model: Any) -> Optional[ModelAdapterSpec]:
             if spec is not None:
                 return spec
     return None
+
+
+def _declared_legacy_targets(provider: str) -> dict:
+    """Read literal compatibility declarations without importing optional model implementations."""
+    module_spec = importlib.util.find_spec(provider)
+    if module_spec is None or module_spec.loader is None:
+        return {}
+    source = module_spec.loader.get_source(provider)
+    if source is None:
+        return {}
+    aliases = {}
+    for statement in ast.parse(source).body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if isinstance(target, ast.Name) and target.id == "LEGACY_TARGETS":
+            aliases.update(ast.literal_eval(statement.value))
+        elif (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+              and target.value.id == "LEGACY_TARGETS"):
+            aliases[ast.literal_eval(target.slice)] = ast.literal_eval(statement.value)
+    return aliases
+
+
+def resolve_legacy_model_target(target_path: str) -> tuple[str, dict[str, Any]]:
+    """Resolve a retired model YAML target from its owner spec without executing adapters.
+
+    Args:
+        target_path: Dotted target from a configuration file.
+
+    Returns:
+        Canonical callable path and model-declared default arguments. A trailing
+        dot in an alias key denotes a retired module prefix; exact aliases take priority.
+    """
+    if not isinstance(target_path, str) or not target_path.strip():
+        raise ValueError("target_path must be a non-empty dotted path")
+    prefix = __package__ + "."
+    if not target_path.startswith(prefix):
+        return target_path, {}
+    parts = target_path[len(prefix):].split(".")
+    if len(parts) < 3 or parts[1] != "adapter":
+        return target_path, {}
+    provider = _discover_family_providers().get(_normalize_family_key(parts[0]))
+    if provider is None or not provider.endswith("_spec"):
+        return target_path, {}
+    aliases = _declared_legacy_targets(provider)
+    for retired in sorted(aliases, key=len, reverse=True):
+        if target_path == retired or (retired.endswith(".") and target_path.startswith(retired)):
+            canonical, defaults = aliases[retired]
+            suffix = target_path[len(retired):]
+            return canonical + suffix, dict(defaults)
+    return target_path, {}

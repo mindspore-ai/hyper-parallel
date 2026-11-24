@@ -37,12 +37,14 @@ class FeatureExchangeMode(Enum):
     PARENT_VARIABLE_A2A = "parent_variable_a2a"
 
 
-def select_feature_exchange(mesh_context: Any) -> FeatureExchangeMode:
+def select_feature_exchange(mesh_context: Any, *, parent_size: int | None = None) -> FeatureExchangeMode:
     """Choose a uniform exchange algorithm from decoder CP/TP/SP topology.
 
     Args:
         mesh_context: Decoder CP, TP, and sequence-parallel coordinates.
     """
+    if parent_size is not None and parent_size > mesh_context.cp_size * mesh_context.tp_size:
+        return FeatureExchangeMode.PARENT_VARIABLE_A2A
     if mesh_context.cp_size > 1:
         return FeatureExchangeMode.PARENT_VARIABLE_A2A
     if mesh_context.tp_size == 1:
@@ -107,19 +109,30 @@ def _route_variable_a2a(*, mode: FeatureExchangeMode,
                  if destination_rank in destinations[item.item_id]]
         chunk = cat_or_empty([local_by_id[item.item_id] for item in items],
                              anchor=prototype, feature_width=width)
+        # HCCL cannot execute a peer with an entirely empty buffer. The
+        # transport-only zero slot is removed before rebuilding image records.
+        if chunk.shape[0] == 0:
+            chunk = prototype.sum().reshape(1, 1).expand(1, width) * 0.0
         send_chunks.append(chunk)
         input_splits.append(chunk.shape[0])
     packed = cat_or_empty(send_chunks, anchor=prototype, feature_width=width)
     output_splits = []
+    logical_output_splits = []
     received_items = []
     for source_rank in range(group_size):
         items = [item for item in source_records.get(source_rank, ())
                  if local_rank in destinations[item.item_id]]
-        output_splits.append(sum(item.output_rows for item in items))
+        logical_rows = sum(item.output_rows for item in items)
+        logical_output_splits.append(logical_rows)
+        output_splits.append(max(1, logical_rows))
         received_items.extend(items)
     rows = differentiable_all_to_all_single(packed, input_splits=input_splits,
                                             output_splits=output_splits, group=exchange_mesh.get_group())
-    return rows, tuple(received_items)
+    chunks, offset = [], 0
+    for actual_rows, transported_rows in zip(logical_output_splits, output_splits):
+        chunks.append(rows.narrow(0, offset, actual_rows))
+        offset += transported_rows
+    return torch.cat(chunks, dim=0), tuple(received_items)
 
 
 def route_features(*, mode: FeatureExchangeMode, producer_records: Sequence[EncoderFeature],

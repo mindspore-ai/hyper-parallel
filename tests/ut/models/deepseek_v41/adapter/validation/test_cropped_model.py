@@ -27,8 +27,8 @@ from safetensors.torch import save_file
 
 from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper, checkpoint_wrapper
-from hyper_parallel.models.deepseek_v41.adapter.validation import cropped_model
-from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
+from hyper_parallel.models.deepseek_v41.validation import cropped_model
+from hyper_parallel.models.deepseek_v41.validation.cropped_model import (
     build_cropped_deepseek_v41,
     build_deepseek_v41_validation_config,
 )

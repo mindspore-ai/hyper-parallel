@@ -32,8 +32,10 @@ from hyper_parallel.components.modules.attention.compressed_sparse_attention2.in
     shared_compressed_indexer_kl_loss,
 )
 from hyper_parallel.components.modules.moe.moe_utils import update_router_bias
-from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
-    accumulate_router_load, sequence_load_balancing_loss, update_modality_bias,
+from hyper_parallel.models.deepseek_v41.components.modality_router import (
+    accumulate_router_load,
+    sequence_load_balancing_loss,
+    update_modality_bias,
 )
 from tests.common.mark_utils import arg_mark
 

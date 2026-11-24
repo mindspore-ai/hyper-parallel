@@ -139,10 +139,11 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
 
     def __init__(self, *, module: torch.nn.Module | None = None, config: Any = None,
                  module_fqn: str = "", context: Any = None,
-                 fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None) -> None:
+                 fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None,
+                 use_fused_ops: bool = True) -> None:
         """Keep CP scheduling options on the parallel member, outside local GQA math."""
         del module_fqn, context
-        super().__init__(config=config, module=module, fuse_qkv=fuse_qkv)
+        super().__init__(config=config, module=module, fuse_qkv=fuse_qkv, use_fused_ops=use_fused_ops)
         self.overlap = overlap
         self.ulysses_degree = ulysses_degree
 
@@ -304,13 +305,12 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
             key, key_pending = self._transfer_input(key, is_query=False)
             value, value_pending = self._transfer_input(value, is_query=False)
         else:
-            query = self.project_query(hidden_states, positions)
+            query, output_state = self.project_query_state(hidden_states, positions)
             query, query_pending = self._transfer_input(query, is_query=True)
             key = self.project_key(hidden_states, positions)
             key, key_pending = self._transfer_input(key, is_query=False)
             value = self.project_value(hidden_states)
             value, value_pending = self._transfer_input(value, is_query=False)
-            output_state = None
         return CPGQAPreparedInputs(
             query, key, value, query_pending, key_pending, value_pending,
             attention_mask, q_lengths, options, output_state)

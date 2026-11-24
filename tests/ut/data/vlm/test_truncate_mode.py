@@ -51,7 +51,8 @@ def _has_vlm_chain() -> bool:
     install without libhccl).
     """
     try:
-        from transformers import AutoProcessor  # noqa: F401
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from transformers import AutoProcessor  # noqa: F401  # pylint: disable=import-outside-toplevel,unused-import
     except ImportError:
         return False
     return True
@@ -93,7 +94,8 @@ class TestInferSeqlen(unittest.TestCase):
 
     @staticmethod
     def _infer_seqlen():
-        from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import _infer_seqlen
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import _infer_seqlen  # pylint: disable=import-outside-toplevel
 
         return _infer_seqlen
 
@@ -119,14 +121,16 @@ class TestTruncateMode(unittest.TestCase):
 
     @staticmethod
     def _transform(truncate_mode: str = "proportional", **kwargs):
-        from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import KimiVLMChatTransform
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import KimiVLMChatTransform  # pylint: disable=import-outside-toplevel
 
         return KimiVLMChatTransform(processor=object(), max_seq_len=600,
                                     truncate_mode=truncate_mode, **kwargs)
 
     def test_proportional_keeps_the_head_of_the_response(self):
         """Half the sample is supervised: the cut lands inside the response."""
-        from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import _infer_seqlen
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import _infer_seqlen  # pylint: disable=import-outside-toplevel
 
         transform = self._transform("proportional")
         sample = _sample(1000, supervised_from=500)
@@ -208,7 +212,8 @@ class TestTruncateMode(unittest.TestCase):
 
     def test_builder_forwards_the_option(self):
         """The builder passes ``truncate_mode`` through and defaults to proportional."""
-        from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import build_kimi_vlm_data_transform
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import build_kimi_vlm_data_transform  # pylint: disable=import-outside-toplevel
 
         self.assertEqual(
             build_kimi_vlm_data_transform(

@@ -38,6 +38,8 @@ import sys
 import textwrap
 from typing import Any
 
+from hyper_parallel.models.registry import resolve_legacy_model_target
+
 
 @dataclass(frozen=True)
 class ReplacementArgument:
@@ -214,6 +216,7 @@ def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
     """Recover an inner wrapper's emitted helper contract from its source."""
     if not factory_path:
         return None
+    factory_path, _ = resolve_legacy_model_target(factory_path)
     module_name, _, factory_name = factory_path.rpartition(".")
     if not module_name or not factory_name:
         return None
@@ -243,7 +246,7 @@ def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
     return InnerWrapperTarget(
         helper_module=module_name,
         helper_name=helper_name,
-        state_attr=_cp_mesh_companion_attr(tree),
+        state_attr=_cp_mesh_companion_attr(request_owner) if request_owner is not None else None,
     )
 
 

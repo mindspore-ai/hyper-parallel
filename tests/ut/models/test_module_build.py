@@ -599,8 +599,8 @@ class TestModuleBuild(unittest.TestCase):
     )
     def test_direct_boundaries_are_excluded_and_conflicting_ownership_fails(self):
         """Feature: A model may contain direct families and untouched source modules.
-        Description: Default globs skip direct boundaries and explicit duplicate ownership is rejected.
-        Expectation: Only the remaining source converts; parent or native-like repeated takeover fails early.
+        Description: Default globs skip direct boundaries and unrelated explicit ownership is rejected.
+        Expectation: Only the remaining source converts; unrelated family or parent takeover fails early.
         """
         model = nn.Sequential(LinearFamily(config=LinearConfig()), nn.Linear(4, 3))
         default = ModuleReplacementRequest(("*",), LinearFamily)
@@ -608,10 +608,58 @@ class TestModuleBuild(unittest.TestCase):
         self.assertEqual(len(rules.targets), 1)
         self.assertEqual(rules.targets[0].module_fqns, ("1",))
         with self.assertRaisesRegex(ValueError, "directly constructed"):
-            compile_module_replacements(model, overrides=(ModuleReplacementRequest(("0",), LinearFamily),))
+            compile_module_replacements(model, overrides=(ModuleReplacementRequest(("0",), _replace_linear),))
         parent = nn.Sequential(model)
         with self.assertRaisesRegex(ValueError, "parent replacement"):
             compile_module_replacements(parent, defaults=(ModuleReplacementRequest(("0",), LinearFamily),))
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_explicit_native_family_options_preserve_state_and_rng(self) -> None:
+        """Native options reselect the same public family from its config without replacing logical tensors."""
+        model = nn.Sequential(LinearFamily(config=LinearConfig())).eval()
+        parameters = dict(model.named_parameters())
+        values = {name: value.detach().clone() for name, value in parameters.items()}
+        rng = torch.get_rng_state().clone()
+        request = ModuleReplacementRequest(("0",), LinearFamily, {"kernel": "megakernel"})
+        plan = compile_module_replacements(model, overrides=(request,))
+        model, _ = _apply_module_replacement_actions(model, plan, context={})
+        self.assertIs(type(model[0]), MegaLinear)
+        self.assertFalse(model[0].training)
+        self.assertEqual(get_family_build_info(model[0]).origin, "direct")
+        for name, value in model.named_parameters():
+            self.assertIs(value, parameters[name])
+            torch.testing.assert_close(value, values[name], rtol=0, atol=0)
+        torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_native_child_alias_and_hooks_reject_reconfiguration_atomically(self) -> None:
+        """Reconfiguration cannot discard child hooks or detach a shared child module."""
+        for with_hook in (False, True):
+            with self.subTest(with_hook=with_hook):
+                model = nn.Sequential(LinearFamily(config=LinearConfig()))
+                model[0].child = nn.Identity()
+                if with_hook:
+                    model[0].child.register_forward_hook(lambda _module, _inputs, output: output)
+                    expected = "module hooks"
+                else:
+                    model.external = model[0].child
+                    expected = "external module alias"
+                source = model[0]
+                weight = source.weight
+                rng = torch.get_rng_state().clone()
+                request = ModuleReplacementRequest(("0",), LinearFamily, {"kernel": "megakernel"})
+                with self.assertRaisesRegex(ValueError, expected):
+                    compile_module_replacements(model, overrides=(request,))
+                self.assertIs(model[0], source)
+                self.assertIs(model[0].weight, weight)
+                torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",

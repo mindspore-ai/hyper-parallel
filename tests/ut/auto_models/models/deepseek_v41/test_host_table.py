@@ -29,7 +29,7 @@ from safetensors.torch import save_file
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping, Engram
 from hyper_parallel.components.checkpoint.weight_conversion import WeightRenaming
 from hyper_parallel.components.modules.engram.host_engram import HostEngramModule
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
+from hyper_parallel.components.modules.engram.host_state import HostEngramState
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models._transformers.model_builder import (
     _validate_external_state_build,
@@ -57,7 +57,7 @@ class TestHostEngramTable(unittest.TestCase):
             logical_rows=15,
         )
         model.embed.bind_planned_shard(ep_rank=0, ep_size=1, compute_dtype=torch.bfloat16)
-        state = DeepseekV41HostState(model, {"embed": model.embed}, None)
+        state = HostEngramState(model, {"embed": model.embed}, None)
         model._hp_external_state = state  # pylint: disable=protected-access
         torch.utils.swap_tensors(model.embed.weight, torch.nn.Parameter(torch.arange(32).float().view(16, 2)))
 
@@ -162,7 +162,7 @@ class TestHostEngramTable(unittest.TestCase):
         host = HostEngramModule(module=source)
         host.embed.bind_planned_shard(ep_rank=0, ep_size=1, compute_dtype=torch.bfloat16)
         torch.utils.swap_tensors(host.embed.weight, torch.nn.Parameter(rows))
-        host._hp_external_state = DeepseekV41HostState(  # pylint: disable=protected-access
+        host._hp_external_state = HostEngramState(  # pylint: disable=protected-access
             host, {"embed": host.embed}, None,
         )
         apply_model_init_dtype(host, "bfloat16")
@@ -261,7 +261,7 @@ class TestHostEngramTable(unittest.TestCase):
         table.bind_planned_shard(ep_rank=1, ep_size=2, ep_group=object())
         model = torch.nn.Module()
         model.embed = table
-        state = DeepseekV41HostState(model, {"embed": table}, None)
+        state = HostEngramState(model, {"embed": table}, None)
         mapping = [WeightRenaming(source_patterns="source.weight", target_patterns="embed.weight")]
         with TemporaryDirectory() as directory:
             source_checkpoint = Path(directory) / "model.safetensors"
@@ -345,7 +345,7 @@ class TestHostEngramTable(unittest.TestCase):
         table.bind_planned_shard(ep_rank=1, ep_size=2, ep_group=object())
         model = torch.nn.Module()
         model.embed = table
-        state = DeepseekV41HostState(model, {"embed": table}, None)
+        state = HostEngramState(model, {"embed": table}, None)
         mapping = [WeightRenaming(source_patterns="source.weight", target_patterns="embed.weight")]
         full = torch.arange(32, dtype=torch.float32).reshape(16, 2)
         with TemporaryDirectory() as directory:
@@ -402,7 +402,7 @@ class TestHostEngramTable(unittest.TestCase):
         Description: Materialize two layers with the same row interval twice.
         Expectation: Layers differ while repeated builds reproduce each layer.
         """
-        def make_state() -> DeepseekV41HostState:
+        def make_state() -> HostEngramState:
             """Build two named Host tables with identical row intervals."""
             model = torch.nn.Module()
             tables = {}
@@ -416,7 +416,7 @@ class TestHostEngramTable(unittest.TestCase):
                 owner.embed = table
                 setattr(model, layer, owner)
                 tables[f"{layer}.embed"] = table
-            return DeepseekV41HostState(model, tables, None)
+            return HostEngramState(model, tables, None)
 
         first = make_state()
         second = make_state()
@@ -443,7 +443,7 @@ class TestHostEngramTable(unittest.TestCase):
         torch.utils.swap_tensors(table.weight, torch.nn.Parameter(torch.ones(16, 2)))
         model = torch.nn.Module()
         model.embed = table
-        state = DeepseekV41HostState(model, {"embed": table}, None)
+        state = HostEngramState(model, {"embed": table}, None)
         state.sparse_optimizer = torch.optim.SparseAdam([table.weight], lr=0.1)
         original_weight_id = id(table.weight)
 

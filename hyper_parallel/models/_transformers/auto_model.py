@@ -186,6 +186,8 @@ def _resolve_module_construction(kwargs, hf_config, distributed_setup, dtype):
     """Consume model construction arguments and create one shared build context."""
     factory = kwargs.pop("model_factory", None)
     spec = resolve_effective_model_spec(hf_config, kwargs.pop("model_spec", None))
+    if spec is not None and spec.source_import is not None:
+        spec.source_import()
     context = build_module_context(
         distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec, config=hf_config,
     )
@@ -199,6 +201,7 @@ class _BaseHyperAutoModelClass:
     """
 
     @classmethod
+
     def _from_pretrained_parent_class(cls, *args, **kwargs):
         """Delegate to the parent HuggingFace AutoModel class.
 
@@ -210,6 +213,7 @@ class _BaseHyperAutoModelClass:
         return super().from_pretrained(*args, **kwargs)  # pylint: disable=E1101
 
     @classmethod
+
     def _from_config_parent_class(cls, *args, **kwargs):
         """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
         parent_classes = (
@@ -223,6 +227,7 @@ class _BaseHyperAutoModelClass:
         raise TypeError(f"{cls.__name__} has no supported Hugging Face AutoModel parent")
 
     @classmethod
+
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
@@ -315,6 +320,7 @@ class _BaseHyperAutoModelClass:
         return model
 
     @classmethod
+
     def from_config(  # pylint: disable=unused-argument
         cls,
         config: PretrainedConfig,
@@ -404,6 +410,7 @@ class _BaseHyperAutoModelClass:
         )
 
     @classmethod
+
     def _build_model(
         cls,
         pretrained_model_name_or_path,

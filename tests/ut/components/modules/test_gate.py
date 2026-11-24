@@ -16,7 +16,7 @@
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import torch
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeTopKRouter
@@ -130,7 +130,11 @@ class TestGate(unittest.TestCase):
         expected = member(values, mask)
         with patch("hyper_parallel.components.modules.moe.router._plan_for_device") as plan:
             with patch("hyper_multicore.modules.mega_gate.function.mega_gate", return_value=expected) as native:
-                actual = member._native_forward(values, mask)  # pylint: disable=protected-access
+                # Only the optional native call is exercised; no NPU operation
+                # runs in this CPU ownership test.
+                with patch.object(torch.Tensor, "device", new_callable=PropertyMock,
+                                  return_value=SimpleNamespace(type="npu")):
+                    actual = member._native_forward(values, mask)  # pylint: disable=protected-access
         self.assertIs(actual, expected)
         args, options = native.call_args
         self.assertIs(args[0], values)

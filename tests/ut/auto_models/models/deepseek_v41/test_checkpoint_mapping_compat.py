@@ -24,7 +24,7 @@ from safetensors.torch import save_file
 from transformers.core_model_loading import WeightRenaming
 
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import HuggingFaceCheckpointer
-from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import (
     build_deepseek_v41_checkpoint_mapping,
 )
 

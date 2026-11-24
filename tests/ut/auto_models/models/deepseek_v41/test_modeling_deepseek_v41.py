@@ -36,13 +36,13 @@ from hyper_multicore import MegaMoeExperts
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
     SharedCompressedPackedSequence,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     deepseek_v41_ep_compute_fn,
     deepseek_v41_megamoe_compute_fn,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
-from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
-from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE
+from hyper_parallel.models.deepseek_v41.components.packed_mega_experts import DeepseekV41MegaMoeExperts
+from hyper_parallel.components.modules import PipelinedMhc
+from hyper_parallel.models.deepseek_v41.validation.native_module_parity import HyperParallelMoE
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Compressor,
     DeepseekV41Model,
@@ -196,8 +196,8 @@ class TestV41SharedExpert(unittest.TestCase):
             shifted = DeepseekV41Model(config)
         shifted.load_state_dict(reference.state_dict(), strict=True)
         for layer in shifted.layers:
-            layer.attn_hc = DeepseekV41HyperMegaMhc(module=layer.attn_hc)
-            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=layer.ffn_hc)
+            layer.attn_hc = PipelinedMhc(module=layer.attn_hc, shifted=True, use_fused_ops=True)
+            layer.ffn_hc = PipelinedMhc(module=layer.ffn_hc, shifted=True, use_fused_ops=True)
         input_ids = torch.tensor([[1, 2, 3, 4]])
         packed = SharedCompressedPackedSequence(
             cu_seq_lens=torch.tensor([0, 1, 4], dtype=torch.int32),
