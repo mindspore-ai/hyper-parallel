@@ -20,7 +20,8 @@ compact document ends. It is not a full-sequence replicated tensor.
 """
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from numbers import Integral
+from typing import Any, Sequence
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.shard.ops.tnd_kv_plan import plan_tnd_kv
@@ -83,9 +84,11 @@ def _route(source: tuple, target: tuple, width: int) -> tuple:
     return tuple(result)
 
 
-@lru_cache(maxsize=16)
-def plan_tnd_kv_exchange(ends: tuple, pairs: tuple) -> tuple:
+def plan_tnd_kv_exchange(ends: Sequence[int], pairs: Sequence[Sequence[int]]) -> tuple:
     """Build routes for a folded TND sequence, including arbitrary dynamic pairs.
+
+    Finite host integer sequences are copied into immutable tuples before
+    entering the cache; malformed structures raise ValueError.
 
     Args:
         ends: Global document cumulative ends, including optional repeated ends.
@@ -97,6 +100,28 @@ def plan_tnd_kv_exchange(ends: tuple, pairs: tuple) -> tuple:
     Raises:
         ValueError: Ownership or document metadata is invalid.
     """
+    if isinstance(ends, (str, bytes)) or isinstance(pairs, (str, bytes)):
+        raise ValueError("Document ends and ownership pairs must be integer sequences.")
+    try:
+        ends = tuple(ends)
+        rows = []
+        for pair in pairs:
+            if isinstance(pair, (str, bytes)):
+                raise ValueError("Each ownership pair must be a two-element integer sequence.")
+            rows.append(tuple(pair))
+        pairs = tuple(rows)
+    except TypeError as exc:
+        raise ValueError("Document ends and ownership pairs must be integer sequences.") from exc
+    values = (*ends, *(chunk for pair in pairs for chunk in pair))
+    if any(isinstance(value, bool) or not isinstance(value, Integral) for value in values):
+        raise ValueError("Document ends and chunk IDs must be integers, excluding booleans.")
+    return _plan_tnd_kv_exchange(tuple(int(value) for value in ends),
+                                 tuple(tuple(int(chunk) for chunk in pair) for pair in pairs))
+
+
+@lru_cache(maxsize=16)
+def _plan_tnd_kv_exchange(ends: tuple, pairs: tuple) -> tuple:
+    """Cache normalized, immutable routing geometry only."""
     size = len(pairs)
     if (not size or any(len(pair) != 2 for pair in pairs)
             or any(isinstance(x, bool) or not isinstance(x, int) for pair in pairs for x in pair)
@@ -133,7 +158,12 @@ def _cat(parts: list, ref: Any) -> Any:
 
 
 def _exchange(parts: list, ref: Any, sends: tuple, receives: tuple, group: Any) -> Any:
-    """Exchange flattened element counts using the shared backend API."""
+    """Exchange a 1-D buffer with splits expressed in flattened element counts.
+
+    MindSpore requires 1-D inputs and element counts; Torch accepts N-D inputs
+    and counts dim-0 rows. Flattening makes each row one element on both
+    backends, so these split counts have the same meaning.
+    """
     packed = _cat(parts, ref)
     columns = 1
     for dim in ref.shape[1:]:
@@ -204,12 +234,16 @@ class _PartialKV(platform.Function):
     def forward(ctx: Any, local: Any, plan: TNDKVRoute, group: Any) -> Any:
         """Materialize the receiver's unique KV rows."""
         ctx.plan, ctx.group = plan, group
-        return _receive_bank(local, plan, group)
+        # The outer custom Function owns the first-order adjoint. Do not record
+        # an additional autograd graph for its nested collective Function.
+        with platform.no_grad():
+            return _receive_bank(local, plan, group)
 
     @staticmethod
     def backward(ctx: Any, gradient: Any) -> tuple:  # pylint: disable=arguments-differ
         """Every participating rank enters the reverse exchange, including zero receivers."""
-        return _return_gradients(gradient, ctx.plan, ctx.group), None, None
+        with platform.no_grad():
+            return _return_gradients(gradient, ctx.plan, ctx.group), None, None
 
 
 def exchange_tnd_kv(local: Any, plan: TNDKVRoute, group: Any) -> Any:
@@ -217,42 +251,49 @@ def exchange_tnd_kv(local: Any, plan: TNDKVRoute, group: Any) -> Any:
 
     All group ranks call this in the same tensor-slot order. The group rank order
     must match plan.pairs; the local token order must match plan.pairs[plan.rank].
+    Only first-order differentiation is supported by this transport.
     """
     if local.ndim < 1 or local.shape[0] != plan.local_rows:
         raise ValueError("Local KV rows do not match the partial exchange ownership plan.")
     return _PartialKV.apply(local, plan, group)
 
 
+def _block_offset(block: Any, plan: TNDKVRoute) -> int:
+    """Locate one causal query block or fail before a partial view can escape."""
+    start, stop = block.key_interval
+    query_start, query_stop = block.query_interval
+    if not 0 <= start <= query_start < query_stop == stop <= plan.full_len:
+        raise ValueError("Compact KV block has invalid causal query coordinates.")
+    offset = 0
+    for left, right in plan.intervals:
+        if left <= start and stop <= right:
+            return offset + start - left
+        offset += right - left
+    raise ValueError("Compact KV block is not covered by the receiver interval union.")
+
+
 def block_views(bank: Any, plan: TNDKVRoute) -> tuple:
     """Return compact KV views in Q-block order, sharing overlapping bank rows."""
-    if bank.shape[0] != plan.bank_rows:
+    if bank.ndim < 1 or bank.shape[0] != plan.bank_rows:
         raise ValueError("Received KV bank does not match the interval union.")
-    result = []
-    for block in plan.blocks:
-        start, stop = block.key_interval
-        offset = 0
-        for left, right in plan.intervals:
-            if left <= start and stop <= right:
-                result.append(bank.narrow(0, offset + start - left, stop - start))
-                break
-            offset += right - left
-    return tuple(result)
+    return tuple(bank.narrow(0, _block_offset(block, plan), block.key_interval[1] - block.key_interval[0])
+                 for block in plan.blocks)
 
 
 def reduce_tnd_kv_gradients(gradients: tuple, plan: TNDKVRoute, group: Any) -> Any:
-    """Return explicit KL key gradients to owners without a global scatter buffer."""
-    if len(gradients) != len(plan.blocks):
-        raise ValueError("One explicit gradient is required per compact Q block.")
-    pieces = []
-    for gradient, block in zip(gradients, plan.blocks):
-        start, stop = block.key_interval
-        if gradient.shape[0] != stop - start:
-            raise ValueError("KL gradient does not match its compact KV block.")
-        offset = 0
-        for left, right in plan.intervals:
-            if left <= start and stop <= right:
-                pieces.append((offset + start - left, gradient))
-                break
-            offset += right - left
-    bank_grad = _sum_segments(pieces, plan.bank_rows, gradients[0])
-    return _return_gradients(bank_grad, plan, group)
+    """Return first-order KL key gradients to owners without recording another graph.
+
+    Already-computed gradients are final first-order values; no higher-order
+    graph is recorded. Automatic first-order consumers use exchange_tnd_kv.
+    """
+    if not gradients or len(gradients) != len(plan.blocks):
+        raise ValueError("One explicit gradient is required per nonempty compact Q block.")
+    with platform.no_grad():
+        pieces = []
+        for gradient, block in zip(gradients, plan.blocks):
+            start, stop = block.key_interval
+            if gradient.ndim < 1 or gradient.shape[0] != stop - start:
+                raise ValueError("KL gradient does not match its compact KV block.")
+            pieces.append((_block_offset(block, plan), gradient))
+        bank_grad = _sum_segments(pieces, plan.bank_rows, gradients[0])
+        return _return_gradients(bank_grad, plan, group)

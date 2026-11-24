@@ -88,3 +88,20 @@ def test_shared_planner_preserves_document_local_causal_coordinates() -> None:
     assert blocks[1].key_interval == (8, 15)
     assert blocks[1].query_ends == (3,)
     assert blocks[1].key_ends == (7,)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_sequence_inputs_normalize_before_cache() -> None:
+    """Mutable application metadata and immutable equivalents select the same plan."""
+    expected = plan_tnd_kv_exchange((4, 8), ((0, 1),))
+    assert plan_tnd_kv_exchange([4, 8], [[0, 1]]) == expected
+
+
+@pytest.mark.parametrize('ends,pairs', [([8, []], ((0, 1),)), ((8,), [0, 1]), ((8,), 3),
+                                       ((8,), None), ([[8]], ((0, 1),)), ('8', ((0, 1),)),
+                                       ((8,), ('01',)), ((8,), ((False, 1),))])
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_malformed_sequence_structure_is_a_value_error(ends: object, pairs: object) -> None:
+    """Structural failures are reported by the API rather than leaking cache TypeErrors."""
+    with pytest.raises(ValueError):
+        plan_tnd_kv_exchange(ends, pairs)
