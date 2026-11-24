@@ -14,17 +14,49 @@
 # ============================================================================
 """Engram parameter ownership, device lookup and local fusion."""
 from __future__ import annotations
+
 from collections.abc import Mapping
-from typing import Any
 from math import isfinite
+from typing import Any
+
 import torch
 from torch import nn
+
+from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch
+from hyper_parallel.distributed.module_binding import ParallelBinding
+
+from .engram_family import build_engram as Engram
 from .ngram_hash_mapping import NgramHashMapping
 from .parallel_engram import ParallelEngram
+
+__all__ = ["Engram", "EngramModule", "EPEngramModule"]
+
+
+def _positive_int(value: Any, name: str) -> int:
+    """Return a strictly positive integer config value."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _integer(value: Any, name: str) -> int:
+    """Return an integer config value while rejecting Boolean aliases."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    return value
+
+
+def _finite_positive(value: Any, name: str) -> float:
+    """Return a finite positive floating-point config value."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+    return float(value)
 
 
 class EngramModule(ParallelEngram, nn.Module):
     """Ordinary Engram parameter ownership and local fusion with separate parallel execution."""
+
+    _requires_parallel_binding = False
 
     def __init__(
         self,
@@ -36,6 +68,7 @@ class EngramModule(ParallelEngram, nn.Module):
     ) -> None:
         """Reuse a source Engram module's parameters and hash mapping."""
         super().__init__()
+        self._parallel_coordinates: dict[str, Any] | None = None
         del module_fqn, context
         if (module is None) == (config is None):
             raise ValueError("provide exactly one of config or module")
@@ -62,31 +95,25 @@ class EngramModule(ParallelEngram, nn.Module):
 
     def _init_from_config(self, config: Any) -> None:
         """Validate hash assets and allocate local fusion parameters for direct construction."""
-        for name in ("hidden_size", "hc_mult", "embedding_dim"):
-            value = getattr(config, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if isinstance(config.layer_id, bool) or not isinstance(config.layer_id, int):
-            raise ValueError("layer_id must be an integer")
-        for name in ("eps", "clamp_value"):
-            value = getattr(config, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be finite and positive")
-        self.layer_id, self.hidden_size, self.hc_mult = config.layer_id, config.hidden_size, config.hc_mult
-        self.eps, self.clamp_value = config.eps, config.clamp_value
-        self.hash_mapping = NgramHashMapping(config.assets, config.layer_id)
+        self.layer_id = _integer(config.layer_id, "layer_id")
+        self.hidden_size = _positive_int(config.hidden_size, "hidden_size")
+        self.hc_mult = _positive_int(config.hc_mult, "hc_mult")
+        embedding_dim = _positive_int(config.embedding_dim, "embedding_dim")
+        self.eps = _finite_positive(config.eps, "eps")
+        self.clamp_value = _finite_positive(config.clamp_value, "clamp_value")
+        self.hash_mapping = NgramHashMapping(config.assets, self.layer_id)
         self.logical_num_embeddings = self.hash_mapping.logical_num_embeddings
-        rows = config.padded_num_embeddings
-        if rows is None:
-            rows = self.logical_num_embeddings
-        if isinstance(rows, bool) or not isinstance(rows, int) or rows < self.logical_num_embeddings:
+        rows = self.logical_num_embeddings if config.padded_num_embeddings is None else _positive_int(
+            config.padded_num_embeddings, "padded_num_embeddings",
+        )
+        if rows < self.logical_num_embeddings:
             raise ValueError("padded_num_embeddings must cover all logical hash rows")
         self.padded_num_embeddings = rows
         columns = (self.hash_mapping.max_ngram_size - 1) * self.hash_mapping.num_heads
-        self.embed = self._create_embedding(self.padded_num_embeddings, config.embedding_dim)
-        self.wkv = nn.Linear(columns * config.embedding_dim, (config.hc_mult + 1) * config.hidden_size, bias=False)
-        self.q_weight = nn.Parameter(torch.ones(config.hc_mult, config.hidden_size))
-        self.k_weight = nn.Parameter(torch.ones(config.hc_mult, config.hidden_size))
+        self.embed = self._create_embedding(self.padded_num_embeddings, embedding_dim)
+        self.wkv = nn.Linear(columns * embedding_dim, (self.hc_mult + 1) * self.hidden_size, bias=False)
+        self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size))
+        self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size))
 
     def _create_embedding(self, rows: int, width: int) -> nn.Embedding:
         """Allocate the device-table representation for direct construction."""
@@ -125,6 +152,28 @@ class EngramModule(ParallelEngram, nn.Module):
             hidden_fp32 + gate.unsqueeze(-1) * value.float().unsqueeze(-2)
         ).to(hidden_states.dtype)
 
+    def bind_parallel(self, binding: ParallelBinding) -> None:
+        """Use the job's existing EP row owners and CP/TP sequence axes.
+
+        Args:
+            binding: Prebuilt topology managed by the common module binder.
+        """
+        mesh = binding.mesh_binding.mesh_context
+        expert_mesh = getattr(mesh, "fsdp_moe_mesh", None)
+        coordinates = {}
+        for axis in ("ep", "cp", "tp"):
+            region = expert_mesh if axis == "ep" and expert_mesh is not None else mesh.device_mesh
+            names = getattr(region, "mesh_dim_names", None) or ()
+            axis_mesh = binding.mesh_binding.axis_mesh(axis) if axis in names else None
+            size = 1 if axis_mesh is None else axis_mesh.size()
+            coordinates[f"{axis}_size"] = size
+            coordinates[f"{axis}_rank"] = 0 if size == 1 else axis_mesh.get_local_rank()
+            if axis != "tp":
+                coordinates[f"{axis}_group"] = None if size == 1 else axis_mesh.get_group()
+        ep_size = coordinates["ep_size"]
+        if (self._requires_parallel_binding and ep_size == 1) or self.padded_num_embeddings % ep_size:
+            raise ValueError("Engram requires a matching EP mesh that evenly divides the padded table")
+        self._parallel_coordinates = coordinates
 
     def forward(
         self,
@@ -133,7 +182,7 @@ class EngramModule(ParallelEngram, nn.Module):
         segment_starts: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run ordinary local Engram.
+        """Run local Engram or use the bound job meshes.
 
         Args:
             hidden_states: Current decoder hidden rows.
@@ -141,8 +190,26 @@ class EngramModule(ParallelEngram, nn.Module):
             segment_starts: Optional packed sequence boundaries.
             token_mask: Optional mask selecting Engram updates.
         """
+        if self._parallel_coordinates is not None:
+            local_inputs = tuple(tensor.to_local() if isinstance(tensor, DTensor) else tensor
+                                 for tensor in (hidden_states, input_ids, segment_starts, token_mask))
+            # EP lookup owns global-to-local row offsets. A DTensor embedding
+            # dispatch would try to apply the table sharding a second time.
+            with SkipDTensorDispatch():
+                fused = self.parallel_forward(*local_inputs, **self._parallel_coordinates)
+            if isinstance(hidden_states, DTensor):
+                return DTensor.from_local(fused, hidden_states.device_mesh, hidden_states.placements)
+            return fused
+        if self._requires_parallel_binding:
+            raise RuntimeError("EP Engram must bind the job mesh before its first forward")
         hash_ids = self._aligned_hash_ids(hidden_states, input_ids, segment_starts, token_mask)
         fused = self._fuse(hidden_states, self.embed(hash_ids))
         if token_mask is None:
             return fused
         return torch.where(token_mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states)
+
+
+class EPEngramModule(EngramModule):
+    """Device Engram whose table is distributed over EP row owners."""
+
+    _requires_parallel_binding = True

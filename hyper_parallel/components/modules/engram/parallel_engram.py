@@ -52,7 +52,7 @@ def _all_gather_sequence(value: torch.Tensor, group: Any, group_size: int) -> to
 
 
 def aligned_hash_ids(
-    self,
+    self: Any,
     hidden_states: torch.Tensor,
     input_ids: torch.Tensor,
     segment_starts: torch.Tensor | None,
@@ -64,7 +64,23 @@ def aligned_hash_ids(
     tp_rank: int = 0,
     tp_size: int = 1,
 ) -> torch.Tensor:
-    """Hash the local sequence plus the left halo required by n-grams."""
+    """Hash the local sequence plus the left halo required by n-grams.
+
+    Args:
+        self: Engram module exposing the n-gram hash mapping.
+        hidden_states: Current hidden-state shard.
+        input_ids: Token IDs for the local sequence.
+        segment_starts: Optional segment boundary flags.
+        token_mask: Optional validity mask for token IDs.
+        cp_group: Context-parallel process group.
+        cp_rank: Local context-parallel rank.
+        cp_size: Context-parallel degree.
+        tp_rank: Local tensor-parallel rank.
+        tp_size: Tensor-parallel degree.
+
+    Returns:
+        Hash row IDs aligned with the local hidden-state sequence.
+    """
     cp_local_ids = input_ids
     if cp_size > 1:
         input_ids = _all_gather_sequence(input_ids, cp_group, cp_size)
@@ -186,10 +202,10 @@ def _communication_device(mesh) -> torch.device:
 
 
 def gather_sparse_along_axis(coo_cpu: torch.Tensor, axis_mesh: Any, width: int) -> torch.Tensor:
-    """Gather variable COO rows and coalesce them without a dense table grad.
+    """Gather variable coordinate-format rows and coalesce them without a dense table grad.
 
     Args:
-        coo_cpu: Owner-local sparse COO gradient on CPU.
+        coo_cpu: Owner-local coordinate-format sparse gradient on CPU.
         axis_mesh: Mesh axis used to synchronize sparse rows.
         width: Number of values in each table row.
     """
@@ -226,7 +242,7 @@ def sparse_sum_same_ep(coo_cpu: torch.Tensor, mesh_context: Any, width: int) -> 
     """Sum row contributions over every existing same-owner replica axis.
 
     Args:
-        coo_cpu: Owner-local sparse COO gradient on CPU.
+        coo_cpu: Owner-local coordinate-format sparse gradient on CPU.
         mesh_context: Parallel mesh and loss-domain configuration.
         width: Number of values in each table row.
     """
@@ -277,7 +293,19 @@ def stage_check(local_bad: bool, mesh_context: Any) -> bool:
 
 def host_sparse_lookup(hash_ids: torch.Tensor, embedding: Any, *, ep_group: Any,
                    ep_rank: int, ep_size: int, padded_num_embeddings: int) -> torch.Tensor:
-    """Use the already-bound Host row route without applying the device-table route twice."""
+    """Use the already-bound Host row route without applying the device-table route twice.
+
+    Args:
+        hash_ids: Global row IDs generated for local tokens.
+        embedding: Bound Host Engram table module.
+        ep_group: Expert-parallel process group.
+        ep_rank: Local expert-parallel rank.
+        ep_size: Expert-parallel degree.
+        padded_num_embeddings: Physical padded table-row count.
+
+    Returns:
+        Lookup values in the table compute dtype.
+    """
     if (embedding.ep_rank != ep_rank or embedding.ep_size != ep_size or embedding.ep_group is not ep_group
             or embedding.physical_rows != padded_num_embeddings):
         raise ValueError("Host lookup must match the table's planned row partition")
@@ -303,6 +331,8 @@ class ParallelEngram:
         padded_num_embeddings: int,
     ) -> torch.Tensor:
         """Route requested global rows to their EP owners and restore order."""
+        if ep_size == 1:
+            return embedding(hash_ids)
         if padded_num_embeddings % ep_size:
             raise ValueError(
                 f"Engram padded rows {padded_num_embeddings} are not divisible by ep_size={ep_size}"
