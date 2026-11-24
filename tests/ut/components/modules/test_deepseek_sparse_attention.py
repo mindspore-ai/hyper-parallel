@@ -27,6 +27,7 @@ from hyper_parallel.components.modules.attention.deepseek_sparse_attention impor
 )
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention.cp_deepseek_sparse_attention import (
     _gather_key_banks,
+    _PendingMainBanks,
     build_cp_sequence_metadata,
 )
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention.deepseek_sparse_attention import (
@@ -80,6 +81,8 @@ def _causal_keys(metadata, key_bank, query_index):
     raise ValueError(f"Query index {query_index} exceeds the packed query endpoints")
 
 
+from tests.common.mark_utils import arg_mark
+
 class TestDeepseekSparseAttention(unittest.TestCase):
     """Cover family wiring and local numerical behavior without device kernels."""
 
@@ -105,6 +108,7 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         """YAML requests that omit arguments receive the documented constructor defaults."""
         expected = {
             "kv_cp_size": 1, "kv_cp_strategy": "allgather", "cp_comm_overlap": False,
+            "main_kv_comm_fusion": False,
         }
         for deferred in (False, True):
             with self.subTest(deferred=deferred):
@@ -169,6 +173,8 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                 DeepseekSparseAttention(config=_config(), kv_cp_size=value)
         with self.assertRaises(ValueError):
             DeepseekSparseAttention(config=_config(), kv_cp_strategy="p2p")
+        with self.assertRaisesRegex(ValueError, "main_kv_comm_fusion must be a bool"):
+            DeepseekSparseAttention(config=_config(), main_kv_comm_fusion=1)
         for name, value in (("ulysses_cp_size", 2), ("kv_cp_load_balance", False)):
             with self.subTest(removed_argument=name):
                 with self.assertRaises(TypeError):
@@ -237,11 +243,18 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                 torch.testing.assert_close(metadata.query_ends, torch.tensor(query_ends, dtype=torch.int32))
                 torch.testing.assert_close(metadata.key_ends, torch.tensor(key_ends, dtype=torch.int32))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_cp_packed_candidates_match_global_causal_documents(self) -> None:
-        """Every local query sees its complete document prefix and no future keys."""
+        """
+        Feature: Shared packed-attention planning and routing.
+        Description: Every local query sees its complete document prefix and no future keys.
+        Expectation: Every local query sees only the causal prefix of its own document.
+        """
         cases = (
             (2, 8, 1, [6, 16]), (2, 8, 2, [8, 16]), (2, 8, 2, [6, 16]),
             (2, 16, 4, [14, 32]), (3, 8, 2, [6, 14, 24]), (3, 8, 2, [24]),
+            (1, 8, 2, [3, 8]), (1, 8, 2, [4, 8]), (2, 8, 4, [1, 3, 7, 11, 16]),
         )
         for batch, length, cp_size, ends in cases:
             bank = torch.arange(batch * length, device="cpu").reshape(batch, length, 1, 1)
@@ -294,14 +307,23 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                         expected[document_start:query_id + 1] += 3
                     torch.testing.assert_close(bank.grad.flatten(), expected, rtol=0, atol=0)
 
-    def test_cp_rejects_zero_query_documents_on_every_rank(self) -> None:
-        """Unsupported packed partitions fail before any rank starts communication."""
-        for rank in (0, 1):
-            with self.subTest(cp_rank=rank), self.assertRaisesRegex(ValueError, "zero-query packed documents"):
-                build_cp_sequence_metadata(
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_cp_omits_documents_without_local_queries(self) -> None:
+        """
+        Feature: Shared packed-attention planning and routing.
+        Description: Packed documents may belong to disjoint CP owners without padding.
+        Expectation: Zero-query documents are absent and active prefixes match the reference.
+        """
+        for rank, expected_key in ((0, (0, 4)), (1, (4, 8))):
+            with self.subTest(cp_rank=rank):
+                metadata = build_cp_sequence_metadata(
                     batch_size=1, local_seq_len=4, device=torch.device("cpu"),
                     cp_size=2, cp_rank=rank, actual_seq_len=[4, 8],
                 )
+                self.assertEqual(metadata.query_ends.tolist(), [4])
+                self.assertEqual(metadata.key_ends.tolist(), [4])
+                self.assertEqual(metadata.key_ranges, (expected_key,))
 
     def test_indexer_weights_scale_without_intermediate_bf16_rounding(self) -> None:
         """The 32-head, 128-dimension scale equals an exact division by 64."""
@@ -320,3 +342,64 @@ class TestDeepseekSparseAttention(unittest.TestCase):
 
         expected = (raw_weights.float() / 64).to(torch.bfloat16).expand(1, 2, 32)
         torch.testing.assert_close(index_states[2], expected, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_worker_projection_preserves_owner_values_without_gradients(self) -> None:
+        """Feature: Detached qr worker selection.
+
+        Description: Reorder query rows across owner-sized projection chunks.
+        Expectation: The FP32 projection matches owner values and builds no graph.
+        """
+        module = DeepseekSparseAttention(config=_config())
+        query = torch.randn(1, 7, module.q_lora_rank, requires_grad=True)
+        order = torch.tensor([6, 1, 3, 0, 5, 4, 2])
+        owner = module.indexer.wq_b(query).view(1, 7, module.num_index_heads, module.index_head_dim)
+        worker = module.project_worker_index_query(query[:, order], None, 4)
+        torch.testing.assert_close(worker, owner[:, order], rtol=1e-6, atol=1e-7)
+        self.assertFalse(worker.requires_grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_deferred_cp_preserves_common_routing_options(self) -> None:
+        """Feature: Shared planner options through module-family promotion.
+
+        Description: Build before the job topology and promote without reinitializing.
+        Expectation: Configuration and parameter identity survive the lifecycle.
+        """
+        options = {
+            "kv_cp_size": 2, "indexer_load_balance": "hybrid", "indexer_balance_block_size": 16,
+            "indexer_zigzag_min_length": 32, "indexer_paged_k": True,
+            "main_kv_comm": "all_to_all_v", "index_k_comm": "all_to_all_v", "main_kv_comm_fusion": True,
+        }
+        source = DeepseekSparseAttention(config=_config(), **options)
+        original = dict(source.named_parameters())
+        promoted, _ = prepare_model_components(source, {"cp_size": 2})
+        for name, value in options.items():
+            self.assertEqual(getattr(promoted, name), value)
+        for name, parameter in promoted.named_parameters():
+            self.assertIs(parameter, original[name])
+
+    def test_merged_main_banks_keep_layout_and_accumulate_prefix_gradients(self) -> None:
+        """Merged fields preserve repeated document prefixes and field-specific gradients."""
+        for gathered in (False, True):
+            with self.subTest(gathered=gathered):
+                latent = torch.arange(24, dtype=torch.float32).reshape(1, 6, 1, 4).requires_grad_()
+                rotary = torch.arange(12, dtype=torch.float32).reshape(1, 6, 1, 2).requires_grad_()
+                combined = torch.cat((latent, rotary), dim=-1)
+                receipt = Mock()
+                receipt.wait.return_value = (combined, None) if gathered else combined
+                pending = _PendingMainBanks((receipt,), ((0, 3), (1, 4)) if gathered else None, (4, 2))
+
+                actual = pending.wait()
+                rows = [0, 1, 2, 1, 2, 3] if gathered else list(range(6))
+                for value, source in zip(actual, (latent, rotary)):
+                    torch.testing.assert_close(value, source[:, rows], rtol=0, atol=0)
+                    self.assertTrue(value.is_contiguous())
+                (actual[0].sum() * 2 + actual[1].sum() * 3).backward()
+                counts = torch.tensor([rows.count(row) for row in range(6)]).view(1, 6, 1, 1)
+                torch.testing.assert_close(latent.grad, (counts * 2).expand_as(latent).float(), rtol=0, atol=0)
+                torch.testing.assert_close(rotary.grad, (counts * 3).expand_as(rotary).float(), rtol=0, atol=0)
+                receipt.wait.assert_called_once()
+                with self.assertRaisesRegex(RuntimeError, "already consumed"):
+                    pending.wait()

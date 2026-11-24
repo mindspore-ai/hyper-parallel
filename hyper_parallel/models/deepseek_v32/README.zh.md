@@ -73,7 +73,7 @@ torchrun --standalone --nproc_per_node=1 \
 ### 多卡
 
 用命令行覆盖设置并行拓扑。recipe 将整个 `*.self_attn` 模块替换为 `DeepseekSparseAttention`，在 `cp_size > 1`
-时自动选择 CP 成员。`kv_cp_size` 须与 `accelerator.cp_size` 一致；示例使用 `allgather` 并开启通信重叠。
+时自动选择 CP 成员。`kv_cp_size` 须与 `accelerator.cp_size` 一致；下例保留 AG 基线。TP1 下还可独立配置 main/Index K 前缀 A2AV、Indexer 均衡和分页。
 参数含义见 [稀疏注意力说明](../../components/modules/attention/deepseek_sparse_attention/readme.md)。
 保留 recipe 的其他模块替换；CP2 的 attention 条目如下。专家模块族根据作业 mesh 选择 local/EP 执行，保留原生
 MoE 的路由和共享专家逻辑，不要再叠加旧的 `deepseekv3_ep_compute_fn` 方法替换。

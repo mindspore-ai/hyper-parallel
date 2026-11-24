@@ -1,0 +1,283 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Bounded host-only preparation of packed context-parallel batch plans."""
+from __future__ import annotations
+
+from bisect import bisect_right
+from dataclasses import dataclass
+from functools import lru_cache
+from itertools import accumulate
+
+from hyper_parallel.distributed.context_parallel.compressed_document import (
+    DocumentCompressionPlan, document_compression_plan,
+)
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import IndexKeyPlan, index_key_plan
+from hyper_parallel.distributed.context_parallel.indexer_balance import (
+    IndexerRoute, indexer_route, resolve_indexer_balance_block_size, validate_indexer_hybrid_threshold,
+)
+from hyper_parallel.distributed.context_parallel.sequence_dispatch import (
+    SequenceDispatchRoute, document_prefix_route, sliding_window_route,
+)
+from hyper_parallel.distributed.context_parallel.sequence_pack import prepare_sequence_pack
+
+
+@dataclass(frozen=True)
+class PackedDocumentPlan:
+    """Active query intersections and causal key prefixes in global token coordinates."""
+
+    lengths: tuple[int, ...]
+    segments: tuple[tuple[int, int, int, int, int], ...]
+    query_ends: tuple[int, ...]
+    key_ends: tuple[int, ...]
+    key_ranges: tuple[tuple[int, int], ...]
+
+
+
+def _validate_document_ends(query_ends: tuple, key_ends: tuple, batch: int, local: int, size: int) -> int:
+    """Validate global endpoints before constructing per-rank intersections."""
+    if min(batch, local, size) < 1:
+        raise ValueError("Packed CP planning requires positive batch, local length and CP size")
+    total, row_length = batch * local * size, local * size
+    if (not query_ends or len(query_ends) != len(key_ends)
+            or any(ends[-1] != total or any(end <= start for start, end in zip((0, *ends[:-1]), ends))
+                   for ends in (query_ends, key_ends))):
+        raise ValueError("Packed CP query/key document ends must strictly increase and cover both banks")
+    return row_length
+
+
+@lru_cache(maxsize=128)
+def packed_document_plans(query_ends: tuple[int, ...], key_ends: tuple[int, ...],
+                          batch: int, local: int, size: int) -> tuple[PackedDocumentPlan, ...]:
+    """Plan active documents on every CP rank before launching communication.
+
+    Args:
+        query_ends: Global cumulative query document ends without a leading zero.
+        key_ends: Matching global key document ends in flattened BSND order.
+        batch: Number of physical batch rows; documents may span rows.
+        local: Equal query/key shard length per physical row and CP rank.
+        size: Number of sequence-ordered CP ranks.
+
+    Returns:
+        Immutable rank plans, retaining repeated prefixes when a document spans
+        disjoint local query intersections. No rank emits zero-query segments.
+    """
+    row_length = _validate_document_ends(query_ends, key_ends, batch, local, size)
+    lengths = tuple(end - start for start, end in zip((0, *query_ends[:-1]), query_ends))
+    plans = []
+    for rank in range(size):
+        segments, ranges, queries, keys = [], [], [], []
+        query_total = key_total = 0
+        for row in range(batch):
+            shard_start = row * row_length + rank * local
+            shard_end = shard_start + local
+            document = bisect_right(query_ends, shard_start)
+            while document < len(query_ends):
+                query_start = query_ends[document - 1] if document else 0
+                if query_start >= shard_end:
+                    break
+                key_start = key_ends[document - 1] if document else 0
+                begin, end = max(query_start, shard_start), min(query_ends[document], shard_end)
+                prefix_end = key_ends[document] - (query_ends[document] - end)
+                if prefix_end <= key_start:
+                    raise ValueError(f"Packed CP has an empty key prefix on rank {rank}")
+                segments.append((query_total, query_total + end - begin, key_start, prefix_end, 0))
+                query_total += end - begin
+                key_total += prefix_end - key_start
+                queries.append(query_total)
+                keys.append(key_total)
+                if ranges and ranges[-1][1] == key_start:
+                    ranges[-1] = (ranges[-1][0], prefix_end)
+                else:
+                    ranges.append((key_start, prefix_end))
+                document += 1
+        plans.append(PackedDocumentPlan(lengths, tuple(segments), tuple(queries), tuple(keys), tuple(ranges)))
+    return tuple(plans)
+
+
+def _host_integers(values: tuple[int, ...], name: str, minimum: int = 1) -> tuple[int, ...]:
+    """Snapshot host input without accepting tensors or mutable nested values."""
+    if not isinstance(values, (tuple, list)) or not values:
+        raise ValueError(f"{name} must be a nonempty sequence of host integers")
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < minimum for value in values):
+        raise ValueError(f"{name} must contain host integers >= {minimum}")
+    return tuple(values)
+
+
+@dataclass(frozen=True)
+class CPBatchPlanConfig:
+    """Static host planning configuration; contains no module, device or group.
+
+    Args:
+        size: Sequence-ordered CP group size.
+        rank: Rank within that group.
+        ratios: Compression ratios used by attention layers, including zero for SWA.
+        windows: Raw attention windows used by those layers.
+        mode: Indexer selection allocation, independent of owner-side KL.
+        block_size: Greedy/hybrid query-block option, defaulting to 2048.
+        zigzag_min_length: Hybrid-only original-document threshold.
+        index_k_comm: Whether selection requires a compact Index K dispatch plan.
+        main_kv_comm: Whether main attention uses a document-prefix dispatch plan.
+    """
+
+    size: int
+    rank: int
+    ratios: tuple[int, ...] = (1, 2)
+    windows: tuple[int, ...] = (128,)
+    mode: str = "none"
+    block_size: int | None = None
+    zigzag_min_length: int | None = None
+    index_k_comm: str = "all_gather"
+    main_kv_comm: str = "all_gather"
+
+    def __post_init__(self) -> None:
+        """Normalize static options while rejecting tensors and Boolean dimensions."""
+        _host_integers((self.size,), "CP size")
+        _host_integers((self.rank,), "CP rank", 0)
+        if self.rank >= self.size:
+            raise ValueError("Batch planning requires a positive CP size and a valid rank")
+        object.__setattr__(self, "ratios", tuple(sorted(set(_host_integers(self.ratios, "ratios", 0)))))
+        if any(ratio not in (0, 1, 2) for ratio in self.ratios):
+            raise ValueError("CP batch planning supports compression ratios 0, 1 and 2")
+        windows = tuple(sorted(set(_host_integers(self.windows, "windows")))) if self.windows else ()
+        object.__setattr__(self, "windows", windows)
+        object.__setattr__(self, "block_size", resolve_indexer_balance_block_size(self.mode, self.block_size))
+        validate_indexer_hybrid_threshold(self.mode, self.zigzag_min_length)
+        if self.main_kv_comm not in ("all_gather", "all_to_all_v"):
+            raise ValueError("main_kv_comm must be all_gather or all_to_all_v")
+        if self.index_k_comm not in ("all_gather", "all_to_all_v"):
+            raise ValueError("index_k_comm must be 'all_gather' or 'all_to_all_v'")
+
+
+@dataclass(frozen=True)
+class CPRatioPlan:
+    """Actual immutable host objects consumed by one compression-ratio family."""
+
+    ratio: int
+    main_route: SequenceDispatchRoute | None
+    index_key: IndexKeyPlan | None
+    worker_route: IndexerRoute | None
+    compression: DocumentCompressionPlan | None
+    owner_segments: tuple
+
+
+@dataclass(frozen=True)
+class CPBatchPlan:
+    """Owned batch snapshot, safe to retain across backward and checkpoint replay."""
+
+    lengths: tuple[int, ...]
+    config: CPBatchPlanConfig
+    raw_routes: tuple[tuple[int, SequenceDispatchRoute], ...]
+    ratio_plans: tuple[CPRatioPlan, ...]
+    query_documents: PackedDocumentPlan
+
+    def validate(self, lengths: tuple[int, ...], size: int, rank: int) -> None:
+        """Reject stale document boundaries or a plan for another CP shard.
+
+        Args:
+            lengths: Global natural document lengths of the active batch.
+            size: Active CP group size.
+            rank: Active rank within the CP group.
+        """
+        if tuple(lengths) != self.lengths or (size, rank) != (self.config.size, self.config.rank):
+            raise ValueError("Prepared CP batch does not match document lengths, CP size or rank")
+
+    def for_ratio(self, ratio: int) -> CPRatioPlan:
+        """Return prepared objects without invoking a plan builder or an LRU lookup.
+
+        Args:
+            ratio: Compression ratio used by the consumer layer.
+        """
+        for plan in self.ratio_plans:
+            if plan.ratio == ratio:
+                return plan
+        raise ValueError(f"Compression ratio {ratio} was not included in this prepared CP batch")
+
+    def raw_route(self, window: int) -> SequenceDispatchRoute:
+        """Return the same-document SWA route for a configured window.
+
+        Args:
+            window: Consumer layer's raw attention window in tokens.
+        """
+        for prepared_window, route in self.raw_routes:
+            if prepared_window == window:
+                return route
+        raise ValueError(f"SWA window {window} was not included in this prepared CP batch")
+
+
+def _owner_segments(boundaries: tuple[int, ...], local: int, rank: int, ratio: int) -> tuple:
+    """Describe original-owner queries using natural-document compressed prefixes."""
+    query_start, query_end = rank * local, (rank + 1) * local
+    segments, key_start = [], 0
+    for start, end in zip(boundaries, boundaries[1:]):
+        first, last = max(start, query_start), min(end, query_end)
+        if first < last:
+            segments.append((first - query_start, last - query_start, key_start,
+                             key_start + (last - start) // ratio, (last - start) % ratio))
+        key_start += (end - start) // ratio
+    return tuple(segments)
+
+
+def _prepare_ratio(boundaries: tuple[int, ...], lengths: tuple[int, ...],
+                   config: CPBatchPlanConfig, ratio: int) -> CPRatioPlan:
+    local = boundaries[-1] // config.size
+    main = None
+    if ratio and config.main_kv_comm == "all_to_all_v":
+        main = document_prefix_route(boundaries, local, config.size, config.rank, ratio)
+    compression = None
+    if ratio > 1 and (local % ratio or any(boundary % ratio for boundary in boundaries)):
+        compression = document_compression_plan(boundaries, ratio, local, config.size, config.rank)
+    selection = (lengths, config.size, config.rank, ratio, config.mode, config.block_size,
+                 config.zigzag_min_length)
+    keys = index_key_plan(*selection) if ratio and config.index_k_comm == "all_to_all_v" else None
+    worker = indexer_route(*selection) if ratio and config.mode != "none" else None
+    return CPRatioPlan(ratio, main, keys, worker, compression,
+                       _owner_segments(boundaries, local, config.rank, max(1, ratio)))
+
+
+def prepare_cp_batch(lengths: tuple[int, ...], config: CPBatchPlanConfig) -> CPBatchPlan:
+    """Build concrete host routes for a batch without touching a device or collective.
+
+    Args:
+        lengths: Natural global document lengths supplied by packing/collation.
+        config: Immutable static context-parallel planning configuration.
+
+    Returns:
+        A batch-owned plan with concrete worker, Index K, raw/main and compression
+        routes. Send-address consumers reuse the prepared host pack caches.
+    """
+    lengths = _host_integers(lengths, "lengths")
+    if not isinstance(config, CPBatchPlanConfig):
+        raise TypeError("config must be CPBatchPlanConfig")
+    if sum(lengths) % config.size:
+        raise ValueError("Global packed length must divide evenly into contiguous CP query shards")
+    return _prepared_cp_batch(lengths, config)
+
+
+@lru_cache(maxsize=32)
+def _prepared_cp_batch(lengths: tuple[int, ...], config: CPBatchPlanConfig) -> CPBatchPlan:
+    """Reuse complete immutable host plans without retaining payloads or device storage."""
+    boundaries = (0, *accumulate(lengths))
+    local = boundaries[-1] // config.size
+    raw = tuple((window, sliding_window_route(boundaries, local, config.size, config.rank, window))
+                for window in config.windows)
+    ratios = tuple(_prepare_ratio(boundaries, lengths, config, ratio) for ratio in config.ratios)
+    for _, route in raw:
+        prepare_sequence_pack(route)
+    for plan in ratios:
+        for route in (plan.main_route, None if plan.index_key is None else plan.index_key.dispatch):
+            if route is not None:
+                prepare_sequence_pack(route)
+    documents = packed_document_plans(boundaries[1:], boundaries[1:], 1, local, config.size)[config.rank]
+    return CPBatchPlan(lengths, config, raw, ratios, documents)

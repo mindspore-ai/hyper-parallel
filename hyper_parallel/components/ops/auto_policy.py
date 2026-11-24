@@ -24,6 +24,7 @@ from .impl.deepseek_sparse_attention import DSA_ABSORBED, DSA_ABSORBED_SINK, DSA
 from .impl.gdn import GDN
 from .impl.grouped_matmul import GROUPED_MATMUL
 from .impl.grouped_swiglu import GROUPED_SWIGLU
+from .impl.indexer_topk_restore import INDEXER_TOPK_RESTORE
 from .impl.kda import KDA
 from .impl.mhc_post import MHC_POST
 from .impl.moe_router import MOE_ROUTER
@@ -38,6 +39,9 @@ from .registry import OpRegistry
 
 def apply_auto_policy(registry: OpRegistry) -> None:
     """Set device-specific priorities independently of implementation registration."""
+    # Keep the existing early local-copy schedule unless fusion is requested.
+    for device in ("cpu", "cuda", "npu"):
+        registry.set_auto_order(INDEXER_TOPK_RESTORE, device=device, candidates=("native",))
     for spec in (RMS_NORM, RMS_NORM_FP32_AFFINE, SWIGLU, SWIGLU_CLAMPED):
         registry.set_auto_order(spec, device="npu", candidates=("torch_npu",))
         registry.set_auto_order(spec, device="cuda", candidates=("native",))

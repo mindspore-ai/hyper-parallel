@@ -43,6 +43,9 @@ from .impl.deepseek_sparse_attention import (
 from .impl.gdn import GDN
 from .impl.grouped_matmul import GROUPED_MATMUL, GroupedMatmulFn
 from .impl.grouped_swiglu import GROUPED_SWIGLU
+from .impl.indexer_topk_restore import (
+    INDEXER_TOPK_RESTORE, IndexerTopKRestoreFn, native_indexer_topk_restore,
+)
 from .impl.kda import KDA
 from .impl.mhc_post import MHC_POST, MhcPostFn
 from .impl.moe_router import MOE_ROUTER, router_scores
@@ -59,6 +62,7 @@ __all__ = [
     "dsa_indexer_kl_packed", "dsa_indexer_packed",
     "deepseek_sparse_attention_absorbed", "deepseek_sparse_attention_compressed_banks",
     "deepseek_sparse_attention_with_sink",
+    "indexer_topk_restore", "prepare_indexer_topk_restore",
     "gdn", "grouped_query_attention", "grouped_matmul", "grouped_swiglu", "kda", "mhc_post", "multi_latent_attention",
     "multi_latent_attention_with_stats",
     "moe_router", "moe_token_reorder", "moe_token_restore", "mome", "ops", "rms_norm", "rms_norm_fp32_affine",
@@ -66,6 +70,8 @@ __all__ = [
     "rope", "rope_interleaved", "rope_qk",
     "sinkhorn", "swiglu", "swiglu_clamped", "vision_attention",
 ]
+
+indexer_topk_restore: IndexerTopKRestoreFn = _dispatch(INDEXER_TOPK_RESTORE)
 
 grouped_matmul: GroupedMatmulFn = _dispatch(GROUPED_MATMUL)
 dsa_indexer_packed: PackedDsaIndexerFn = _dispatch(DSA_PACKED_INDEXER)
@@ -325,3 +331,15 @@ def moe_router(
         native_only = "MegaGate requires nonempty batched tokens and sqrtsoftplus scoring"
     route = _select_for_call(MOE_ROUTER, x, native_only=native_only)
     return route(x, weight, bias, vision_bias, image_mask, top_k, scoring_func, scale)
+
+
+def prepare_indexer_topk_restore(selected: torch.Tensor) -> IndexerTopKRestoreFn | None:
+    """Resolve a deferred restore callable before launching the return collective.
+
+    None preserves Torch's early local-copy and post-wait remote-copy schedule.
+    A fused callable instead places both partitions after the receive wait. It
+    must be retained by the pending handle, along with the source buffers, so
+    changing process configuration cannot alter an in-flight return operation.
+    """
+    operation = _select_for_call(INDEXER_TOPK_RESTORE, selected)
+    return None if operation is native_indexer_topk_restore else operation

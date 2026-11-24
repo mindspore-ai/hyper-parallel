@@ -16,111 +16,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
 from itertools import accumulate
 from typing import Any, Callable
 
 import torch
 
-
-def pack_ranges(tensor: torch.Tensor, ranges: tuple[tuple[int, int], ...]) -> torch.Tensor:
-    """Pack token ranges without copying an already contiguous partition.
-
-    Args:
-        tensor: Source tensor with tokens on the first dimension.
-        ranges: Nonempty, ordered half-open token intervals.
-
-    Returns:
-        Contiguous packed tokens; autograd restores gradients to the source.
-    """
-    if all(left[1] == right[0] for left, right in zip(ranges, ranges[1:])):
-        start, end = ranges[0][0], ranges[-1][1]
-        if start == 0 and end == tensor.shape[0]:
-            return tensor.contiguous()
-        return tensor[start:end].contiguous()
-    return torch.cat([tensor[start:end] for start, end in ranges], dim=0).contiguous()
-
-
-@dataclass(frozen=True)
-class CSATNDPlan:
-    """Document-local lengths and canonical K offsets; no training activations."""
-
-    segments: tuple[tuple[int, int, int, int, int], ...]
-    q_ranges: tuple[tuple[int, int], ...]
-    k_ranges: tuple[tuple[int, int], ...]
-    q_lengths: tuple[int, ...]
-    k_lengths: tuple[int, ...]
-    residuals: tuple[int, ...]
-
-    def query(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Pack a [1,Q,...] tensor in the plan's document order."""
-        return pack_ranges(tensor.squeeze(0), self.q_ranges)
-
-    def key(self, tensor: torch.Tensor, key_offset: int = 0) -> torch.Tensor:
-        """Pack global document prefixes using the physical origin of a [1,K,...] bank."""
-        ranges = self.k_ranges if not key_offset else tuple((start-key_offset, end-key_offset)
-                                                           for start, end in self.k_ranges)
-        return pack_ranges(tensor.squeeze(0), ranges)
-
-    def lengths(self, device: torch.device) -> tuple:
-        """Reuse device length tensors, including across inference and recomputation."""
-        return _device_lengths(self, device)
-
-    def indexer_options(self, device: torch.device, ratio: int) -> dict:
-        """Share the document partition and causal mask between Indexer and KL."""
-        cu_q, cu_k, residuals, _ = self.lengths(device)
-        return {"cu_seqlens_q": cu_q, "cu_seqlens_k": cu_k,
-                "cmp_residual_k": residuals if ratio > 1 else None,
-                "layout_q": "TND", "layout_k": "TND", "mask_mode": 3, "cmp_ratio": ratio}
-
-    def local_indices(self, indices: torch.Tensor, padded_width: int = 0) -> torch.Tensor:
-        """Translate bank IDs; pad only when the consumer explicitly requires a width."""
-        selected = self.query(indices)
-        offsets = self.lengths(indices.device)[3]
-        selected = torch.where(selected >= 0, selected - offsets, -1).int()
-        if selected.shape[-1] < padded_width:
-            selected = torch.nn.functional.pad(selected, (0, padded_width-selected.shape[-1]), value=-1)
-        return selected.unsqueeze(1).contiguous()
-
-    def covers_queries(self, length: int) -> bool:
-        """Return whether packed rows already follow the complete original Q order."""
-        return (self.q_ranges[0][0] == 0 and self.q_ranges[-1][1] == length
-                and all(left[1] == right[0] for left, right in zip(self.q_ranges, self.q_ranges[1:])))
-
-    def restore(self, part: torch.Tensor, output: torch.Tensor) -> None:
-        """Write packed query rows into their original positions, preserving autograd."""
-        cursor = 0
-        for start, end in self.q_ranges:
-            output[0, start:end] = part[cursor:cursor+end-start]
-            cursor += end-start
-
-
-@lru_cache(maxsize=128)
-def csa_tnd_plan(segments: tuple, ratio: int, has_keys: bool = True) -> CSATNDPlan | None:
-    """Separate true SWA-only/empty-prefix queries without inventing valid keys."""
-    active = tuple(item for item in segments
-                   if item[1] > item[0] and (bool(ratio and item[3] > item[2]) == has_keys))
-    if not active:
-        return None
-    return CSATNDPlan(
-        active, tuple((s, e) for s, e, _, _, _ in active), tuple((s, e) for _, _, s, e, _ in active),
-        tuple(e-s for s, e, _, _, _ in active), tuple(e-s for _, _, s, e, _ in active),
-        tuple(r for _, _, _, _, r in active),
-    )
-
-
-@lru_cache(maxsize=128)
-@torch.inference_mode(False)
-def _device_lengths(plan: CSATNDPlan, device: torch.device) -> tuple:
-    """Cache by the complete document partition, not merely by total Q/K sizes."""
-    cu_q = torch.tensor((0, *accumulate(plan.q_lengths)), device=device, dtype=torch.int32)
-    cu_k = torch.tensor((0, *accumulate(plan.k_lengths)), device=device, dtype=torch.int32)
-    residuals = torch.tensor(plan.residuals, device=device, dtype=torch.int32)
-    offsets = torch.tensor([s for s, _ in plan.k_ranges], device=device, dtype=torch.int32)
-    lengths = torch.tensor(plan.q_lengths, device=device, dtype=torch.int64)
-    offsets = torch.repeat_interleave(offsets, lengths, output_size=sum(plan.q_lengths)).unsqueeze(1)
-    return cu_q, cu_k, residuals, offsets
+from hyper_parallel.components.functional.sparse_attention_layout import (
+    SparseTNDPlan as CSATNDPlan, sparse_tnd_plan as csa_tnd_plan, pack_ranges,
+)
 
 
 @lru_cache(maxsize=1)

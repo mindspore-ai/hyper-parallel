@@ -23,12 +23,14 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from heapq import heapify, heappop, heappush
+from heapq import heapify, heappop, heappush, heapreplace
 from itertools import accumulate
+from operator import attrgetter
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -84,7 +86,7 @@ class IndexerTask:
 
 def _merge_tasks(tasks: list[IndexerTask]) -> tuple[IndexerTask, ...]:
     merged = []
-    for task in sorted(tasks):
+    for task in sorted(tasks, key=attrgetter("document", "start", "end")):
         if merged and merged[-1].document == task.document and merged[-1].end == task.start:
             merged[-1] = IndexerTask(task.document, merged[-1].start, task.end)
         elif task.length:
@@ -131,11 +133,30 @@ def _zigzag_tasks(lengths: tuple[int, ...], size: int) -> list[list[IndexerTask]
     return assignments
 
 
+@lru_cache(maxsize=128)
+def _initial_tasks(lengths: tuple[int, ...], size: int, block: int,
+                   min_length: int | None) -> tuple:
+    """Share immutable raw-Q blocks across ratios; allocation still uses each ratio's cost."""
+    assignments, pooled = [[] for _ in range(size)], []
+    for document, length in enumerate(lengths):
+        chunk, remainder = divmod(length, 2 * size)
+        if min_length is not None and length >= min_length and chunk:
+            for rank in range(size):
+                for slot in (rank, 2 * size - 1 - rank):
+                    start = remainder + slot * chunk
+                    assignments[rank].append(IndexerTask(document, start, start + chunk))
+            pool_end = remainder
+        else:
+            pool_end = length
+        pooled.extend(IndexerTask(document, start, min(start + block, pool_end))
+                      for start in range(0, pool_end, block))
+    return tuple(tuple(tasks) for tasks in assignments), tuple(pooled)
+
+
 def _greedy_tasks(lengths: tuple[int, ...], size: int, ratio: int, block: int) -> list[list[IndexerTask]]:
     """Keep the original cost/count/rank ordering without scanning every rank."""
-    tasks = [IndexerTask(document, start, min(start + block, length))
-             for document, length in enumerate(lengths) for start in range(0, length, block)]
-    assignments = [[] for _ in range(size)]
+    initial, tasks = _initial_tasks(lengths, size, block, None)
+    assignments = [list(assigned) for assigned in initial]
     _assign_greedy_tasks(assignments, tasks, ratio, 2 * (sum(lengths) // size))
     return assignments
 
@@ -147,7 +168,14 @@ def _assign_greedy_tasks(assignments: list[list[IndexerTask]], tasks: list[Index
                  for rank, assigned in enumerate(assignments)]
     heapify(available)
     # Reuse the cost computed for sorting when updating the selected worker.
-    for negative_work, task in sorted((-_task_work(task, ratio), task) for task in tasks):
+    ordered = sorted(((-_task_work(task, ratio), task) for task in tasks),
+                     key=lambda item: (item[0], item[1].document, item[1].start, item[1].end))
+    for negative_work, task in ordered:
+        cost, count, rank = available[0]
+        if count + task.length <= capacity:
+            assignments[rank].append(task)
+            heapreplace(available, (cost - negative_work, count + task.length, rank))
+            continue
         skipped = []
         for _ in range(len(available)):
             cost, count, rank = heappop(available)
@@ -168,19 +196,8 @@ def _hybrid_tasks(lengths: tuple[int, ...], size: int, ratio: int, block: int,
 
     Documents shorter than 2*size contain no complete pair and enter the greedy pool.
     """
-    assignments, pooled = [[] for _ in range(size)], []
-    for document, length in enumerate(lengths):
-        chunk, remainder = divmod(length, 2 * size)
-        if length >= min_length and chunk:
-            for rank in range(size):
-                for slot in (rank, 2 * size - 1 - rank):
-                    start = remainder + slot * chunk
-                    assignments[rank].append(IndexerTask(document, start, start + chunk))
-            pool_end = remainder
-        else:
-            pool_end = length
-        pooled.extend(IndexerTask(document, start, min(start + block, pool_end))
-                      for start in range(0, pool_end, block))
+    initial, pooled = _initial_tasks(lengths, size, block, min_length)
+    assignments = [list(assigned) for assigned in initial]
     _assign_greedy_tasks(assignments, pooled, ratio, 2 * (sum(lengths) // size))
     return assignments
 
@@ -283,6 +300,7 @@ def _append_ordered_task(tasks: list[IndexerTask], document: int, start: int, en
         tasks.append(IndexerTask(document, start, end))
 
 
+@lru_cache(maxsize=128)
 def _zigzag_rank_tasks(lengths: tuple[int, ...], size: int, rank: int) -> tuple[IndexerTask, ...]:
     """Construct only this worker's paired chunks and share of leading remainders."""
     capacity = sum(length % (2 * size) for length in lengths) // size
@@ -336,16 +354,38 @@ def _zigzag_send_ranges(lengths: tuple[int, ...], size: int, rank: int, boundari
 
 @dataclass(frozen=True)
 class IndexerRoute:
-    """Device-independent row ordering and matching variable collective splits."""
+    """Immutable interval ordering and collective splits, without per-token Python IDs."""
 
     segments: tuple
     input_splits: tuple[int, ...]
     output_splits: tuple[int, ...]
-    send_rows: tuple[int, ...]
-    receive_rows: tuple[int, ...]
-    local_sources: tuple[int, ...]
-    local_targets: tuple[int, ...]
+    send_ranges: tuple[tuple[int, int], ...]
+    receive_ranges: tuple[tuple[int, int], ...]
+    local_source_ranges: tuple[tuple[int, int], ...]
+    local_target_ranges: tuple[tuple[int, int], ...]
     query_count: int
+    _cached_hash: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Hash immutable metadata once; equality still checks every routing field."""
+        object.__setattr__(self, "_cached_hash", hash((
+            self.segments, self.input_splits, self.output_splits, self.send_ranges,
+            self.receive_ranges, self.local_source_ranges, self.local_target_ranges, self.query_count,
+        )))
+
+    def __hash__(self) -> int:
+        """Avoid rescanning a long route on each device-index cache lookup."""
+        return self._cached_hash
+
+
+@lru_cache(maxsize=128)
+def _zigzag_transport(lengths: tuple[int, ...], size: int, rank: int) -> IndexerRoute:
+    """Share raw-Q transport across ratios; only K segments depend on compression."""
+    boundaries = (0, *accumulate(lengths))
+    tasks = _zigzag_rank_tasks(lengths, size, rank)
+    sends = _zigzag_send_ranges(lengths, size, rank, boundaries)
+    receives = _receive_ranges(tasks, boundaries, size, boundaries[-1] // size)
+    return _route_from_ranges(tasks, lengths, rank, 1, sends, receives)
 
 
 @lru_cache(maxsize=128)
@@ -370,11 +410,10 @@ def indexer_route(lengths: tuple[int, ...], size: int, rank: int, ratio: int, mo
     if mode == "zigzag":
         _validate_task_plan(lengths, size, ratio, mode, block_size)
         validate_indexer_hybrid_threshold(mode, zigzag_min_length)
-        boundaries = (0, *accumulate(lengths))
-        tasks = _zigzag_rank_tasks(lengths, size, rank)
-        sends = _zigzag_send_ranges(lengths, size, rank, boundaries)
-        receives = _receive_ranges(tasks, boundaries, size, boundaries[-1] // size)
-        return _route_from_ranges(tasks, lengths, rank, ratio, sends, receives)
+        transport = _zigzag_transport(lengths, size, rank)
+        if ratio == 1:
+            return transport
+        return replace(transport, segments=_segments(_zigzag_rank_tasks(lengths, size, rank), lengths, ratio))
     assignments = indexer_task_plan(lengths, size, ratio, mode, block_size,
                                     zigzag_min_length)
     return _route_from_tasks(assignments, lengths, rank, ratio)
@@ -389,29 +428,63 @@ def _route_from_tasks(assignments: tuple, lengths: tuple[int, ...], rank: int, r
     return _route_from_ranges(assignments[rank], lengths, rank, ratio, sends, receives)
 
 
+def _merge_ranges(ranges: Iterator[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    """Coalesce consecutive IDs without reordering their collective payload positions."""
+    merged = []
+    for start, count in ranges:
+        if not count:
+            continue
+        if merged and merged[-1][0] + merged[-1][1] == start:
+            previous, length = merged[-1]
+            merged[-1] = (previous, length + count)
+        else:
+            merged.append((start, count))
+    return tuple(merged)
+
+
 def _route_from_ranges(tasks: tuple, lengths: tuple[int, ...], rank: int, ratio: int,
                        sends: tuple, receives: tuple) -> IndexerRoute:
-    """Preserve peer ordering and local bypass for either task-planning path."""
-    send_rows, receive_rows, inputs, outputs = [], [], [], []
-    for peer, sent in enumerate(sends):
-        sent = sent if peer != rank else ()
-        received = receives[peer] if peer != rank else ()
+    """Preserve peer ordering and local bypass for either task-planning path.
+
+    Merging storage intervals does not merge attention documents or change peer
+    splits. Each index vector retains exactly the original row order.
+    """
+    inputs, outputs, send_ranges, receive_ranges = [], [], [], []
+    for peer, (sent, received) in enumerate(zip(sends, receives)):
+        if peer == rank:
+            inputs.append(0)
+            outputs.append(0)
+            continue
         inputs.append(sum(count for _, count in sent))
         outputs.append(sum(count for _, _, count in received))
-        send_rows.extend(row for start, count in sent for row in range(start, start + count))
-        receive_rows.extend(row for _, start, count in received for row in range(start, start + count))
-    sources = tuple(row for start, _, count in receives[rank] for row in range(start, start + count))
-    targets = tuple(row for _, start, count in receives[rank] for row in range(start, start + count))
-    return IndexerRoute(_segments(tasks, lengths, ratio), tuple(inputs), tuple(outputs),
-                        tuple(send_rows), tuple(receive_rows), sources, targets,
-                        sum(task.length for task in tasks))
+        send_ranges.extend(sent)
+        receive_ranges.extend((start, count) for _, start, count in received)
+    sent, received = _merge_ranges(iter(send_ranges)), _merge_ranges(iter(receive_ranges))
+    sources = _merge_ranges((start, count) for start, _, count in receives[rank])
+    targets = _merge_ranges((start, count) for _, start, count in receives[rank])
+    return IndexerRoute(
+        _segments(tasks, lengths, ratio), tuple(inputs), tuple(outputs), sent, received, sources, targets,
+        sum(task.length for task in tasks),
+    )
+
+
+def _range_rows(ranges: tuple[tuple[int, int], ...]) -> torch.Tensor:
+    """Expand CPU-only routing metadata in bulk, without Python objects per token."""
+    if not ranges:
+        return torch.empty(0, dtype=torch.long)
+    intervals = np.asarray(ranges, dtype=np.int64)
+    counts = intervals[:, 1]
+    offsets = np.cumsum(counts) - counts
+    rows = np.repeat(intervals[:, 0] - offsets, counts)
+    rows += np.arange(rows.size, dtype=np.int64)
+    return torch.from_numpy(rows)
 
 
 @lru_cache(maxsize=32)
 @torch.inference_mode(False)
 def _device_rows(route: IndexerRoute, device: torch.device) -> tuple:
-    return tuple(torch.tensor(rows, device=device, dtype=torch.long) for rows in
-                 (route.send_rows, route.receive_rows, route.local_sources, route.local_targets))
+    return tuple(_range_rows(ranges).to(device=device) for ranges in
+                 (route.send_ranges, route.receive_ranges, route.local_source_ranges, route.local_target_ranges))
 
 
 def _exchange_rows(tensor: torch.Tensor, route: IndexerRoute, group: Any, rows: tuple) -> torch.Tensor:
@@ -438,8 +511,8 @@ def _exchange_inputs(inputs: tuple[torch.Tensor, ...], route: IndexerRoute, grou
         widths = [inputs[index].shape[-1] for index in indices]
         packed = torch.cat([inputs[index][0] for index in indices], dim=-1)
         received = _exchange_rows(packed, route, group, rows)
-        for index, field in zip(indices, received.split(widths, dim=-1)):
-            outputs[index] = field.unsqueeze(0).contiguous()
+        for index, value in zip(indices, received.split(widths, dim=-1)):
+            outputs[index] = value.unsqueeze(0).contiguous()
     return tuple(outputs)
 
 
@@ -515,6 +588,33 @@ class _PendingRows:
 
 
 @dataclass
+class _PendingIndexerResult:
+    """Retain local IDs until a supplied restore operator consumes both partitions."""
+
+    send: torch.Tensor | None
+    received: torch.Tensor | None
+    selected: torch.Tensor | None
+    output: torch.Tensor | None
+    rows: tuple
+    work: Any
+    restore_op: Callable
+    consumed: bool = False
+
+    @torch.no_grad()
+    def wait(self) -> torch.Tensor:
+        """Wait for remote IDs, restore once, then release communication storage."""
+        if self.consumed:
+            raise RuntimeError("Indexer communication handle cannot be consumed twice")
+        self.consumed = True
+        self.work.wait()
+        output = self.output
+        self.restore_op(self.selected, self.received, self.rows, output)
+        self.send = self.received = self.selected = self.output = self.work = None
+        self.rows = ()
+        return output
+
+
+@dataclass
 class IndexerInputExchange:
     """One balanced query dispatch with original routing and dtype groups."""
 
@@ -542,8 +642,19 @@ class IndexerInputExchange:
         return tuple(outputs)
 
     @torch.no_grad()
-    def launch_result(self, selected: torch.Tensor) -> _PendingRows:
-        """Return selection IDs while owner-side differentiable projections run."""
+    def launch_result(
+        self, selected: torch.Tensor, *, restore_op: Callable | None = None,
+    ) -> _PendingRows | _PendingIndexerResult:
+        """Return selection IDs while owner-side differentiable projections run.
+
+        Args:
+            selected: Worker TopK matrix in the input route's query order.
+            restore_op: Optional integer placement function accepting worker IDs,
+                received IDs, (local sources, local destinations, remote
+                destinations), and output. It runs only after the receive wait;
+                local IDs remain alive until then. None retains the Torch path
+                and its early local bypass copy.
+        """
         send_rows, receive_rows, local_sources, local_targets = self.rows
         send = selected.index_select(0, receive_rows).contiguous()
         received = selected.new_empty((sum(self.route.input_splits), selected.shape[-1]))
@@ -552,6 +663,10 @@ class IndexerInputExchange:
             group=self.group, async_op=True,
         )
         output = selected.new_empty((self.owner_queries, selected.shape[-1]))
+        if restore_op is not None:
+            return _PendingIndexerResult(
+                send, received, selected, output, (local_targets, local_sources, send_rows), work, restore_op,
+            )
         output.index_copy_(0, local_sources, selected.index_select(0, local_targets))
         return _PendingRows(send, received, output, send_rows, work)
 
@@ -561,6 +676,7 @@ def launch_indexer_inputs(
         query_residual: torch.Tensor, weights: torch.Tensor, embeddings: tuple,
         lengths: tuple[int, ...], ratio: int, mode: str, group: Any,
         block_size: int | None = None, zigzag_min_length: int | None = None,
+        *, prepared_route: IndexerRoute | None = None,
 ) -> IndexerInputExchange:
     """Launch all selection input fields without waiting for worker readiness.
 
@@ -574,6 +690,7 @@ def launch_indexer_inputs(
         group: CP process group.
         block_size: Greedy task length in original query rows.
         zigzag_min_length: Hybrid long-document threshold.
+        prepared_route: Validated batch-owned route supplied by the CP adapter.
 
     Returns:
         Single-use handle retaining transfer storage until wait.
@@ -586,8 +703,9 @@ def launch_indexer_inputs(
     if any(value.ndim != 3 or value.shape[:2] != query_residual.shape[:2]
            or value.device != query_residual.device for value in inputs):
         raise ValueError("Indexer qr, weights and rotary embeddings must share token axes and device")
-    route = indexer_route(lengths, size, rank, ratio, mode, block_size,
-                          zigzag_min_length)
+    route = prepared_route
+    if route is None:
+        route = indexer_route(lengths, size, rank, ratio, mode, block_size, zigzag_min_length)
     rows = _device_rows(route, query_residual.device)
     send_rows, receive_rows, local_sources, local_targets = rows
     grouped = {}

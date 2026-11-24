@@ -65,6 +65,7 @@ swiglu    standard     native
 | `grouped_swiglu` | `standard`，非量化专家的 Gate、Up 和 Down 计算 | `torch_npu`, `native` | `torch_grouped_mm`, `native` | `native` |
 | `moe_router` | `deepseek_v41`，V4.1 TopK 路由 | `megagate`, `native` | `native` | `native` |
 | `moe_token_reorder` | `standard`、`weighted_restore`，专家顺序重排和加权还原 | `torch_npu`, `native` | `native` | `native` |
+| `indexer_topk_restore` | `standard`，Indexer 返回的整数 TopK 行落位 | `triton_ascend`, `native`；auto 保留 native | `native` | `native` |
 | `attention` | `vision`、`gqa`、`mla`、`mla_with_stats` | `torch_npu`, `native` | `sdpa`, `native` | `sdpa`, `native` |
 | `gdn` | `zero_state`，Gated DeltaNet 局部零状态计算 | `triton_ascend`, `ascendc`, `native` | `native` | `native` |
 | `kda` | `zero_state`，Kimi Delta Attention 局部零状态计算 | `triton_ascend`, `ascendc`, `native` | `native` | `native` |
@@ -144,6 +145,27 @@ print(ops.used_backends())
 ```
 
 第三方 step-end callback 可以读取 `ops.used_backends()`。现有高性能模块替换、具体模型和 recipe 接入随第二阶段 PR 提供，届时再补完整 Trainer 训练示例和兼容性验证。
+
+## Indexer TopK 返回恢复
+
+DSA 和 CSA2 的 CP Indexer 均衡返回路径共用此算子。原 Torch 路径在回传期间先写本地行，
+等通信完成后再写远端行；融合路径等通信完成后用一个 Triton-Ascend kernel 完成两部分落位。
+发送内容、TopK 槽位顺序和 `-1` 标记保持不变。仅在实际执行 Indexer 均衡时使用该配置。
+
+```yaml
+ops:
+  indexer_topk_restore: triton_ascend
+```
+
+`native` 或默认 `auto` 保留原 Torch 调度；显式选择 `triton_ascend` 时，缺少 Triton-Ascend、
+设备不支持或执行失败均报错，不静默改走 Torch。此算子只要求 Triton-Ascend，不依赖 FLA。
+整数输入支持 int32/int64，输入和输出均为连续二维矩阵，行路由为同设备 int64 向量。
+路由生产者保证本地/远端目标行不重复、覆盖完整输出并且索引有效，恢复过程不对设备索引做主机同步。
+
+公共 `indexer_topk_restore(selected, received, rows, output)` 将结果写入给定输出；
+通信接线使用 `prepare_indexer_topk_restore(selected)` 在下发回传前解析后端。
+返回 `None` 表示保留 Torch 的提前本地落位；返回融合函数时，待完成句柄持有该函数及源缓冲，
+在 `wait()` 完成后调用，并释放持有的缓冲。这样不改变未启用融合时的通信重叠窗口。
 
 ## 注册新算子族或后端
 

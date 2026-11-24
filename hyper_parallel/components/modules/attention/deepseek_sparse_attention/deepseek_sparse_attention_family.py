@@ -36,6 +36,16 @@ def validate_sparse_attention_family(*, config: Any, module: nn.Module | None, c
     cp_size = context.get("cp_size")
     if cp_size is not None and member.arguments.get("kv_cp_size", 1) != cp_size:
         raise ValueError("kv_cp_size must equal the job cp_size")
+    options = member.arguments
+    advanced = (options.get("indexer_load_balance", "none") != "none"
+                or options.get("main_kv_comm", "all_gather") != "all_gather"
+                or options.get("index_k_comm", "all_gather") != "all_gather"
+                or options.get("indexer_paged_k", False)
+                or options.get("main_kv_comm_fusion", False))
+    if advanced and member.axis_sizes["tp"] > 1:
+        raise ValueError("DSA advanced CP options currently require TP1")
+    if advanced and cp_size == 1:
+        raise ValueError("DSA advanced CP options currently require CP > 1")
     config = config if module is None else module.config
     if member.axis_sizes["pp"] > 1:
         raise ValueError("DeepSeek sparse attention does not support pipeline parallelism")
@@ -106,7 +116,8 @@ def sparse_attention_parallel_spec(*, module: nn.Module, member: Any) -> Paralle
             ),
             "prepare_attention_inputs": ("hidden_states", "position_embeddings", "metadata", "use_dense"),
             "exchange_attention": ("inputs",),
-            "run_attention": ("index_states", "attention_states", "sequence_lengths", "use_dense"),
+            "run_attention": ("index_states", "attention_states", "sequence_lengths", "use_dense",
+                              "selected", "host_lengths"),
             "project_output": ("output",),
         },
         validate=validate_sparse_attention_layout,
@@ -119,6 +130,9 @@ def DeepseekSparseAttention(  # pylint: disable=invalid-name
     context: Any = None, mesh: Any = None,
     kv_cp_size: int = 1, kv_cp_strategy: str = "allgather",
     cp_comm_overlap: bool = False, dense_warmup: bool | None = None,
+    main_kv_comm: str = "all_gather", index_k_comm: str = "all_gather", main_kv_comm_fusion: bool = False,
+    indexer_load_balance: str = "none", indexer_balance_block_size: int | None = None,
+    indexer_zigzag_min_length: int | None = None, indexer_paged_k: bool = False,
 ) -> nn.Module:
     """Build a local or CP member while retaining V3.2 source and checkpoint contracts.
 
@@ -129,9 +143,16 @@ def DeepseekSparseAttention(  # pylint: disable=invalid-name
         context: Logical job topology used for family selection.
         mesh: Optional existing MeshContext for shared layout planning and binding.
         kv_cp_size: KV domain size; must equal the job CP size for this implementation.
-        kv_cp_strategy: KV transport; currently only allgather is supported.
+        kv_cp_strategy: Legacy allgather compatibility value; bank options choose actual transport.
         cp_comm_overlap: Submit all key-bank gathers before waiting when true; defaults to False.
         dense_warmup: None follows the mutable model stage; bool pins the stage.
+        main_kv_comm: all_gather or document-prefix all_to_all_v for main banks.
+        main_kv_comm_fusion: Merge latent KV and RoPE K transport; disabled by default.
+        index_k_comm: Independent Index K all_gather or all_to_all_v.
+        indexer_load_balance: Sparse selection allocation: none, zigzag, greedy or hybrid.
+        indexer_balance_block_size: Greedy/hybrid block length, default 2048.
+        indexer_zigzag_min_length: Hybrid long-document threshold.
+        indexer_paged_k: Share LI physical pages between logical key prefixes.
 
     Returns:
         Concrete member retaining the requested family and parameter layout.
@@ -140,6 +161,10 @@ def DeepseekSparseAttention(  # pylint: disable=invalid-name
         DeepseekSparseAttention, config=config, module=module, module_fqn=module_fqn, context=context,
         mesh=mesh, kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy,
         cp_comm_overlap=cp_comm_overlap, dense_warmup=dense_warmup,
+        main_kv_comm=main_kv_comm, index_k_comm=index_k_comm, main_kv_comm_fusion=main_kv_comm_fusion,
+        indexer_load_balance=indexer_load_balance,
+        indexer_balance_block_size=indexer_balance_block_size,
+        indexer_zigzag_min_length=indexer_zigzag_min_length, indexer_paged_k=indexer_paged_k,
     )
 
 
