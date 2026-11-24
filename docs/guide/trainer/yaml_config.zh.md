@@ -179,3 +179,5 @@ Value 先由 `yaml.safe_load()` 解析，再按照目标节点的类型转换：
 - `Target` 参数必须已在配置中，或存在于 callable 签名中；带 `**kwargs` 的 callable 可以接收新增参数。
 - `_target_` 不参与替换，CLI override 不改变 callable。
 - 当前值为 `None` 的可选组件没有可继续遍历的配置节点，组件结构需要由 YAML 提供。
+
+`--ops.<算子族>=<实现>` 可以新增或覆盖已注册的算子族配置。自动选择、参考实现和后端支持见 [算子后端选型与接入](../op_select.zh.md)。

@@ -141,6 +141,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **code-review** | Full distributed review (stream/memory/DTensor/collectives) | `/code-review` |
 | **dist-op-analysis** | Operator analysis → plan (human confirm) | called before dist-op-dev |
 | **dist-op-dev** | Implement + test from confirmed plan | `/dist-op-dev` |
+| **op-select-dev** | OpSelect operator families, fused backends, module call sites and precision acceptance | `$op-select-dev` / OpSelect 算子接入与验收 |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **sapp-parallel-strategy** | Layout for a job on Ascend dies, every valid layout priced by ND: the pick, the next two, why | `$sapp-parallel-strategy` (Codex), `/sapp-parallel-strategy` |

@@ -277,6 +277,29 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertTrue(config.compile.selects_graph_compiler())
         self.assertEqual(config.compile.dynamic_arg_dims, {"model_inputs.input_ids": [0, 1], "labels": 0})
 
+    def test_ops_overrides_preserve_other_families(self) -> None:
+        """Family overrides merge into selections and later values replace earlier ones."""
+        config = self._parse("--ops.swiglu=native", "--ops.rms_norm=native", "--ops.swiglu=auto")
+        self.assertEqual(config.ops, {"swiglu": "auto", "rms_norm": "native"})
+
+    def test_invalid_ops_overrides_report_cli_path(self) -> None:
+        """Invalid families, implementations and YAML value types identify their CLI key."""
+        for token in ("--ops.unknown=native", "--ops.swiglu=unknown", "--ops.swiglu=null"):
+            key = token.split("=", 1)[0][2:]
+            with self.subTest(token=token), self.assertRaisesRegex(ConfigResolutionError, f"CLI.{key}"):
+                self._parse(token)
+
+    def test_duplicate_ops_yaml_keys_are_rejected(self) -> None:
+        """Reject duplicate root ops mappings and repeated family keys before resolution."""
+        cases = (("ops: {}\nops: {}\n", "duplicate ops mapping"),
+                 ("ops:\n  swiglu: native\n  swiglu: auto\n", "duplicate family"))
+        for selections, message in cases:
+            with self.subTest(selections=selections), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "train.yaml"
+                path.write_text(_SAMPLE_YAML.format(module=__name__) + selections, encoding="utf-8")
+                with self.assertRaisesRegex(ConfigResolutionError, message):
+                    parse_training_args([str(path)])
+
 
 if __name__ == "__main__":
     unittest.main()
