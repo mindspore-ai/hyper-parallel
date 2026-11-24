@@ -18,48 +18,15 @@ from __future__ import annotations
 
 import logging
 from copy import copy
-from fnmatch import fnmatch
 from typing import Any
-
-from hyper_parallel.codegen.inline.ir import SourceObservation
-from hyper_parallel.codegen.inline.framework_spec import strategy_spec_for as strategy_spec
-from hyper_parallel.codegen.inline.strategy_pass import rule_block_classes
 
 logger = logging.getLogger(__name__)
 
 
-def normalize_inline_meta(
-    meta: Any,
-    rules: tuple[SourceObservation, ...],
-    model_type: str | None = None,
-) -> Any:
-    """Align the frozen plan with the inline-generated source shape.
-
-    Every stage is structure-proven: the strategy each strategy target
-    resolves to names the class whose forward is inlined and the sub-patterns
-    that forward owns, and ``meta.external_state_classes`` (recorded from the
-    same structure at freeze time) names the classes whose forward an inline
-    strategy body *replaces* (the MoE EP shell) and which therefore read their
-    parallel state from install-time instance attributes.  A rendered component
-    class (the fused attention) keeps the component's own forward and is not
-    stripped: its boundary is emitted and compiled like any other.
-    """
-
-    # EP strategy forwards inline the entire routed+shared path, so any
-    # boundary entries for sub-modules of an EP target (e.g. routed experts
-    # and shared_experts) must be stripped — otherwise the shared class used
-    # in both EP and TP contexts fails the single-contract invariant.
-    # Capture the complete class map BEFORE stripping, so we can detect
-    # classes shared between boundary and non-boundary instances (e.g.
-    # DeepseekV3MLP used as both dense decoder layers and shared experts
-    # inside MoE). Source lowering rewrites class.forward, which ALL
-    # instances inherit -- a non-boundary instance would get a boundary
-    # body it cannot satisfy (no _hp_boundary installed).
+def normalize_inline_meta(meta: Any) -> Any:
+    """Copy emission metadata and protect classes shared with non-boundary instances."""
     normalized = _copy_inline_meta(meta)
-    full_class_map = dict(getattr(normalized, "boundary_classes", None) or {})
-    _strip_ep_sub_boundaries(normalized, rules, model_type)
-    _strip_external_state_boundaries(normalized)
-    _mark_shared_class_boundaries(normalized, full_class_map)
+    _mark_shared_class_boundaries(normalized, normalized.boundary_classes)
     return normalized
 
 
@@ -70,152 +37,15 @@ def _copy_inline_meta(meta: Any) -> Any:
     normalized.boundary_classes = dict(
         getattr(meta, "boundary_classes", None) or {}
     )
-    normalized.external_state_classes = list(
-        getattr(meta, "external_state_classes", None) or ()
-    )
     return normalized
 
 
-def _strip_external_state_boundaries(meta: Any) -> None:
-    """Keep parameter sharding without duplicating inline-body-owned collectives.
-
-    Only a class whose forward an inline strategy body replaced is stripped:
-    that body carries its own orchestration, so a boundary wrapper for the same
-    class would rewrite the very forward the inline patch installed.  A
-    rendered component class is deliberately kept — the emitted boundary form
-    wraps its ``_forward_impl`` and is compiled at install time.
-    """
-    external_classes = set(getattr(meta, "external_state_classes", None) or ())
-    boundary_classes = getattr(meta, "boundary_classes", None) or {}
-    param_plan = getattr(meta, "param_plan", None) or {}
-    for fqn, class_name in list(boundary_classes.items()):
-        if class_name not in external_classes:
-            continue
-        entry = param_plan.get(fqn)
-        if isinstance(entry, dict):
-            param_plan[fqn] = {**entry, "is_boundary": False}
-        boundary_classes.pop(fqn)
-
-
-def _strip_ep_sub_boundaries(
-    meta: Any, rules: tuple[SourceObservation, ...], model_type: str | None,
-) -> None:
-    """Mark boundary entries owned by inline EP strategy forwards as non-boundary.
-
-    The EP strategy forward replaces the target class's ``forward`` and calls
-    sub-modules directly (routed experts via all-to-all, shared experts via
-    ``self.shared_experts(...)``).  Boundary entries for the EP target itself
-    and for routed-expert / shared-expert sub-modules are marked
-    ``is_boundary: false`` so ``lower_forward_boundaries`` does not double-wrap
-    them.  The param_plan entries are kept so FSDP / EP param sharding still
-    applies and the preflight coverage check passes.
-    """
-    param_plan = getattr(meta, "param_plan", None) or {}
-    boundary_classes = getattr(meta, "boundary_classes", None) or {}
-    ep_fqns, strip_patterns = _collect_ep_boundaries(
-        meta, rules, model_type, boundary_classes
-    )
-    if not ep_fqns:
-        return
-    mark_fqns = _expanded_ep_boundaries(ep_fqns, strip_patterns, param_plan)
-    for fqn in mark_fqns:
-        entry = param_plan.get(fqn)
-        if isinstance(entry, dict):
-            param_plan[fqn] = {**entry, "is_boundary": False}
-        boundary_classes.pop(fqn, None)
-
-
-def _collect_ep_boundaries(
-    meta: Any,
-    rules: tuple[SourceObservation, ...],
-    model_type: str | None,
-    boundary_classes: dict[str, str],
-) -> tuple[set[str], tuple[str, ...]]:
-    """Collect EP host FQNs and sub-boundary patterns from inline rules."""
-    ep_fqns: set[str] = set()
-    strip_patterns: tuple[str, ...] = ()
-    for rule in rules:
-        resolved = _ep_rule_hosts(rule, model_type, boundary_classes)
-        if resolved is None:
-            continue
-        spec, host_classes = resolved
-        if spec.strip_boundary_subpatterns:
-            strip_patterns = spec.strip_boundary_subpatterns
-        if host_classes:
-            # Persist the derived classes so a re-emission of this
-            # already-normalized meta (whose boundary entries the strip below
-            # consumes) can still resolve its patch hosts.
-            recorded = set(getattr(meta, "external_state_classes", None) or ())
-            meta.external_state_classes = sorted(recorded | host_classes)
-        for fqn, cls in boundary_classes.items():
-            if cls not in host_classes:
-                continue
-            if any(fnmatch(fqn, pattern) for pattern in rule.match):
-                ep_fqns.add(fqn)
-    return ep_fqns, strip_patterns
-
-
-def _expanded_ep_boundaries(
-    ep_fqns: set[str], strip_patterns: tuple[str, ...], param_plan: dict[str, Any]
-) -> set[str]:
-    """Expand EP hosts with matching routed/shared expert sub-boundaries."""
-    mark_fqns: set[str] = set()
-    for ep_fqn in ep_fqns:
-        mark_fqns.add(ep_fqn)
-        if not strip_patterns:
-            continue
-        sub_prefix = ep_fqn + "."
-        for fqn in list(param_plan):
-            if not fqn.startswith(sub_prefix):
-                continue
-            local_suffix = fqn[len(sub_prefix):]
-            for pat in strip_patterns:
-                if fnmatch(local_suffix, pat):
-                    mark_fqns.add(fqn)
-                    break
-    return mark_fqns
-
-
-def _ep_rule_hosts(
-    rule: SourceObservation, model_type: str | None, boundary_classes: dict[str, str]
-) -> tuple[Any, set[str]] | None:
-    """Resolve an inline EP rule and the source classes that host it."""
-    if rule.local_compute_target is None:
-        return None
-    spec = strategy_spec(rule.local_compute_target, model_type)
-    if spec is None or spec.body_template is None:
-        return None
-    if spec.target_class is not None:
-        return spec, {spec.target_class}
-    return spec, rule_block_classes(rule, boundary_classes)
-
-
 def _mark_shared_class_boundaries(meta: Any, full_class_map: dict[str, str]) -> None:
-    """Mark source lowering as skipped for classes shared with a non-boundary instance.
+    """Avoid imposing one instance's boundary on every instance of its class.
 
-    Source lowering rewrites class.forward, which ALL instances of the class
-    inherit -- including instances that are NOT boundaries. A non-boundary
-    instance would inherit a boundary body that references
-    self._hp_boundary, but hp_install_boundaries skips non-boundary FQNs
-    (is_boundary=False), so the attribute is never installed and the
-    forward raises AttributeError at train time.
-
-    The classic trigger is DeepSeek-V3 hybrid stack: DeepseekV3MLP is
-    used both as the dense decoder MLP (a TP boundary) and as the shared
-    expert inside the MoE layer (stripped to is_boundary=False by
-    _strip_ep_sub_boundaries). Source lowering the dense-layer boundary
-    rewrites the class forward; the shared-expert instance inherits it;
-    the runtime never installs _hp_boundary on the shared expert -> crash.
-
-    The decision travels as an explicit ``skip_source_lowering`` marker on
-    the param-plan entry (``is_boundary`` stays True; ``boundary_classes``
-    is kept intact) rather than by removing the class mapping: the
-    emitter's fail-fast on an unresolvable boundary class is a real safety
-    contract (a silently dropped redistribution would change the model's
-    numeric behavior), so "skip source lowering" must be stated, not
-    implied by missing data.  ``hp_install_boundaries`` installs the
-    per-instance runtime wrapper for the marked boundary, which executes
-    the same contract.
+    Keep the boundary and class mapping visible, but mark the class-level
+    rewrite as skipped. Native per-instance boundary application remains
+    Trainer-owned; the review artifact does not install runtime state.
     """
     param_plan = getattr(meta, "param_plan", None) or {}
     boundary_classes = getattr(meta, "boundary_classes", None) or {}
@@ -241,7 +71,7 @@ def _mark_shared_class_boundaries(meta: Any, full_class_map: dict[str, str]) -> 
             logger.info(
                 "codegen: boundary %s (class %s) marked skip_source_lowering "
                 "-- the class is shared with a non-boundary instance; the "
-                "runtime per-instance wrapper is used instead",
+                "class forward is preserved for native per-instance application",
                 fqn, class_name,
             )
 

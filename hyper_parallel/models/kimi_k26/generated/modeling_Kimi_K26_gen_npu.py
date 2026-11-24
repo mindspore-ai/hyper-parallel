@@ -6,11 +6,317 @@
 #   source       : transformers.models.kimi_k25.modeling_kimi_k25
 #   architecture : KimiK25ForConditionalGeneration
 #   parallel_dims: tp=1 cp=1 ep=128 pp=1 sp=False loss_parallel=False
-#   injections   : 60 rule(s)
+#   injections   : 0 rule(s)
 #   runtime      : mesh / FSDP2 / PP / AC / compile still handled by runtime
 #
 # [HYPER PLAN] training derives a live plan from its YAML and this model;
 # Regenerate this file from the training YAML after strategy changes.
+#
+#   model.language_model.layers.0.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.0.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.0.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.0.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.1.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.1.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.1.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.1.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.2.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.2.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.2.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.2.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.3.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.3.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.3.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.3.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.4.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.4.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.4.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.4.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.5.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.5.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.5.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.5.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.6.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.6.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.6.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.6.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.7.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.7.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.7.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.7.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.8.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.8.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.8.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.8.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.9.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.9.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.9.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.9.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.10.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.10.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.10.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.10.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.11.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.11.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.11.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.11.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.12.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.12.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.12.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.12.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.13.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.13.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.13.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.13.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.14.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.14.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.14.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.14.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.15.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.15.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.15.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.15.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.16.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.16.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.16.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.16.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.17.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.17.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.17.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.17.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.18.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.18.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.18.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.18.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.19.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.19.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.19.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.19.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.20.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.20.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.20.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.20.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.21.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.21.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.21.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.21.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.22.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.22.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.22.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.22.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.23.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.23.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.23.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.23.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.24.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.24.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.24.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.24.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.25.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.25.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.25.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.25.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.26.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.26.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.26.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.26.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.27.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.27.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.27.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.27.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.28.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.28.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.28.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.28.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.29.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.29.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.29.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.29.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.30.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.30.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.30.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.30.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.31.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.31.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.31.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.31.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.32.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.32.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.32.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.32.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.33.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.33.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.33.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.33.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.34.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.34.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.34.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.34.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.35.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.35.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.35.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.35.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.36.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.36.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.36.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.36.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.37.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.37.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.37.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.37.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.38.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.38.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.38.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.38.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.39.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.39.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.39.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.39.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.40.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.40.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.40.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.40.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.41.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.41.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.41.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.41.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.42.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.42.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.42.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.42.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.43.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.43.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.43.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.43.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.44.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.44.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.44.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.44.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.45.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.45.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.45.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.45.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.46.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.46.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.46.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.46.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.47.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.47.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.47.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.47.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.48.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.48.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.48.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.48.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.49.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.49.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.49.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.49.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.50.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.50.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.50.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.50.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.51.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.51.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.51.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.51.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.52.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.52.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.52.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.52.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.53.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.53.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.53.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.53.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.54.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.54.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.54.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.54.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.55.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.55.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.55.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.55.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.56.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.56.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.56.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.56.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.57.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.57.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.57.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.57.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.58.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.58.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.58.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.58.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.59.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.59.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.59.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.59.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.60.self_attn.q_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.60.self_attn.kv_a_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.60.input_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.60.post_attention_layernorm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.norm: DeepseekV3RMSNorm -> RMSNormModule
+#   model.language_model.layers.1.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.2.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.3.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.4.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.5.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.6.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.7.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.8.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.9.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.10.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.11.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.12.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.13.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.14.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.15.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.16.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.17.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.18.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.19.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.20.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.21.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.22.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.23.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.24.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.25.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.26.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.27.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.28.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.29.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.30.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.31.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.32.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.33.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.34.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.35.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.36.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.37.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.38.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.39.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.40.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.41.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.42.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.43.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.44.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.45.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.46.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.47.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.48.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.49.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.50.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.51.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.52.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.53.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.54.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.55.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.56.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.57.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.58.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.59.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
+#   model.language_model.layers.60.mlp.experts: DeepseekV3Experts -> EPGroupedExperts
 #
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 #           This file was automatically generated from src/transformers/models/kimi_k25/modular_kimi_k25.py.
@@ -961,16 +1267,16 @@ from transformers.utils.generic import is_flash_attention_requested, maybe_autoc
 
 from transformers.utils.output_capturing import capture_outputs
 
-
-
-from hyper_parallel.components.modules.common.rms_norm import RMSNorm
-
-
-
-
-# Codegen replacement: RMSNorm wraps DeepseekV3RMSNorm; the original class is kept as the wrapper input.
-
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+
+from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts import EPGroupedExperts
+from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
+
+
+
+
+
 
 @use_kernel_forward_from_hub('RMSNorm')
 class DeepseekV3RMSNorm(nn.Module):
@@ -1132,13 +1438,11 @@ class DeepseekV3MoE(nn.Module):
     def __init__(self, config: DeepseekV3Config):
         super().__init__()
         self.config = config
-        self.experts = DeepseekV3Experts(config)
+        self.experts = EPGroupedExperts(module=DeepseekV3Experts(config), context={'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'num_layers': 61})
         self.gate = DeepseekV3TopkRouter(config)
         self.shared_experts = DeepseekV3MLP(config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
 
-    ep_enable = False
-
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residuals = hidden_states
         orig_shape = hidden_states.shape
         _, topk_weights, topk_indices = self.gate(hidden_states)
@@ -1146,19 +1450,7 @@ class DeepseekV3MoE(nn.Module):
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.ep_enable:
-            # [HYPER LOCAL REGION] boundary entry
-            args, kwargs = self._hp_boundary.redistribute_inputs(
-                ((hidden_states,), {}),
-            )
-            # [HYPER LOCAL REGION] run the region compute fn on local tensors
-            # hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute.kimi_k26_ep_compute_fn is bound to self by generated source.
-            outputs = self.kimi_k26_ep_compute_fn(*args, **kwargs)
-            # [HYPER LOCAL REGION] boundary exit
-            outputs = self._hp_boundary.redistribute_outputs(outputs)
-            return outputs
-        return self._forward_impl(hidden_states)
+
 def _hp_nested_rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., :x.shape[-1] // 2]
@@ -1274,10 +1566,10 @@ class DeepseekV3Attention(nn.Module):
             self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-            self.q_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.q_lora_rank), module_fqn='', context={})
+            self.q_a_layernorm = RMSNormModule(config.q_lora_rank, eps=1e-06, cast_order='before_weight', fp32_weight=False)
             self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=config.attention_bias)
-        self.kv_a_layernorm = RMSNorm(module=DeepseekV3RMSNorm(self.kv_lora_rank), module_fqn='', context={})
+        self.kv_a_layernorm = RMSNormModule(self.kv_lora_rank, eps=1e-06, cast_order='before_weight', fp32_weight=False)
         self.kv_b_proj = nn.Linear(self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias)
         self.scaling = self.qk_head_dim ** (-0.5)
@@ -1333,8 +1625,8 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
             self.mlp = DeepseekV3MoE(config)
         else:
             self.mlp = DeepseekV3MLP(config)
-        self.input_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
-        self.post_attention_layernorm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
+        self.input_layernorm = RMSNormModule(config.hidden_size, eps=config.rms_norm_eps, cast_order='before_weight', fp32_weight=False)
+        self.post_attention_layernorm = RMSNormModule(config.hidden_size, eps=config.rms_norm_eps, cast_order='before_weight', fp32_weight=False)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None=None, position_ids: torch.LongTensor | None=None, past_key_values: Cache | None=None, use_cache: bool | None=False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None=None, **kwargs: Unpack[TransformersKwargs]) -> torch.Tensor:
         residual = hidden_states
@@ -1382,7 +1674,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(module=DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps), module_fqn='', context={})
+        self.norm = RMSNormModule(config.hidden_size, eps=config.rms_norm_eps, cast_order='before_weight', fp32_weight=False)
         self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()

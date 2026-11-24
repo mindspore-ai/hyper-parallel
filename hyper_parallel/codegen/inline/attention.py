@@ -12,26 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Generate a self-contained attention class from real component source.
+"""Read native attention component source for visible forward patches.
 
-The generated artifact preserves the genuine construction and fused QKV weight
-layout (``linear_qkv`` + ``InterleaveQKV`` checkpoint conversion) by copying the
-real ``GroupedQueryAttentionModule`` methods verbatim; ``forward`` is emitted exactly as the
-native class writes it, keeping its ``self.attention_interface(...)`` call.  The
-kernel entry function that the real class normally receives as
-``attention_interface`` is inlined from its real source (plan §6) so the
-artifact stays readable down to the single hardware kernel
-``torch_npu.npu_fusion_attention``.
-
-Neither CP nor TP orchestration is inlined into this rendered class, and the
-class is not an external-state class: it keeps the component's own forward, so
-the emitted boundary form wraps ``_forward_impl`` around it (``emit.parallel``
-lowering + ``hp_install_boundaries``) and the declared CP inner wrapper is
-installed by ``hp_apply_inner_wrapper`` — the same shared mechanisms native
-uses at apply time.
-
-This generator is platform-agnostic ``core`` code: the module type and kernel
-entry are handed in, never imported here.
+Expansion preserves the component's methods, QKV layout and kernel references.
+Unchanged components remain native imports; the existing emitter expands source
+only where a visible method rewrite requires it. CP dispatch and boundary
+redistribution are emitted by their respective passes from native observations.
+This source reader does not install runtime state or communication resources.
 """
 
 from __future__ import annotations
@@ -39,21 +26,13 @@ from __future__ import annotations
 import ast
 import builtins
 import inspect
+from importlib.util import resolve_name
 import symtable
 import textwrap
 from types import ModuleType
 from typing import Any, Callable, Iterable
 
 from hyper_parallel.codegen.inline.expansion import ExpandedSource, expand_function
-
-
-#: The generated forward is the native GroupedQueryAttentionModule.forward verbatim — its
-#: ``self.attention_interface(...)`` call site is kept unmodified, and neither CP
-#: nor TP orchestration is inlined into it.  The rendered class keeps the
-#: component's own forward, so the emitted boundary form owns the TP
-#: redistribution (``emit.parallel`` lowering, installed by
-#: ``hp_install_boundaries``) and the CP inner wrapper is installed by
-#: ``hp_apply_inner_wrapper``.
 
 
 _FUSION_REPLACEMENT_NOTE = (
@@ -205,10 +184,12 @@ def _owner_import_lines(owner: ModuleType) -> dict[str, str]:
                 bound = alias.asname or alias.name.split(".")[0]
                 line = f"import {alias.name}" + (f" as {alias.asname}" if alias.asname else "")
                 lines.setdefault(bound, line)
-        elif isinstance(node, ast.ImportFrom) and not node.level:
+        elif isinstance(node, ast.ImportFrom):
+            module = (resolve_name("." * node.level + (node.module or ""), owner.__package__)
+                      if node.level else node.module)
             for alias in node.names:
                 bound = alias.asname or alias.name
-                line = f"from {node.module} import {alias.name}" + (
+                line = f"from {module} import {alias.name}" + (
                     f" as {alias.asname}" if alias.asname else ""
                 )
                 lines.setdefault(bound, line)
@@ -224,7 +205,7 @@ def _definition_source(node: ast.stmt) -> str:
 
 
 def _component_dependencies(
-    module_type: type, code: str, *, provided: Iterable[str]
+    module_type: type, code: str, *, provided: Iterable[str], inline_definitions: bool = True,
 ) -> tuple[str, tuple[str, ...]]:
     """Inline and import every name ``code`` reads from the component's module.
 
@@ -242,6 +223,7 @@ def _component_dependencies(
         module_type: The real component whose source module is the access path.
         code: Emitted artifact text (the inlined class) to close over.
         provided: Names other emitted parts already bind in the artifact.
+        inline_definitions: Copy local helpers, or retain their native module bindings.
 
     Returns:
         The inlined definitions and the import lines the copied code needs.
@@ -264,6 +246,10 @@ def _component_dependencies(
             return
         node = definitions.get(name)
         if node is not None:
+            if not inline_definitions:
+                resolved.add(name)
+                imports.append(f"from {owner.__name__} import {name}")
+                return
             resolved.add(name)  # before recursing: a helper may reference itself
             for dependency in sorted(_referenced_global_names(ast.unparse(node))):
                 resolve(dependency)

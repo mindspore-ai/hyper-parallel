@@ -5,12 +5,17 @@
 #
 #   source       : transformers.models.deepseek_v3.modeling_deepseek_v3
 #   architecture : DeepseekV3ForCausalLM
-#   parallel_dims: tp=1 cp=1 ep=8 pp=1 sp=False loss_parallel=False
-#   injections   : 4 rule(s)
+#   parallel_dims: tp=1 cp=4 ep=1 pp=1 sp=False loss_parallel=False
+#   injections   : 0 rule(s)
 #   runtime      : mesh / FSDP2 / PP / AC / compile still handled by runtime
 #
 # [HYPER PLAN] training derives a live plan from its YAML and this model;
 # Regenerate this file from the training YAML after strategy changes.
+#
+#   model.layers.0.self_attn: DeepseekV3Attention -> CPMultiLatentAttentionModule
+#   model.layers.1.self_attn: DeepseekV3Attention -> CPMultiLatentAttentionModule
+#   model.layers.2.self_attn: DeepseekV3Attention -> CPMultiLatentAttentionModule
+#   model.layers.3.self_attn: DeepseekV3Attention -> CPMultiLatentAttentionModule
 #
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 #           This file was automatically generated from src/transformers/models/deepseek_v3/modular_deepseek_v3.py.
@@ -45,16 +50,15 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
-
-
-from hyper_parallel.components.modules import MultiLatentAttention
-
-
-
-
-# Codegen replacement: MultiLatentAttention wraps DeepseekV3Attention; the original class is kept as the wrapper input.
-
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+
+from hyper_parallel.components.modules.attention.multi_latent_attention.cp_multi_latent_attention import CPMultiLatentAttentionModule
+
+
+
+
+
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -154,24 +158,10 @@ class DeepseekV3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    ep_enable = False
-
-    def _forward_impl(self, x):
+    def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-    def forward(self, x):
-        if self.ep_enable:
-            # [HYPER LOCAL REGION] boundary entry
-            args, kwargs = self._hp_boundary.redistribute_inputs(
-                ((x,), {}),
-            )
-            # [HYPER LOCAL REGION] run the region compute fn on local tensors
-            # hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn is bound to self by generated source.
-            outputs = self.deepseekv3_ep_compute_fn(*args, **kwargs)
-            # [HYPER LOCAL REGION] boundary exit
-            outputs = self._hp_boundary.redistribute_outputs(outputs)
-            return outputs
-        return self._forward_impl(x)
+
 
 class DeepseekV3TopkRouter(nn.Module):
     def __init__(self, config):
@@ -268,9 +258,7 @@ class DeepseekV3MoE(nn.Module):
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
 
-    ep_enable = False
-
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residuals = hidden_states
         orig_shape = hidden_states.shape
         _, topk_weights, topk_indices = self.gate(hidden_states)
@@ -278,19 +266,7 @@ class DeepseekV3MoE(nn.Module):
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.ep_enable:
-            # [HYPER LOCAL REGION] boundary entry
-            args, kwargs = self._hp_boundary.redistribute_inputs(
-                ((hidden_states,), {}),
-            )
-            # [HYPER LOCAL REGION] run the region compute fn on local tensors
-            # hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn is bound to self by generated source.
-            outputs = self.deepseekv3_ep_compute_fn(*args, **kwargs)
-            # [HYPER LOCAL REGION] boundary exit
-            outputs = self._hp_boundary.redistribute_outputs(outputs)
-            return outputs
-        return self._forward_impl(hidden_states)
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -530,7 +506,8 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = MultiLatentAttention(module=DeepseekV3Attention(config=config, layer_idx=layer_idx), module_fqn='', context={})
+        self.self_attn = CPMultiLatentAttentionModule(config=config, context={'tp_size': 1, 'cp_size': 4, 'ep_size': 1, 'pp_size': 1, 'num_layers': 4}, kv_exchange='all_gather', overlap=False, strategy='expanded_ulysses')
+        self.self_attn.layer_idx = layer_idx
 
         if layer_idx >= config.first_k_dense_replace:
             self.mlp = DeepseekV3MoE(config)

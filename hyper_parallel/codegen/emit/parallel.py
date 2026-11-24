@@ -12,59 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lower the frozen parallel plan into explicit forward code.
+"""Lower frozen boundary transitions into reviewable forward methods.
 
-The lowerer sinks forward wrappers into the source.  Which form a boundary
-class's ``forward`` takes is decided by
-:func:`hyper_parallel.codegen.plan.boundary_forms.classify_boundary_form` —
-the same pure classifier the runtime re-runs at install time and preflight
-re-runs at train time, so the three stages can never disagree about a
-boundary's form.
+The pure boundary classifier selects identity, static TP or generic
+redistribution forms. Boundaries are keyed by FQN, while a method rewrite is
+shared by every instance of its class. The emitter therefore groups compatible
+contracts by class and preserves the original method as ``_forward_impl``.
 
-Class vs FQN: the frozen plan is keyed by boundary FQN
-(``model.layers.0.self_attn``), but a ``class.forward`` is shared by many
-instances.  The lowerer groups boundary FQNs by their class (meta's
-``boundary_classes``), enforces that every FQN of a class carries the SAME
-boundary contract, and emits one rewritten ``forward`` per class.
-
-The original ``forward`` is kept
-verbatim as the class-private ``_forward_impl`` (extracted by a zero-width
-insert before the ``def forward`` — a fresh-source operation, so the offsets
-stay valid when combined with the body replacement), and the public
-``forward`` is rewritten in one of the classified forms:
-
-- ``identity`` (pruned): every declared transition is identity on the plan's
-  active axes — the class forward is NOT rewritten at all.  The runtime's
-  install path covers the exact no-op / to-local semantics with its generic
-  wrapper, so pruning is byte-for-byte equivalent to the previous rewrite.
-- ``tp_collective`` (static bare operators): every declared transition is
-  identity or TP-lowerable, and the source-side structural gates pass
-  (single-value return, no ``*args``/``**kwargs``, declared inputs bind to
-  forward parameters).  The forward names its form with the class attribute
-  ``_hp_boundary_form = "tp_collective"`` and calls bare operators on
-  ``self._hp_tp`` (bound at install time after the runtime re-validates
-  the compiled plan against the live mesh; on mismatch the runtime replaces
-  the forward with the generic engine — the baked calls never run unvalidated).
-- ``generic``: redistribute in, ``_forward_impl``, redistribute out, through
-  the instance-bound compiled plan (``self._hp_boundary``, bound once by
-  ``hp_install_boundaries``), with a declarative comment block annotating
-  what each side's transitions lower to.
-- ``region`` (EP MoE local region): redistribute in, call the explicit
-  factory-named attribute materialized by source emission, redistribute out.
-
-A CP inner-wrapper boundary is ``generic`` in the generated code: the wrapper
-is installed at runtime by ``hp_apply_inner_wrapper`` (it mutates
-``target.forward`` in place — not a bindable callable), and runs inside the
-``_forward_impl`` call.
-
-The lowerer is a pure function over the source text + the frozen plan.  It
-returns the patched text.  Structural work (finding a class / its forward /
-the import block) is delegated to :mod:`astkit`.
+Rendered forwards expose placement transitions and native CP dispatch. Their
+``_hp_boundary`` and ``_hp_tp`` references describe runtime dependencies; this
+module does not install those fields or make the artifact a training backend.
+Native Trainer continues to apply its own per-instance plan and wrappers.
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
+import textwrap
 from typing import Any, Iterator, Optional
 
 from hyper_parallel.codegen.astkit.edits import (
@@ -102,7 +67,7 @@ def lower_forward_boundaries(
     boundary_classes: Optional[dict[str, str]] = None,
     module_name: str = "",
 ) -> str:
-    """Rewrite each boundary class's ``forward`` to call the codegen runtime.
+    """Render each boundary class's observed redistribution and computation.
 
     ``frozen_plan`` is the meta/param-plan dict or a ``CodegenMeta``; the
     plan entries are read via ``_plan_field``.  ``boundary_classes``
@@ -116,12 +81,13 @@ def lower_forward_boundaries(
 
     Returns the patched source text.  This function only rewrites the
     ``forward`` bodies; the rewritten bodies reference the ``_hp_boundary``
-    / ``_hp_tp`` instance attributes that ``hp_install_boundaries`` binds
-    at runtime — no per-boundary global constant is emitted.
+    / ``_hp_tp`` runtime interfaces. This pass does not bind their state
+    or emit per-boundary global constants.
     """
     if _plan_field(frozen_plan, "status") == "not_required":
         raise ValueError("codegen emit: not_required snapshot has no parallel boundaries")
     edits: list[TextEdit] = []
+    index = build_source_index(source_text)
     for class_name, form, emitted, func, injection, deferred_bias in iter_emitted_forms(
         source_text,
         frozen_plan,
@@ -144,8 +110,12 @@ def lower_forward_boundaries(
                     "identity forward has no exit hook to re-add them"
                 )
             continue
+        host = index.find_class(class_name)
+        dispatch = (_cp_dispatch_call(source_text[func.body_start:func.body_end])
+                    if "_forward_impl" in host.methods else None)
         body = _build_forward_body(
-            source_text, injection, func, form, emitted, deferred_bias
+            source_text, injection, func, form, emitted, deferred_bias,
+            inner_compute=ast.unparse(dispatch) if dispatch is not None else None,
         )
         # Keep the original forward as ``_forward_impl``. The
         # extracted method is inserted BEFORE the ``def forward`` (zero-width
@@ -154,7 +124,7 @@ def lower_forward_boundaries(
         # incremental-shift validation in ``_apply_edits`` passes.  The static
         # form additionally prefixes the class marker naming the form.
         marker = _TP_FORM_MARKER_LINE if emitted == FORM_TP_COLLECTIVE else None
-        impl = _build_forward_impl_edit(source_text, func, prefix=marker)
+        impl = None if dispatch is not None else _build_forward_impl_edit(source_text, func, prefix=marker)
         if impl is not None:
             edits.append(impl)
         edits.extend(replace_function_body(source_text, func, body, indent=""))
@@ -311,37 +281,13 @@ def _group_boundaries_by_class(
     Returns ``{class_name: [(fqn, entry), ...]}`` in a stable order (FQN sorted
     for determinism).
 
-    A boundary whose class is NOT defined in this source file — ``index`` is
-    the source index, so ``index.find_class(name) is None`` means the class is
-    imported (``nn.Embedding`` / ``nn.Linear`` / ``nn.LayerNorm`` for
-    ``embed_tokens`` / ``lm_head`` / ``norm``) — has no ``def forward`` span
-    to rewrite, so its FQN is dropped from the grouping and the boundary is
-    left un-rewritten here.  Its boundary contract is still executed at runtime
-    by ``hp_install_boundaries``: the in/out
-    redistribution for an imported class is installed as a forward wrapper on
-    the live module, so the contract is not dropped.  Skipping the rewrite here
-    is exactly what lets the real plan (which marks ``embed_tokens`` /
-    ``lm_head`` as boundaries) emit without failing on a class that has no
-    source ``forward``.
+    Imported classes and inherited forwards have no method span in this
+    source unit. Keep their boundary facts for native per-instance application
+    without copying or rewriting an unrelated class. The same restriction
+    applies to ``skip_source_lowering`` entries shared with non-boundaries.
 
-    The same drop applies to a class that IS defined in this source file but
-    inherits its ``forward`` from an imported base (an attention subclassing
-    a component base class): the class body has no ``def forward`` span to
-    rewrite, and live instances carry no ``_forward_impl``, so the runtime
-    install path takes its imported-class branch all the same.
-
-    An FQN whose param-plan entry carries the explicit ``skip_source_lowering``
-    marker (set by meta normalization when the class is shared between
-    boundary and non-boundary instances — DeepSeek-V3 ``DeepseekV3MLP``:
-    dense decoder layers and shared experts) is skipped: a class-level
-    ``forward`` rewrite is inherited by every instance, so the non-boundary
-    instance would run a boundary body without the attributes
-    ``hp_install_boundaries`` binds only on boundary instances.  The
-    per-instance runtime wrapper is installed instead and executes the same
-    boundary contract.
-
-    An FQN whose class CANNOT be resolved fails fast — a boundary whose forward
-    is never rewritten would silently drop its redistribution.
+    A boundary whose class cannot be resolved fails fast rather than silently
+    losing its source coverage.
     """
     logger = logging.getLogger(__name__)
     groups: dict[str, list[tuple[str, dict[str, Any]]]] = {}
@@ -352,8 +298,7 @@ def _group_boundaries_by_class(
             logger.info(
                 "lower_forward_boundaries: boundary %s is marked "
                 "skip_source_lowering (class shared with a non-boundary "
-                "instance); the per-instance runtime wrapper will be "
-                "installed instead",
+                "instance); native per-instance application remains Trainer-owned",
                 fqn,
             )
             continue
@@ -367,21 +312,16 @@ def _group_boundaries_by_class(
                 "redistribution"
             )
         if index.find_class(class_name) is None:
-            # Imported class (Embedding/Linear/LayerNorm): no source ``forward``
-            # to rewrite; runtime ``hp_install_boundaries`` installs the
-            # in/out boundary wrapper. Not added to ``groups``.
+            # Imported methods have no source span in this unit; do not
+            # copy an entire native class solely to render its boundary.
             continue
         if index.find_forward(class_name) is None:
-            # In-source class with an inherited forward (an attention
-            # subclassing an imported base): no class-body ``def forward``
-            # span to rewrite, the same shape an imported class has.  Live
-            # instances carry no ``_forward_impl``, so hp_install_boundaries
-            # takes its imported-class branch and installs the per-instance
-            # entry/exit wrapper.
+            # An inherited forward has the same source-span restriction
+            # as an imported class.
             logger.info(
                 "lower_forward_boundaries: boundary %s is a %s instance whose "
                 "forward is inherited (no class-body ``def forward``); the "
-                "per-instance runtime wrapper will be installed instead",
+                "native per-instance application remains Trainer-owned",
                 fqn,
                 class_name,
             )
@@ -595,6 +535,43 @@ def _build_forward_impl_edit(
     return TextEdit(func.def_offset, func.def_offset, impl)
 
 
+def _cp_dispatch_pair(source_body: str) -> Optional[tuple[ast.Call, ast.Call]]:
+    """Recognize the CP branch and local fallback with Python 3.9-compatible AST checks."""
+    body = ast.parse(textwrap.dedent(source_body)).body
+    if len(body) != 2 or not isinstance(body[0], ast.If) or not isinstance(body[1], ast.Return):
+        return None
+    branch, fallback = body
+    if branch.orelse or len(branch.body) != 1 or not isinstance(branch.body[0], ast.Return):
+        return None
+    if ast.dump(branch.test) != ast.dump(ast.parse("self.cp_enable", mode="eval").body):
+        return None
+    call, original = branch.body[0].value, fallback.value
+    if not isinstance(call, ast.Call) or not isinstance(original, ast.Call) or not call.args:
+        return None
+    if (ast.dump(call.args[0]) != ast.dump(ast.Name(id="self", ctx=ast.Load()))
+            or ast.dump(original.func) != ast.dump(ast.parse("self._forward_impl", mode="eval").body)):
+        return None
+    return call, original
+
+
+def _cp_dispatch_call(source_body: str) -> Optional[ast.Call]:
+    """Recognize our passthrough CP shell and bind it to redistributed arguments."""
+    pair = _cp_dispatch_pair(source_body)
+    if pair is None:
+        return None
+    call, original = pair
+    if [ast.dump(arg) for arg in call.args[1:]] != [ast.dump(arg) for arg in original.args]:
+        return None
+    originals = {ast.dump(keyword) for keyword in original.keywords}
+    if not originals <= {ast.dump(keyword) for keyword in call.keywords}:
+        return None
+    call.args = [ast.Name(id="self", ctx=ast.Load()),
+                 ast.Starred(value=ast.Name(id="args", ctx=ast.Load()), ctx=ast.Load())]
+    call.keywords = [keyword for keyword in call.keywords if ast.dump(keyword) not in originals]
+    call.keywords.append(ast.keyword(arg=None, value=ast.Name(id="kwargs", ctx=ast.Load())))
+    return ast.fix_missing_locations(call)
+
+
 def _build_forward_body(
     source_text: str,
     injection: Optional[dict[str, Any]],
@@ -602,16 +579,15 @@ def _build_forward_body(
     form: BoundaryForm,
     emitted: str,
     deferred_bias: bool = False,
+    inner_compute: Optional[str] = None,
 ) -> str:
     """Render the rewritten forward body for one boundary class.
 
     ``emitted`` is :func:`resolve_emitted_form`'s verdict (the classifier's
     form after the static gates).  The redistribute calls go through the
-    instance-bound compiled plan (``self._hp_boundary``, installed by
-    ``hp_install_boundaries``); the static ``tp_collective`` form calls bare
-    operators on ``self._hp_tp`` instead; the factory-named compute attribute
-    is bound by ``hp_bind_compute`` for the local-region shape. Either way the class
-    stays runtime-importable without a mesh.
+    ``self._hp_boundary`` runtime interface; the static ``tp_collective``
+    form calls operators on ``self._hp_tp`` instead. Source emission only
+    renders these references; actual state binding remains runtime-owned.
 
     ``deferred_bias`` (D-22) appends the exit hook call
     ``self._hp_deferred_bias(outputs)`` after the output redistribution —
@@ -631,11 +607,9 @@ def _build_forward_body(
             "builder recording must mark it skip_source_lowering so runtime "
             "can install the trainer's native Phase C wrapper"
         )
-    # A generic boundary (including an inner-wrapper one — the CP wrapper is
-    # installed at runtime by ``hp_apply_inner_wrapper`` and weaves into
-    # this forward) redistributes through the compiled plan, annotated with
-    # what each side's transitions lower to.
-    return _render_plain_redistribute(input_redist, out_redist, form)
+    # Keep source-visible CP dispatch inside the boundary and outside the
+    # preserved local implementation that its helper may call back into.
+    return _render_plain_redistribute(input_redist, out_redist, form, inner_compute)
 
 
 def _render_input_redistribute(func: FunctionInfo) -> str:
@@ -643,9 +617,8 @@ def _render_input_redistribute(func: FunctionInfo) -> str:
 
     The generated forward re-binds args/kwargs against its own signature, so a
     positional ``(args, kwargs)`` pair reaches the compiled plan as the
-    boundary's input side.  Index binding happens once at install time
-    (``hp_install_boundaries`` → ``_bind_input_indices``); the pair is still
-    built from the signature's own parameter names (not the plan's) — for a
+    boundary's input side. The pair is built from the signature's own
+    parameter names rather than relying on runtime index binding — for a
     ``def forward(self, hidden_states)`` that is ``((hidden_states,), {})``.
 
     The full parameter profile is preserved on the re-pass: positional names go
@@ -704,7 +677,7 @@ def _ordered_notes(notes: dict[str, str]) -> list[str]:
 
 
 def _render_plain_redistribute(
-    input_redist: str, out_redist: str, form: BoundaryForm
+    input_redist: str, out_redist: str, form: BoundaryForm, inner_compute: Optional[str] = None,
 ) -> str:
     """Generic boundary: annotated redistribute around the original forward.
 
@@ -714,13 +687,17 @@ def _render_plain_redistribute(
     fallback owns), so a reader sees what the boundary communicates without
     re-deriving the plan.
     """
+    compute = "        outputs = self._forward_impl(*args, **kwargs)"
+    if inner_compute is not None:
+        compute = (f"        if self.cp_enable:\n            outputs = {inner_compute}\n"
+                   "        else:\n            outputs = self._forward_impl(*args, **kwargs)")
     return "\n".join([
         "        # [HYPER BOUNDARY] input redistribution",
         *_ordered_notes(form.in_notes),
         input_redist,
         "",
         "        # [HYPER BOUNDARY] original forward body (now ``_forward_impl``)",
-        "        outputs = self._forward_impl(*args, **kwargs)",
+        compute,
         "",
         "        # [HYPER BOUNDARY] output redistribution",
         *_ordered_notes(form.out_notes),
@@ -753,10 +730,8 @@ def _render_tp_collective_forward(
     - ``_forward_impl`` is called with every declared parameter in signature
       order (the static forward re-binds names, so no ``*args`` re-pass).
 
-    ``self._hp_tp`` is bound by ``hp_install_boundaries`` only after the
-    runtime re-validates the emitted form against the live mesh; on mismatch
-    the runtime replaces this forward with the generic engine, so the baked
-    calls never run unvalidated.
+    The rendered ``self._hp_tp`` calls expose the selected transitions for
+    review. This source pass neither binds a mesh nor installs runtime state.
 
     ``deferred_bias`` (D-22) appends ``self._hp_deferred_bias(outputs)``
     after the output ops — the Partial(sum) -> R all_reduce above is exactly

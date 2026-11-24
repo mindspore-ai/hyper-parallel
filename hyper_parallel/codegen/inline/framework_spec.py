@@ -45,12 +45,16 @@ may rely on object identity across calls).
 
 from __future__ import annotations
 
+import ast
 import importlib
+from functools import lru_cache
 import inspect
+import textwrap
 from typing import Any, Callable, cast
 
 from hyper_parallel.components.modules.family import get_module_family
 
+from hyper_parallel.codegen.inline.component_source import render_component_source
 from hyper_parallel.codegen.inline.ir import (
     ImportPatch,
     ModuleSnippetPatch,
@@ -307,7 +311,7 @@ def _build_replacement_spec(
 #: repeated lookup returns the same object (callers may compare identity) and
 #: the expensive fused-attention render runs once.
 _REPLACEMENT_CACHE: dict[tuple[str | None, Any, str | None], ReplacementSpec | None] = {}
-_STRATEGY_CACHE: dict[tuple[str | None, str | None, bool], StrategySpec | None] = {}
+_STRATEGY_CACHE: dict[tuple[str | None, str | None, bool, tuple[str, ...]], StrategySpec | None] = {}
 
 
 def replacement_spec_for(
@@ -430,6 +434,7 @@ def strategy_spec_for(
     model_type: str | None = None,
     *,
     inner_wrapper: bool = False,
+    construction_kwargs: tuple[str, ...] = (),
 ) -> StrategySpec | None:
     """Resolve a strategy target from structure.
 
@@ -442,25 +447,28 @@ def strategy_spec_for(
         target: Import path of the selected strategy.
         model_type: Optional source model type.
         inner_wrapper: Whether the strategy wraps the existing forward boundary.
+        construction_kwargs: Literal arguments already recorded for the selected wrapper.
     """
     if target is None:
         return None
     model_type = _family_key(model_type, target)
-    key = (target, model_type, inner_wrapper)
+    key = (target, model_type, inner_wrapper, construction_kwargs)
     if key in _STRATEGY_CACHE:
         return _STRATEGY_CACHE[key]
-    spec = _resolve_strategy_spec(target, inner_wrapper)
+    spec = _resolve_strategy_spec(target, inner_wrapper, construction_kwargs)
     _STRATEGY_CACHE[key] = spec
     return spec
 
 
-def _resolve_strategy_spec(target: str, inner_wrapper: bool) -> StrategySpec | None:
+def _resolve_strategy_spec(
+    target: str, inner_wrapper: bool, construction_kwargs: tuple[str, ...],
+) -> StrategySpec | None:
     if inner_wrapper:
-        return _cp_strategy_spec(target)
+        return _cp_strategy_spec(target, construction_kwargs=construction_kwargs)
     return None
 
 
-def _cp_strategy_spec(target: str) -> StrategySpec:
+def _cp_strategy_spec(target: str, *, construction_kwargs: tuple[str, ...] = ()) -> StrategySpec:
     """Build the CP strategy spec: an in-place dispatch shell plus imports.
 
     A recognizable inner forward rewrite participates in inline CP: the
@@ -470,28 +478,29 @@ def _cp_strategy_spec(target: str) -> StrategySpec:
     active. The helper is the same kernel the runtime CP wrapper delegates
     to (trainer and codegen share one CP implementation), and the import is
     derived from the wrapper factory source, so this module never hardcodes a
-    family helper and
-    stays free of torch imports at resolution time.  ``subclass_state_attr``
-    carries the family kernel's companion attribute so the runtime binding
-    satisfies the identical contract the native wrapper installs.
+    family helper and stays free of torch imports at resolution time.
 
-    Families without an inline helper keep the original framework CP
-    strategy (imports only), preserving the runtime wrapper path.
+    Unrecognized wrappers carry no source body; artifact verification must
+    reject a declared patch that was not materialized.
     """
-    resolved = inner_wrapper_target(target)
+    resolved = inner_wrapper_target(target, construction_kwargs=construction_kwargs)
     if resolved is None:
         return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    imports = tuple(ImportPatch(module, (name,)) for module, name in resolved.extra_imports)
+    if resolved.helper_module and resolved.helper_name:
+        imports = (ImportPatch(resolved.helper_module, (resolved.helper_name,)), *imports)
     if resolved.inline_body is not None:
         return StrategySpec(
             kind=CP_ATTENTION_KIND,
             subclass_shell=resolved.inline_body,
-            imports=(),
+            imports=imports,
+            definition=resolved.definition,
+            snippets=tuple(ModuleSnippetPatch(source) for source in resolved.bindings),
         )
     return StrategySpec(
         kind=CP_ATTENTION_KIND,
         subclass_shell=cp_dispatch_shell_body(resolved.helper_name),
-        subclass_state_attr=resolved.state_attr,
-        imports=(ImportPatch(resolved.helper_module, (resolved.helper_name,)),),
+        imports=imports,
     )
 
 
@@ -501,3 +510,73 @@ __all__ = [
     "replacement_spec_for",
     "strategy_spec_for",
 ]
+
+
+def observed_constructor_spec(rule: Any) -> ReplacementSpec | None:
+    """Use the native-selected class and its existing construction contracts."""
+    module_name, name = rule.construction["implementation"].replace(":", ".", 1).rsplit(".", 1)
+    component = getattr(importlib.import_module(module_name), name)
+    parameters = inspect.signature(component.__init__).parameters
+    values = dict(item.split("=", 1) for item in rule.construction_kwargs)
+    values.update({name: repr(value) for name, value in rule.construction.get("arguments", {}).items()})
+    arguments = []
+    ignored = _ignored_constructor_parameters(component)
+    for key, value in values.items():
+        if key in parameters and key not in ignored and key != "module_fqn" and value != "None":
+            arguments.append(f"{key}={value}")
+    mode = _observed_constructor_mode(component, parameters)
+    if mode == "wrap_source" and "module" not in parameters:
+        return replacement_spec_for(rule.replace_target, module_type=rule.module_type)
+    imports, snippets = _observed_component_source(component)
+    return ReplacementSpec(
+        old_ctor=class_name_of(rule.module_type), new_ctor=name,
+        imports=imports, mode=mode,
+        keyword_args=tuple(arguments), remove_class=False, snippets=snippets,
+    )
+
+
+def _observed_constructor_mode(component: type, parameters: Any) -> str:
+    """Require the source argument before considering a member's direct construction interface."""
+    module = parameters.get("module")
+    if module is not None and module.default is inspect.Parameter.empty:
+        return "wrap_source"
+    if {"hidden_size", "eps"} <= parameters.keys():
+        return "construct"
+    if ("config" in parameters and callable(getattr(component, "_initialize_source", None))
+            and callable(getattr(component, "_initialize_config", None))):
+        return "config"
+    return "wrap_source"
+
+
+def _observed_component_source(component: type) -> tuple[tuple[ImportPatch, ...], tuple[ModuleSnippetPatch, ...]]:
+    """Expose native member stages absent from the legacy injection records."""
+    if not callable(getattr(component, "parallel_module_spec", None)):
+        return (ImportPatch(component.__module__, (component.__name__,)),), ()
+    expanded = render_component_source(component)
+    imports = tuple(ImportPatch(module="", names=(), raw=line) for line in expanded.imports)
+    snippets = tuple(ModuleSnippetPatch(ast.unparse(node)) for node in ast.parse(expanded.source).body)
+    return imports, snippets
+
+
+@lru_cache(maxsize=None)
+def _ignored_constructor_parameters(component: type) -> frozenset[str]:
+    """Read unused native arguments, following only explicit super keyword forwarding."""
+    owner = next(base for base in component.__mro__ if "__init__" in base.__dict__)
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(owner.__init__)))
+    except (OSError, TypeError):
+        return frozenset()
+    inherited = _ignored_constructor_parameters(owner.__mro__[1]) if len(owner.__mro__) > 1 else frozenset()
+    _discard_unused_super_keywords(tree, inherited)
+    loaded = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    return frozenset(inspect.signature(owner.__init__).parameters) - loaded - {"self"}
+
+
+def _discard_unused_super_keywords(tree: ast.AST, inherited: frozenset[str]) -> None:
+    """Exclude forwarding reads only when the native parent ignores the argument."""
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if (isinstance(call.func, ast.Attribute) and call.func.attr == "__init__"
+                and isinstance(call.func.value, ast.Call) and isinstance(call.func.value.func, ast.Name)
+                and call.func.value.func.id == "super"):
+            call.keywords = [kw for kw in call.keywords
+                             if not (kw.arg in inherited and isinstance(kw.value, ast.Name))]

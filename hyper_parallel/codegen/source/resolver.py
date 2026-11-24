@@ -12,38 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Locate the real modeling source file for a model id.
+"""Locate modeling source from native model configuration and recorded identity.
 
-The generated modeling file is produced from the original ``modeling_*.py``
-that the checkpoint actually loads — for native HF models that is the file in
-the installed transformers package, for remote-code models it is the file
-shipped inside the checkpoint.  Getting the right file matters: the generated
-bundle must stay importable in the exact environment the model runs in.
-
-The resolution chain mirrors what HF actually loads (``from_pretrained``):
-
-    pretrained_model_name_or_path -> AutoConfig -> model_type / architectures
-                                        -> modeling source file
-
-and prefers the *same* source HF would load.  The deciding input is
-``trust_remote_code`` (forwarded from the YAML ``model:`` block): when it is
-set and the checkpoint declares ``auto_map``, HF loads the checkpoint's own
-modeling file — remote code wins even over an installed transformers module.
-Without it, HF uses the installed module (if any), and remote code is only
-reached as a fallback.  ``None`` of the resolution helpers import
-``transformers`` at module scope: the codegen manager runs before the model is
-built, and source resolution must stay functional (degrading) in environments
-without torch/transformers.
+Resolved HF configuration determines installed versus trusted remote code;
+source identity also supports local repository models. These helpers locate
+readable files without loading another AutoConfig or starting a model build.
+Remote-code siblings are copied by the bundle emitter for source inspection.
 """
 from __future__ import annotations
 
 import importlib.util
-import json
 import logging
 import os
 import re
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -66,41 +48,6 @@ class ResolvedSource:
             "architecture": self.architecture,
             "model_type": self.model_type,
         }
-
-
-def resolve_model_source(
-    config: Any, model_id: str, *, hf_config: Any = None,
-) -> Optional[ResolvedSource]:
-    """Resolve the modeling source for a model id, degrading gracefully.
-
-    Resolves ``model_id -> AutoConfig -> architectures/model_type -> modeling
-    file``, with fallbacks when the environment cannot do the real lookup:
-
-    1. ``hf_config`` already resolved by the caller -> resolve against it.
-    2. ``AutoConfig.from_pretrained(model_id)`` (real HF config, lazy import;
-       None on any failure — no transformers / no network / bad id).
-    3. ``resolve_source_identity`` — installed module guessed from the
-       basename (covers locally-installed model types when AutoConfig is
-       unavailable).
-    4. Local checkpoint ``config.json`` -> remote code (``SimpleNamespace``
-       mirrors ``AutoConfig`` attribute access).
-
-    Returns ``None`` when no readable modeling source can be resolved.
-    """
-    if hf_config is not None:
-        return resolve_hf_source(config, hf_config)
-    cfg = _load_auto_config(model_id, config)
-    if cfg is not None:
-        try:
-            return resolve_hf_source(config, cfg)
-        except FileNotFoundError:
-            # AutoConfig resolved but no modeling file exists anywhere (not
-            # even remote code in the checkpoint) — keep degrading.
-            pass
-    source = resolve_source_identity(model_id)
-    if source is not None:
-        return source
-    return _resolve_source_from_yaml(config, model_id)
 
 
 def resolve_hf_source(config: Any, hf_config: Any) -> ResolvedSource:
@@ -345,53 +292,6 @@ def import_module_file(module_name: str) -> Optional[str]:
     return spec.origin
 
 
-def _load_auto_config(model_id: str, config: Any) -> Optional[Any]:
-    """``AutoConfig.from_pretrained(model_id)`` with lazy import; None on failure.
-
-    ``trust_remote_code`` is forwarded so remote-code checkpoints can load
-    their own config classes — mirroring what ``HyperAutoModel.from_pretrained``
-    will do at build time.  Any failure (no transformers installed, no network,
-    unknown id, remote config raising) returns ``None``; the caller degrades.
-    """
-    if not model_id:
-        return None
-    try:
-        # Transformers is optional for repository-only source resolution.
-        from transformers import AutoConfig  # pylint: disable=import-outside-toplevel
-    except ImportError:
-        return None
-    kwargs: dict[str, Any] = {}
-    if _trust_remote_code(config):
-        kwargs["trust_remote_code"] = True
-    try:
-        return AutoConfig.from_pretrained(model_id, **kwargs)
-    except Exception:
-        return None
-
-
-def _resolve_source_from_yaml(config: Any, model_id: str) -> Optional[ResolvedSource]:
-    """Best-effort source resolution from a local checkpoint's ``config.json``.
-
-    Used when ``AutoConfig`` and the basename guess both came up empty: for a
-    local checkpoint directory, read its ``config.json`` and resolve against
-    it.  ``SimpleNamespace`` attribute access mirrors what
-    ``AutoConfig.from_pretrained`` produces, without importing transformers.
-    Returns ``None`` on any failure so the caller degrades.
-    """
-    if not model_id or not os.path.isdir(model_id):
-        return None
-    config_path = os.path.join(model_id, "config.json")
-    if not os.path.isfile(config_path):
-        return None
-    try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-        hf_config = SimpleNamespace(**raw)
-        return resolve_hf_source(config, hf_config)
-    except (OSError, ValueError, FileNotFoundError, ImportError):
-        return None
-
-
 def _module_for_model_type(model_type: Optional[str]) -> Optional[str]:
     """Map ``config.model_type`` to a transformers ``modeling_*`` module name."""
     if not model_type:
@@ -469,19 +369,12 @@ def _relative_imports_of(path: str) -> list[str]:
 def resolve_remote_siblings(source: ResolvedSource) -> dict[str, str]:
     """Transitive closure of a ``<remote>`` source's package siblings.
 
-    A trust-remote-code modeling file is compiled as the top-level module of a
-    synthetic package (loader.import_generated_module), so its single-dot
-    relative imports must resolve against *siblings in the same directory*.
-    ``source.module_name == "<remote>"`` or the Hugging Face dynamic-module
-    namespace ``transformers_modules.*`` marks this case; for an installed
-    transformers module the source uses absolute imports and this returns
-    empty.
+    Relative imports of a checkpoint-owned source must resolve within its
+    source directory. ``<remote>`` and ``transformers_modules.*`` identify
+    these sources; installed transformers modules use absolute imports.
 
-    Returns ``{basename: absolute_path}`` for every sibling reachable through
-    the source's relative-import closure, e.g. a ``configuration_deepseek.py``
-    that ``modeling_deepseek.py`` imports (and any module *it* relatively
-    imports).  The caller copies these into the bundle so the artifact is
-    self-contained; the loader registers them under the synthetic package.
+    Returns ``{absolute_path: absolute_path}`` for each reachable sibling.
+    The emitter copies these files beside the generated modeling source.
     """
     if isinstance(source, dict):
         module_name = source.get("module_name")
@@ -526,7 +419,6 @@ __all__ = [
     "ResolvedSource",
     "import_module_file",
     "resolve_hf_source",
-    "resolve_model_source",
     "resolve_remote_code_file",
     "resolve_remote_siblings",
     "resolve_source_identity",

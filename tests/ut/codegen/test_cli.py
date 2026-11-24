@@ -190,9 +190,10 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
             return object()
 
     @contextmanager
-    def _model_overlay(_session, received_artifact_dir):
+    def _model_overlay(_session, received_artifact_dir, *, defer_publish):
         """Provide the artifact normally populated by the overlay."""
         assert received_artifact_dir == "bundle"
+        assert defer_publish is True
         yield SimpleNamespace(artifact_layout=layout)
 
     config = SimpleNamespace(
@@ -264,7 +265,8 @@ def test_native_build_reports_isolated_publication_failure(monkeypatch):
     )
 
     @contextmanager
-    def _failed_overlay(_session, _artifact_dir):
+    def _failed_overlay(_session, _artifact_dir, *, defer_publish):
+        assert defer_publish is True
         yield SimpleNamespace(
             artifact_layout=None,
             snapshot=SimpleNamespace(

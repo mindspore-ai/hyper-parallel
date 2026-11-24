@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.attention.gated_multi_latent_attention import (
         GatedMultiLatentAttention, GatedMultiLatentAttentionModule,
     )
-    from hyper_parallel.components.modules.mtp import (
+    from hyper_parallel.components.modules.common.mtp import (
         MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
     )
     from hyper_parallel.components.modules.attention.deepseek_sparse_attention import (
@@ -76,10 +76,10 @@ _EXPORT_TO_MODULE = {
     "RMSNorm": "common.rms_norm",
     "OffsetRMSNormModule": "common.rms_norm",
     "OffsetRMSNorm": "common.rms_norm",
-    "build_mtp": "mtp",
-    "MTPLayer": "mtp",
-    "MultiTokenPrediction": "mtp",
-    "MTPOutput": "mtp",
+    "build_mtp": "common.mtp",
+    "MTPLayer": "common.mtp",
+    "MultiTokenPrediction": "common.mtp",
+    "MTPOutput": "common.mtp",
     "DeepseekSparseAttention": "attention.deepseek_sparse_attention",
     "DeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",
     "CPDeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",

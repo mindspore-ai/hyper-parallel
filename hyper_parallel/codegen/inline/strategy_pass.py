@@ -17,15 +17,17 @@
 from __future__ import annotations
 
 from fnmatch import fnmatch
-from typing import Collection, Mapping
+from typing import Mapping
 
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch,
+    ImportPatch,
     InlinePatchSet,
+    ModuleSnippetPatch,
     SourceObservation,
     StrategySpec,
 )
-from hyper_parallel.codegen.inline.framework_spec import strategy_spec_for as strategy_spec
+from hyper_parallel.codegen.inline.framework_spec import CP_ATTENTION_KIND, strategy_spec_for as strategy_spec
 
 
 def rule_block_classes(
@@ -48,91 +50,31 @@ def build_strategy_patches(
     rules: tuple[SourceObservation, ...],
     model_type: str | None = None,
     boundary_classes: Mapping[str, str] | None = None,
-    external_state_classes: Collection[str] | None = None,
 ) -> InlinePatchSet:
-    """Build inline forward patches from strategy targets.
+    """Materialize selected inner-wrapper forwards, deduplicating shared source bindings.
 
-    A plan carries one rule per matched FQN, so the same strategy target (and
-    therefore the same imports and module snippets) is seen once per module it
-    applies to.  Those contributions are deduplicated here — mirroring
-    ``build_replacement_patches`` — so a module-level snippet such as the
-    parallel-state accessor is emitted once per generated file instead of once
-    per matched layer.
-
-    Host derivation is deliberately *not* deduplicated per target: rules that
-    share one strategy target may select different host classes (one EP
-    compute target serving both dense-MLP and MoE layers), so every rule
-    derives its hosts and the per-class ``emitted`` bookkeeping keeps one
-    materialization per host — mirroring how the freeze side derives
-    ``external_state_classes`` per record.
-
-    A spec whose body inlines a forward but carries no literal target class
-    (the EP strategy) applies to every class the rule's match selects in
-    ``boundary_classes``: the block class is a per-model fact, so the patch is
-    materialized per artifact rather than cached in the capability spec.  A
-    spec that carries a ``subclass_shell`` (inline CP) instead materializes an
-    in-artifact subclass of the attention host plus a scoped constructor swap,
-    and never a forward extract — the host keeps its compiled boundary.  A
-    declared strategy that selects no boundary fails fast — a silently
-    unmaterialized strategy is an artifact that only looks distributed.
+    Host classes come from each rule's observed FQNs. Local-compute methods
+    are materialized separately from native records by ``emit.recorded``.
     """
-
     patch_set = InlinePatchSet()
-    emitted: dict[tuple[str, str], str] = {}
-    imported: set[tuple[str, bool]] = set()
-    subclassed: set[str] = set()
+    imported: set[str] = set()
+    subclassed: dict[str, str] = {}
     for rule in rules:
-        for target in (rule.local_compute_target, rule.inner_wrapper_target):
-            if target is None:
-                continue
-            inner_wrapper = target == rule.inner_wrapper_target
-            spec = strategy_spec(target, model_type, inner_wrapper=inner_wrapper)
-            if spec is None:
-                continue
-            if (target, inner_wrapper) not in imported:
-                imported.add((target, inner_wrapper))
-                patch_set.imports.extend(spec.imports)
-                patch_set.module_snippets.extend(spec.snippets)
-            if spec.subclass_shell is not None:
-                _materialize_cp_forward(
-                    patch_set, spec, rule, target, model_type,
-                    boundary_classes, subclassed,
-                )
-                continue
-            if spec.body_template is None:
-                continue
-            if spec.target_class is not None:
-                host_classes = {spec.target_class}
-            else:
-                host_classes = rule_block_classes(rule, boundary_classes)
-                if not host_classes:
-                    # Re-emission of an already-normalized meta: the boundary
-                    # entries the first pass stripped are gone, but the pass
-                    # persisted the derived classes in
-                    # ``meta.external_state_classes`` — the surviving record of
-                    # which classes an inline body replaced. (Today the EP
-                    # shell is the only body-bearing strategy, so the whole
-                    # record is this rule's host set; a second body-bearing
-                    # strategy would need a kind filter here.)
-                    host_classes = set(external_state_classes or ())
-                if not host_classes:
-                    raise _unmaterialized_strategy_error(
-                        spec.kind, target, rule, model_type
-                    )
-            for host_class in sorted(host_classes):
-                key = (host_class, spec.method_name)
-                if key in emitted:
-                    if emitted[key] != spec.body_template:
-                        raise ValueError(f"Conflicting inline strategies for {host_class}.{spec.method_name}")
-                    continue
-                emitted[key] = spec.body_template
-                patch_set.forward_extracts.append(
-                    ForwardExtractPatch(
-                        class_name=host_class,
-                        method_name=spec.method_name,
-                        body=spec.body_template,
-                    )
-                )
+        target = rule.inner_wrapper_target
+        if target is None:
+            continue
+        spec = _rule_strategy(rule, target, model_type)
+        if spec is None:
+            continue
+        patch_set.imports.extend(spec.imports)
+        if target not in imported:
+            imported.add(target)
+            patch_set.module_snippets.extend(spec.snippets)
+        if spec.subclass_shell is not None:
+            _materialize_cp_forward(
+                patch_set, spec, rule, target, model_type,
+                boundary_classes, subclassed,
+            )
     return patch_set
 
 
@@ -143,28 +85,25 @@ def _materialize_cp_forward(
     target: str,
     model_type: str | None,
     boundary_classes: Mapping[str, str] | None,
-    subclassed: set[str],
+    subclassed: dict[str, str],
 ) -> None:
     """Materialize CP dispatch in the original host class exactly once."""
-    host_classes = rule_block_classes(rule, boundary_classes)
+    host_classes = ({rule.observed_wrapper["host_class"]} if rule.observed_wrapper is not None
+                    else rule_block_classes(rule, boundary_classes))
     if not host_classes:
         raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
-    helper_names = [name for patch in spec.imports for name in patch.names]
-    if len(helper_names) > 1:
-        raise ValueError(
-            f"codegen: CP strategy {target!r} carries multiple helper "
-            f"imports for one subclass shell: {helper_names}"
-        )
     for host_class in sorted(host_classes):
         if host_class in subclassed:
+            if subclassed[host_class] != (spec.definition or spec.subclass_shell):
+                raise RuntimeError(f"codegen: conflicting CP bindings for source class {host_class!r}")
             continue
-        subclassed.add(host_class)
+        subclassed[host_class] = spec.definition or spec.subclass_shell
         patch_set.forward_extracts.append(
             ForwardExtractPatch(
                 class_name=host_class,
                 method_name=spec.method_name,
                 body=spec.subclass_shell,
-                merge_original_body=True,
+                definition=spec.definition,
             )
         )
 
@@ -180,3 +119,17 @@ def _unmaterialized_strategy_error(
         "materialized; check the match pattern or the plan's "
         "boundary coverage"
     )
+
+
+def _rule_strategy(
+    rule: SourceObservation, target: str, model_type: str | None,
+) -> StrategySpec | None:
+    """Use an already-installed factory-tail method or the declared wrapper source."""
+    if rule.observed_wrapper is not None:
+        return StrategySpec(
+            kind=CP_ATTENTION_KIND, subclass_shell=rule.observed_wrapper["body"],
+            definition=rule.observed_wrapper.get("definition"),
+            imports=tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"]),
+            snippets=tuple(ModuleSnippetPatch(source) for source in rule.observed_wrapper.get("bindings", ())),
+        )
+    return strategy_spec(target, model_type, inner_wrapper=True, construction_kwargs=rule.construction_kwargs)
