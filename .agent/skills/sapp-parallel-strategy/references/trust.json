@@ -1,6 +1,6 @@
 {
   "_about": "How far ND's ranking was checked against timed runs, per template and cluster; '*' matches any. scripts/ask.py prints 'status. may_say' at the top of every answer, applies the cluster's ratios only where calibrated is true, and leaves exclude_modes out of a search that leaves the recompute mode open. scripts/answer.py checks the pick against region, the degree values the check covered (ND's column names, MP is tensor parallel); null means no region was checked. checked_with names the library version, or the list of versions, the region was checked with; ND's census follows the installed Transformers, so ask.py warns when the asker's differs. per_layer says how far a plan of recompute per layer was checked, for scripts/plan.py. described_note is what ask.py adds when the checkout cannot build the template's model and the family's model described by hand is priced instead.",
-  "qwen3_5_moe/a3": {
+  "qwen3_5_moe/a3_64": {
     "status": "Back-tested",
     "may_say": "The order of the layouts and which fit, inside the checked region. Not the size of a gain: ND said 14.4% for a recompute plan that measured 6.0%.",
     "calibrated": true,
@@ -48,7 +48,7 @@
       "selective": "ND prices selective recompute 37 to 45% below its measured step on this family, on the A3"
     }
   },
-  "deepseek_v41/a3": {
+  "deepseek_v41/a3_64": {
     "status": "Timed, not validated",
     "may_say": "Which layouts fit. No recommendation on the expert degree, which ND prices backwards on this model, and no step time: the A3 ratios were fitted on Qwen3.5-MoE.",
     "calibrated": false,

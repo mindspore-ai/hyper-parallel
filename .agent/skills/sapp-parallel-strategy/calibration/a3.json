@@ -15,6 +15,10 @@
       "DP 64 EP 4",
       "DP 64 OP 64",
       "DP 64 EP 2"
-    ]
+    ],
+    "cluster": "a3_64",
+    "cards_per_node": 4,
+    "dies_per_card": 2,
+    "dies_per_node": 8
   }
 }
