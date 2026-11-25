@@ -54,8 +54,6 @@ def _split_packed_prefixes(
             if begin >= end:
                 continue
             prefix_end = key_end - (query_end - end)
-            if prefix_end <= key_start:
-                raise ValueError(f"Sparse attention has an empty packed KV segment on CP rank {rank}")
             query_total += end - begin
             key_total += prefix_end - key_start
             query_ends.append(query_total)
@@ -84,11 +82,29 @@ def _project_ends(
     return tuple(result)
 
 
+def _project_rank_metadata(
+    queries: Sequence[int], keys: Sequence[int], *, global_length: int, local_seq_len: int,
+    rank: int, compact: bool,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[tuple[int, int], ...]]:
+    """Project one rank's sequence metadata and causal KV prefixes."""
+    if compact:
+        return _split_packed_prefixes(
+            queries, keys, global_seq_len=global_length, local_seq_len=local_seq_len, rank=rank,
+        )
+    query = _project_ends(
+        queries, global_seq_len=global_length, local_seq_len=local_seq_len, rank=rank, query=True,
+    )
+    key = _project_ends(
+        keys, global_seq_len=global_length, local_seq_len=local_seq_len, rank=rank, query=False,
+    )
+    return query, key, ()
+
+
 def build_cp_sequence_metadata(
     *, batch_size: int, local_seq_len: int, device: torch.device, cp_size: int, cp_rank: int,
     actual_seq_len: torch.Tensor | Sequence[int] | None = None, kwargs: Mapping[str, Any] | None = None,
 ) -> CPSparseAttentionSequenceMetadata:
-    """Project packed documents after checking every rank before communication.
+    """Project each rank's non-empty query fragments and causal KV prefixes.
 
     Args:
         batch_size: Number of batch-major rows.
@@ -108,38 +124,23 @@ def build_cp_sequence_metadata(
     if actual_seq_len is not None:
         packed["actual_seq_len"] = actual_seq_len
     queries, keys = resolve_packed_sequence_lengths(packed, total, total)
+    compact = cp_size > 1 and queries is not None
     if queries is None:
         queries = keys = [(row + 1) * global_length for row in range(batch_size)]
     if len(queries) != len(keys):
         raise ValueError("Sparse attention requires the same number of packed Q and KV documents")
-    cross_row = cp_size > 1 and any(
-        begin // global_length != (end - 1) // global_length
-        for boundaries in (queries, keys)
-        for begin, end in zip((0, *boundaries[:-1]), boundaries)
+    if cp_size > 1 and queries != keys:
+        raise ValueError("Sparse attention CP requires matching packed Q and KV document boundaries")
+    projected = tuple(
+        _project_rank_metadata(
+            queries, keys, global_length=global_length, local_seq_len=local_seq_len,
+            rank=rank, compact=compact,
+        )
+        for rank in range(cp_size)
     )
-    projected = []
-    for rank in range(cp_size):
-        query = _project_ends(
-            queries, global_seq_len=global_length, local_seq_len=local_seq_len, rank=rank, query=True,
-        )
-        key = _project_ends(
-            keys, global_seq_len=global_length, local_seq_len=local_seq_len, rank=rank, query=False,
-        )
-        if any(end == previous for previous, end in zip((0, *query[:-1]), query)):
-            raise ValueError(f"Sparse attention does not support zero-query packed documents on CP rank {rank}")
-        if any(end == previous for previous, end in zip((0, *key[:-1]), key)):
-            raise ValueError(f"Sparse attention has an empty packed KV document on CP rank {rank}")
-        key_ranges = ()
-        if cross_row:
-            # A rank's cross-row queries are not a contiguous document suffix.
-            # CANN's right-aligned causal mask needs one segment per intersection.
-            query, key, key_ranges = _split_packed_prefixes(
-                queries, keys, global_seq_len=global_length, local_seq_len=local_seq_len, rank=rank,
-            )
-        projected.append((query, key, key_ranges))
     local_query, local_key, key_ranges = projected[cp_rank]
     return CPSparseAttentionSequenceMetadata(
-        (cp_rank + 1) * local_seq_len,
+        local_key[-1] if key_ranges else (cp_rank + 1) * local_seq_len,
         torch.tensor(local_query, dtype=torch.int32, device=device),
         torch.tensor(local_key, dtype=torch.int32, device=device),
         key_ranges,
@@ -193,7 +194,11 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         )
 
     def bind_parallel(self, binding: ParallelBinding) -> None:
-        """Borrow an existing CPContext before FSDP installs projection hooks."""
+        """Borrow an existing CPContext before FSDP installs projection hooks.
+
+        Args:
+            binding: Existing CP context and mesh resources owned by the job.
+        """
         context = binding.cp_context
         if context is None or context.size <= 1:
             raise ValueError("DeepSeek sparse-attention CP member requires an active CPContext")
@@ -213,36 +218,30 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         All readiness receipts belong to this invocation. The existing gather
         adjoint sums consumers into each source shard, including the zero
         gradients from unused suffix tokens.
+
+        Args:
+            index_states: Local indexer query, key and weight tensors.
+            attention_states: Local attention query, latent KV and rotary tensors.
+            metadata: Compact Q/K endpoints and ranges for this CP rank.
+
+        Returns:
+            Indexer and attention operands with compacted global key banks.
         """
         return _gather_key_banks(self._cp_context, self.cp_comm_overlap, index_states, attention_states, metadata)
 
     def exchange_attention(self, inputs: SparseAttentionInputs) -> SparseAttentionInputs:
-        """Return ready key banks without taking ownership of the attention algorithm."""
+        """Return ready key banks without taking ownership of the attention algorithm.
+
+        Args:
+            inputs: Invocation-local DSA states and compact sequence metadata.
+
+        Returns:
+            The same states with gathered and selected key banks.
+        """
         index_states, attention_states = self.prepare_key_bank(
             inputs.index_states, inputs.attention_states, inputs.metadata,
         )
         return SparseAttentionInputs(index_states, attention_states, inputs.metadata, inputs.use_dense)
-
-    def _validate_attention_mask(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> None:
-        """Accept existing causal-mask carriers without reading their device contents."""
-        if attention_mask is None:
-            return
-        batch_size, local_length = hidden_states.shape[:2]
-        global_length = local_length * self._cp_context.size
-        prefix_length = local_length * (self._cp_context.rank + 1)
-        shapes = {
-            (local_length, local_length), (local_length, global_length),
-            (global_length, global_length), (local_length, prefix_length),
-        }
-        # TextParallelBatch constructs a global square mask after slicing token fields.
-        # Packed endpoints, rather than mask values, remain the CANN causality contract.
-        if (attention_mask.ndim != 4 or attention_mask.shape[0] not in (1, batch_size)
-                or attention_mask.shape[1] != 1 or tuple(attention_mask.shape[-2:]) not in shapes):
-            raise ValueError(
-                "DeepSeek sparse attention CP requires a standard 4D causal mask "
-                "with local/global sequence dimensions; "
-                "padding and custom masks are not supported"
-            )
 
     def preflight_attention(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None,
@@ -250,12 +249,24 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         actual_seq_len: torch.Tensor | Sequence[int] | None,
         kwargs: dict[str, Any], *, use_dense: bool,
     ) -> SparseAttentionSequenceMetadata:
-        """Validate every rank's packed geometry before any operand collective."""
+        """Validate every rank's packed geometry before any operand collective.
+
+        Args:
+            hidden_states: Local batch-major activation shard.
+            attention_mask: Optional Transformers causal-mask carrier.
+            past_key_values: Unsupported KV cache input.
+            position_ids: Optional local or global position IDs.
+            actual_seq_len: Global cumulative TND document endpoints.
+            kwargs: Other supported packed-sequence aliases.
+            use_dense: Whether the current training stage uses dense warm-up.
+
+        Returns:
+            This rank's compact local Q/K endpoints and key ranges.
+        """
         del use_dense
         if self._cp_context is None:
             raise ValueError("DeepSeek sparse-attention CP member must be bound before execution")
-        self._validate_forward_inputs(hidden_states, None, past_key_values, position_ids, kwargs)
-        self._validate_attention_mask(hidden_states, attention_mask)
+        self._validate_forward_inputs(hidden_states, attention_mask, past_key_values, position_ids, kwargs)
         return build_cp_sequence_metadata(
             batch_size=hidden_states.shape[0], local_seq_len=hidden_states.shape[1],
             device=hidden_states.device, cp_size=self._cp_context.size, cp_rank=self._cp_context.rank,

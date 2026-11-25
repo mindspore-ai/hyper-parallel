@@ -285,9 +285,9 @@ class DeepseekSparseAttentionModule(nn.Module):
     """DeepSeek-V3.2 sparse attention with native configuration and source-module construction.
 
     It supports causal training and packed sequences. Packed boundaries must
-    be supplied through ``actual_seq_len``. The optional ``attention_mask`` is
-    assumed to be the standard causal mask created by Transformers; padding,
-    custom attention masks, dropout, and KV cache are not supported.
+    be supplied through ``actual_seq_len``. ``attention_mask`` is a compatibility
+    argument whose values are not consumed; causal masking comes from DSA kernels
+    and sequence metadata. Padding/custom masks, dropout, and KV cache are unsupported.
     """
 
     def bind_parallel(self, binding: ParallelBinding) -> None:
@@ -655,8 +655,8 @@ class DeepseekSparseAttentionModule(nn.Module):
             return True
         return position_ids.shape[0] not in (1, batch_size) or position_ids.shape[1] != seq_length
 
-    @staticmethod
     def _validate_forward_inputs(
+        self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
         past_key_values: Any | None,
@@ -664,6 +664,7 @@ class DeepseekSparseAttentionModule(nn.Module):
         kwargs: dict[str, Any],
     ) -> None:
         """Validate inputs supported by the DeepSeek sparse-attention path."""
+        del attention_mask
         if hidden_states.ndim != 3:
             raise ValueError("DeepSeek-V3.2 hidden_states must have shape [batch, sequence, hidden]")
         batch_size, seq_length = hidden_states.shape[:-1]
@@ -671,13 +672,6 @@ class DeepseekSparseAttentionModule(nn.Module):
             raise NotImplementedError("DeepseekSparseAttention does not support KV cache")
         if DeepseekSparseAttentionModule._invalid_position_ids(position_ids, batch_size, seq_length):
             raise ValueError("position_ids must have shape [1 or batch_size, sequence_length]")
-        if attention_mask is not None:
-            expected_shape = (batch_size, 1, seq_length, seq_length)
-            if tuple(attention_mask.shape) != expected_shape:
-                raise ValueError(
-                    "DeepseekSparseAttention supports only a Transformers 4D causal mask; "
-                    "padding and custom masks are not supported"
-                )
         if kwargs.pop("output_attentions", False):
             raise NotImplementedError("DeepseekSparseAttention does not expose attention weights")
 
