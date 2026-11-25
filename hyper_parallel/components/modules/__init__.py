@@ -38,7 +38,7 @@ if TYPE_CHECKING:
         CPDeepseekSparseAttentionModule, DeepseekSparseAttention, DeepseekSparseAttentionModule,
     )
     from hyper_parallel.components.modules.attention.grouped_query_attention import (
-        GroupedQueryAttention, RingGroupedQueryAttention,
+        GroupedQueryAttention,
     )
     from hyper_parallel.components.modules.attention.gated_grouped_query_attention import (
         GatedGroupedQueryAttention,
@@ -86,7 +86,6 @@ _EXPORT_TO_MODULE = {
     "DeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",
     "CPDeepseekSparseAttentionModule": "attention.deepseek_sparse_attention",
     "GroupedQueryAttention": "attention.grouped_query_attention.grouped_query_attention_family",
-    "RingGroupedQueryAttention": "attention.grouped_query_attention.ring_grouped_query_attention_family",
     "GatedGroupedQueryAttention": "attention.gated_grouped_query_attention.gated_grouped_query_attention_family",
     "EngramModule": "engram",
     "GroupedExperts": "moe.grouped_experts.grouped_experts_family",

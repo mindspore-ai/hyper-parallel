@@ -15,6 +15,5 @@
 """Class-owned attention math and parallel family members."""
 
 from .grouped_query_attention_family import GroupedQueryAttention
-from .ring_grouped_query_attention_family import RingGroupedQueryAttention
 
-__all__ = ['GroupedQueryAttention', 'RingGroupedQueryAttention']
+__all__ = ['GroupedQueryAttention']

@@ -31,9 +31,9 @@ def test_ring_gqa_family_npu_2_cards() -> None:
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
-def test_ring_gqa_ulysses_ring_npu_4_cards() -> None:
-    """Compare the Ulysses + Ring member against full-sequence GQA."""
-    torchrun_case(_WORKER, "test_ring_gqa_ulysses_ring_bfloat16", num_proc=4)
+def test_gqa_ulysses_cp_npu_4_cards() -> None:
+    """Compare the existing Ulysses GQA CP member against full-sequence GQA."""
+    torchrun_case(_WORKER, "test_gqa_ulysses_cp_bfloat16", num_proc=4)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",

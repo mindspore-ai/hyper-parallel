@@ -22,8 +22,6 @@ of reusable receive buffers; no remote KV survives forward.
 Algorithm: https://arxiv.org/abs/2310.01889. The NPU block-kernel contract was
 cross-checked against Yunchang's ring_npu_flash_attn.py:
 https://github.com/feifeibear/long-context-attention/tree/main/yunchang/ring
-Ulysses + Ring composes the framework's differentiable layout exchanges with
-this kernel; the two-dimensional decomposition follows https://arxiv.org/abs/2405.07719.
 """
 
 from __future__ import annotations
@@ -31,17 +29,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import accumulate
-import math
-from typing import Any, Optional
+from typing import Any
 
 # Native Torch is required; the legacy lint rule predates the Torch-only migration.
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.distributed.context_parallel.collectives import (
-    _build_hybrid_cp_submeshes, ulysses_head_to_seq, ulysses_seq_to_head,
-)
 from hyper_parallel.distributed.context_parallel.ring_layout import (
     PrunedRingPlan, RingAttentionTrace, pruned_ring_plan, redistribute_ring_qkv, redistribute_ring_rows,
     ring_task_plan,
@@ -613,15 +607,13 @@ class _RingAttention(torch.autograd.Function):
         return (*gradients, *(None for _ in range(len(ctx.needs_input_grad) - 3)))
 
 
-def _validate_inputs(query, key, value, causal, scale, input_layout, dropout_p, overlap):
+def _validate_inputs(query, key, value, causal, input_layout, overlap):
     if not isinstance(overlap, bool):
         raise ValueError("overlap must be bool")
     if input_layout not in ("BNSD", "BSND", "TND"):
         raise ValueError("ring_attention supports only BNSD, BSND and TND layouts")
     if not isinstance(causal, bool):
         raise ValueError("causal must be bool")
-    if dropout_p != 0:
-        raise ValueError("ring_attention currently requires dropout_p=0")
     tensors = (query, key, value)
     dimensions = 3 if input_layout == "TND" else 4
     if any(not isinstance(tensor, torch.Tensor) or tensor.ndim != dimensions for tensor in tensors):
@@ -641,10 +633,6 @@ def _validate_inputs(query, key, value, causal, scale, input_layout, dropout_p, 
         raise ValueError("the query head count must be divisible by the KV head count")
     if query.dtype not in (torch.float16, torch.bfloat16) or any(tensor.dtype != query.dtype for tensor in tensors):
         raise ValueError("query, key and value must share FP16 or BF16 dtype")
-    if scale is not None and (
-        not isinstance(scale, (int, float)) or isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0
-    ):
-        raise ValueError("scale must be finite and positive")
     if query.device.type != "npu" or any(tensor.device != query.device for tensor in tensors):
         raise ValueError("ring_attention currently requires all inputs on the same NPU")
 
@@ -663,11 +651,9 @@ def _prepare_task_plan(query, layout, size, rank, causal, mode, lengths, block_s
                           rank, mode, causal, block_size, threshold, document_subrings=document_subrings)
 
 
-def _validate_pruning(prune_documents, input_layout):
+def _validate_pruning(prune_documents):
     if not isinstance(prune_documents, bool):
         raise ValueError("prune_documents must be bool")
-    if prune_documents and input_layout != "TND":
-        raise ValueError("prune_documents requires TND input_layout")
 
 
 def ring_attention(
@@ -677,16 +663,11 @@ def ring_attention(
     cp_mesh: Any = None,
     *,
     causal: bool = False,
-    scale: Optional[float] = None,
     input_layout: str = "BNSD",
-    dropout_p: float = 0.0,
     overlap: bool = False,
     load_balance: str = "none",
-    prune_documents: bool = False,
+    prune_documents: bool = True,
     document_lengths: tuple[int, ...] | None = None,
-    balance_block_size: int | None = None,
-    zigzag_min_length: int | None = None,
-    trace: RingAttentionTrace | None = None,
 ) -> torch.Tensor:
     """Compute NPU MHA/GQA attention and restore original contiguous sequence ownership.
 
@@ -696,17 +677,12 @@ def ring_attention(
         value: Local V with the same shape as K, including head dimension.
         cp_mesh: One-dimensional framework CP mesh, or None for single-rank execution.
         causal: Apply global causal order, with token shards ordered by CP group rank.
-        scale: Positive score scale; defaults to the inverse square root of head dimension.
         input_layout: BNSD, BSND, or packed TND; shared by Q, K, V and output.
-        dropout_p: Must be zero in this implementation.
         overlap: Prefetch KV and pipeline dKV communication with block computation.
-        load_balance: Internal query/KV layout: none, zigzag, greedy or hybrid.
+        load_balance: Query layout, either contiguous ``none`` or ``zigzag``.
         prune_documents: Build per-document Ring subplans; can be combined with load_balance.
         document_lengths: Global positive document lengths, required for TND only.
             Supply identical host tuples on all ranks; total equals local tokens times CP.
-        balance_block_size: Greedy block size, at most local tokens; default min(2048, local).
-        zigzag_min_length: Explicit original-token threshold for hybrid.
-        trace: Optional per-round NPU events; no barriers are inserted.
 
     Returns:
         Attention output for this rank's Q shard, with Q's shape and dtype.
@@ -726,16 +702,18 @@ def ring_attention(
         may have atomic reduction roundoff; exact repeatability requires
         torch.use_deterministic_algorithms(True).
     """
-    _validate_pruning(prune_documents, input_layout)
-    _validate_inputs(query, key, value, causal, scale, input_layout, dropout_p, overlap)
+    _validate_pruning(prune_documents)
+    if load_balance not in ("none", "zigzag"):
+        raise ValueError("load_balance must be none or zigzag")
+    _validate_inputs(query, key, value, causal, input_layout, overlap)
     ring = _ring_context(cp_mesh)
     # Register optional NPU operators only when the NPU implementation is invoked.
     import torch_npu  # pylint: disable=C0415,unused-import
 
-    scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
+    scale = query.shape[-1] ** -0.5
+    prune_documents = prune_documents and input_layout == "TND"
     plan = _prepare_task_plan(query, input_layout, ring.size, ring.rank, causal, load_balance,
-                              document_lengths, balance_block_size, zigzag_min_length,
-                              document_subrings=prune_documents)
+                              document_lengths, None, None, document_subrings=prune_documents)
     if prune_documents:
         if load_balance != "none":
             query, key, value = redistribute_ring_qkv(
@@ -746,15 +724,13 @@ def ring_attention(
             document_lengths, ring.size, ring.rank, causal, plan.assignments,
         )
         output = _RingAttention.apply(
-            query, key, value, ring, causal, scale, "TND", overlap, pruning_plan, trace,
+            query, key, value, ring, causal, scale, "TND", overlap, pruning_plan,
         )
         if load_balance != "none":
             output = redistribute_ring_rows(output, plan, ring.group, _token_axis(input_layout), inverse=True)
         return output
     if load_balance == "none" and input_layout != "TND":
-        if trace is None:
-            return _RingAttention.apply(query, key, value, ring, causal, scale, input_layout, overlap)
-        return _RingAttention.apply(query, key, value, ring, causal, scale, input_layout, overlap, None, trace)
+        return _RingAttention.apply(query, key, value, ring, causal, scale, input_layout, overlap)
     axis = _token_axis(input_layout)
     if load_balance != "none":
         head_dim = 2 if input_layout == "BSND" else 1
@@ -765,124 +741,12 @@ def ring_attention(
         # heads preserves GQA groups and avoids duplicating the document plan.
         query, key, value = (tensor.permute(axis, 0, head_dim, 3).flatten(1, 2)
                              for tensor in (query, key, value))
-        output = _RingAttention.apply(query, key, value, ring, causal, scale, "TND", overlap, plan, trace)
+        output = _RingAttention.apply(query, key, value, ring, causal, scale, "TND", overlap, plan)
         output = output.view(-1, batch, heads, output.shape[-1])
         output = output.permute(1, 2, 0, 3) if input_layout == "BNSD" else output.permute(1, 0, 2, 3)
     else:
-        output = _RingAttention.apply(query, key, value, ring, causal, scale, input_layout, overlap, plan, trace)
+        output = _RingAttention.apply(query, key, value, ring, causal, scale, input_layout, overlap, plan)
     if load_balance != "none":
         output = redistribute_ring_rows(output, plan, ring.group, axis, inverse=True)
     return output
 
-
-def _validate_ulysses_degree(cp_mesh, ulysses_degree):
-    if isinstance(ulysses_degree, bool) or not isinstance(ulysses_degree, int):
-        raise ValueError("ulysses_degree must be an integer")
-    if cp_mesh is not None and cp_mesh.ndim != 1:
-        raise ValueError("ulysses_ring_attention requires a one-dimensional CP mesh")
-    cp_size = 1 if cp_mesh is None else cp_mesh.size()
-    if not 1 <= ulysses_degree <= cp_size or cp_size % ulysses_degree:
-        raise ValueError(
-            f"ulysses_degree ({ulysses_degree}) must be a positive divisor of CP size ({cp_size})"
-        )
-    return cp_size
-
-
-def ulysses_ring_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    cp_mesh: Any = None,
-    *,
-    ulysses_degree: int = 1,
-    causal: bool = False,
-    scale: Optional[float] = None,
-    input_layout: str = "BNSD",
-    dropout_p: float = 0.0,
-    overlap: bool = False,
-    load_balance: str = "none",
-    prune_documents: bool = False,
-    document_lengths: tuple[int, ...] | None = None,
-    balance_block_size: int | None = None,
-    zigzag_min_length: int | None = None,
-    trace: RingAttentionTrace | None = None,
-) -> torch.Tensor:
-    """Compose Ulysses head sharding with NPU Ring Attention over sequence blocks.
-
-    Args:
-        query: Local Q in BNSD/BSND or TND, with sequence length global tokens / CP.
-        key: Compact local K; both Q and KV head counts must be divisible by Ulysses degree.
-        value: Local V with K's shape and dtype.
-        cp_mesh: One-dimensional framework CP mesh in contiguous sequence-shard order.
-            None selects single-rank execution and requires ulysses_degree=1.
-        ulysses_degree: Positive divisor U of CP size C. Ring degree is R=C/U.
-            U=1 selects pure Ring; U=C selects pure Ulysses.
-        causal: Apply the causal mask in global sequence order.
-        scale: Positive score scale; defaults to the inverse square root of head dimension.
-        input_layout: BNSD, BSND, or packed TND, shared by inputs and output.
-        dropout_p: Must be zero, as in ring_attention.
-        overlap: Enable Ring KV/dKV overlap; Ulysses exchanges remain synchronous.
-        load_balance: Ring subgroup task layout: none, zigzag, greedy or hybrid.
-        prune_documents: Prune KV routes independently inside each document's Ring subplan.
-        document_lengths: Global document lengths for TND, as in ring_attention.
-        balance_block_size: Greedy query block size, as in ring_attention.
-        zigzag_min_length: Explicit document threshold for hybrid.
-        trace: Optional Ring round device events, as in ring_attention.
-
-    Returns:
-        Output with the original local Q shape, dtype and sequence order.
-
-    Raises:
-        ValueError: If mesh, degree, local head counts or Ring input contracts are unsupported.
-
-    Note:
-        CP ranks are arranged as [R, U], with U varying fastest. At C=4, U=2,
-        Ulysses groups are [0, 1] and [2, 3]; Ring groups are [0, 2] and [1, 3].
-        All-to-all converts [B, H, S/C, D] to [B, H/U, S/R, D] before Ring,
-        and the inverse exchange restores the output. KV heads are never repeated.
-        Head counts are local counts after any TP sharding. All ranks must use
-        matching shapes, options and requires_grad flags, and participate in backward
-        even when their upstream gradient is zero. Gradients sum all local losses
-        without CP-size averaging. Other limitations are shared with ring_attention.
-    """
-    _validate_pruning(prune_documents, input_layout)
-    cp_size = _validate_ulysses_degree(cp_mesh, ulysses_degree)
-    _validate_inputs(query, key, value, causal, scale, input_layout, dropout_p, overlap)
-    sequence_dim, head_dim = _token_axis(input_layout), 2 if input_layout == "BSND" else 1
-    if any(tensor.shape[head_dim] % ulysses_degree for tensor in (query, key, value)):
-        raise ValueError(
-            f"local Q and KV head counts must be divisible by ulysses_degree ({ulysses_degree})"
-        )
-    # Validate metadata before Ulysses creates subgroups or exchanges tensors.
-    _prepare_task_plan(query, input_layout, cp_size, 0, causal, load_balance,
-                       document_lengths, balance_block_size, zigzag_min_length,
-                       workers=cp_size // ulysses_degree, document_subrings=prune_documents)
-    options = {"load_balance": load_balance, "prune_documents": prune_documents,
-               "document_lengths": document_lengths,
-               "balance_block_size": balance_block_size, "zigzag_min_length": zigzag_min_length, "trace": trace}
-    # Validate parent rank order before submesh creation or any tensor exchange.
-    _ring_context(cp_mesh)
-    if ulysses_degree == 1:
-        return ring_attention(
-            query, key, value, cp_mesh, causal=causal, scale=scale, input_layout=input_layout,
-            overlap=overlap, **options,
-        )
-    if ulysses_degree == cp_size:
-        ulysses_mesh, ring_mesh = cp_mesh, None
-    else:
-        # The existing helper names the complementary axis "colossal"; here it carries Ring.
-        ulysses_mesh, ring_mesh = _build_hybrid_cp_submeshes(cp_mesh, ulysses_degree)
-    _ring_context(ulysses_mesh)
-    _ring_context(ring_mesh)
-    heads = tuple(tensor.shape[head_dim] // ulysses_degree for tensor in (query, key, value))
-    # Group Q/K/V by destination head shard before the common sequence exchange.
-    packed = torch.cat(tuple(tensor.unflatten(head_dim, (ulysses_degree, count))
-                             for tensor, count in zip((query, key, value), heads)), dim=head_dim + 1)
-    packed = packed.flatten(head_dim, head_dim + 1)
-    packed = ulysses_seq_to_head(packed, sequence_dim, head_dim, ulysses_mesh)
-    query, key, value = packed.split(heads, dim=head_dim)
-    output = ring_attention(
-        query, key, value, ring_mesh, causal=causal, scale=scale, input_layout=input_layout,
-        overlap=overlap, **options,
-    )
-    return ulysses_head_to_seq(output, sequence_dim, head_dim, ulysses_mesh)

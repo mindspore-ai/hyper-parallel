@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.distributed.context_parallel.ring_attention import (
-    _merge_blocks, _RingContext, _RingExchange, _ring_context, ring_attention, ulysses_ring_attention,
+    _merge_blocks, _RingContext, _RingExchange, _ring_context, ring_attention,
 )
 
 _RING_MODULE = importlib.import_module("hyper_parallel.distributed.context_parallel.ring_attention")
@@ -43,13 +43,8 @@ class TestRingArguments(unittest.TestCase):
             ({"input_layout": "TNHD"}, "layouts"),
             ({"causal": 1}, "causal"),
             ({"overlap": 1}, "overlap"),
-            ({"dropout_p": 0.1}, "dropout_p=0"),
-            ({"scale": 0}, "scale"),
-            ({"scale": -0.25}, "scale"),
-            ({"scale": float("nan")}, "scale"),
-            ({"scale": float("inf")}, "scale"),
-            ({"scale": True}, "scale"),
-            ({"scale": "0.25"}, "scale"),
+            ({"load_balance": "greedy"}, "none or zigzag"),
+            ({"prune_documents": 1}, "prune_documents must be bool"),
         )
         for options, message in cases:
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
@@ -211,27 +206,3 @@ class TestRingSoftmaxMerge(unittest.TestCase):
                 torch.testing.assert_close(merged_sum, denominator * (1 + torch.exp(torch.tensor(-1.0))))
 
 
-class TestUlyssesRingArguments(unittest.TestCase):
-    """Invalid decomposition must fail before mesh creation or communication."""
-
-    def test_invalid_degrees_before_collectives(self) -> None:
-        mesh = Mock(ndim=1)
-        mesh.size.return_value = 4
-        tensor = torch.zeros(1, 4, 16, 64, dtype=torch.float16)
-        cases = ((None, "integer"), (True, "integer"), (2.0, "integer"), ("2", "integer"),
-                 (0, "positive divisor"), (-1, "positive divisor"), (3, "positive divisor"),
-                 (8, "positive divisor"))
-        with (patch.object(_RING_MODULE, "_build_hybrid_cp_submeshes") as build,
-              patch.object(_RING_MODULE, "ulysses_seq_to_head") as exchange):
-            for degree, message in cases:
-                with self.subTest(degree=degree), self.assertRaisesRegex(ValueError, message):
-                    ulysses_ring_attention(tensor, tensor, tensor, mesh, ulysses_degree=degree)
-            with self.assertRaisesRegex(ValueError, r"CP size \(1\)"):
-                ulysses_ring_attention(tensor, tensor, tensor, ulysses_degree=2)
-            build.assert_not_called()
-            exchange.assert_not_called()
-
-    def test_multidimensional_mesh_is_rejected(self) -> None:
-        tensor = torch.zeros(1, 4, 16, 64, dtype=torch.float16)
-        with self.assertRaisesRegex(ValueError, "one-dimensional CP mesh"):
-            ulysses_ring_attention(tensor, tensor, tensor, Mock(ndim=2), ulysses_degree=2)

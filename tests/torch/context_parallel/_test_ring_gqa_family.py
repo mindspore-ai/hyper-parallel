@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel import init_device_mesh
-from hyper_parallel.components.modules import GroupedQueryAttention, RingGroupedQueryAttention
+from hyper_parallel.components.modules import GroupedQueryAttention
 from hyper_parallel.distributed.context_parallel.cp_context import CPContext
 
 
@@ -33,6 +33,7 @@ def _run_ring_gqa_case(
     packed: bool = False,
     load_balance: str = "none",
     prune_documents: bool = False,
+    cp_algorithm: str = "ring",
 ) -> None:
     """Check Ring outputs and gradients against full-sequence GQA."""
     import torch_npu  # pylint: disable=import-outside-toplevel,unused-import
@@ -61,8 +62,9 @@ def _run_ring_gqa_case(
         )
         torch.manual_seed(53)
         reference = GroupedQueryAttention(config=config).to(device=device)
-        ring = RingGroupedQueryAttention(
+        ring = GroupedQueryAttention(
             config=config, context={"cp_size": cp_size}, ulysses_degree=ulysses_degree,
+            cp_algorithm=cp_algorithm,
             load_balance=load_balance, prune_documents=prune_documents,
         ).to(device=device)
         ring.load_state_dict(reference.state_dict())
@@ -105,9 +107,9 @@ def test_ring_gqa_family_bfloat16() -> None:
     _run_ring_gqa_case(ulysses_degree=1)
 
 
-def test_ring_gqa_ulysses_ring_bfloat16() -> None:
-    """Check Ulysses + Ring outputs and gradients on four ranks."""
-    _run_ring_gqa_case(ulysses_degree=2)
+def test_gqa_ulysses_cp_bfloat16() -> None:
+    """Check the existing Ulysses GQA CP member on four ranks."""
+    _run_ring_gqa_case(ulysses_degree=2, cp_algorithm="ulysses")
 
 
 def test_ring_gqa_packed_tnd_bfloat16() -> None:
@@ -126,7 +128,7 @@ if __name__ == "__main__":
     test_name = sys.argv[1] if len(sys.argv) > 1 else "test_ring_gqa_family_bfloat16"
     test_cases = {
         "test_ring_gqa_family_bfloat16": test_ring_gqa_family_bfloat16,
-        "test_ring_gqa_ulysses_ring_bfloat16": test_ring_gqa_ulysses_ring_bfloat16,
+        "test_gqa_ulysses_cp_bfloat16": test_gqa_ulysses_cp_bfloat16,
         "test_ring_gqa_packed_tnd_bfloat16": test_ring_gqa_packed_tnd_bfloat16,
         "test_ring_gqa_pruned_zigzag_bfloat16": test_ring_gqa_pruned_zigzag_bfloat16,
     }

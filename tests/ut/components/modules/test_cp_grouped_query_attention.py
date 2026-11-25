@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU contracts for the Ring GQA module-family member."""
+"""CPU contracts for the GQA family CP member and Ring selector."""
 
 from types import SimpleNamespace
 import unittest
@@ -21,12 +21,12 @@ from unittest.mock import Mock, patch
 import torch
 from torch import nn
 
-from hyper_parallel.components.modules import RingGroupedQueryAttention
+from hyper_parallel.components.modules import GroupedQueryAttention
 from hyper_parallel.components.modules.module_family import get_family_build_info
 
 
-class TestRingGroupedQueryAttention(unittest.TestCase):
-    """Verify family selection and runtime layout translation without an NPU."""
+class TestCPGroupedQueryAttention(unittest.TestCase):
+    """Verify family selection and CP attention preparation without an NPU."""
 
     @staticmethod
     def _config():
@@ -46,12 +46,14 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
             attention_dropout=0.0,
         )
 
-    def test_family_builds_ring_member(self):
-        """The explicit Ring factory resolves to its concrete family member."""
-        module = RingGroupedQueryAttention(config=self._config(), context={"cp_size": 4})
+    def test_family_selects_cp_member_for_ring_algorithm(self):
+        """The shared GQA family passes the Ring selector to its CP member."""
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 4}, cp_algorithm="ring",
+        )
 
-        self.assertEqual(type(module).__name__, "RingGroupedQueryAttentionModule")
-        self.assertEqual(get_family_build_info(module).resolved.variant, "ring")
+        self.assertEqual(type(module).__name__, "CPGroupedQueryAttentionModule")
+        self.assertEqual(get_family_build_info(module).resolved.variant, "cp")
         self.assertEqual(module.parallel_module_spec().binding_kind, "cp")
 
         from hyper_parallel.components.modules.module_family import FamilyShardingContext
@@ -64,13 +66,16 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
                                    context=layout_context)
         validate_parallel_module(module, _module_parallel(module, family), sharding, layout_context)
 
-    def test_dense_forward_keeps_bsnd_contract(self):
+    def test_ring_dense_forward_keeps_bsnd_contract(self):
         """Dense BSH input returns the ordinary output-projection shape."""
-        module = RingGroupedQueryAttention(config=self._config())
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 2}, cp_algorithm="ring", prune_documents=False,
+        )
+        module.bind_parallel(SimpleNamespace(cp_context=Mock(size=2, rank=0, mesh=object())))
         hidden_states = torch.randn(1, 4, 16)
         with patch(
             "hyper_parallel.components.modules.attention.grouped_query_attention."
-            "ring_grouped_query_attention.ulysses_ring_attention",
+            "cp_grouped_query_attention.ring_attention",
             side_effect=lambda query, key, value, *args, **kwargs: query,
         ) as ring:
             output, weights = module(hidden_states)
@@ -81,12 +86,14 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
 
     def test_packed_forward_converts_cumulative_lengths(self):
         """Packed metadata is converted to global document lengths and TND."""
-        module = RingGroupedQueryAttention(config=self._config(), context={"cp_size": 4})
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 4}, cp_algorithm="ring",
+        )
         module.bind_parallel(SimpleNamespace(cp_context=Mock(size=4, rank=0, mesh=object())))
         hidden_states = torch.randn(1, 2, 16)
         with patch(
             "hyper_parallel.components.modules.attention.grouped_query_attention."
-            "ring_grouped_query_attention.ulysses_ring_attention",
+            "cp_grouped_query_attention.ring_attention",
             side_effect=lambda query, key, value, *args, **kwargs: query,
         ) as ring:
             output, _ = module(hidden_states, actual_seq_len=[4, 8])
@@ -97,15 +104,15 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
 
     def test_pruning_and_balance_reach_ring_kernel(self):
         """Packed module options enable both planners on the Ring kernel."""
-        module = RingGroupedQueryAttention(
-            config=self._config(), context={"cp_size": 4},
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 4}, cp_algorithm="ring",
             load_balance="zigzag", prune_documents=True,
         )
         module.bind_parallel(SimpleNamespace(cp_context=Mock(size=4, rank=0, mesh=object())))
         hidden_states = torch.randn(1, 2, 16)
         with patch(
             "hyper_parallel.components.modules.attention.grouped_query_attention."
-            "ring_grouped_query_attention.ulysses_ring_attention",
+            "cp_grouped_query_attention.ring_attention",
             side_effect=lambda query, key, value, *args, **kwargs: query,
         ) as ring:
             module(hidden_states, actual_seq_len=[4, 8])
@@ -113,18 +120,25 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
         self.assertEqual(ring.call_args.kwargs["load_balance"], "zigzag")
         self.assertTrue(ring.call_args.kwargs["prune_documents"])
 
-    def test_pruning_requires_packed_document_metadata(self):
-        """Document pruning cannot guess document boundaries from dense input."""
-        module = RingGroupedQueryAttention(
-            config=self._config(), context={"cp_size": 2}, prune_documents=True,
+    def test_default_pruning_is_a_dense_noop_without_document_metadata(self):
+        """The default flag is forwarded but only prunes when packed metadata exists."""
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 2}, cp_algorithm="ring",
         )
         module.bind_parallel(SimpleNamespace(cp_context=Mock(size=2, rank=0, mesh=object())))
-        with self.assertRaisesRegex(ValueError, "requires packed document lengths"):
+        with patch(
+            "hyper_parallel.components.modules.attention.grouped_query_attention."
+            "cp_grouped_query_attention.ring_attention",
+            side_effect=lambda query, key, value, *args, **kwargs: query,
+        ) as ring:
             module(torch.randn(1, 2, 16))
+        self.assertTrue(ring.call_args.kwargs["prune_documents"])
 
     def test_global_positions_are_sliced_to_local_cp_tokens(self):
         """Global rotary tables use the source rank's contiguous token slice."""
-        module = RingGroupedQueryAttention(config=self._config(), context={"cp_size": 4})
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 4}, cp_algorithm="ring",
+        )
         module.bind_parallel(SimpleNamespace(cp_context=Mock(size=4, rank=2, mesh=object())))
         cosine = torch.arange(8).view(1, 8, 1).expand(1, 8, 4)
         sine = -cosine
@@ -153,7 +167,7 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
         for name, value in vars(source).items():
             setattr(source_module, name, value)
 
-        module = RingGroupedQueryAttention(module=source_module, context={"cp_size": 4})
+        module = GroupedQueryAttention(module=source_module, context={"cp_size": 4}, cp_algorithm="ring")
 
         self.assertIs(module.o_proj, source.o_proj)
         self.assertIs(module.q_norm, source.q_norm)
@@ -161,18 +175,28 @@ class TestRingGroupedQueryAttention(unittest.TestCase):
 
     def test_explicit_mask_is_rejected(self):
         """Ring does not silently reinterpret an explicit visibility mask."""
-        module = RingGroupedQueryAttention(config=self._config())
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 2}, cp_algorithm="ring", prune_documents=False,
+        )
+        module.bind_parallel(SimpleNamespace(cp_context=Mock(size=2, rank=0, mesh=object())))
         with self.assertRaisesRegex(ValueError, "explicit attention mask"):
             module(torch.randn(1, 4, 16), attention_mask=torch.ones(1, 4, dtype=torch.bool))
 
-    def test_sliding_window_is_rejected_at_construction(self):
+    def test_sliding_window_is_rejected_during_forward(self):
         """A source's windowed attention semantics cannot be silently dropped."""
         config = self._config()
         config.sliding_window = 128
+        module = GroupedQueryAttention(
+            config=config, context={"cp_size": 2}, cp_algorithm="ring", prune_documents=False,
+        )
+        module.bind_parallel(SimpleNamespace(cp_context=Mock(size=2, rank=0, mesh=object())))
         with self.assertRaisesRegex(ValueError, "sliding_window"):
-            RingGroupedQueryAttention(config=config)
+            module(torch.randn(1, 4, 16))
 
-    def test_ulysses_degree_must_divide_configured_cp_degree(self):
-        """Reject unsupported decomposition before mesh binding or execution."""
-        with self.assertRaisesRegex(ValueError, "divide the CP degree"):
-            RingGroupedQueryAttention(config=self._config(), ulysses_degree=2)
+    def test_ring_member_rejects_ulysses_degree(self):
+        """Ring uses the complete CP group without an extra Ulysses split."""
+        module = GroupedQueryAttention(
+            config=self._config(), context={"cp_size": 4}, cp_algorithm="ring", ulysses_degree=2,
+        )
+        with self.assertRaisesRegex(ValueError, "requires ulysses_degree=1"):
+            module.bind_parallel(SimpleNamespace(cp_context=Mock(size=4, rank=0, mesh=object())))
