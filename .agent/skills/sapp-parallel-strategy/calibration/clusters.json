@@ -1,13 +1,38 @@
 {
-  "a3": {
+  "a3_384": {
     "device": "A3",
+    "specification": "Ascend A3(384超节点)",
+    "cards_per_node": 8,
+    "dies_per_card": 2,
     "dies_per_node": 16,
+    "nodes_per_supernode": 48,
+    "cards_per_supernode": 384,
+    "memory_gb_per_die": 64,
+    "bw_intra_gbps_per_die": 400,
+    "bw_inter_gbps_per_die": 50,
+    "bf16_tflops_per_die": 200,
+    "ratios": null,
+    "about": "Reference specification supplied for the 384-card A3 supernode. No timing calibration or allocator reserve measurement is recorded for this specification; do not borrow a3_64 measurements."
+  },
+  "a3_64": {
+    "device": "A3",
+    "dies_per_node": 8,
     "ratios": "a3.json",
     "budget": "58GB",
     "remeasure_spread_pct": 0.79,
     "usable_gib": 59.39,
     "reserve_at_full_gib": 8.76,
-    "about": "Ascend A3, 16 dies a node, 64 GB a die. The budget leaves the runtime its own reserve. The ratios turn ND's score into a step time in ms; they were fitted on five launches of 30 September 2026 (see a3.json). The spread is how far the same layout's step time moved between two rounds on different node sets (six layouts, 0.013 to 0.790%): two layouts closer than that cannot be told apart by one round.",
-    "reserve_note": "A die leaves a rank 59.39 GiB, 61.27 less 1.88 held by CANN and HCCL. On 1 October the default allocator reserved 8.76 GiB beyond what was allocated, at EP2 OP32 with full recompute (34.38 reserved, 25.63 allocated): a per-layer plan is priced against 59.39 less that, measured at one layout only. Under expandable segments the reserve behaves otherwise."
+    "about": "Ascend A3, 2 dies per chip, 4 chips and 8 dies a node, 64 GB a die. The budget leaves the runtime its own reserve. The ratios turn ND's score into a step time in ms; they were fitted on five launches of 30 September 2026 (see a3.json). The spread is how far the same layout's step time moved between two rounds on different node sets (six layouts, 0.013 to 0.790%): two layouts closer than that cannot be told apart by one round.",
+    "reserve_note": "A die leaves a rank 59.39 GiB, 61.27 less 1.88 held by CANN and HCCL. On 1 October the default allocator reserved 8.76 GiB beyond what was allocated, at EP2 OP32 with full recompute (34.38 reserved, 25.63 allocated): a per-layer plan is priced against 59.39 less that, measured at one layout only. Under expandable segments the reserve behaves otherwise.",
+    "specification": "Ascend A3(64超节点)",
+    "cards_per_node": 4,
+    "dies_per_card": 2,
+    "nodes_per_supernode": 16,
+    "cards_per_supernode": 64,
+    "memory_gb_per_die": 64,
+    "bw_intra_gbps_per_die": 196,
+    "bw_inter_gbps_per_die": 196,
+    "bf16_tflops_per_die": 400,
+    "calibration_scope": "a3_64"
   }
 }

@@ -1,0 +1,16 @@
+Self-check injection 1 (category: tied-embeddings).
+Disables the tied-alias exclusion in the released-layout pin, so a tied
+release reports the build-side alias as an invented entry. A healthy
+validation suite must flip the tied-embeddings layout cell to fail.
+Applied only inside throwaway benchmark snapshots; never commit applied.
+--- a/.agent/skills/hf-model-integration/scripts/check_released_layout.py
++++ b/.agent/skills/hf-model-integration/scripts/check_released_layout.py
+@@ -405,7 +405,6 @@
+               flush=True)
+         return 1
+     built, aliases, ignore_patterns = built_entries_and_aliases(model_dir)
+-    tied_skipped = sorted(name for name in aliases
+-                          if name in built and name not in released)
++    tied_skipped = []
+     for name in tied_skipped:
+         built.pop(name)

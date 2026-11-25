@@ -73,7 +73,11 @@ def asked(run: Path, family: Optional[str], cluster: Optional[str]) -> Tuple[str
     if path.is_file():
         record = json.loads(path.read_text(encoding="utf-8"))
     family = family or record.get("family")
-    cluster = cluster or record.get("cluster") or "a3"
+    cluster = cluster or record.get("cluster")
+    if cluster in (None, "a3"):
+        raise SystemExit("Run has no explicit A3 specification. Query physical cards/node, then pass "
+                         "--cluster a3_384 (8 cards/node) or --cluster a3_64 (4 cards/node). "
+                         "Legacy 'a3' records must not silently select a different calibration.")
     if not family:
         raise SystemExit(f"{run} names no template: give --family")
     return family, cluster

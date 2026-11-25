@@ -14,7 +14,7 @@
 # ============================================================================
 """Plan recompute layer by layer for one layout: which layers can run without it within memory.
 
-    python <this skill's folder>/scripts/plan.py --family qwen3_5_moe --cluster a3 --layers 8 --seq 8192 \\
+    python <this skill's folder>/scripts/plan.py --family qwen3_5_moe --cluster a3_64 --layers 8 --seq 8192 \\
         --global-batch 64 --micro-batch 1 --dies 64 --layout "EP=2,OP=32" --request "the request"
 
 ND's search-config path chooses each layer's mode among those the trust record allows, against a budget stated
@@ -49,6 +49,7 @@ def _arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if not (args.family or args.yaml):
         parser.error("give --family, or --yaml with the asker's trainer yaml")
+    ask.select_cluster(args)
     args.recompute = ["full"]  # the plan names the layers that run without it
     return args
 
@@ -80,11 +81,19 @@ def search_config(run: Path, doc: Dict[str, Any], degrees: Dict[str, int], clust
                   trust: Dict[str, Any]) -> Dict[str, Any]:
     """The search config: the layout fixed, recompute chosen per layer, the budget the cluster's reserve leaves."""
     dies = int(doc["context"]["device_num"])
-    per_node = int(cluster.get("dies_per_node", 16))
+    per_node = cluster.get("dies_per_node")
+    if not isinstance(per_node, int) or isinstance(per_node, bool) or per_node <= 0:
+        raise ValueError("cluster must declare a positive integer dies_per_node from the selected specification")
+    cards, per_card = cluster.get("cards_per_node"), cluster.get("dies_per_card")
+    if cards is not None and per_card is not None and cards * per_card != per_node:
+        raise ValueError("cluster dies_per_node disagrees with physical cards_per_node * dies_per_card")
+    if dies <= 0 or dies % per_node:
+        raise ValueError(f"search.yaml requires whole nodes: {dies} dies is not a multiple of {per_node}")
     modes = [mode for mode in ("off", "full") if mode not in (trust.get("exclude_modes") or {})]
     return {
         "train_yaml": (run / "run.yaml").as_posix(),
-        "cluster": {"num_nodes": max(1, dies // per_node), "cards_per_node": per_node,
+        # ND's legacy cards_per_node field counts logical devices (dies), not physical A3 cards.
+        "cluster": {"num_nodes": dies // per_node, "cards_per_node": per_node,
                     "device_type": cluster["device"].lower(), "device_memory_gb": cluster["usable_gib"]},
         "parallelism": {"dp": "auto", "fsdp": degrees["OP"], "ep": degrees["EP"], "cp": degrees["CP"],
                         "tp": degrees["TP"], "pp": degrees["PP"]},

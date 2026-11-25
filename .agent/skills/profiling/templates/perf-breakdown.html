@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Performance breakdown report</title>
+<style>
+  body { font-family: Consolas, "Courier New", monospace; margin: 24px; color: #171c23; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 24px; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #b9c0c8; padding: 4px 12px; text-align: left; }
+  th { background: #edf3fa; }
+  .note { color: #555e68; font-size: 13px; }
+  .todo { color: #a5322e; }
+</style>
+</head>
+<body>
+<h1>Performance breakdown report</h1>
+<p class="note">Profiling source directory: <code><!--SOURCE--></code></p>
+<p class="note">Capture environment: <!--PROVENANCE--></p>
+<p class="note">Parser rules: breakdown-dimensions v2, based on actual output fields.
+Shares are relative; profiling overhead is excluded from the uninstrumented step-time measurement.</p>
+
+<h2>1. Step-time breakdown (mean per step)</h2>
+<table>
+  <tr><th>Component</th><th>Duration (us)</th><th>Share of Stage</th><th>Notes</th></tr>
+  <!--STEP_ROWS-->
+</table>
+<p class="note">The three additive components come from <code>step_trace_time.csv</code>
+and sum to <code>Stage</code>. The optimizer interval comes from
+<code>Optimizer.step#</code> in <code>operator_details.csv</code>. It is
+<b>a subset of Computing</b>, shown separately for attribution and excluded from the sum.</p>
+
+<h2>2. Device execution by Core Type</h2>
+<table>
+  <tr><th>Class</th><th>Duration (us)</th><th>Share of summed operator time</th></tr>
+  <!--COMPUTE_ROWS-->
+</table>
+<p class="note">Derived from <code>Core Type</code> in <code>op_statistic.csv</code>.
+Durations cover the entire capture window, not one step.</p>
+
+<h2>3. AI_CPU operator-fallback hotspots</h2>
+<table>
+  <tr><th>Operator type</th><th>Duration (us)</th><th>Share</th></tr>
+  <!--FALLBACK_ROWS-->
+</table>
+<p class="note">HCCL launch kernels (<code>*AicpuKernel</code>) are excluded.
+They execute on AI CPU as communication work, not operator fallback. For genuine fallback,
+such as integer ArgSort, use the perf-playbook skill to select an intervention.</p>
+
+<h2>4. Communication breakdown</h2>
+<table>
+  <tr><th>Metric</th><th>Value</th><th>Notes</th></tr>
+  <!--COMM_ROWS-->
+</table>
+<p class="note">Derived from <code>communication.json</code>. Per-step aggregates use
+<code>Total Op Info</code>; individual-operator enumeration excludes that key.
+A large Wait share indicates synchronization waiting rather than transfer bandwidth.
+Communication groups map to parallel dimensions through <code>parallel_group_info</code>
+in <code>profiler_metadata.json</code>, shown in the capture environment above.</p>
+
+<h2>5. Consistency checks</h2>
+<table>
+  <tr><th>Check</th><th>Result</th><th>Details</th></tr>
+  <!--CHECK_ROWS-->
+</table>
+<p class="note">A failed check limits confidence in the affected measurements.
+Exit codes: 0 = all checks passed; 2 = one or more checks failed.</p>
+
+<h2>6. Bottleneck and next step</h2>
+<p>Largest actionable component: <!--VERDICT--></p>
+<p class="note">The breakdown localizes the bottleneck. Use the perf-playbook skill to select an optimization.</p>
+</body>
+</html>

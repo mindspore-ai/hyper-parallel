@@ -37,6 +37,37 @@ Transformers, PyYAML). ND runs on the CPU, with no device. Where `hyper_parallel
 is in the checkout, the V4.1 crop is priced with a census of its layers; where it is not, `ask.py`
 prices the description instead and says so. `install.py` reports which of the two applies.
 
+## Select the A3 specification
+
+Query the target hosts' physical card inventory first, not only container-visible
+logical devices or ranks. Both supported specifications have two dies per card:
+
+- **8 cards/node → `a3_384`**: 16 dies/node, 48 nodes per 384-card supernode.
+- **4 cards/node → `a3_64`**: 8 dies/node, 16 nodes per 64-card supernode.
+
+Check that the target node group is homogeneous. Record the inventory source in
+`--request` and pass the queried count as `--cards-per-node 8` or `4`, or use the
+explicit cluster key. If inventory is unavailable, ask the user; only if it
+remains unspecified, use the 8-card / 16-die default. Generic `a3` without a count
+selects this default with a warning and records the assumption. See
+[the hardware specifications](../parallel-strategy-analyzer/references/known-hardware.md).
+
+Historical A3 timings, ratios and allocator reserve belong only to `a3_64`.
+`a3_384` has reference hardware parameters but no recorded calibration or measured
+allocator reserve. Do not transfer milliseconds or the per-layer memory budget
+from `a3_64`; `plan.py` stops until the selected specification has those
+measurements. An uncalibrated ranking is not a measured speed claim.
+
+`search.yaml` uses ND's existing `cards_per_node` field for **logical devices
+(dies)**: 16 for `a3_384`, 8 for `a3_64`. In `clusters.json`, `cards_per_node`
+means physical cards and `dies_per_node` supplies that ND field. Non-whole-node
+die counts are rejected rather than rounded down. This selection does not change
+ND's underlying A3 cost model or claim the reference peak is used by it.
+
+Old run folders labelled only `a3` require an explicit `--cluster a3_64` or
+`--cluster a3_384` when using `launch.py` or `readback.py`, after confirming the
+original hardware. They must not silently inherit the new default.
+
 ## Answer a request
 
 A question about the fastest layout runs as a loop: check the model (step 5), rank the layouts (steps 1 to 4),
@@ -62,7 +93,7 @@ an answer trustworthy where ND's order was never checked against timed runs.
    there, so it works from any folder, also through a link to this skill:
 
    ```bash
-   python <this skill's folder>/scripts/ask.py --family qwen3_5_moe --cluster a3 \
+   python <this skill's folder>/scripts/ask.py --family qwen3_5_moe --cluster a3_64 \
        --layers 8 --seq 8192 --global-batch 64 --micro-batch 1 --dies 64 --recompute full \
        --request "<the request, in the asker's words>"
    ```
