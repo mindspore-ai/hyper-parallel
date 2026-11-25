@@ -974,6 +974,27 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             inputs_embeds = inputs_embeds + anchor.to(inputs_embeds.dtype) * 0.0
         return inputs_embeds
 
+    def _prepare_decoder_inputs(self, input_ids, inputs_embeds, position_ids, kwargs):
+        """Prepare rotary and packed-sequence metadata for the local decoder layers."""
+        if position_ids is None:
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+        position_embeddings = {
+            "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
+            "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
+        }
+        packed_sequence = kwargs.get("packed_seq_params")
+        if packed_sequence is not None:
+            if not isinstance(packed_sequence, SharedPackedSequence):
+                raise TypeError("packed_seq_params must be SharedCompressedPackedSequence")
+            packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
+            kwargs["packed_seq_params"] = packed_sequence
+
+            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
+            kwargs["router_sequence_ids"] = sequence_ids
+            kwargs["router_num_sequences"] = sequence_capacity
+        segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
+        return position_ids, position_embeddings, segment_start_mask
+
     def _run_decoder_layers(
             self,
             hidden_states: torch.Tensor,
@@ -988,8 +1009,10 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             engram_token_mask: torch.Tensor | None,
             image_mask: torch.Tensor | None,
             dspark_layer_ids: tuple[int, ...],
+            pending_mhc: tuple[torch.Tensor, ...] = (),
+            finish_mhc: bool = True,
             **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         """Run decoder boundaries and collect detached DSpark targets.
 
         Args:
@@ -1004,21 +1027,27 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             engram_token_mask: Mask selecting tokens with Engram contributions.
             image_mask: Mask selecting visual tokens.
             dspark_layer_ids: Layers whose outputs supervise the drafter.
+            pending_mhc: Shifted FFN output and mixing tensors from the previous stage.
+            finish_mhc: Apply the last deferred FFN residual on the output stage.
             **kwargs: Additional decoder-layer keyword arguments.
 
         Returns:
             Completed residual streams and final input-mixing coefficients.
         """
-        shifted_mhc_layers = [_uses_shifted_mhc(layer) for layer in self.layers]
+        shifted_mhc_layers = [_uses_shifted_mhc(layer) for layer in self.layers.children()]
         if any(shifted_mhc_layers) and not all(shifted_mhc_layers):
             raise RuntimeError("shifted mHC must replace every retained V4.1 boundary")
         shifted_mhc = all(shifted_mhc_layers)
         previous_output = post_mix = residual_mix = None
-        if shifted_mhc:
+        if pending_mhc:
+            previous_output, post_mix, residual_mix = pending_mhc
+        elif shifted_mhc:
             previous_output = torch.zeros_like(hidden_states[:, :, 0])
             post_mix = torch.zeros_like(pre_mix)
             residual_mix = _identity_residual_mix(pre_mix)
-        for layer_index, layer in enumerate(self.layers):
+        for local_index, layer in enumerate(self.layers.children()):
+            partition = getattr(self, "pipeline_partition", None)
+            layer_index = local_index + (partition.start if partition is not None else 0)
             if shifted_mhc:
                 previous_output, hidden_states, pre_mix, post_mix, residual_mix = layer(
                     hidden_states,
@@ -1059,6 +1088,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                         target_hidden = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
                     self.dspark_target_hiddens.append(_hc_pre(target_hidden, pre_mix).detach())
         if shifted_mhc:
+            if not finish_mhc:
+                return hidden_states, pre_mix, previous_output, post_mix, residual_mix
             hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
         return hidden_states, pre_mix
 
@@ -1128,23 +1159,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
         image_mask = None if token_types is None else token_types >= 0
         engram_token_mask = None if image_mask is None else ~image_mask
-        if position_ids is None:
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
-        position_embeddings = {
-            "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-            "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
-        }
-        packed_sequence = kwargs.get("packed_seq_params")
-        if packed_sequence is not None:
-            if not isinstance(packed_sequence, SharedPackedSequence):
-                raise TypeError("packed_seq_params must be SharedCompressedPackedSequence")
-            packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
-            kwargs["packed_seq_params"] = packed_sequence
-
-            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
-            kwargs["router_sequence_ids"] = sequence_ids
-            kwargs["router_num_sequences"] = sequence_capacity
-        segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
+        position_ids, position_embeddings, segment_start_mask = self._prepare_decoder_inputs(
+            input_ids, inputs_embeds, position_ids, kwargs,
+        )
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
@@ -1152,7 +1169,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         dspark_layer_ids = tuple(getattr(self.config, "v41_dspark_target_layer_ids", ()) or ())
         self.dspark_target_hiddens = [] if dspark_layer_ids else None
         self.dspark_inputs_embeds = inputs_embeds.detach() if dspark_layer_ids else None
-        hidden_states, pre_mix = self._run_decoder_layers(
+        decoder_outputs = self._run_decoder_layers(
             hidden_states,
             pre_mix,
             input_ids=input_ids,
@@ -1166,6 +1183,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             dspark_layer_ids=dspark_layer_ids,
             **kwargs,
         )
+        hidden_states, pre_mix = decoder_outputs[:2]
         hidden_states = self.norm(_hc_pre(hidden_states, pre_mix))
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 

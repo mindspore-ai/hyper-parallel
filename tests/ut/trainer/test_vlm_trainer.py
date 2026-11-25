@@ -27,6 +27,7 @@ from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeter
 from hyper_parallel.trainer.callbacks.logging_callback import LoggingCallback
 from hyper_parallel.trainer.state import TrainerState
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
+from tests.common.mark_utils import arg_mark
 
 
 class TestVLMTrainer(unittest.TestCase):
@@ -180,6 +181,58 @@ class TestVLMTrainer(unittest.TestCase):
         trainer.base.model_integration.begin_step.assert_called_once_with(1)
         trainer.base.prepare_optimizer_step.assert_called_once()
         trainer.base.step_optimizers_and_schedulers.assert_called_once_with()
+
+    def test_pipeline_step_schedules_batches_before_optimizer_update(self) -> None:
+        """Route VLM accumulation through the pipeline while leaving its iterator lazy."""
+        trainer = self._make_trainer(3)
+        trainer.base.model._hp_pipeline_partition = object()
+        trainer.base.config = SimpleNamespace(pipeline=SimpleNamespace(schedule="1f1b"))
+        trainer.base.forward_backward_step = Mock()
+        seen = []
+
+        def get_batch(iterator):
+            index = next(iterator)
+            seen.append(index)
+            return {"input_ids": torch.tensor([[index]])}, {"labels": torch.tensor([[index]])}
+
+        def pipeline(batches, count):
+            self.assertEqual(seen, [])
+            self.assertEqual(count, 3)
+            for inputs, labels in batches:
+                torch.testing.assert_close(inputs["input_ids"], labels["labels"])
+            return 6.0, {"foundation_loss": 6.0}
+
+        trainer.base.get_batch = get_batch
+        trainer.base.pipeline_forward_backward = Mock(side_effect=pipeline)
+        result = trainer.train_step(iter(range(3)))
+        self.assertEqual(seen, [0, 1, 2])
+        self.assertEqual(result, {"loss": 6.0, "grad_norm": 0.5})
+        trainer.base.forward_backward_step.assert_not_called()
+        trainer.base.step_optimizers_and_schedulers.assert_called_once()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_mpipe_incomplete_batch_skips_optimizer_step(self) -> None:
+        """Feature: MPipe epoch exhaustion.
+        Description: Exhaust the loader after the first of two scheduled microbatches.
+        Expectation: The epoch loop receives StopIteration and leaves optimizer state untouched.
+        """
+        trainer = self._make_trainer(2)
+        trainer.base.model._hp_pipeline_partition = object()  # pylint: disable=protected-access
+        trainer.base.mesh.pp_size = 2
+        trainer.base.config = SimpleNamespace(pipeline=SimpleNamespace(schedule="mpipe"))
+        trainer.base.get_batch = Mock(side_effect=[({}, {}), StopIteration])
+
+        def _consume(batches, count):
+            for _ in range(count):
+                next(batches)
+
+        trainer.base.pipeline_forward_backward = _consume
+        with self.assertRaises(StopIteration):
+            trainer.train_step(iter(()))
+        owners = [call.kwargs["mpipe_owner"] for call in trainer.base.get_batch.call_args_list]
+        self.assertEqual(owners, [0, 1])
+        self.assertEqual(trainer.base.state.global_step, 0)
+        trainer.base.step_optimizers_and_schedulers.assert_not_called()
 
     def test_backward_failure_does_not_fetch_later_micro_batches(self) -> None:
         """Stop reading input when the current micro-step fails.

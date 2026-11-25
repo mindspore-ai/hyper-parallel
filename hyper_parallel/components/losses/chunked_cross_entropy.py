@@ -292,12 +292,16 @@ class ChunkedCausalLMLoss(nn.Module):
         loss_parallel = bool(
             getattr(getattr(distributed_setup, "mesh_context", None), "loss_parallel", False)
         )
-        if tp_size != 1 or pp_size != 1 or loss_parallel:
+        partition = getattr(model, "_hp_pipeline_partition", None)
+        if tp_size != 1 or (pp_size != 1 and partition is None) or loss_parallel:
             raise NotImplementedError(
-                "ChunkedCausalLMLoss currently requires tp_size=1, pp_size=1, "
+                "ChunkedCausalLMLoss requires tp_size=1, pp_size=1 or a model-owned pipeline partition, "
                 f"and loss_parallel=false; got tp_size={tp_size}, "
                 f"pp_size={pp_size}, loss_parallel={loss_parallel}"
             )
+
+        if partition is not None and not partition.is_last:
+            return
 
         # Lazy imports keep generic loss-package import independent of concrete
         # model families and their optional backend dependencies.

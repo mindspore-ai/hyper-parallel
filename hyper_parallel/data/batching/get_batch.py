@@ -27,6 +27,7 @@ from hyper_parallel.data.batching.runtime_input import (
     OnlineBoundaryResolver,
     RuntimeInputAdapter,
 )
+from hyper_parallel.data.parallel.batch_parallel import broadcast_batch_mapping
 from hyper_parallel.data.constants import (
     OMNI_CP_TOKEN_FIELDS,
     OMNI_INTERNAL_FIELDS,
@@ -54,6 +55,7 @@ class OmniParallelBatch:
             mesh_context: Any,
             device: Any,
             pp_shared_data: bool = False,
+            mpipe: bool = False,
             runtime_input_adapter: RuntimeInputAdapter | None = None,
             dataloader_context: DataLoaderParallelContext | None = None,
             data_config: Mapping[str, Any] | None = None,
@@ -64,6 +66,7 @@ class OmniParallelBatch:
             mesh_context: Trainer mesh exposing TP, CP, and PP sizes.
             device: Destination model device.
             pp_shared_data: Whether pipeline stages share the source batch.
+            mpipe: Read vision payloads on their MPipe owner and share decoder fields.
             runtime_input_adapter: Provider of additional forward inputs.
             data_config: Dataset cache settings used by DataLoader ownership.
             dataloader_context: Shared ownership and transport policy from the Trainer.
@@ -74,8 +77,10 @@ class OmniParallelBatch:
         if runtime_input_adapter is not None and not isinstance(runtime_input_adapter, RuntimeInputAdapter):
             raise TypeError("OmniParallelBatch runtime_input_adapter must be a RuntimeInputAdapter")
 
-        if int(getattr(mesh_context, "pp_size", 1)) != 1 or pp_shared_data:
-            raise NotImplementedError("OmniParallelBatch does not support pipeline parallelism or pp_shared_data")
+        if pp_shared_data:
+            raise NotImplementedError("OmniParallelBatch does not support pp_shared_data")
+        # Each PP coordinate reads the same deterministic DP sample stream;
+        # TP broadcast and CP slicing remain local to that physical stage.
 
         source_config = data_config or {}
         self.parallel_context = dataloader_context or create_dataloader_parallel_context(
@@ -88,6 +93,7 @@ class OmniParallelBatch:
         ):
             raise ValueError("OmniParallelBatch requires an initialized process group for TP or CP")
 
+        self.mpipe_mesh = mesh_context.pp_mesh if mpipe else None
         self.device = device
         self.sequence_parallel = bool(mesh_context.sequence_parallel)
         self.runtime_input_adapter = runtime_input_adapter
@@ -101,6 +107,7 @@ class OmniParallelBatch:
             data_iterator: Any,
             *,
             external_batch: Mapping[str, Any] | None = None,
+            mpipe_owner: int | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Read on source owners, slice for CP, and distribute only if needed."""
         self._batch_index += 1
@@ -111,6 +118,17 @@ class OmniParallelBatch:
             if not isinstance(source_batch, Mapping):
                 raise TypeError("Omni DataLoader must yield a mapping batch")
 
+            if self.mpipe_mesh is not None:
+                if mpipe_owner is None:
+                    raise ValueError("MPipe batch requires its visual owner rank")
+                fields = None
+                pixels = None
+                if self.mpipe_mesh.get_local_rank() == mpipe_owner:
+                    fields = dict(source_batch)
+                    pixels = fields.pop("pixel_values", None)
+                source_batch = broadcast_batch_mapping(fields, self.mpipe_mesh.get_group(), mpipe_owner, self.device)
+                if pixels is not None:
+                    source_batch["pixel_values"] = pixels
             normalized_batch = self._normalize_source_batch(source_batch)
             local_batch = self.cp_sharder.shard(normalized_batch)
             logger.debug(

@@ -41,6 +41,7 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.pipeline import partition_model
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
@@ -246,6 +247,19 @@ def _has_module_owned_layouts(model):
     return any(boundary.info.resolved.sharding is not None for boundary in collect_family_modules(model))
 
 
+def _prune_pipeline_parameter_contracts(model: nn.Module, plan: Any) -> None:
+    """Remove only parameter contracts retired by the pipeline partition installer."""
+    removed = getattr(model, "_hp_pipeline_removed_parameters", frozenset())
+    if not removed:
+        return
+    for fqn, spec in plan.modules.items():
+        if spec.params is not None:
+            spec.params = {
+                name: layout for name, layout in spec.params.items()
+                if (f"{fqn}.{name}" if fqn else name) not in removed
+            }
+
+
 def _plan_and_apply_sharding(
     model: nn.Module,
     mesh,
@@ -286,6 +300,7 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
+    _prune_pipeline_parameter_contracts(model, plan)
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
@@ -768,6 +783,11 @@ def apply_model_infrastructure(
         _apply_parameter_freezing(model, freeze_config)
 
     _apply_model_method_replacements(model, distributed_setup, low_precision_config)
+
+    pipeline_config = getattr(distributed_setup, "pipeline_config", None)
+    graph_mode_requested = compile_config is not None and compile_config.selects_graph_compiler()
+    if pipeline_config is not None and not graph_mode_requested:
+        partition_model(model, mesh, pipeline_config, distributed_setup.pipeline_chunk_index)
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(

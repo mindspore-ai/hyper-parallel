@@ -55,8 +55,11 @@ logger = logging.getLogger(__name__)
 def _get_attr_by_path(model, fqn):
     """Fetch an attribute along a dotted FQN (numeric segments index into ModuleLists)."""
     obj = model
-    for p in fqn.split("."):
-        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    for part in fqn.split(".") if fqn else ():
+        if part.isdigit() and not isinstance(obj, nn.Module):
+            obj = obj[int(part)]
+        else:
+            obj = getattr(obj, part)
     return obj
 
 
@@ -67,10 +70,8 @@ def _set_param_by_path(model: nn.Module, fqn: str, new_param) -> None:
     attribute on model and would not replace the submodule parameter — you
     must walk the path to the true parent module before assigning.
     """
-    *path, leaf = fqn.split(".")
-    obj = model
-    for p in path:
-        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    parent, _, leaf = fqn.rpartition(".")
+    obj = _get_attr_by_path(model, parent)
     if hasattr(obj, "register_parameter"):
         obj.register_parameter(leaf, new_param)
     else:
@@ -87,12 +88,7 @@ def _resolve_module(model, fqn):
     to the model itself (D-14: a root-level outer spec, e.g. a whole-LM
     contract, 05 §13.4).
     """
-    obj = model
-    if not fqn:
-        return obj
-    for p in fqn.split("."):
-        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
-    return obj
+    return _get_attr_by_path(model, fqn)
 
 
 def _local_params_context(model: nn.Module):
@@ -138,10 +134,8 @@ def _temp_local_params(module, exclude=()):
             continue
         if isinstance(param, DTensor):
             saved.append((name, param))
-            *path, leaf = name.split(".")
-            owner = module
-            for part in path:
-                owner = owner[int(part)] if part.isdigit() else getattr(owner, part)
+            parent, _, leaf = name.rpartition(".")
+            owner = _get_attr_by_path(module, parent)
             owner._parameters[leaf] = param.to_local()  # pylint: disable=protected-access
     try:
         yield
