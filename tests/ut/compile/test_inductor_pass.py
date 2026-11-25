@@ -38,6 +38,8 @@ Covers the terminal TorchInductor compilation pass:
 # pylint: disable=wrong-import-position,import-outside-toplevel,protected-access
 
 import os
+import sys
+import types
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -60,6 +62,8 @@ from hyper_parallel.compile.pass_config import (
 )
 from hyper_parallel.compile.passes.inductor_pass import (
     InductorPass,
+    _loaded_npu_inductor_backend,
+    _patch_dvm_autotune_scope,
     _propagate_fake_vals,
 )
 from hyper_parallel.compile.passes.parallel.pp_schedule import PipelineScheduleBase
@@ -465,6 +469,330 @@ class TestInductorGuards(unittest.TestCase):
         # config keeps the defaults and ignores CompileConfig-level overrides.
         self.assertEqual(config.inductor_mode, "off")
         self.assertIsNone(config.inductor_configs)
+
+    def test_trainer_config_projects_dvm_backend(self):
+        """Test ``compile.dvm`` selects the regional DVM backend projection."""
+        trainer_config = SimpleNamespace(
+            accelerator=SimpleNamespace(
+                tp_size=1, sequence_parallel=False, loss_parallel=False
+            ),
+            fsdp_config=SimpleNamespace(
+                dp_shard_size=1, edp_shard_size=1, reshard_after_forward=True
+            ),
+            compile=SimpleNamespace(dvm=True),
+        )
+        config = build_pass_config_from_trainer_config(trainer_config)
+        self.assertEqual(config.inductor_backend, "dvm")
+        self.assertEqual(config.inductor_mode, "regional")
+
+
+class TestInductorDvmBackend(unittest.TestCase):
+    """DVM backend validation and graph-module metadata."""
+
+    def _traced(self):
+        torch.manual_seed(13)
+        model = nn.Linear(4, 4)
+        return trace_model_graph(
+            model, _train_fn, dict(zip(("x", "y"), _fixed_batch()))
+        )
+
+    @staticmethod
+    def _dvm_config(mode="regional"):
+        return PassConfig(inductor_mode=mode, inductor_backend="dvm")
+
+    @staticmethod
+    def _dvm_modules(wrapper_cls, *, with_async_compile):
+        """Build fake torch_npu modules for DVM autotune-scope tests."""
+        module_paths = [
+            "torch_npu",
+            "torch_npu._inductor",
+            "torch_npu._inductor.ascend_npu_ir",
+            "torch_npu._inductor.ascend_npu_ir.ascend_npu_ir",
+            "torch_npu._inductor.ascend_npu_ir.ascend_npu_ir.codecache",
+            "torch_npu._inductor.ascend_npu_ir.ascend_npu_ir.npu",
+            "torch_npu._inductor.ascend_npu_ir.ascend_npu_ir.npu.codegen",
+            "torch_npu._inductor.ascend_npu_ir.ascend_npu_ir.npu.codegen.wrapper",
+        ]
+        fake_modules = {}
+        for path in module_paths:
+            module = types.ModuleType(path)
+            module.__path__ = []
+            fake_modules[path] = module
+        if with_async_compile:
+            fake_modules[module_paths[4]].CustomAsyncCompile = object()
+        fake_modules[module_paths[-1]].NpuMlirWrapperCodeGen = wrapper_cls
+        return fake_modules
+
+    def test_rejects_torch_older_than_2_10(self):
+        """Test DVM graph mode rejects torch builds older than 2.10."""
+        joint = self._traced()
+        with mock.patch(
+            "hyper_parallel.compile.passes.inductor_pass._torch_version_tuple",
+            return_value=(2, 9, 3),
+        ):
+            with self.assertRaisesRegex(ValueError, "2.10"):
+                InductorPass().run(
+                    joint.graph_module,
+                    self._dvm_config(),
+                    example_inputs=joint.example_inputs,
+                )
+
+    def test_rejects_unloaded_dvm_backend(self):
+        """Test a process that loaded another torch_npu backend is rejected."""
+        joint = self._traced()
+        with (
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._torch_version_tuple",
+                return_value=(2, 14, 0),
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._regional_inductor_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._loaded_npu_inductor_backend",
+                return_value="default",
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "TORCHINDUCTOR_NPU_BACKEND"):
+                InductorPass().run(
+                    joint.graph_module,
+                    self._dvm_config(),
+                    example_inputs=joint.example_inputs,
+                )
+
+    def test_rejects_missing_torch_npu(self):
+        """Test DVM graph mode requires torch_npu."""
+        joint = self._traced()
+        with (
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._torch_version_tuple",
+                return_value=(2, 14, 0),
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._regional_inductor_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._loaded_npu_inductor_backend",
+                return_value=None,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "torch_npu"):
+                InductorPass().run(
+                    joint.graph_module,
+                    self._dvm_config(),
+                    example_inputs=joint.example_inputs,
+                )
+
+    def test_reads_backend_from_torch_npu_lazy_registry(self):
+        """Test the backend is read from torch_npu.utils._dynamo, not _inductor."""
+        registry = mock.Mock()
+        registry._loaded_backend = "dvm"
+        dynamo_module = types.ModuleType("torch_npu.utils._dynamo")
+        dynamo_module._InductorNpuRegistry = registry
+        utils_module = types.ModuleType("torch_npu.utils")
+        npu_module = types.ModuleType("torch_npu")
+        fake_modules = {
+            "torch_npu": npu_module,
+            "torch_npu.utils": utils_module,
+            "torch_npu.utils._dynamo": dynamo_module,
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            self.assertEqual(_loaded_npu_inductor_backend(), "dvm")
+        registry.register_inductor_npu.assert_called_once_with()
+
+    def test_patches_dvm_runtime_into_autotune_defs(self):
+        """Test DVM and NPU AsyncCompile are defined before kernel defs."""
+
+        class _Buffer:
+            def __init__(self):
+                self.lines = []
+
+            def writeline(self, line: str) -> None:
+                """Record one emitted source line."""
+                self.lines.append(line)
+
+        class _Wrapper:
+            def __init__(self):
+                self.kernel_autotune_defs = _Buffer()
+
+            def write_kernel_autotune_defs_header(self) -> None:
+                """Emit a marker header line before kernel definitions."""
+                self.kernel_autotune_defs.writeline("header")
+
+        fake_modules = self._dvm_modules(_Wrapper, with_async_compile=True)
+        with mock.patch.dict(sys.modules, fake_modules):
+            _patch_dvm_autotune_scope()
+            _patch_dvm_autotune_scope()
+
+        wrapper = _Wrapper()
+        wrapper.write_kernel_autotune_defs_header()
+        self.assertEqual(
+            wrapper.kernel_autotune_defs.lines,
+            [
+                "header",
+                "from torch_npu._inductor import dvm",
+                "from torch_npu._inductor.ascend_npu_ir.ascend_npu_ir.codecache "
+                "import CustomAsyncCompile",
+                "async_compile = CustomAsyncCompile()",
+            ],
+        )
+
+    def test_patch_warns_when_torch_npu_modules_missing(self):
+        """Test an unpatched DVM scope logs a warning instead of failing silently."""
+        with mock.patch.dict(sys.modules, {"torch_npu": None}):
+            with self.assertLogs(
+                "hyper_parallel.compile.passes.inductor_pass", level="WARNING"
+            ) as captured:
+                _patch_dvm_autotune_scope()
+        self.assertIn("ascend_npu_ir", captured.output[0])
+
+    def test_patch_warns_and_skips_missing_async_compile(self):
+        """Test DVM codegen omits CustomAsyncCompile when torch_npu lacks it."""
+
+        class _Buffer:
+            def __init__(self):
+                self.lines = []
+
+            def writeline(self, line: str) -> None:
+                """Record one emitted source line."""
+                self.lines.append(line)
+
+        class _Wrapper:
+            def __init__(self):
+                self.kernel_autotune_defs = _Buffer()
+
+            def write_kernel_autotune_defs_header(self) -> None:
+                """Emit a marker header line before kernel definitions."""
+                self.kernel_autotune_defs.writeline("header")
+
+        fake_modules = self._dvm_modules(_Wrapper, with_async_compile=False)
+        with mock.patch.dict(sys.modules, fake_modules):
+            with self.assertLogs(
+                "hyper_parallel.compile.passes.inductor_pass", level="WARNING"
+            ) as captured:
+                _patch_dvm_autotune_scope()
+
+        wrapper = _Wrapper()
+        wrapper.write_kernel_autotune_defs_header()
+        self.assertEqual(
+            wrapper.kernel_autotune_defs.lines,
+            ["header", "from torch_npu._inductor import dvm"],
+        )
+        self.assertIn("CustomAsyncCompile", captured.output[0])
+
+    def test_validation_applies_autotune_patch_on_success(self):
+        """Test successful DVM validation installs the autotune-scope patch."""
+        joint = self._traced()
+        with (
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._torch_version_tuple",
+                return_value=(2, 14, 0),
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._regional_inductor_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._loaded_npu_inductor_backend",
+                return_value="dvm",
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._patch_dvm_autotune_scope"
+            ) as patched,
+        ):
+            InductorPass().run(
+                joint.graph_module,
+                self._dvm_config(),
+                example_inputs=joint.example_inputs,
+            )
+        patched.assert_called_once_with()
+
+    def test_reports_unreadable_loaded_backend(self):
+        """Test an installed torch_npu with no loaded backend gets a specific error."""
+        joint = self._traced()
+        with (
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._torch_version_tuple",
+                return_value=(2, 14, 0),
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._regional_inductor_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass._loaded_npu_inductor_backend",
+                return_value=None,
+            ),
+            mock.patch(
+                "hyper_parallel.compile.passes.inductor_pass.importlib.util.find_spec",
+                return_value=object(),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "could not read"):
+                InductorPass().run(
+                    joint.graph_module,
+                    self._dvm_config(),
+                    example_inputs=joint.example_inputs,
+                )
+
+    def test_rejects_non_bool_dvm_projection(self):
+        """Test trainer projection rejects a non-bool ``compile.dvm`` value."""
+        trainer_config = SimpleNamespace(
+            accelerator=SimpleNamespace(
+                tp_size=1, sequence_parallel=False, loss_parallel=False
+            ),
+            fsdp_config=SimpleNamespace(
+                dp_shard_size=1, edp_shard_size=1, reshard_after_forward=True
+            ),
+            compile=SimpleNamespace(dvm="false"),
+        )
+        with self.assertRaisesRegex(ValueError, "compile.dvm"):
+            build_pass_config_from_trainer_config(trainer_config)
+
+    def test_records_backend_on_compiled_graph(self):
+        """Test a validated DVM run records the backend on the joint graph."""
+        joint = self._traced()
+        with mock.patch(
+            "hyper_parallel.compile.passes.inductor_pass._validate_dvm_backend"
+        ):
+            InductorPass().run(
+                joint.graph_module,
+                self._dvm_config(),
+                example_inputs=joint.example_inputs,
+            )
+        self.assertEqual(joint.graph_module.meta.get("inductor_compiled"), "regional")
+        self.assertEqual(joint.graph_module.meta.get("inductor_backend"), "dvm")
+
+    def test_records_backend_on_pp_stage_graphs(self):
+        """Test PP stage subgraphs inherit the requested backend meta."""
+        stub, schedule = _make_pp_stub()
+        with mock.patch(
+            "hyper_parallel.compile.passes.inductor_pass._validate_dvm_backend"
+        ):
+            InductorPass().run(stub, self._dvm_config())
+        self.assertEqual(stub.meta.get("inductor_backend"), "dvm")
+        for stage_gm in (schedule.fwd_gm, schedule.bwd_gm):
+            self.assertEqual(stage_gm.meta.get("inductor_backend"), "dvm")
+
+    def test_compiler_validates_before_tracing(self):
+        """Test GraphCompiler fails before tracing/mutating the model."""
+        model = _make_model()
+        compiler = GraphCompiler(
+            model=model,
+            train_fn=_train_fn,
+            pass_config=self._dvm_config(),
+            device=torch.device("cpu"),
+        )
+        x, y = _fixed_batch()
+        with mock.patch(
+            "hyper_parallel.compile.passes.inductor_pass._validate_dvm_backend",
+            side_effect=ValueError("dvm backend unavailable"),
+        ):
+            with self.assertRaisesRegex(ValueError, "dvm backend unavailable"):
+                compiler.forward_backward(x=x, y=y)
+        self.assertFalse(compiler.is_compiled)
 
 
 if __name__ == "__main__":

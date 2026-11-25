@@ -71,11 +71,13 @@ Contract notes:
   ``FakeTensorMode``.
 """
 
-__all__ = ["InductorPass"]
+__all__ = ["InductorPass", "validate_inductor_backend"]
 
 import importlib
+import importlib.util
 import logging
 import operator
+import re
 from typing import Any, Dict, Optional, Sequence
 
 import torch
@@ -101,8 +103,16 @@ _C10D_FUNCTIONAL_NS = "_c10d_functional."
 # Meta key recording that (and how) a graph module was compiled.
 _INDUCTOR_COMPILED_META = "inductor_compiled"
 
+# Meta key recording the Inductor backend requested for the compiled graph.
+_INDUCTOR_BACKEND_META = "inductor_backend"
+
 # Meta value when the running torch predates regional_inductor (<= 2.9.x).
 _INDUCTOR_UNAVAILABLE = "unavailable"
+
+# Graph mode only declares DVM support on torch builds that ship regional
+# Inductor compilation. Older torch/torch_npu combinations use eager DVM
+# (TORCH_NPU_LAZY_FUSION) instead.
+_DVM_MIN_TORCH_VERSION = (2, 10)
 
 
 def _regional_inductor_available() -> bool:
@@ -118,6 +128,160 @@ def _regional_inductor_available() -> bool:
     except ImportError:
         return False
     return True
+
+
+def _torch_version_tuple() -> tuple[int, int, int]:
+    """Return ``(major, minor, patch)`` parsed from ``torch.__version__``."""
+    match = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", torch.__version__)
+    if match is None:
+        raise ValueError(f"cannot parse torch version {torch.__version__!r}")
+    major, minor, patch = match.groups(default="0")
+    return int(major), int(minor), int(patch)
+
+
+def _loaded_npu_inductor_backend() -> Optional[str]:
+    """Return torch_npu's loaded Inductor backend, or None without torch_npu.
+
+    ``_InductorNpuRegistry`` lives in ``torch_npu.utils._dynamo`` (it is not
+    re-exported by ``torch_npu._inductor``). torch_npu loads the heavy Inductor
+    backend lazily, so trigger the registry once to apply the configured
+    backend before reading it.
+    """
+    try:
+        from torch_npu.utils._dynamo import (  # pylint: disable=import-outside-toplevel
+            _InductorNpuRegistry,
+        )
+    except ImportError:
+        try:
+            from torch_npu._inductor import (  # pylint: disable=import-outside-toplevel
+                _InductorNpuRegistry,
+            )
+        except ImportError:
+            return None
+    register = getattr(_InductorNpuRegistry, "register_inductor_npu", None)
+    if register is not None:
+        register()
+    return getattr(_InductorNpuRegistry, "_loaded_backend", None)
+
+
+_DVM_IMPORT = "from torch_npu._inductor import dvm"
+_DVM_WRAPPER_PATCHED = "_hyper_parallel_dvm_autotune_patched"
+
+
+def _patch_dvm_autotune_scope() -> None:
+    """Make torch_npu's DVM runtime available to compile-time autotune.
+
+    torch_npu registers the DVM import through ``wrapper.add_import_once``,
+    which writes to ``kernel_autotune_calls``. That section executes *after*
+    ``kernel_autotune_defs``, but DVM builder functions reference ``dvm`` in
+    their decorators at definition time. ``standalone_compile`` also forces
+    ``autotune_at_compile_time=True``, so hoist the import into the autotune
+    defs header.
+
+    The base autotune header also imports torch's ``AsyncCompile``, while NPU
+    kernels (including the MLIR fallback used by DVM) call the NPU-only
+    ``import_fx`` method. Rebind the instance to ``CustomAsyncCompile`` in the
+    same scope. Idempotent; only applied when the DVM backend is requested.
+    """
+    try:
+        from torch_npu._inductor.ascend_npu_ir.ascend_npu_ir import (  # pylint: disable=import-outside-toplevel
+            codecache as npu_codecache,
+        )
+        from torch_npu._inductor.ascend_npu_ir.ascend_npu_ir.npu.codegen.wrapper import (  # pylint: disable=import-outside-toplevel
+            NpuMlirWrapperCodeGen,
+        )
+    except ImportError:
+        _LOG.warning(
+            "InductorPass: cannot patch the torch_npu DVM autotune scope "
+            "because the expected ascend_npu_ir modules are missing; compiled "
+            "DVM kernels may fail to resolve 'dvm' during compile-time autotune."
+        )
+        return
+
+    if getattr(NpuMlirWrapperCodeGen, _DVM_WRAPPER_PATCHED, False):
+        return
+    original = NpuMlirWrapperCodeGen.write_kernel_autotune_defs_header
+    has_custom_async_compile = hasattr(npu_codecache, "CustomAsyncCompile")
+    if not has_custom_async_compile:
+        _LOG.warning(
+            "InductorPass: %s does not expose CustomAsyncCompile; DVM kernels "
+            "keep torch's AsyncCompile, which lacks the NPU-only import_fx used "
+            "by MLIR fallback kernels.",
+            npu_codecache.__name__,
+        )
+
+    def _write_kernel_autotune_defs_header(self) -> None:
+        """Write NPU/DVM imports before any autotuned kernel definition."""
+        original(self)
+        self.kernel_autotune_defs.writeline(_DVM_IMPORT)
+        if has_custom_async_compile:
+            self.kernel_autotune_defs.writeline(
+                f"from {npu_codecache.__name__} import CustomAsyncCompile"
+            )
+            self.kernel_autotune_defs.writeline("async_compile = CustomAsyncCompile()")
+
+    NpuMlirWrapperCodeGen.write_kernel_autotune_defs_header = (
+        _write_kernel_autotune_defs_header
+    )
+    setattr(NpuMlirWrapperCodeGen, _DVM_WRAPPER_PATCHED, True)
+
+
+def _validate_dvm_backend() -> None:
+    """Fail fast when the requested DVM Inductor backend is not active.
+
+    Raises:
+        ValueError: When torch predates 2.10, regional Inductor compilation is
+            unavailable, torch_npu is not importable, or torch_npu loaded a
+            backend other than ``dvm``.
+    """
+    version = _torch_version_tuple()
+    if version[:2] < _DVM_MIN_TORCH_VERSION:
+        raise ValueError(
+            "inductor_backend='dvm' requires torch >= "
+            f"{_DVM_MIN_TORCH_VERSION[0]}.{_DVM_MIN_TORCH_VERSION[1]}; "
+            f"found torch {torch.__version__}"
+        )
+    if not _regional_inductor_available():
+        raise ValueError(
+            "inductor_backend='dvm' requires "
+            "torch.fx.passes.regional_inductor (torch >= 2.10)"
+        )
+    loaded = _loaded_npu_inductor_backend()
+    if loaded is None:
+        try:
+            torch_npu_available = importlib.util.find_spec("torch_npu") is not None
+        except (ImportError, ValueError):
+            torch_npu_available = False
+        if not torch_npu_available:
+            raise ValueError(
+                "inductor_backend='dvm' requires torch_npu; install a "
+                "torch_npu build that provides the DVM Inductor backend"
+            )
+        raise ValueError(
+            "inductor_backend='dvm' could not read torch_npu's loaded Inductor "
+            "backend; set TORCHINDUCTOR_NPU_BACKEND=dvm before importing torch, "
+            "torch_npu, or hyper_parallel"
+        )
+    if loaded != "dvm":
+        raise ValueError(
+            "inductor_backend='dvm' requires TORCHINDUCTOR_NPU_BACKEND=dvm "
+            "to be set before importing torch, torch_npu, or hyper_parallel; "
+            f"torch_npu loaded backend {loaded!r}"
+        )
+    _patch_dvm_autotune_scope()
+
+
+def validate_inductor_backend(pass_config: PassConfig) -> None:
+    """Validate the configured terminal Inductor backend.
+
+    Args:
+        pass_config: Graph-mode configuration carrying ``inductor_backend``.
+
+    Raises:
+        ValueError: When the DVM backend is requested but unavailable.
+    """
+    if pass_config.inductor_backend == "dvm":
+        _validate_dvm_backend()
 
 
 def _get_fake_mode_from_gm(gm: fx.GraphModule) -> Optional[Any]:
@@ -325,13 +489,14 @@ class InductorPass(GraphPass):
 
         Raises:
             ValueError: When ``example_inputs`` is missing for a non-PP graph,
-                or a ``call_module`` stub is not a pipeline schedule (unknown
-                split).
+                a ``call_module`` stub is not a pipeline schedule (unknown
+                split), or the requested DVM backend is unavailable.
         """
         mode = pass_config.inductor_mode
         if mode == "off":
             return graph_module
 
+        validate_inductor_backend(pass_config)
         compiled = False
         if graph_module.graph.find_nodes(op="call_module"):
             compiled = self._compile_pipeline_stages(graph_module, pass_config)
@@ -350,6 +515,7 @@ class InductorPass(GraphPass):
         graph_module.meta[_INDUCTOR_COMPILED_META] = (
             mode if compiled else _INDUCTOR_UNAVAILABLE
         )
+        graph_module.meta[_INDUCTOR_BACKEND_META] = pass_config.inductor_backend
         return graph_module
 
     @staticmethod
@@ -478,6 +644,7 @@ class InductorPass(GraphPass):
         graph_module.graph.set_codegen(CodeGen())
         graph_module.recompile()
         graph_module.meta[_INDUCTOR_COMPILED_META] = mode
+        graph_module.meta[_INDUCTOR_BACKEND_META] = pass_config.inductor_backend
         if output_spec is not None:
             # Rebuild the stage's original (possibly nested) output structure
             # for the schedule / backward subgraph; only the compiled graph is

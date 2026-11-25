@@ -130,6 +130,10 @@ class CompileConfig:
     ``offload_budget_gb`` and ``offload_prefetch_n_layers`` tune the graph-mode
     attention activation offload selected by the top-level ``activation_swap``
     field (they have no eager counterpart).
+    ``dvm`` selects torch_npu's DVM Inductor backend for joint-graph mode. It
+    requires torch >= 2.10 and ``TORCHINDUCTOR_NPU_BACKEND=dvm`` to be set
+    before torch_npu is imported; the graph-mode projection enables the
+    ``regional`` Inductor pass.
     Eager FSDP2 module prefetch depths do not configure these graph passes.
     """
 
@@ -148,6 +152,7 @@ class CompileConfig:
     max_in_flight_gb: float = 0.25
     offload_budget_gb: float = 64.0
     offload_prefetch_n_layers: int = 1
+    dvm: bool = False
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -155,15 +160,31 @@ class CompileConfig:
 
     def __post_init__(self) -> None:
         """Validate values that the YAML resolver cannot express precisely."""
+        self._validate_booleans()
+        if self.dvm and not self.selects_graph_compiler():
+            raise ValueError(
+                "compile.dvm requires the joint-graph compiler; set "
+                "compile.enabled and compile.use_joint_graph"
+            )
+        self._validate_max_in_flight_gb()
+        self._validate_offload()
+        self._validate_mode_and_backend()
+        self._validate_options()
+        self._validate_dynamo_cache_size_limit()
+
+    def _validate_booleans(self) -> None:
+        """Validate that every flag field is a real bool."""
         boolean_fields = (
             "enabled", "use_joint_graph", "fullgraph", "dynamic", "fsdp_allgather_prefetch",
             "fsdp_overlap_grad_reduce",
+            "dvm",
         )
         for name in boolean_fields:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
-        self._validate_max_in_flight_gb()
-        self._validate_offload()
+
+    def _validate_mode_and_backend(self) -> None:
+        """Validate the dynamic input dims, compile mode and backend strings."""
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -172,12 +193,18 @@ class CompileConfig:
             not isinstance(self.backend, str) or not self.backend.strip()
         ):
             raise ValueError("compile.backend must be None or a non-empty string")
+
+    def _validate_options(self) -> None:
+        """Validate the optional compiler options mapping."""
         if self.options is not None and not isinstance(self.options, dict):
             raise TypeError("compile.options must be a mapping or None")
         if self.options and self.mode != "default" and not self.selects_graph_compiler():
             raise ValueError(
                 "compile.options cannot be combined with a non-default compile.mode"
             )
+
+    def _validate_dynamo_cache_size_limit(self) -> None:
+        """Validate the positive dynamo cache size limit."""
         if (
             isinstance(self.dynamo_cache_size_limit, bool)
             or not isinstance(self.dynamo_cache_size_limit, int)

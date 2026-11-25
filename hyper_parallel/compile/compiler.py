@@ -57,6 +57,7 @@ from .pass_config import (
     normalize_dp_mode,
 )
 from .passes.pipeline import PassPipeline
+from .passes.inductor_pass import validate_inductor_backend
 from .passes.parallel.fsdp_pass import FsdpParamSpec, FsdpPlan
 from .passes.activation_checkpoint import prepare_activation_checkpoint
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
@@ -244,6 +245,10 @@ class GraphCompiler:
         external = get_model_external_state(self.model)
         if external is not None and external.parameters:
             raise ValueError("GraphCompiler does not support externally managed parameters yet")
+
+        # Validate the terminal backend before tracing / partitioning mutates
+        # the live model, so a missing DVM backend fails on a retry-safe state.
+        validate_inductor_backend(self.pass_config)
 
         if (
             self.dynamic or self.dynamic_arg_dims is not None
