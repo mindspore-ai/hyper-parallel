@@ -14,9 +14,12 @@
 # ============================================================================
 """Register the DeepSeek-V4.1 model and adapter providers."""
 
+from hyper_parallel.components.modules.module_family import get_family_build_info
+from hyper_parallel.components.modules.moe.moe_utils import router_sharding
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import CompressedSparseAttention2
 from hyper_parallel.models.replacement import ModuleReplacementRequest
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import DeepseekV41RouterStatistics
 from hyper_parallel.models.registry import register_custom_model
 from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
     register_deepseek_v41_checkpoint_mapping,
@@ -83,12 +86,27 @@ def _replacements(model, context):
     ),)
 
 
+def _router_sharding(*, model, context):
+    """Give each native decoder router its statistics binding with family experts."""
+    layouts = {}
+    for fqn, gate in model.named_modules():
+        if not (fqn.startswith("model.layers.") and fqn.endswith(".mlp.gate")
+                and isinstance(gate, DeepseekV41RouterStatistics)):
+            continue
+        mlp = model.get_submodule(fqn.removesuffix(".gate"))
+        experts = get_family_build_info(mlp.experts)
+        if experts is not None and experts.resolved.family.name == "routed_grouped_experts":
+            layouts[fqn] = router_sharding(module=gate, module_fqn=fqn, member=None, context=context)
+    return layouts
+
+
 MODEL_SPEC = ModelAdapterSpec(
     architecture="DeepseekV41ForCausalLM",
     model_type="deepseek_v41",
     replacements=_replacements,
     expert_parallel=_load_expert_parallel,
     external_state=build_deepseek_v41_external_state,
+    sharding=_router_sharding,
     sharding_rules=build_parameter_sharding_rules,
     fsdp_wrap_modules=get_fsdp_wrap_modules,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,

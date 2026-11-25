@@ -44,6 +44,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
+from hyper_parallel.components.modules.moe.moe_utils import local_router_metadata
 from hyper_parallel.components.modules.moe.shared_expert import SharedExpertModule
 from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation
 from hyper_parallel.components.modules.moe.router import routing_scores, select_topk_scores
@@ -51,6 +52,7 @@ from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
+    DeepseekV41RouterStatistics,
     accumulate_router_load,
     sequence_load_balancing_loss,
     update_modality_bias,
@@ -255,7 +257,7 @@ def _apply_router_training_state(
     return weights
 
 
-class DeepseekV41TopKRouter(nn.Module):
+class DeepseekV41TopKRouter(DeepseekV41RouterStatistics, nn.Module):
     """V4.1 learned router with independent text and image correction biases."""
 
     def __init__(self, config: Any) -> None:
@@ -291,7 +293,7 @@ class DeepseekV41TopKRouter(nn.Module):
             hidden_states: torch.Tensor,
             image_mask: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
-            sequence_partition_groups: tuple[Any, ...] = (),
+            sequence_partition_groups: tuple[Any, ...] | None = None,
             sequence_ids: torch.Tensor | None = None,
             num_sequences: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -306,7 +308,7 @@ class DeepseekV41TopKRouter(nn.Module):
             token_mask: Optional boolean mask matching the token dimensions;
                 true tokens contribute to auxiliary statistics.
             sequence_partition_groups: Independent CP/TP groups partitioning
-                one microbatch's token stream, supplied by the parallel adapter.
+                one microbatch's token stream. None uses the bound groups.
             sequence_ids: Optional logical sample IDs matching the token dimensions.
             num_sequences: Total logical samples, including samples absent on this rank.
 
@@ -315,6 +317,11 @@ class DeepseekV41TopKRouter(nn.Module):
             training with a positive coefficient, weights carry the auxiliary
             gradient and ``last_aux_loss`` stores its unweighted detached value.
         """
+        image_mask = local_router_metadata(image_mask, hidden_states, self.router_tp_mesh)
+        token_mask = local_router_metadata(token_mask, hidden_states, self.router_tp_mesh)
+        sequence_ids = local_router_metadata(sequence_ids, hidden_states, self.router_tp_mesh)
+        if sequence_partition_groups is None:
+            sequence_partition_groups = self.sequence_partition_groups
         flattened = hidden_states.reshape(-1, self.hidden_size)
         logits = functional.linear(  # pylint: disable=not-callable
             flattened.float(), self.weight.float()

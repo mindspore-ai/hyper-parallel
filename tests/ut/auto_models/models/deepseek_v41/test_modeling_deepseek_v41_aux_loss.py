@@ -37,6 +37,10 @@ from hyper_parallel.components.modules.attention.compressed_sparse_attention2.do
     SharedCompressedPackedSequence,
 )
 from hyper_parallel.distributed.apply import apply_sharding_plan
+from hyper_parallel.distributed.mesh import LogicalDeviceMesh
+from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
+from hyper_parallel.distributed._builder.planner import ShardingPlanner
+from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
@@ -50,6 +54,7 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     _v41_sparse_moe_forward,
 )
 from hyper_parallel.trainer.config import PlanOverride, entries_to_plan_overrides
+from hyper_parallel.trainer.config.parallelism import entries_to_module_replacements
 from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
@@ -258,6 +263,57 @@ class TestV41RouterAuxLoss(unittest.TestCase):
 
 class TestV41NativeAuxLoss(unittest.TestCase):
     """Exercise the real causal-LM and EP adapter paths on CPU."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_family_router_binds_partition_groups_and_slices_packed_metadata(self) -> None:
+        """Feature: V4.1 router placement with the public expert family.
+        Description: Plan the migrated MegaKernel recipe and call the model-owned router.
+        Expectation: The gate consumes the TP-local metadata and retains CP/TP sequence statistics.
+        """
+        model = torch.nn.Module()
+        model.config = tiny_config()
+        model.config.architectures = ["DeepseekV41ForCausalLM"]
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        model.model.layers[0].mlp = _RouterCarrier()
+        rule = resolve_component({"match": "model.layers.*.mlp.experts", "replace": {
+            "kind": "module", "implementation": {
+                "_target_": "hyper_parallel.components.modules.GroupedExperts", "megakernel": True,
+            },
+        }}, annotation=PlanOverride, path="plan_overrides")
+        rules = entries_to_module_replacements([rule])
+        apply_module_replacements(model, compile_module_replacements(model, rules),
+                                  weights_mapping=[], context={"ep_size": 2})
+        logical_mesh = LogicalDeviceMesh(("cp", "tp"), (2, 2))
+        plan = ShardingPlanner().plan(model, logical_mesh, cp_size=2, tp_size=2, ep_size=2,
+                                      sequence_parallel=True)
+        gate_fqn = "model.layers.0.mlp.gate"
+        self.assertEqual(plan.parallel_modules[gate_fqn].binding_kind, "mesh")
+        self.assertFalse(plan.modules[gate_fqn].is_boundary)
+        self.assertFalse(plan.modules["model.layers.0.mlp"].region_dispatch)
+
+        axes = {
+            name: SimpleNamespace(size=lambda: 2, get_group=Mock(return_value=name))
+            for name in ("dp", "cp", "tp")
+        }
+        axes["tp"].get_local_rank = lambda: 1
+        mesh = Mock()
+        mesh.mesh_dim_names = tuple(axes)
+        mesh.__getitem__ = Mock(side_effect=axes.__getitem__)
+        gate = model.get_submodule(gate_fqn)
+        gate.bind_parallel(ParallelBinding(MeshBinding(
+            SimpleNamespace(device_mesh=mesh, sequence_parallel=True, ep_size=2),
+        )))
+        self.assertEqual(gate.expert_bias_update_groups, ("dp", "cp", "tp"))
+        with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.sequence_load_balancing_loss",
+                   return_value=torch.tensor(0.5)) as loss:
+            gate(torch.randn(1, 2, 16), token_mask=torch.tensor([[True, True, True, False]]),
+                 sequence_ids=torch.tensor([[0, 0, 1, 1]]), num_sequences=2)
+        _, _, local_ids, num_sequences, local_mask, groups = loss.call_args.args
+        torch.testing.assert_close(local_ids, torch.tensor([1, 1]))
+        torch.testing.assert_close(local_mask, torch.tensor([True, False]))
+        self.assertEqual(num_sequences, 2)
+        self.assertEqual(groups, ("cp", "tp"))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cropped_config_preserves_aux_coefficient_and_upstream_structure(self) -> None:
