@@ -69,6 +69,13 @@ def _load_loss():
     return chunk_loss
 
 
+def _load_pipeline():
+    """Load the model-owned stage protocol without importing the model eagerly."""
+    from hyper_parallel.models.deepseek_v41.adapter.pipeline import get_pipeline_spec  # pylint: disable=C0415
+
+    return get_pipeline_spec()
+
+
 def _replacements(model, context):
     """Declare the complete CSA2 family; user options override this default."""
     # Resolve the canonical class after model construction to avoid a spec/model import cycle.
@@ -97,6 +104,7 @@ MODEL_SPEC = ModelAdapterSpec(
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,
     loss=_load_loss,
+    pipeline_parallel=_load_pipeline,
 )
 
 register_custom_model(

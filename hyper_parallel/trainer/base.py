@@ -35,8 +35,9 @@ import os
 import sys
 from abc import ABC
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -78,9 +79,11 @@ from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from hyper_parallel.components.ops import ops
+from hyper_parallel.trainer.runtime.pipeline import TrainerPipeline
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.models.external_state import get_model_external_state
+from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.core.optimizer import (
     ChainedOptimizer,
@@ -245,6 +248,7 @@ class BaseTrainer(Stateful, ABC):
     # Model
     model: PreTrainedModel = None
     model_parts: Optional[List[torch.nn.Module]] = None
+    pipeline_runtime: Optional[TrainerPipeline] = None
     hsdp_model_parts: List[torch.nn.Module] = []
     fsdp_runtime_diagnostics: Optional[fsdp_runtime.FSDPRuntimeDiagnostics] = None
     model_integration: Optional[model_integration_runtime.ModelIntegrationSession] = None
@@ -389,12 +393,26 @@ class BaseTrainer(Stateful, ABC):
         if self.global_rank == 0:
             save_configs(self.config, self.config.checkpoint.checkpoint_dir)
 
+    def _combine_pipeline_chunks(self, build: Callable) -> torch.nn.Module:
+        """Build the remaining virtual stages and register the rank's training parameters."""
+        local_count = self.config.pipeline.local_stage_count
+        if local_count == 1 and self.config.pipeline.schedule != "mpipe":
+            return self.model
+        spec = resolve_model_adapter(self.model).pipeline_parallel()
+        if spec.combine_chunks is None:
+            raise ValueError("The model pipeline adapter must support virtual chunks for interleaved training")
+        parts = [self.model]
+        for index in range(1, local_count):
+            setup = replace(self.distributed_setup, pipeline_chunk_index=index)
+            parts.append(build(distributed_setup=setup))
+        return spec.combine_chunks(tuple(parts), self.mesh.pp_mesh.get_group())
+
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
         ops.set_backends(getattr(self.config, "ops", {}))
-        self.model = self.config.model.build(
-            distributed_setup=self.distributed_setup,
+        build = partial(
+            self.config.model.build,
             peft_config=self.peft_config,
             activation_checkpoint=self.config.activation_checkpoint,
             compile_config=self.config.compile,
@@ -402,6 +420,13 @@ class BaseTrainer(Stateful, ABC):
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
         )
+        if self.config.pipeline.schedule == "mpipe" and self.mesh.dp_size != 1:
+            raise ValueError("MPipe currently requires DP1 for variable-image visual FSDP execution")
+        self.model = build(distributed_setup=self.distributed_setup)
+        if self.config.accelerator.pp_size > 1 and not self.config.compile.selects_graph_compiler():
+            if getattr(self.model, "_hp_pipeline_partition", None) is None:
+                raise ValueError("Eager Trainer PP requires a model factory that installs a pipeline partition")
+            self.model = self._combine_pipeline_chunks(build)
         _validate_optimize_dtype(
             self.model,
             fp32_main_params=self.config.optimizer.fp32_main_params,
@@ -413,7 +438,8 @@ class BaseTrainer(Stateful, ABC):
                 json.dumps(self.model.config.to_dict(), indent=2),
             )
         if self.config.accelerator.loss_parallel:
-            self.model.loss_function = causal_lm_loss_parallel
+            for part in getattr(self.model, "parts", (self.model,)):
+                part.loss_function = causal_lm_loss_parallel
         model_parts = getattr(self.model, "parts", None)
         self.model_parts = list(model_parts) if model_parts is not None else [self.model]
         self.hsdp_model_parts = [
@@ -447,7 +473,8 @@ class BaseTrainer(Stateful, ABC):
         # ordinary forward materializes an otherwise avoidable output tensor.
         loss_model_binding_hook = getattr(self.loss_fn, "bind_model", None)
         if callable(loss_model_binding_hook):
-            loss_model_binding_hook(self.model, self.distributed_setup)
+            for part in getattr(self.model, "parts", (self.model,)):
+                loss_model_binding_hook(part, self.distributed_setup)
 
     def _build_model_assets(self) -> None:
         """Require a concrete Trainer to build modality-specific model assets."""
@@ -976,6 +1003,19 @@ class BaseTrainer(Stateful, ABC):
             del micro_batch
             return loss, loss_dict
 
+    def pipeline_forward_backward(
+            self, batches: Iterator[tuple[dict, dict]], count: int,
+    ) -> tuple[float, dict[str, float]]:
+        """Run one optimizer step through the model-owned pipeline partition.
+
+        Args:
+            batches: Model and loss inputs for the local data-parallel replica.
+            count: Number of microbatches to schedule.
+        """
+        if self.pipeline_runtime is None:
+            self.pipeline_runtime = TrainerPipeline(self)
+        return self.pipeline_runtime.run(batches, count)
+
     def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
         """Reshard model after backward pass; policy lives in ``runtime/fsdp.py``.
 
@@ -1095,6 +1135,8 @@ class BaseTrainer(Stateful, ABC):
         post_clip_norm = None
         compiler = getattr(self, "graph_compiler", None)
         clip_kwargs = {"parameter_layouts": compiler.parameter_layouts} if compiler is not None else {}
+        if self.pipeline_runtime is not None:
+            clip_kwargs["pp_group"] = self.mesh.pp_mesh.get_group()
         if max_grad_norm > 0:
             grad_norm = clip_grad_norm_(self.model, max_grad_norm, **clip_kwargs)
             if self.model_integration.runtime_enabled:
@@ -1192,21 +1234,26 @@ class BaseTrainer(Stateful, ABC):
         # token num for fixed_ce_loss in postforward
         self.begin_loss_step()
         num_micro_steps = len(micro_batches)
-        # forward and backward pass with gradient_accumulationsteps
-        for micro_step, micro_batch in enumerate(micro_batches):
-            self.model_reshard(micro_step, num_micro_steps)
-            self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
-            self.begin_fsdp_runtime_diagnostics(micro_step)
-            loss: torch.Tensor
-            loss_dict: Dict[str, torch.Tensor]
-            # token num for fixed_ce_loss in postforward
-            self.current_token_counts = count_loss_token(micro_batch)
-            loss, loss_dict = self.forward_backward_step(micro_batch)
-            self.on_micro_step_end(loss_dict)
+        if getattr(self.model, "_hp_pipeline_partition", None) is not None:
+            batches = ((batch, {name: batch[name] for name in ("labels", "shift_labels", "loss_mask")
+                                if name in batch}) for batch in micro_batches)
+            total_loss, total_loss_dict = self.pipeline_forward_backward(batches, num_micro_steps)
+        else:
+            # forward and backward pass with gradient_accumulationsteps
+            for micro_step, micro_batch in enumerate(micro_batches):
+                self.model_reshard(micro_step, num_micro_steps)
+                self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
+                self.begin_fsdp_runtime_diagnostics(micro_step)
+                loss: torch.Tensor
+                loss_dict: Dict[str, torch.Tensor]
+                # token num for fixed_ce_loss in postforward
+                self.current_token_counts = count_loss_token(micro_batch)
+                loss, loss_dict = self.forward_backward_step(micro_batch)
+                self.on_micro_step_end(loss_dict)
 
-            total_loss += loss.item()
-            for k, v in loss_dict.items():
-                total_loss_dict[k] += v.item()
+                total_loss += loss.item()
+                for k, v in loss_dict.items():
+                    total_loss_dict[k] += v.item()
 
         total_loss, grad_norm = self.prepare_optimizer_step(total_loss, total_loss_dict)
         self.step_optimizers_and_schedulers()

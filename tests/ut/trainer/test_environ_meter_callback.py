@@ -638,5 +638,39 @@ class TestEnvironMeterCallback(unittest.TestCase):
         )
 
 
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module, "get_device_type", return_value="npu")
+    def test_pp1_step_end_does_not_synchronize_device(self, mock_device_type: Mock, mock_world: Mock) -> None:
+        """Keep the default PP1 metric callback free of device-level synchronization."""
+        del mock_device_type, mock_world
+        device = SimpleNamespace(
+            synchronize=Mock(), max_memory_allocated=Mock(return_value=0), max_memory_reserved=Mock(return_value=0),
+        )
+        trainer = self._build_trainer(mesh=SimpleNamespace(pp_size=1, pp_mesh=None))
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1)
+        with patch.object(environ_meter_module, "get_torch_device", return_value=device):
+            callback.on_step_begin(state)
+            callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+        device.synchronize.assert_not_called()
+
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module, "get_device_type", return_value="npu")
+    def test_pp_step_end_synchronizes_device_once(self, mock_device_type: Mock, mock_world: Mock) -> None:
+        """Bound cross-stage step timing with one device synchronization when PP is active."""
+        del mock_device_type, mock_world
+        device = SimpleNamespace(
+            synchronize=Mock(), max_memory_allocated=Mock(return_value=0), max_memory_reserved=Mock(return_value=0),
+        )
+        mesh = SimpleNamespace(pp_size=2, pp_mesh=SimpleNamespace(get_group=lambda: object()))
+        trainer = self._build_trainer(mesh=mesh)
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1)
+        with patch.object(environ_meter_module, "get_torch_device", return_value=device):
+            callback.on_step_begin(state)
+            callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+        device.synchronize.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

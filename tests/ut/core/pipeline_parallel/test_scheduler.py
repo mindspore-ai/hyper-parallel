@@ -23,7 +23,10 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleDualPipeV
 from hyper_parallel.core.pipeline_parallel.stage import PipelineStage, SharedParameterInfo
+from hyper_parallel.core.pipeline_parallel.utils import MetaStepType
+from tests.common.mark_utils import arg_mark
 
 
 class TestSharedParameterInfoReFetch(unittest.TestCase):
@@ -142,6 +145,98 @@ class TestSyncSharedParametersGradGuards(unittest.TestCase):
         self.assertEqual(completed, [True])
         self.assertIs(info.parameter.grad, grad)
         torch.testing.assert_close(grad, torch.full_like(grad, 2))
+
+
+class TestDualPipeVSchedule(unittest.TestCase):
+    """Validate the V-shaped execution order and its local autograd boundary."""
+
+    @staticmethod
+    def _make_schedule(micro_batches: int = 4) -> ScheduleDualPipeV:
+        schedule = object.__new__(ScheduleDualPipeV)
+        schedule.real_stage_num = 2
+        schedule._stage_num = 4  # pylint: disable=protected-access
+        schedule.micro_batch_num = micro_batches
+        schedule.exec_order = {}
+        return schedule
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_each_microbatch_has_ordered_forward_and_backward(self) -> None:
+        """Feature: DualPipeV execution order.
+        Description: Construct two ranks with four virtual stages and four microbatches.
+        Expectation: Each computation occurs once with receives before it and sends after it.
+        """
+        schedule = self._make_schedule()
+        schedule.construct_exec_order()
+        for rank, order in schedule.exec_order.items():
+            owned_stages = (rank, 3 - rank)
+            for stage in owned_stages:
+                for micro in range(schedule.micro_batch_num):
+                    indices = {
+                        step.type: index
+                        for index, step in enumerate(order)
+                        if step.stage_index == stage and step.micro_index == micro
+                    }
+                    self.assertLess(indices[MetaStepType.FWD], indices[MetaStepType.BWD])
+                    self.assertEqual(
+                        sum(step.type == MetaStepType.FWD and step.stage_index == stage
+                            and step.micro_index == micro for step in order),
+                        1,
+                    )
+                    if stage not in (0, 3):
+                        self.assertLess(indices[MetaStepType.FWD_RECV], indices[MetaStepType.FWD])
+                    if stage not in (0, 3):
+                        self.assertLess(indices[MetaStepType.BWD], indices[MetaStepType.BWD_SEND])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_local_fold_uses_direct_recv_and_send_steps(self) -> None:
+        """Feature: DualPipeV local fold.
+        Description: Inspect the last rank's middle edge and its adjacent operations.
+        Expectation: Local handoff steps remain while distributed P2P is omitted on that edge.
+        """
+        schedule = self._make_schedule()
+        order = schedule._construct_rank_exec_order(1)  # pylint: disable=protected-access
+        fold_recv = [step for step in order if step.type == MetaStepType.FWD_RECV and step.stage_index == 2]
+        fold_send = [step for step in order if step.type == MetaStepType.BWD_SEND and step.stage_index == 2]
+        self.assertEqual(len(fold_recv), schedule.micro_batch_num)
+        self.assertEqual(len(fold_send), schedule.micro_batch_num)
+        self.assertFalse(any(step.type == MetaStepType.FWD_SEND and step.stage_index == 1 for step in order))
+        self.assertFalse(any(step.type == MetaStepType.BWD_RECV and step.stage_index == 1 for step in order))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_rejects_too_few_microbatches(self) -> None:
+        """Feature: DualPipeV configuration validation.
+        Description: Construct two ranks with fewer than two microbatches per rank.
+        Expectation: Schedule construction raises a descriptive ValueError.
+        """
+        schedule = self._make_schedule(micro_batches=3)
+        with self.assertRaisesRegex(ValueError, "at least 4 micro-batches"):
+            schedule.construct_exec_order()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_local_fold_detaches_inputs_and_returns_gradients(self) -> None:
+        """Feature: DualPipeV local autograd boundary.
+        Description: Transfer one activation and one gradient between the two local halves.
+        Expectation: The input is a detached leaf and the gradient reaches the source recv slot.
+        """
+        schedule = self._make_schedule()
+        source = SimpleNamespace(stage_index=1, fwd_outputs_cache={}, grad_recv_info={})
+        destination = SimpleNamespace(stage_index=2, args_recv_info={}, bwd_cache={})
+        output = torch.randn(2, 3, requires_grad=True)
+        source.fwd_outputs_cache[0] = (output,)
+        destination.bwd_cache[0] = [torch.ones_like(output)]
+        schedule.stages = [SimpleNamespace(stage_index=1), destination]
+        schedule._stage_dict = {1: source, 2: destination}  # pylint: disable=protected-access
+
+        with patch("hyper_parallel.core.pipeline_parallel.scheduler.dist.get_rank", return_value=1):
+            schedule.recv_fwd(destination, 0)
+            schedule.send_bwd(destination, 0)
+
+        received = destination.args_recv_info[0][0].buffer
+        self.assertIsNot(received, output)
+        self.assertIsNone(received.grad_fn)
+        self.assertTrue(received.requires_grad)
+        torch.testing.assert_close(received, output)
+        torch.testing.assert_close(source.grad_recv_info[0][0].buffer, torch.ones_like(output))
 
 
 if __name__ == "__main__":

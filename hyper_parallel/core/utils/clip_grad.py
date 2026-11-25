@@ -181,6 +181,15 @@ def _check_dense_grad_presence(present: dict[str, bool], replica_ranks: dict[str
             raise ValueError(f"Norm shard gradient presence differs across replicas: {fqn}")
 
 
+def _norm_scalar_device(parameter_device: Optional[torch.device], mesh_context: Any) -> torch.device:
+    """Keep offloaded gradients on CPU while reducing scalar norms on the mesh device."""
+    mesh = getattr(mesh_context, "device_mesh", None)
+    mesh_type = getattr(mesh, "device_type", None)
+    if mesh_type is not None:
+        return torch.device(mesh_type)
+    return parameter_device if parameter_device is not None else torch.device("cpu")
+
+
 def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
                                 excluded_params: Iterable[torch.nn.Parameter],
                                 norm_shard_plan: NormShardPlan,
@@ -199,9 +208,7 @@ def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
         if param.requires_grad and id(param) not in excluded_ids
     ]
     device = next(((_param_device(param)) for _, param in parameters), None)
-    if device is None:
-        mesh = getattr(mesh_context, "device_mesh", None)
-        device = torch.device(getattr(mesh, "device_type", "cpu"))
+    device = _norm_scalar_device(device, mesh_context)
     infos, reduced = _effective_dense_grads(parameters)
     refs = []
     local_sq = torch.zeros((), device=device, dtype=torch.float32)
@@ -230,8 +237,11 @@ def scale_grad_refs_(refs: Iterable[torch.Tensor], coefficient: torch.Tensor) ->
         refs: Mutable dense effective gradients.
         coefficient: Shared clipping coefficient.
     """
+    coefficients = {}
     for grad in refs:
-        grad.mul_(coefficient)
+        if grad.device not in coefficients:
+            coefficients[grad.device] = coefficient.to(grad.device)
+        grad.mul_(coefficients[grad.device])
 
 
 # (id(mesh) or None, shard_dims) -> list of local grads for norm computation
@@ -1026,6 +1036,17 @@ def _clip_grads_with_norm_(
             grad.mul_(clip_coef_clamped.to(grad.device, grad.dtype))
 
 
+def _reduce_pipeline_norm(norm: torch.Tensor, norm_type: float, group: object) -> torch.Tensor:
+    """Combine norms of disjoint stages on the group's communication device."""
+    if math.isinf(norm_type):
+        op = dist.ReduceOp.MAX if norm_type > 0 else dist.ReduceOp.MIN
+        return _all_reduce_offloaded(norm, op, group)
+    if norm_type == 0:
+        return _all_reduce_offloaded(norm, dist.ReduceOp.SUM, group)
+    power_sum = _all_reduce_offloaded(norm.pow(norm_type), dist.ReduceOp.SUM, group)
+    return power_sum.pow(1.0 / norm_type)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1041,6 +1062,7 @@ def clip_grad_norm_(
     foreach: Optional[bool] = None,
     *,
     parameter_layouts: Optional[Mapping[torch.nn.Parameter, "Layout"]] = None,
+    pp_group: Optional[Any] = None,
 ) -> torch.Tensor:
     """Compute and clip gradient norm for distributed models.
 
@@ -1061,9 +1083,8 @@ def clip_grad_norm_(
       using the placement's ``reduce_op`` before norm computation
     * ``Replicate`` / plain tensor -- no communication
 
-    This covers FSDP, HSDP, TP+FSDP, and any combination expressible
-    via DTensor placements.  PP cross-stage norm aggregation is not
-    yet handled (requires manual all-reduce across stages).
+    This covers FSDP, HSDP, TP+FSDP, and combinations expressible via DTensor
+    placements. An explicit PP group adds disjoint stages before clipping.
 
     Args:
         parameters: An ``nn.Module``, a single ``Tensor``, or an
@@ -1081,6 +1102,7 @@ def clip_grad_norm_(
             Layouts for local tensors. DTensor gradient/parameter layouts take
             precedence and must agree with explicit metadata. Local trainable
             parameters must be fully covered; frozen parameters are ignored.
+        pp_group: Process group joining corresponding ranks in disjoint stages.
 
     Returns:
         The total (unclipped) gradient norm as a scalar tensor,
@@ -1108,6 +1130,9 @@ def clip_grad_norm_(
         grad_groups, norm_type, mesh_cache, device,
         norm_grads, key_per_grad,
     )
+
+    if pp_group is not None:
+        total_norm = _reduce_pipeline_norm(total_norm, norm_type, pp_group)
 
     if error_if_nonfinite and torch.logical_or(
         total_norm.isnan(), total_norm.isinf()
