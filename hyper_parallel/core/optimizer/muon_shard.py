@@ -20,11 +20,13 @@ __all__ = [
     "build_pad_ns_inputs",
     "chunk_update_by_layout",
     "fused_allgather_dtensor_params",
+    "get_or_alloc_buffer",
 ]
 
 import math
 import logging
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -204,13 +206,17 @@ def build_pad_ns_inputs(
         comm_params: List[torch.Tensor],
         param_to_ns_input: Dict[torch.Tensor, torch.Tensor],
         param_shard_metadata: Optional[Dict[torch.Tensor, ParamShardMeta]] = None,
+        *,
+        fallback_dtype: Optional[torch.dtype] = None,
 ) -> List[torch.Tensor]:
     """Build aligned local NS inputs for all communication params."""
     if not comm_params:
         return []
 
     ref_tensor = next(iter(param_to_ns_input.values()), None)
-    default_dtype = ref_tensor.dtype if ref_tensor is not None else to_local_if_dtensor(comm_params[0].data).dtype
+    default_dtype = ref_tensor.dtype if ref_tensor is not None else fallback_dtype
+    if default_dtype is None:
+        default_dtype = to_local_if_dtensor(comm_params[0].data).dtype
     local_inputs: List[torch.Tensor] = []
 
     for param in comm_params:
@@ -282,7 +288,7 @@ def chunk_update_by_layout(
     return local_update
 
 
-def _get_or_alloc_buffer(
+def get_or_alloc_buffer(
         cache: Optional[Dict],
         key: Any,
         numel: int,
@@ -376,26 +382,59 @@ def _pack_and_allgather(
         shard_pg: dist.ProcessGroup,
         shard_size: int,
         buffer_cache: Optional[Dict],
+        while_gathering: Optional[Callable[[], None]],
 ) -> torch.Tensor:
     """Pack local shards into one buffer, all-gather, return gathered view."""
-    pack_buffer = _get_or_alloc_buffer(
+    pack_buffer = get_or_alloc_buffer(
         buffer_cache, ("fused_allgather", axis_idx, dtype, device), total_padded_numel,
         dtype, device,
     )[:total_padded_numel]
 
-    pack_buffer.zero_()
+    destinations = []
     for gi, meta in zip(gather_inputs, param_meta):
-        pack_buffer[meta.offset:meta.offset + meta.actual_numel].copy_(gi.view(-1))
+        end = meta.offset + meta.actual_numel
+        destinations.append(pack_buffer[meta.offset:end])
+        if meta.actual_numel < meta.padded_numel:
+            pack_buffer[end:meta.offset + meta.padded_numel].zero_()
+    # Keep one batched copy to avoid launching a copy per parameter.
+    # pylint: disable-next=protected-access
+    torch._foreach_copy_(destinations, [gi.view(-1) for gi in gather_inputs])
 
-    gathered_buffer = _get_or_alloc_buffer(
+    gathered_buffer = get_or_alloc_buffer(
         buffer_cache,
         ("fused_allgather_out", axis_idx, dtype, device),
         total_padded_numel * shard_size,
         dtype, device,
     )[:total_padded_numel * shard_size]
 
-    dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
+    if while_gathering is None:
+        dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
+    else:
+        work = dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg, async_op=True)
+        try:
+            while_gathering()
+        finally:
+            work.wait()
     return gathered_buffer.view(shard_size, total_padded_numel)
+
+
+def _get_owner_buffer(
+        gathered_view: torch.Tensor,
+        param_meta: List[_GatherParamMeta],
+        keep_indices: Optional[set],
+        cache: Optional[Dict],
+) -> Optional[torch.Tensor]:
+    """Reserve storage for the gathered parameters this rank will update."""
+    if cache is None:
+        return None
+    owner_numel = sum(
+        sum(meta.split_sizes) * math.prod(meta.rest_shape)
+        for idx, meta in enumerate(param_meta) if keep_indices is None or idx in keep_indices
+    )
+    if owner_numel == 0:
+        return None
+    dtype, device = gathered_view.dtype, gathered_view.device
+    return get_or_alloc_buffer(cache, (dtype, device), owner_numel, dtype, device)
 
 
 def _unpack_gathered_results(
@@ -404,36 +443,39 @@ def _unpack_gathered_results(
         param_meta: List[_GatherParamMeta],
         current_tensors: List[torch.Tensor],
         tensor_dim: int,
-        shard_size: int,
-        n_params: int,
         is_last_axis: bool,
         keep_indices: Optional[set],
+        owner_buffer_cache: Optional[Dict],
 ) -> List[Optional[torch.Tensor]]:
     """Slice gathered buffer back to per-parameter full tensors."""
+    owner_buffer = None
+    if is_last_axis:
+        owner_buffer = _get_owner_buffer(gathered_view, param_meta, keep_indices, owner_buffer_cache)
     new_tensors: List[Optional[torch.Tensor]] = []
-    for i in range(n_params):
+    owner_offset = 0
+    for i, meta in enumerate(param_meta):
         if is_last_axis and keep_indices is not None and i not in keep_indices:
             new_tensors.append(None)
             continue
 
-        meta = param_meta[i]
         rest_shape = meta.rest_shape
-        rest_numel = math.prod(rest_shape) if rest_shape else 1
+        rest_numel = math.prod(rest_shape)
         param_slice = gathered_view[:, meta.offset:meta.offset + meta.padded_numel]
 
-        param_chunks = []
-        for rank in range(shard_size):
-            valid_numel = meta.split_sizes[rank] * rest_numel
-            if valid_numel == 0:
-                continue
-            param_chunks.append(param_slice[rank, :valid_numel].contiguous().view(-1))
-
-        if param_chunks:
-            param_data = torch.cat(param_chunks, dim=0)
-        else:
+        full_rows = sum(meta.split_sizes)
+        count = full_rows * rest_numel
+        if count == 0:
             param_data = gather_inputs[i].new_empty((0,))
+        elif owner_buffer is not None:
+            param_data = owner_buffer.narrow(0, owner_offset, count)
+            _unpack_into_owner_buffer(param_data, param_slice, meta.split_sizes, rest_numel)
+            owner_offset += count
+        else:
+            param_chunks = [param_slice[rank, :rows * rest_numel]
+                            for rank, rows in enumerate(meta.split_sizes) if rows > 0]
+            param_data = torch.cat(param_chunks, dim=0)
 
-        result = param_data.view(sum(meta.split_sizes), *rest_shape)
+        result = param_data.view(full_rows, *rest_shape)
         tensor_dim_norm = tensor_dim % current_tensors[i].dim()
         if tensor_dim_norm == 0:
             new_tensors.append(result)
@@ -443,6 +485,19 @@ def _unpack_gathered_results(
     return new_tensors
 
 
+def _unpack_into_owner_buffer(
+        output: torch.Tensor, gathered: torch.Tensor, split_sizes: Tuple[int, ...], rest_numel: int,
+) -> None:
+    """Copy even shards as one strided matrix, otherwise concatenate the valid rank slices."""
+    rows = split_sizes[0]
+    if split_sizes == (rows,) * len(split_sizes):
+        cols = rows * rest_numel
+        output.view(len(split_sizes), cols).copy_(gathered[:, :cols])
+    else:
+        chunks = [gathered[rank, :rows * rest_numel] for rank, rows in enumerate(split_sizes) if rows > 0]
+        torch.cat(chunks, dim=0, out=output)
+
+
 def fused_allgather_dtensor_params(
         local_tensors: List[torch.Tensor],
         shard_pgs: Sequence[dist.ProcessGroup],
@@ -450,12 +505,14 @@ def fused_allgather_dtensor_params(
         param_shard_metadata: Optional[List[Optional[ParamShardMeta]]] = None,
         buffer_cache: Optional[Dict] = None,
         keep_indices: Optional[set] = None,
+        *,
+        while_gathering: Optional[Callable[[], None]] = None,
+        owner_buffer_cache: Optional[Dict] = None,
 ) -> List[Optional[torch.Tensor]]:
     """Fuse many parameter shards into one all-gather per shard axis."""
     if not shard_pgs or not local_tensors:
         return _early_return_tensors(local_tensors, keep_indices)
 
-    n_params = len(local_tensors)
     device = local_tensors[0].device
     dtype = local_tensors[0].dtype
     alignment_bytes = 512
@@ -493,13 +550,12 @@ def fused_allgather_dtensor_params(
 
         gathered_view = _pack_and_allgather(
             gather_inputs, param_meta, total_padded_numel,
-            axis_idx, dtype, device, shard_pg, shard_size, buffer_cache,
+            axis_idx, dtype, device, shard_pg, shard_size, buffer_cache, while_gathering,
         )
 
         new_tensors = _unpack_gathered_results(
             gathered_view, gather_inputs, param_meta,
-            current_tensors, tensor_dim, shard_size,
-            n_params, is_last_axis, keep_indices,
+            current_tensors, tensor_dim, is_last_axis, keep_indices, owner_buffer_cache,
         )
 
         if is_last_axis:
