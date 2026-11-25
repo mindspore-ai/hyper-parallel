@@ -1,0 +1,41 @@
+# Standalone offline generation. Replace local model/input/output paths.
+run_mode: predict
+
+model:
+  _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /models/Qwen3-0.6B
+  local_files_only: true
+
+model_assets:
+  tokenizer:
+    _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /models/Qwen3-0.6B
+    local_files_only: true
+  chat_template: tokenizer
+  chat_template_kwargs:
+    enable_thinking: false
+
+training:
+  backend: hccl
+  seed: 42
+
+fsdp_config:
+  dp_shard_size: 1
+  edp_shard_size: 1
+
+checkpoint:
+  restore_from: null
+  save_ckpt: false
+
+prediction:
+  input: /inputs/prompts.jsonl
+  output_file: /outputs/predictions.jsonl
+  batch_size: 4
+  # Counts padded prompt tokens only; generated tokens are bounded separately.
+  max_batch_tokens: 8192
+  bucket_by_length: true
+  overwrite: false
+  generation:
+    max_new_tokens: 256
+    do_sample: false
+    use_cache: true

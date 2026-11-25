@@ -402,9 +402,13 @@ class BaseTrainer(Stateful, ABC):
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
         )
+        optimizer_config = self.config.optimizer
         _validate_optimize_dtype(
             self.model,
-            fp32_main_params=self.config.optimizer.fp32_main_params,
+            fp32_main_params=(
+                bool(optimizer_config.fp32_main_params)
+                if optimizer_config is not None else False
+            ),
         )
         self.model_config = self.model.config
         if self.global_rank == 0:

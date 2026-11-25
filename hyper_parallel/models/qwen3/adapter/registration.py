@@ -53,6 +53,7 @@ QWEN3_ADAPTER_SPEC = ModelAdapterSpec(
     attention=_load_attention,
     sharding_rules=build_parameter_sharding_rules,
     codegen=_load_codegen,
+    supports_generation=True,
 )
 
 register_model_adapter(QWEN3_ADAPTER_SPEC)

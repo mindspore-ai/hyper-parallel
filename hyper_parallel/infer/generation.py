@@ -13,12 +13,16 @@
 # limitations under the License.
 # ============================================================================
 """Prefill + decode generation loop."""
+
+from __future__ import annotations
 import inspect
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.infer.config import GenerationOptions, resolve_generation_options
+from hyper_parallel.infer.runtime import GenerationResult, GenerationRuntime
 from hyper_parallel.infer.kv_cache import (
     ContextParallelKVCache,
     KVCache,
@@ -373,10 +377,14 @@ def _validate_generate_inputs(
     input_ids: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
 ) -> None:
-    if input_ids.ndim != 2:
+    if input_ids.ndim != 2 or input_ids.numel() == 0:
         raise ValueError("input_ids must have shape (batch, seq)")
     if attention_mask is not None and attention_mask.shape != input_ids.shape:
         raise ValueError("attention_mask must match input_ids shape")
+    if attention_mask is not None and (
+            torch.any((attention_mask != 0) & (attention_mask != 1))
+            or torch.any(attention_mask[:, 1:] < attention_mask[:, :-1])):
+        raise ValueError("attention_mask must describe contiguous left padding")
     if attention_mask is not None and torch.any(attention_mask.long().sum(dim=-1) == 0):
         raise ValueError("attention_mask rows must contain at least one valid token")
 
@@ -440,6 +448,7 @@ def _prepare_generation_context(
         "generated_counts": torch.zeros(
             input_ids.size(0), device=input_ids.device, dtype=torch.long,
         ),
+        "finish_codes": torch.zeros(input_ids.size(0), device=input_ids.device, dtype=torch.long),
         "unfinished": torch.ones(
             input_ids.size(0), device=input_ids.device, dtype=torch.bool,
         ),
@@ -519,9 +528,10 @@ def _append_next_token(context: dict, next_tokens: torch.Tensor, config: Generat
         next_tokens,
     )
     if config.eos_token_id is not None:
-        context["unfinished"] = (
-            context["unfinished"] & (next_tokens.squeeze(-1) != config.eos_token_id)
-        )
+        eos_ids = torch.as_tensor(config.eos_token_id, device=next_tokens.device).reshape(-1)
+        finished = (next_tokens == eos_ids).any(dim=-1) & context["unfinished"]
+        context["finish_codes"].masked_fill_(finished, 1)
+        context["unfinished"] = context["unfinished"] & ~finished
     return next_tokens
 
 
@@ -535,6 +545,7 @@ def _should_finish_generation(
     if config.eos_token_id is not None and not context["unfinished"].any():
         return True
     if should_stop_generation(context["sequences"], logits, config):
+        context["finish_codes"].masked_fill_(context["unfinished"], 2)
         return True
     return step == config.max_new_tokens - 1
 
@@ -593,21 +604,68 @@ def _decode(
     )
 
 
+def _resolve_generation_config(
+    model: Any, input_ids: torch.Tensor, generation_config: Optional[GenerationConfig],
+    options: Optional[GenerationOptions], runtime: Optional[GenerationRuntime],
+) -> GenerationConfig:
+    """Resolve legacy or typed options and validate the requested runtime device."""
+    if generation_config is not None and (options is not None or runtime is not None):
+        raise ValueError("generation_config cannot be combined with options/runtime")
+    if options is not None or runtime is not None:
+        runtime = runtime or GenerationRuntime()
+        if runtime.device is not None:
+            requested = torch.device(runtime.device)
+            different_index = (requested.type != "cpu" and requested.index is not None
+                               and requested.index != input_ids.device.index)
+            if requested.type != input_ids.device.type or different_index:
+                raise ValueError("runtime.device must match input_ids.device")
+        options = resolve_generation_options(options or GenerationOptions(), model)
+        config = runtime.bind(options)
+    else:
+        config = generation_config or GenerationConfig()
+    return config
+
+
 @torch.no_grad()
 def generate(
-    model,
+    model: Any,
     input_ids: torch.Tensor,
     generation_config: Optional[GenerationConfig] = None,
     attention_mask: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> torch.Tensor:
-    """Generate token ids from a causal language model."""
+    *,
+    options: Optional[GenerationOptions] = None,
+    runtime: Optional[GenerationRuntime] = None,
+    return_dict: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor | GenerationResult:
+    """Generate tokens using the shared prefill/decode loop.
+
+    Args:
+        model: Causal language model returning logits and optional cache.
+        input_ids: Left-padded prompt token ids.
+        generation_config: Legacy configuration, retaining its historical defaults.
+        attention_mask: Binary prompt mask, required for padded input.
+        options: Serializable sampling parameters, mutually exclusive with legacy config.
+        runtime: Code-injected state used with options.
+        return_dict: Return lengths and finish reasons in addition to sequences.
+        **kwargs: Unknown arguments are rejected.
+
+    Returns:
+        A Tensor by default, or GenerationResult when return_dict is true.
+    """
     if kwargs:
         raise TypeError(f"Unexpected generate kwargs: {sorted(kwargs)}")
-    config = generation_config or GenerationConfig()
+    config = _resolve_generation_config(model, input_ids, generation_config, options, runtime)
     _validate_generate_inputs(input_ids, attention_mask)
     if config.max_new_tokens == 0:
-        return _finalize_zero_new_tokens(input_ids, attention_mask, config)
+        sequences = _finalize_zero_new_tokens(input_ids, attention_mask, config)
+        if not return_dict:
+            return sequences
+        return GenerationResult(
+            sequences, _prompt_lengths(input_ids, attention_mask),
+            torch.zeros(input_ids.size(0), device=input_ids.device, dtype=torch.long),
+            ["length"] * input_ids.size(0),
+        )
 
     was_training = getattr(model, "training", False)
     model.eval()
@@ -627,7 +685,11 @@ def generate(
                 next_logits,
                 config,
             )
-            next_tokens = sample_next_token(next_logits, context["sequences"], config)
+            # Padding is not part of a request's history, even when pad equals EOS.
+            history = context["sequences"]
+            if context["current_attention_mask"] is not None:
+                history = history.masked_fill(context["current_attention_mask"] == 0, -1)
+            next_tokens = sample_next_token(next_logits, history, config)
             next_tokens = _append_next_token(context, next_tokens, config)
             if _should_finish_generation(context, next_logits, config, step):
                 break
@@ -637,12 +699,19 @@ def generate(
                 _update_cache(context["cache"], outputs)
             logits = _required_logits(outputs)
 
-        return _finalize_sequences(
+        sequences = _finalize_sequences(
             context["sequences"],
             initial_attention_mask=context["initial_attention_mask"],
             prompt_lengths=context["prompt_lengths"],
             generated_counts=context["generated_counts"],
             pad_token_id=config.pad_token_id,
+        )
+        if not return_dict:
+            return sequences
+        reasons = ("length", "eos", "stop")
+        return GenerationResult(
+            sequences, context["prompt_lengths"], context["generated_counts"],
+            [reasons[code] for code in context["finish_codes"].tolist()],
         )
     finally:
         if was_training:

@@ -69,6 +69,7 @@ QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     expert_parallel=_load_expert_parallel,
     loss=_load_loss,
     codegen=_load_codegen,
+    supports_generation=True,
 )
 
 register_model_adapter(QWEN3_MOE_ADAPTER_SPEC)

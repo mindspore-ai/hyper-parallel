@@ -251,6 +251,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "ModelIntegrationConfig",
                 "OptimizerConfig",
                 "OptimizerSwapConfig",
+                "PredictionConfig",
                 "ProfilingAnalysisConfig",
                 "ProfilingConfig",
                 "StressDetectConfig",
