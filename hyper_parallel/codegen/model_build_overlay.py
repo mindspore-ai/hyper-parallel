@@ -278,10 +278,6 @@ def _codegen_build_model(
         compile_config=None,
         freeze_config=None,
         activation_checkpoint=None,
-        activation_checkpoint_selection=None,
-        swap_inputs=False,
-        allow_cache_entry_mutation=False,
-        activation_swap="none",
         model_init_dtype=None,
         **kwargs,
     ) -> Any:
@@ -291,10 +287,6 @@ def _codegen_build_model(
             validate_placement,
             compile_config,
             activation_checkpoint,
-            activation_checkpoint_selection,
-            swap_inputs,
-            allow_cache_entry_mutation,
-            activation_swap,
         )
         factory, context = auto_model._resolve_module_construction(  # pylint: disable=protected-access
             kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,

@@ -31,10 +31,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
-    SharedCompressedAttentionState, _apply_v41_rope,
-)
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
-    CSA2Indexer,
+    SharedCompressedAttentionState,
 )
 from hyper_parallel.models.deepseek_v41.adapter.validation import (
     shared_state_trace as shared_state_trace_module,
@@ -79,7 +76,6 @@ from hyper_parallel.tools.model_integration.integration_validator import (
     validate_final_model,
     validate_state_invariants,
 )
-from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (
     _run_native_module_parity,
 )
@@ -95,7 +91,6 @@ from hyper_parallel.models.validation_spec import (
 from hyper_parallel.tools.model_integration import cli as model_integration_cli
 from hyper_parallel.tools.model_integration.cli import main as model_integration_main
 from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.trainer.config.parallelism import ActivationCheckpointSelection
 from hyper_parallel.trainer.config.training import ModelIntegrationConfig
 from hyper_parallel.trainer.runtime.model_integration import TrainerModelIntegrationSession
 
@@ -269,45 +264,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
         )
         self.assertIsNone(isolated.candidate_builder)
 
-    def test_activation_checkpoint_selection_requires_one_exact_selector(self) -> None:
-        """Require exactly one valid count-based or index-based selector."""
-        with self.assertRaisesRegex(ValueError, "only valid"):
-            ActivationCheckpointSelection(source="default", layer_count=1)
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            ActivationCheckpointSelection(source="model_adapter_safe_regions")
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=1,
-                layer_indices=[0],
-            )
-        with self.assertRaisesRegex(ValueError, "non-negative integer"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=-1,
-            )
-        with self.assertRaisesRegex(ValueError, "must not contain duplicates"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_indices=[0, 0],
-            )
-        self.assertEqual(
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=0,
-            ).layer_count,
-            0,
-        )
-        self.assertEqual(
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_indices=[0, 2],
-            ).layer_indices,
-            [0, 2],
-        )
-        with self.assertRaisesRegex(ValueError, "must be default or"):
-            ActivationCheckpointSelection(source="model_adapter_layer_regions")
-
     def test_manifest_is_local_only_and_command_validated(self) -> None:
         """Reject implicit remote model sources before command execution."""
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -344,7 +300,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
 
             self.assertIn("config.json", fingerprints["model.id_or_path"]["metadata"])
             self.assertIn(
-                "inference/model.py",
+                str(Path("inference") / "model.py"),
                 fingerprints["reference.source_path"]["metadata"],
             )
             self.assertIn(
@@ -631,7 +587,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "_validation_spec",
                 return_value=ModelValidationSpec(),
             ),
-            mock.patch.object(model_integration_cli, "_recompute_policy", return_value=None),
         ):
             with self.assertRaisesRegex(ManifestError, "invalid validation matrix"):
                 model_integration_cli.command_validate(SimpleNamespace())
@@ -642,17 +597,16 @@ class TestModelIntegrationContracts(unittest.TestCase):
         cases = generate_validation_cases(
             {
                 "baseline": baseline,
-                "recompute_selections": [{"layer_count": 2}],
+                "recompute_layers": [[0, 1]],
                 "cross_topology_resume": {"tp": 2, "ep": 16, "fsdp": 8},
             },
-            RecomputePolicy(region_patterns=("model.layers.*.mlp",)),
         )
         by_name = {case.name: case for case in cases}
 
         recompute_case = next(
             case
             for case in cases
-            if case.topology.get("recompute") == {"layer_count": 2}
+            if case.topology.get("recompute_layer") == [0, 1]
         )
         self.assertEqual(recompute_case.metadata["acceptance"], "same_topology")
         cross_resume = by_name["cross_topology_resume"]
@@ -669,10 +623,10 @@ class TestModelIntegrationContracts(unittest.TestCase):
                         "cp": 1,
                         "ep": 1,
                         "fsdp": 16,
-                        "recompute": {"layer_count": 0},
+                        "recompute_layer": [],
                     },
                     "cross_topology_resume": {
-                        "recompute": {"layer_indices": [0, 1]},
+                        "recompute_layer": [0, 1],
                     },
                 }
             )
@@ -708,27 +662,26 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 ("PASS", "PASS"),
             )
 
-    def test_case_generator_uses_production_recompute_policy(self) -> None:
-        """Generate recompute cases without importing validation declarations."""
+    def test_case_generator_uses_explicit_recompute_layers(self) -> None:
+        """Generate full-checkpoint cases from explicit layer sets."""
         cases = generate_validation_cases(
             {
                 "baseline": {"tp": 1, "cp": 1, "ep": 1, "fsdp": 1},
-                "recompute_selections": [
-                    {"layer_count": 0},
-                    {"layer_count": 3},
-                    {"layer_indices": [0, 2]},
+                "recompute_layers": [
+                    [],
+                    ["0-2"],
+                    [0, 2],
                 ],
             },
-            RecomputePolicy(region_patterns=("model.layers.*.mlp",)),
         )
 
         self.assertEqual(
-            [case.topology.get("recompute") for case in cases],
+            [case.topology.get("recompute_layer") for case in cases],
             [
                 None,
-                {"layer_count": 0},
-                {"layer_count": 3},
-                {"layer_indices": [0, 2]},
+                [],
+                [0, 1, 2],
+                [0, 2],
             ],
         )
 
@@ -1418,60 +1371,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
         finally:
             finish_shared_state_trace(token)
 
-    def test_indexer_routes_selection_through_the_exclusion_region(self) -> None:
-        """An enabled exclusion region owns the discrete selection call."""
-
-        class _ReindexSource(nn.Module):
-            """Minimal Reindex-style source that exercises the selection contract."""
-
-            def __init__(self) -> None:
-                """Create the two projections the selection contract needs."""
-                super().__init__()
-                self.q_b_proj = nn.Linear(4, 4, bias=False)
-                self.weights_proj = nn.Linear(4, 2, bias=False)
-                self.compress_ratio = 1
-                self.num_heads = 2
-                self.head_dim = 2
-                self.index_topk = 2
-                self.owns_key = False
-                self.is_candidate_source = False
-                self.uses_candidates = True
-                self.candidate_topk_blocks = 1
-                self.candidate_block_size = 2
-                self.loss_coeff = 0.0
-
-        indexer = CSA2Indexer(_ReindexSource(), apply_rope=_apply_v41_rope)
-        hidden_states = torch.randn(1, 3, 4)
-        query_residual = torch.randn(1, 3, 4)
-        index_key = torch.randn(1, 5, 2)
-        # cos/sin carry half the rotary channels: _apply_v41_rope interleaves them.
-        cos = torch.randn(1, 3, 1)
-        sin = torch.randn(1, 3, 1)
-        saved_topk = torch.tensor([[[1, 2]]], dtype=torch.int32)
-        saved_candidates = torch.tensor([[[0]]], dtype=torch.int32)
-
-        def _cached_selection(*_args, **_kwargs):
-            """Stand in for the exclusion wrapper's cached selection."""
-            return saved_topk, saved_candidates
-
-        object.__setattr__(indexer, "_selection_region", _cached_selection)
-        output = indexer(
-            hidden_states,
-            query_residual,
-            None,
-            (cos, sin),
-            index_key=index_key,
-            candidate_blocks=saved_candidates,
-        )
-
-        # The selection came from the exclusion region; the projections above it
-        # are still computed because they carry the Indexer gradients.
-        self.assertIs(output.topk_indices, saved_topk)
-        self.assertIs(output.candidate_blocks, saved_candidates)
-        self.assertIs(output.index_key, index_key)
-        self.assertEqual(tuple(output.index_query.shape), (1, 3, 2, 2))
-        self.assertEqual(tuple(output.merge_weight.shape), (1, 3, 2))
-
     def test_trainer_reuses_clip_result_for_runtime_diagnostics(self) -> None:
         """Derive the post-clip norm without a second full-model reduction."""
         trainer = BaseTrainer.__new__(BaseTrainer)
@@ -1753,7 +1652,17 @@ class TestModelIntegrationContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
             manifest_path = root / "validation.yaml"
-            (root / "trainer.yaml").write_text("training: {}\n", encoding="utf-8")
+            (root / "trainer.yaml").write_text(
+                "training: {}\n"
+                "activation_checkpoint:\n"
+                "  mode: full\n"
+                "  full:\n"
+                "    recompute_layer: [0]\n"
+                "    exclude_region:\n"
+                "      save:\n"
+                "        self_attn.indexer: [2, 8, 14]\n",
+                encoding="utf-8",
+            )
             manifest_path.write_text(
                 "schema_version: 2\n"
                 "model:\n  adapter: example\n"
@@ -1766,7 +1675,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "  resume_split_step: 5\n"
                 "  shared_initial_checkpoint: true\n"
                 "  baseline: {tp: 2, cp: 1, ep: 16, fsdp: 8, "
-                "recompute: {layer_indices: [0, 1, 2, 3]}}\n"
+                "recompute_layer: [0, 1, 2, 3]}\n"
                 "  same_topology_resume: true\n",
                 encoding="utf-8",
             )
@@ -1778,7 +1687,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "ep": 16,
                 "fsdp": 8,
                 "sequence_parallel": True,
-                "recompute": {"layer_indices": [0, 1, 2, 3]},
+                "recompute_layer": [0, 1, 2, 3],
             }
             ordinary_case = SimpleNamespace(
                 name="baseline",
@@ -1855,8 +1764,9 @@ class TestModelIntegrationContracts(unittest.TestCase):
         self.assertIn("--accelerator.ep_size=16", ordinary_argv)
         self.assertIn("--fsdp_config.dp_shard_size=8", ordinary_argv)
         self.assertIn(
-            "--activation_checkpoint.selection={'source': "
-            "'model_adapter_safe_regions', 'layer_indices': [0, 1, 2, 3]}",
+            "--activation_checkpoint={'mode': 'full', 'full': "
+            "{'recompute_layer': [0, 1, 2, 3], 'exclude_region': "
+            "{'save': {'self_attn.indexer': [2]}}}}",
             ordinary_argv,
         )
         self.assertIn("--training.train_iters=10", ordinary_argv)

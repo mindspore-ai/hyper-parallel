@@ -35,13 +35,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The activation_checkpoint modes HyperParallel's trainer runs every layer
-# with, that recompute "auto" chooses among. Its selective mode recomputes
-# every other matmul, which the cost model's formulas do not price; a census
-# of the layers measures it (IR phase 5), so a run that states one offers it
-# too, where the census priced it.
+# A generic census does not specify the module regions the trainer's
+# selective mode now requires, so it cannot add that mode to an auto search.
 TRAINER_RECOMPUTE_MODES = ("off", "full")
-TRAINER_CENSUS_MODES = ("off", "selective", "full")
 # The search config's recompute values that choose among those modes: "auto"
 # one for every layer, "per_layer" one for each layer, which the trainer runs
 # as activation_checkpoint.layers.
@@ -640,15 +636,14 @@ def search_strategies(config: NormalizedConfig, offload: Optional[Mapping[str, A
     )
     strategy = config.estimator.get("recompute_strategy")
     auto = strategy in CHOSEN_RECOMPUTE
-    census = bool((hp_config.get("context") or {}).get("census"))
     trainer = {
         "auto_recompute": True,
         # The search config may narrow the modes, as to leave out a mode the
         # estimate prices faster than the device runs it.
         "recompute_modes": tuple(config.estimator.get("recompute_modes")
-                                 or (TRAINER_CENSUS_MODES if census else TRAINER_RECOMPUTE_MODES)),
-        # The trainer's selective mode runs its policy, whatever switches
-        # the mode the model is described with sets.
+                                 or TRAINER_RECOMPUTE_MODES),
+        # Explicit legacy cost-model selective choices retain their switches;
+        # they are not inferred from a generic activation census.
         "recompute_selective": dict(HYPER_SELECTIVE_REC_OP),
         "recompute_mode_per_layer": strategy == "per_layer",
     }

@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Contracts that let a CSA2 attention layer be recomputed as a whole.
+"""Contracts for recomputing CSA2 sources without replaying discrete selection.
 
-Three mechanisms make a recomputed attention legal, and this module exercises
-them on CPU against the real classes:
+The tests exercise the shared-state and context-parallel contracts on CPU:
 
 * State-owned phase guards keep ``publish_*`` from writing twice.
   Those calls contain no differentiable op, so skipping them cannot change the
   checkpoint's saved-tensor count.
-* the indexer's discrete selection is an exclusion region, because a recompute
-  must neither choose a different Top-K set nor drop saved tensors.
+* Full/Reindex selection is retained across replay, including CP transfers whose
+  asynchronous handles can only be consumed once.
 * nothing drops a published entry early: a recomputed consumer reads its
   entries a second time during backward, so they stay alive until the graph
   releases the state.
@@ -31,7 +30,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest import mock
 
 import torch
 from torch import nn
@@ -45,24 +43,24 @@ from hyper_parallel.models.replacement import ModuleReplacementRequest
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention
 
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
-    SharedCompressedAttentionState,
+    CompressedSparseAttention2Module, SharedCompressedAttentionState, _apply_v41_rope,
 )
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
-    CompressedSparseAttention2Module, _apply_v41_rope,
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.cp_compressed_sparse_attention2 import (
+    CPCompressedSparseAttention2, _CPIndexer,
 )
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
     CSA2Indexer,
 )
-from hyper_parallel.components.modules.attention.compressed_sparse_attention2.cp_compressed_sparse_attention2 import (
-    CPCompressedSparseAttention2,
-)
 from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
-from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
-from hyper_parallel.models.deepseek_v41.adapter.policies import (
-    activation_checkpointing as attention_policy,
+from hyper_parallel.core.activation_memory.api import (
+    checkpoint_exclude_wrapper,
+    checkpoint_wrapper,
 )
-from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
-    attention_role,
+from hyper_parallel.core.activation_memory.wrapper import (
+    CheckpointExcludeWrapper,
+)
+from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
+    configure_deepseek_v41_activation_checkpointing,
 )
 
 HIDDEN, HEADS, HEAD_DIM, GROUPS, OUT_PER_GROUP = 8, 2, 8, 2, 4
@@ -145,10 +143,10 @@ class _Source(nn.Module):
 
 
 class _IndexerSource(nn.Module):
-    """Duck-typed indexer source for a Reindex-style layer."""
+    """Duck-typed indexer parameters for a Reindex source."""
 
     def __init__(self) -> None:
-        """Create the projections a Reindex-style indexer needs."""
+        """Create the projections used by the real CSA2 indexer."""
         super().__init__()
         self.q_b_proj = nn.Linear(HIDDEN, HEADS * HEAD_DIM, bias=False)
         self.weights_proj = nn.Linear(HIDDEN, HEADS, bias=False)
@@ -167,10 +165,10 @@ class _IndexerSource(nn.Module):
 
 
 class _IndexSource(nn.Module):
-    """Attention source whose layer consumes shared state and republishes Top-K."""
+    """Attention source that consumes shared keys and republishes Top-K."""
 
     def __init__(self) -> None:
-        """Describe the Reindex-style layer this source stands for."""
+        """Describe the Reindex-style CSA2 structural contract."""
         super().__init__()
         self.q_a_proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
         self.q_a_norm = nn.LayerNorm(HIDDEN, bias=False)
@@ -262,14 +260,13 @@ def _kv_source_layer(use_cp, state):
 
 
 def _index_source_layer(use_cp, state):
-    """Build a Reindex-style layer that republishes the shared Top-K."""
+    """Build a replay-safe Reindex layer and its shared source state."""
     torch.manual_seed(11)
     source = _IndexSource()
     source.indexer = CSA2Indexer(_IndexerSource(), apply_rope=_apply_v41_rope)
     implementation = _GatherCSA2 if use_cp else CompressedSparseAttention2Module
-    layer = implementation(
-        source, replace_indexer=False, use_fused_ops=False
-    )
+    layer = implementation(source, replace_indexer=False, use_fused_ops=False)
+    layer.indexer.enable_selection_exclude()
     state.publish_compressed_kv(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
     state.publish_index_key(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
     counter = _bind_gather(layer) if use_cp else None
@@ -354,77 +351,210 @@ def test_checkpointed_kv_source_matches_plain_and_writes_state_once():
 
 
 def test_checkpointed_index_source_matches_plain_and_writes_state_once():
-    """A recomputed index source republishes its Top-K exactly once."""
+    """A protected Reindex source matches eager execution and publishes once."""
     for use_cp in (False, True):
         _assert_recompute_matches_plain(_index_source_layer, use_cp=use_cp)
 
 
-class _FakeIndexer:
-    """Minimal indexer that records whether the selection pin was installed."""
+class _RecordingIndexer(nn.Module):
+    """Record post-install selection-exclusion requests."""
 
     def __init__(self) -> None:
-        """Start unpinned until the model-owned hook decides otherwise."""
-        self.selection_pinned = False
+        """Start without an installed exclusion region."""
+        super().__init__()
+        self.enable_calls = 0
 
     def enable_selection_exclude(self) -> None:
-        """Record that the hook pinned the discrete selection."""
-        self.selection_pinned = True
+        """Record one automatic protection request."""
+        self.enable_calls += 1
 
 
-class _FakeAttention(nn.Module):
-    """Attention stand-in exposing the attributes the CSA2 roles read."""
+class _RoleAttention(nn.Module):
+    """Minimal attention exposing one CSA2 role to the adapter hook."""
 
-    def __init__(self, layer_idx: int, *, kv_source: bool = False, index_source: bool = False) -> None:
-        """Describe one layer stand-in of a CSA2 role."""
+    def __init__(self, *, index_source: bool) -> None:
+        """Create an index source or an ordinary Reuse consumer."""
         super().__init__()
-        self.compress_ratio = 1
-        self.layer_idx = layer_idx
-        self.is_kv_source = kv_source
         self.is_index_source = index_source
-        self.indexer = _FakeIndexer() if index_source else None
+        self.indexer = _RecordingIndexer()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Keep the fixture callable for activation wrappers."""
+        return hidden_states
 
 
-def _role_model():
-    """Return a stand-in model with one attention per CSA2 role."""
-    attentions = {
-        "full": _FakeAttention(2, kv_source=True, index_source=True),
-        "reindex": _FakeAttention(24, index_source=True),
-        "reuse": _FakeAttention(25),
-    }
+class _ReplayBlock(nn.Module):
+    """Transformer-block stand-in containing one attention module."""
+
+    def __init__(self, attention: nn.Module) -> None:
+        """Register the supplied attention under its production child name."""
+        super().__init__()
+        self.self_attn = attention
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Delegate to the attention child."""
+        return self.self_attn(hidden_states)
+
+
+def test_post_install_hook_protects_only_replayed_index_sources() -> None:
+    """Index sources inside replay are pinned unless their attention is excluded."""
+    protected = _RoleAttention(index_source=True)
+    excluded = _RoleAttention(index_source=True)
+    reuse = _RoleAttention(index_source=False)
+    resident = _RoleAttention(index_source=True)
     model = nn.Module()
-    model.norm = nn.LayerNorm(HIDDEN)
-    model.layers = nn.ModuleList(list(attentions.values()))
-    return model, attentions
+    model.layers = nn.ModuleList([
+        checkpoint_wrapper(_ReplayBlock(protected)),
+        checkpoint_wrapper(_ReplayBlock(checkpoint_exclude_wrapper(excluded))),
+        checkpoint_wrapper(_ReplayBlock(reuse)),
+        _ReplayBlock(resident),
+    ])
+
+    configure_deepseek_v41_activation_checkpointing(model)
+
+    assert protected.indexer.enable_calls == 1
+    assert excluded.indexer.enable_calls == 0
+    assert reuse.indexer.enable_calls == 0
+    assert resident.indexer.enable_calls == 0
 
 
-_RECOMPUTE_TIERS = (
-    # tier, roles kept out of the recompute, index sources that recompute and get pinned
-    ("none", ("full", "reindex", "reuse"), ()),
-    ("reuse", ("full", "reindex"), ()),
-    ("reuse_reindex", ("full",), ("reindex",)),
-    ("all", (), ("full", "reindex")),
-)
+def test_post_install_hook_is_idempotent_for_real_indexers() -> None:
+    """Repeated adapter application must not nest selection exclusions."""
+    attention = _RoleAttention(index_source=True)
+    attention.indexer = CSA2Indexer(_IndexerSource(), apply_rope=_apply_v41_rope)
+    model = nn.Module()
+    model.layer = checkpoint_wrapper(_ReplayBlock(attention))
+
+    configure_deepseek_v41_activation_checkpointing(model)
+    first_region = attention.indexer._selection_region  # pylint: disable=protected-access
+    configure_deepseek_v41_activation_checkpointing(model)
+
+    assert isinstance(first_region, CheckpointExcludeWrapper)
+    assert attention.indexer._selection_region is first_region  # pylint: disable=protected-access
 
 
-def _keeps_out_of_recompute(policy, module: nn.Module) -> bool:
-    """Return whether one policy keeps a module outside the recompute regions."""
-    predicate = policy.exclude_predicate
-    return bool(predicate is not None and predicate("layer.self_attn", module))
+class _SelectionReplayProbe(CSA2Indexer):
+    """Minimal local indexer that records discrete selection executions."""
+
+    def __init__(self) -> None:
+        """Initialize only the state needed by ``_run_selection``."""
+        super().__init__(_IndexerSource(), apply_rope=_apply_v41_rope)
+        self.selection_calls = 0
+
+    def _select_tokens(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, None]:
+        """Return a no-grad stand-in for discrete Top-K IDs.
+
+        The parent accepts the whole ``_select_indices`` argument list, so the
+        probe keeps the same variadic shape and reads the query positionally.
+        """
+        del kwargs
+        self.selection_calls += 1
+        return args[0].detach().round(), None
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:  # pylint: disable=arguments-differ
+        """Combine differentiable work with the retained selection."""
+        selected, _ = self._run_selection(inputs)
+        return inputs.sin() + selected
 
 
-def test_recompute_tiers_exclude_and_pin_one_role_set():
-    """The tier selects which attentions recompute and which of them get pinned."""
-    for tier, resident, pinned in _RECOMPUTE_TIERS:
-        with mock.patch.object(attention_policy, "ATTENTION_RECOMPUTE_TIER", tier):
-            policy = attention_policy.build_recompute_policy()
-            model, attentions = _role_model()
-            policy.on_applied(model)
+def test_local_selection_exclusion_executes_once_across_replay() -> None:
+    """The local Top-K callable runs in forward and is reused during replay."""
+    probe = _SelectionReplayProbe()
+    probe.enable_selection_exclude()
+    inputs = torch.randn(4, requires_grad=True)
 
-            assert not _keeps_out_of_recompute(policy, model.norm)
-            for role, attention in attentions.items():
-                assert attention_role(attention) == role
-                assert _keeps_out_of_recompute(policy, attention) == (role in resident)
-                assert bool(getattr(attention.indexer, "selection_pinned", False)) == (role in pinned)
+    checkpoint_wrapper(probe)(inputs).square().sum().backward()
+
+    assert probe.selection_calls == 1
+    assert inputs.grad is not None
+
+
+class _WaitHandle:
+    """One-shot asynchronous handle used by the CP replay probe."""
+
+    def __init__(self, value: Any) -> None:
+        """Store the value and start with no waits."""
+        self.value = value
+        self.wait_calls = 0
+        self.owner_queries = value[0].shape[1] if isinstance(value, tuple) else None
+
+    def wait(self) -> Any:
+        """Return the value while rejecting a second handle consumption."""
+        self.wait_calls += 1
+        if self.wait_calls > 1:
+            raise RuntimeError("CP test handle was consumed more than once")
+        return self.value
+
+
+class _CPSelectionReplayProbe(_CPIndexer):
+    """Exercise the CP launch, result transfer, and wait exclusion regions."""
+
+    def __init__(self) -> None:
+        """Initialize real indexer state and the transfer counters."""
+        super().__init__(_IndexerSource(), apply_rope=_apply_v41_rope)
+        self.launch_calls = 0
+        self.selection_calls = 0
+        self.finish_calls = 0
+        self.wave = None
+        self.result = None
+
+    def _launch_selection(
+            self, qr: torch.Tensor, weights: torch.Tensor,
+            embeddings: tuple[torch.Tensor, torch.Tensor], lengths: tuple,
+    ) -> _WaitHandle:
+        """Create one input-transfer receipt."""
+        del lengths
+        self.launch_calls += 1
+        self.wave = _WaitHandle((qr.detach(), weights, *embeddings))
+        return self.wave
+
+    def _project_worker_index_query(
+            self, query_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+            owner_query_length: int,
+    ) -> torch.Tensor:
+        """Keep the probe's received query unchanged."""
+        del cos, sin, owner_query_length
+        return query_residual
+
+    def _select_dispatched(self, prepared: tuple, key: torch.Tensor) -> _WaitHandle:
+        """Create one result-transfer receipt from prepared worker inputs."""
+        del key
+        self.selection_calls += 1
+        query, _, _ = prepared
+        self.result = _WaitHandle(query.round())
+        return self.result
+
+    def _finish_selection(self, result: _WaitHandle) -> torch.Tensor:  # pylint: disable=arguments-differ
+        """Consume the result receipt exactly once and tally the protected call."""
+        self.finish_calls += 1
+        return result.wait()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:  # pylint: disable=arguments-differ
+        """Mirror the protected CP selection stages around differentiable work."""
+        launch = self._launch_selection if self._input_region is None else self._input_region
+        wave = launch(inputs, torch.ones_like(inputs), (inputs, inputs), ())
+        prepared = self._prepare_dispatched(wave)
+        select = self._select_dispatched if self._result_region is None else self._result_region
+        result = select(prepared, inputs)
+        finish = self._finish_selection if self._wait_region is None else self._wait_region
+        selected = finish(result)
+        return inputs.sin() + selected.detach()
+
+
+def test_cp_selection_transfers_and_handles_execute_once_across_replay() -> None:
+    """CP replay reuses every protected stage without consuming handles twice."""
+    probe = _CPSelectionReplayProbe()
+    probe.enable_selection_exclude()
+    inputs = torch.randn(1, 4, requires_grad=True)
+
+    checkpoint_wrapper(probe)(inputs).square().sum().backward()
+
+    assert probe.launch_calls == 1
+    assert probe.selection_calls == 1
+    assert probe.finish_calls == 1
+    assert probe.wave.wait_calls == 1
+    assert probe.result.wait_calls == 1
+    assert inputs.grad is not None
 
 
 def test_attention_source_replacement_retains_norm_parameters() -> None:

@@ -15,6 +15,7 @@
 """Public module and RL examples share a namespace in either import order."""
 
 from importlib.util import find_spec
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,7 +28,16 @@ class TestExampleNamespaces(unittest.TestCase):
 
     def test_public_examples_coexist_with_rl_examples(self) -> None:
         """Import both example trees before and after adding the independent RL root."""
-        rl_root = Path(find_spec("hyper_parallel").origin).parent / "rl"
+        # CI installs the wheel and stages tests separately, so resolve from the installed package.
+        package_spec = find_spec("hyper_parallel")
+        if package_spec is None or package_spec.origin is None:
+            self.fail("hyper_parallel must be importable as a regular package")
+        package_root = Path(package_spec.origin).resolve().parent
+        rl_root = package_root / "rl"
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(package_root.parent), environment.get("PYTHONPATH")))
+        )
         for family_first in (True, False):
             program = f"""
 import sys
@@ -45,5 +55,6 @@ assert gsm8k.__file__
                 result = subprocess.run(
                     [sys.executable, "-c", program], cwd=directory,
                     capture_output=True, text=True, check=False, timeout=120,
+                    env=environment,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

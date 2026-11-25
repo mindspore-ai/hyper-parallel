@@ -33,6 +33,7 @@ from hyper_parallel.integration.llamafactory.utils import (
     wrap_optimizer_with_skip_dtensor_dispatch,
 )
 from hyper_parallel.models._transformers import model_builder
+from hyper_parallel.trainer.config.parallelism import ActivationCheckpointConfig
 
 
 class _FakeOptimizer:
@@ -83,7 +84,10 @@ def test_parallelize_model_delegates_to_existing_model_infrastructure(monkeypatc
         setup,
         pretrained_path="checkpoint",
         device=torch.device("cpu"),
-        activation_checkpoint="full",
+        activation_checkpoint={
+            "mode": "full",
+            "full": {"recompute_layer": [0]},
+        },
     )
 
     assert result is model
@@ -91,7 +95,46 @@ def test_parallelize_model_delegates_to_existing_model_infrastructure(monkeypatc
     assert calls["sharding_planner"] == "planner"
     assert calls["fsdp2_manager"] == "manager"
     assert calls["pretrained_path"] == "checkpoint"
-    assert calls["activation_checkpoint"] == "full"
+    activation_checkpoint = calls["activation_checkpoint"]
+    assert isinstance(activation_checkpoint, ActivationCheckpointConfig)
+    assert activation_checkpoint.mode == "full"
+    assert activation_checkpoint.full.recompute_layers == (0,)
+    assert "activation_swap" not in calls
+    assert "swap_inputs" not in calls
+
+
+def test_parallel_args_normalize_activation_checkpoint_config():
+    """LlamaFactory dictionaries should use the shared activation schema."""
+    args = HyperParallelArguments.from_dict(
+        {
+            "activation_checkpoint": {
+                "mode": "selective",
+                "selective": {
+                    "recompute": {"self_attn": [0]},
+                    "swap": {
+                        "group_swap": True,
+                        "cpu_pool": 128,
+                        "mlp": [1],
+                    },
+                },
+            }
+        }
+    )
+
+    config = args.activation_checkpoint
+    assert isinstance(config, ActivationCheckpointConfig)
+    assert config.mode == "selective"
+    assert config.selective.recompute_regions[0].module_path == "self_attn"
+    assert config.selective.swap_regions[0].module_path == "mlp"
+    assert config.selective.group_swap is True
+    assert config.selective.cpu_pool_mb == 128
+
+
+@pytest.mark.parametrize("field", ["activation_mode", "activation_swap_inputs"])
+def test_parallel_args_reject_unknown_fields(field):
+    """Unknown LlamaFactory integration options must not be silently ignored."""
+    with pytest.raises(ValueError, match="unknown hyper_parallel_args fields"):
+        HyperParallelArguments.from_dict({field: "legacy"})
 
 
 def test_parallel_args_build_new_distributed_setup_for_cp_ep(monkeypatch):
