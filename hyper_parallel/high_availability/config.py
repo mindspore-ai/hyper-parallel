@@ -14,21 +14,21 @@
 # ============================================================================
 """User-facing switch and optional rank-zero Controller endpoint."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
 @dataclass(frozen=True)
-class RecoveryConfig:
+class WorkerRecoveryConfig:
     """Enable replica recovery with a rank-zero or TaskD-hosted Controller.
 
     Args:
-        enable_worker_reboot: Enable process recovery; disabled by default.
+        enable: Enable process recovery; disabled by default.
         controller_ip: Rank zero's reachable address; omit to use TaskD.
         controller_port: Rank-zero listening port; defaults to 8000 when an IP is supplied.
     """
 
-    enable_worker_reboot: bool = False
+    enable: bool = False
     controller_ip: str = ""
     controller_port: Optional[int] = None
 
@@ -40,3 +40,10 @@ class RecoveryConfig:
             raise ValueError("controller_port requires controller_ip; omit both to use TaskD")
         if self.controller_port is not None and not 0 < self.controller_port < 65536:
             raise ValueError("controller_port must be between 1 and 65535")
+
+
+@dataclass(frozen=True)
+class HighAvailabilityConfig:
+    """Group independently enabled high availability features."""
+
+    worker_recovery: WorkerRecoveryConfig = field(default_factory=WorkerRecoveryConfig)

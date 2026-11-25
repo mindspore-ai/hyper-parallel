@@ -72,6 +72,39 @@ class TestConfigOverrides(unittest.TestCase):
             yaml_path.write_text(_SAMPLE_YAML.format(module=__name__), encoding="utf-8")
             return parse_training_args([str(yaml_path), *overrides])
 
+    def test_worker_recovery_defaults_and_overrides(self) -> None:
+        """Resolve the nested recovery switch and Controller endpoint overrides."""
+        config = self._parse()
+        self.assertFalse(config.high_availability.worker_recovery.enable)
+        config = self._parse(
+            "--high_availability.worker_recovery.enable=true",
+            "--high_availability.worker_recovery.controller_ip=127.0.0.1",
+            "--high_availability.worker_recovery.controller_port=18000",
+        )
+        recovery = config.high_availability.worker_recovery
+        self.assertTrue(recovery.enable)
+        self.assertEqual(recovery.controller_ip, "127.0.0.1")
+        self.assertEqual(recovery.controller_port, 18000)
+        self.assertEqual(config.to_dict()["high_availability"]["worker_recovery"], {
+            "enable": True, "controller_ip": "127.0.0.1", "controller_port": 18000,
+        })
+
+    def test_worker_recovery_yaml(self) -> None:
+        """Parse nested recovery YAML and preserve the default Controller port."""
+        recovery_yaml = """high_availability:
+  worker_recovery:
+    enable: true
+    controller_ip: 127.0.0.1
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yaml_path = Path(tmpdir) / "train.yaml"
+            yaml_path.write_text(
+                _SAMPLE_YAML.format(module=__name__) + recovery_yaml, encoding="utf-8"
+            )
+            config = parse_training_args([str(yaml_path)])
+        self.assertTrue(config.high_availability.worker_recovery.enable)
+        self.assertEqual(config.high_availability.worker_recovery.controller_port, 8000)
+
     def test_reads_yaml_without_overrides(self) -> None:
         """YAML values survive, and the callable default is filled in."""
         config = self._parse()

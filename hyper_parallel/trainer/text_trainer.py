@@ -29,7 +29,7 @@ from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize
-from hyper_parallel.trainer.runtime.process_recovery import (
+from hyper_parallel.trainer.runtime.worker_recovery import (
     recovery_constructor,
     recovery_epoch_initialized,
     recovery_train_loop,

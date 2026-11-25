@@ -114,7 +114,7 @@ from hyper_parallel.trainer.callbacks import (
     CheckpointerCallback,
     TrainerState,
 )
-from hyper_parallel.trainer.runtime.process_recovery import (
+from hyper_parallel.trainer.runtime.worker_recovery import (
     recovery_constructor,
     recovery_epoch_initialized,
     recovery_optimizer_update,

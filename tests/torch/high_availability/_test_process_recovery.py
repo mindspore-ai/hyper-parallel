@@ -47,7 +47,7 @@ from hyper_parallel import (
     ColwiseParallel, DTensor, Replicate, RowwiseParallel, Shard, SkipDTensorDispatch, distribute_tensor,
     fully_shard, init_device_mesh, parallelize_module,
 )
-from hyper_parallel.high_availability import RecoveryConfig, RecoverySession, TrainState
+from hyper_parallel.high_availability import WorkerRecoveryConfig, RecoverySession, TrainState
 from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
@@ -126,7 +126,10 @@ def worker(options: argparse.Namespace) -> None:
     run_dir = Path(options.directory)
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE=str(world))
     taskd_hosted = os.getenv("HP_RECOVERY_TEST_CONTROLLER") == "taskd"
-    config = RecoveryConfig(True) if taskd_hosted else RecoveryConfig(True, "127.0.0.1", options.controller_port)
+    config = (
+        WorkerRecoveryConfig(True) if taskd_hosted
+        else WorkerRecoveryConfig(True, "127.0.0.1", options.controller_port)
+    )
     session = RecoverySession(config)
     logging.basicConfig(level=logging.INFO)
     if rank == 0 and not taskd_hosted:

@@ -36,8 +36,9 @@ def recovery_constructor(initialize: Callable) -> Callable:
     """
     @wraps(initialize)
     def _construct(trainer: Any, config: Any) -> None:
-        recovery_config = vars(config).get("worker_recovery")
-        if recovery_config is None or not recovery_config.enable_worker_reboot:
+        availability = vars(config).get("high_availability")
+        recovery_config = availability.worker_recovery if availability is not None else None
+        if recovery_config is None or not recovery_config.enable:
             initialize(trainer, config)
             vars(trainer).get("base", trainer).recovery = None
             return

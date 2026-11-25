@@ -38,22 +38,24 @@ HyperParallel 进程级快恢用于在分布式训练的部分 worker 退出后�
 
 #### 由 rank 0 托管 Controller
 
-在 Trainer YAML 顶层加入 `worker_recovery`。示例 IP 应替换为其他 worker 可以访问的 rank 0 地址。
+在 Trainer YAML 顶层加入 `high_availability` / `worker_recovery`。示例 IP 应替换为其他 worker 可以访问的 rank 0 地址。
 
 ```yaml
-worker_recovery:
-  enable_worker_reboot: true
-  controller_ip: "192.168.1.10"
-  controller_port: 8000
+high_availability:
+  worker_recovery:
+    enable: true
+    controller_ip: "192.168.1.10"
+    controller_port: 8000
 ```
 
-`enable_worker_reboot` 默认关闭。指定 `controller_ip` 时，`controller_port` 默认是 `8000`。此部署模式要求 rank 0 上的 Controller 在恢复期间可用。
+`enable` 默认关闭。指定 `controller_ip` 时，`controller_port` 默认是 `8000`。此部署模式要求 rank 0 上的 Controller 在恢复期间可用。
 
 #### 由 TaskD 托管 Controller
 
 ```yaml
-worker_recovery:
-  enable_worker_reboot: true
+high_availability:
+  worker_recovery:
+    enable: true
 ```
 
 由部署侧启动 Controller 和 Agent，并提供 Controller 地址和端口。框架依次查找 `PROCESSOR_ADDR`、`CONTROLLER_ADDR`、`TTP_ADDR`、`MASTER_ADDR`，端口取 `TTP_PORT`。在加载 TaskD 或 MindIO 动态库前注入这些变量。
@@ -210,7 +212,7 @@ PRELOCK 约束优化器推进。若存活 worker 已在第 9 步等待设备计�
 | `high_availability/recovery_state.py` | 绑定模型与优化器的训练张量，捕获和恢复训练元信息。 |
 | `high_availability/replica_transport.py` | 镜像元信息并分块传输恢复张量。 |
 | `high_availability/validation.py` | 集中维护快恢的配置、模型和状态接口校验规则。 |
-| `trainer/runtime/process_recovery.py` | 构造 Trainer 前调用配置校验，登记训练进度、loader 和回调，并将会话接入原训练流程。 |
+| `trainer/runtime/worker_recovery.py` | 构造 Trainer 前调用配置校验，登记训练进度、loader 和回调，并将会话接入原训练流程。 |
 
 ## 验证与排查
 

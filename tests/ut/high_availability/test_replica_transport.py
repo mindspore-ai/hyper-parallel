@@ -26,7 +26,7 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, FSDPMeshInfo, MixedPrecisionPolicy
-from hyper_parallel.high_availability.config import RecoveryConfig
+from hyper_parallel.high_availability.config import WorkerRecoveryConfig
 from hyper_parallel.high_availability.group_registry import GroupDescriptor, GroupRegistry
 from hyper_parallel.high_availability.recovery_state import ModelOptimizerState
 from hyper_parallel.high_availability.replica_topology import (
@@ -49,10 +49,10 @@ class TestRecoveryConfig(unittest.TestCase):
     """Controller hosting never requires user-supplied replica pairs."""
 
     def test_simple_configuration(self):
-        self.assertEqual(RecoveryConfig(True, "192.168.1.1").controller_port, 8000)
-        self.assertIsNone(RecoveryConfig(True).controller_port)
+        self.assertEqual(WorkerRecoveryConfig(True, "192.168.1.1").controller_port, 8000)
+        self.assertIsNone(WorkerRecoveryConfig(True).controller_port)
         with self.assertRaisesRegex(ValueError, "controller_ip"):
-            RecoveryConfig(True, controller_port=8000)
+            WorkerRecoveryConfig(True, controller_port=8000)
 
 
 class TestReplicaTopology(unittest.TestCase):
