@@ -26,8 +26,13 @@ from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.high_availability.config import HighAvailabilityConfig
 from hyper_parallel.components.ops.catalog import builtin_registry
 
-from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
 from hyper_parallel.auto_parallel.hyper_offload.api.config import HyperOffloadConfig
+from hyper_parallel.trainer.config.data import (
+    DataLoaderConfig,
+    DatasetConfig,
+    ModelAssetsConfig,
+)
+from hyper_parallel.trainer.config.tasks import PredictionConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
@@ -54,7 +59,10 @@ class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
     model: Target[Any]
-    optimizer: OptimizerConfig
+    # ``optimizer`` is required by the training assembly only. Prediction
+    # never builds one, so the section is optional here and
+    # the run-mode validator enforces it for ``run_mode: train``.
+    optimizer: Optional[OptimizerConfig] = None
 
     lr_scheduler: Optional[Target[Any]] = None
     loss_fn: Optional[Target[Any]] = None
@@ -91,6 +99,14 @@ class TrainerConfig:
     peft: Optional[Any] = None
     ops: dict[str, str] = field(default_factory=dict)
 
+    run_mode: Literal["train", "predict"] = "train"
+
+    # Top-level tokenizer/processor assets for standalone tasks. Empty falls
+    # back to the selected ``DatasetConfig.model_assets``.
+    model_assets: Optional[ModelAssetsConfig] = None
+
+    prediction: PredictionConfig = field(default_factory=PredictionConfig)
+
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
         builtin_registry.validate_selections(self.ops)
@@ -116,6 +132,19 @@ class TrainerConfig:
             if (checkpoint is not None and checkpoint.mode in ("selective", "hybrid")
                     and checkpoint.selective is not None and checkpoint.selective.swap_regions):
                 raise ValueError("hyper_offload cannot be combined with activation swapping")
+        self._validate_optimizer()
+
+    def _validate_optimizer(self) -> None:
+        """Validate training requirements without constructing an optimizer."""
+        if self.optimizer is None:
+            # Standalone prediction never builds an optimizer. Rejecting a
+            # training run here as well keeps the old ``Trainer.train()`` entry
+            # honest: it never runs the run-mode validator.
+            if self.run_mode == "train":
+                raise ValueError(
+                    "run_mode='train' requires an 'optimizer' configuration section"
+                )
+            return
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(

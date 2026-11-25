@@ -14,6 +14,8 @@
 # ============================================================================
 """Autoregressive generation utilities."""
 
+from hyper_parallel.infer.config import GenerationOptions, resolve_generation_options
+from hyper_parallel.infer.runtime import GenerationResult, GenerationRuntime
 from hyper_parallel.infer.generation import generate
 from hyper_parallel.infer.kv_cache import (
     ContextParallelKVCache,
@@ -43,6 +45,10 @@ from hyper_parallel.infer.utils import (
 
 __all__ = [
     "GenerationConfig",
+    "GenerationOptions",
+    "GenerationResult",
+    "GenerationRuntime",
+    "resolve_generation_options",
     "GenerateMixin",
     "KVCache",
     "ContextParallelKVCache",

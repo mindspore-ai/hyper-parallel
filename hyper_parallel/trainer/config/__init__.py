@@ -41,6 +41,7 @@ __all__ = [
     "ModelIntegrationConfig",
     "OptimizerConfig",
     "OptimizerSwapConfig",
+    "PredictionConfig",
     "ProfilingAnalysisConfig",
     "ProfilingConfig",
     "StressDetectConfig",
@@ -63,6 +64,7 @@ from hyper_parallel.trainer.config.data import (
     DatasetConfig,
     ModelAssetsConfig,
 )
+from hyper_parallel.trainer.config.tasks import PredictionConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,

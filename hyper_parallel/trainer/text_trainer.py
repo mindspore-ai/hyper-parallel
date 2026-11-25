@@ -17,6 +17,7 @@
 __all__ = ["TextTrainer"]
 
 from collections import defaultdict
+from dataclasses import replace
 from itertools import count
 from typing import Any, Dict, Iterator, Optional
 
@@ -24,6 +25,8 @@ import torch
 
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
+from hyper_parallel.components.checkpoint.model_restore import restore_model_weights
+from hyper_parallel.predict import PredictionSummary
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
@@ -35,6 +38,10 @@ from hyper_parallel.trainer.runtime.worker_recovery import (
     recovery_train_loop,
     recovery_train_step,
 )
+from hyper_parallel.trainer.runtime.run_mode import (
+    BuildStep, get_build_steps, validate_run_config, validate_run_capabilities,
+)
+from hyper_parallel.trainer.runtime.prediction import run_prediction
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.data.distributed import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
@@ -42,54 +49,145 @@ from hyper_parallel.trainer.config import TrainerConfig
 logger = create_logger(__name__)
 
 
+def _target_signature(target: Any) -> Any:
+    """Reduce a configured target (or plain value) to a comparable structure.
+
+    Targets compare by their normalized ``_target_`` path and arguments, never
+    by object identity: two YAML sections spelling the same tokenizer produce
+    distinct ``Target`` objects that must not read as a conflict.
+    """
+    if target is None or isinstance(target, str):
+        return target
+    to_dict = getattr(target, "to_dict", None)
+    return to_dict() if callable(to_dict) else repr(target)
+
+
 class TextTrainer:
     """Compose the text training runtime from explicit BaseTrainer stages."""
 
     base: BaseTrainer
 
-    @recovery_constructor
     def __init__(self, config: TrainerConfig) -> None:
-        """Build the text Trainer in the same explicit order as VeOmni."""
+        """Validate standalone configuration before starting runtime services."""
+        if getattr(config, "run_mode", "train") != "train":
+            validate_run_config(config)
+        self._initialize(config)
+
+    @recovery_constructor
+    def _initialize(self, config: TrainerConfig) -> None:
+        """Assemble the components the configured run mode actually executes.
+
+        Training-only steps (optimizer, scheduler, training context, graph
+        compiler, callbacks) are skipped for standalone tasks: they cost
+        startup time and, for an optimizer with fp32 main parameters, device
+        memory comparable to the weights. The plan comes from
+        :func:`get_build_steps` so the skip list is declared and testable
+        rather than an accident of a shorter constructor.
+        """
+        run_mode = getattr(config, "run_mode", "train")
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.config = config
 
         self.base._setup()
+        if run_mode != "train":
+            validate_run_capabilities(config, self.base.mesh)
+        if run_mode == "predict":
+            # Independent decode lanes must never inherit training-time FSDP collectives.
+            self.base.distributed_setup = replace(self.base.distributed_setup, strategy_config=None)
+        self._reset_memory_profiler()
+        self.base._build_model()
+
+        # The plan is resolved after the profiler reset and model build so those
+        # first stages keep depending on nothing but the sections they read.
+        steps = get_build_steps(run_mode)
+        if BuildStep.LOSS in steps:
+            self.base._build_loss()
+
+        if BuildStep.MODEL_RESTORE in steps:
+            self.base.restore_outcome = restore_model_weights(
+                self.base.model,
+                config,
+                self.base.mesh,
+            )
+
+        self._build_model_assets()
+        self._build_data_pipeline(steps)
+
+        if BuildStep.OPTIMIZER in steps:
+            self.base._build_optimizer()
+            self.base.model_integration.attach_optimizer(self.base.optimizer)
+        if BuildStep.LR_SCHEDULER in steps:
+            self.base._build_lr_scheduler()
+        if BuildStep.TRAINING_CONTEXT in steps:
+            self.base._build_training_context()
+        if BuildStep.GRAPH_COMPILER in steps:
+            self.base._build_graph_compiler()
+        if BuildStep.CALLBACKS in steps:
+            self.base._init_callbacks()
+
+    def _build_data_pipeline(self, steps: tuple[str, ...]) -> None:
+        """Assemble only the data stages declared by the selected task plan."""
+        if BuildStep.DATA_TRANSFORM in steps:
+            self._build_data_transform()
+        if BuildStep.DATASET in steps:
+            self.base._build_dataset()
+        if BuildStep.COLLATE in steps:
+            self._build_collate_fn()
+        if BuildStep.DATALOADER in steps:
+            self.base._build_dataloader()
+        if BuildStep.GET_BATCH in steps:
+            self._build_get_batch()
+            self.base.attach_model_integration_data_pipeline()
+        if BuildStep.TRAIN_ITERS in steps:
+            self.base._compute_train_iters()
+
+    def _reset_memory_profiler(self) -> None:
+        """Start allocator snapshots with this run's identities."""
         memory_profiler.reset(
             self.base.config.memory,
             global_rank=self.base.global_rank,
             tp_rank=self.base.mesh.tp_rank,
             dp_rank=self.base.mesh.dp_rank,
         )
-        self.base._build_model()
-        self.base._build_loss()
 
-        # datasets
-        self._build_model_assets()
-        self._build_data_transform()
-        self.base._build_dataset()
+    def run(self) -> None:
+        """Execute the run mode this Trainer was configured for.
 
-        # dataloader
-        self._build_collate_fn()
-        self.base._build_dataloader()
+        Raises:
+            ValueError: An unknown task mode reached the dispatcher.
+        """
+        run_mode = self.base.config.run_mode
+        if run_mode == "train":
+            self.train()
+            return
+        if run_mode == "predict":
+            summary = self.predict()
+            logger.info("Prediction report: %s", summary.to_dict())
+            return
+        raise ValueError(f"TextTrainer.run() does not support run_mode={run_mode!r}")
 
-        # get_batch
-        self._build_get_batch()
-        self.base.attach_model_integration_data_pipeline()
-        self.base._compute_train_iters()
-
-        self.base._build_optimizer()
-        self.base.model_integration.attach_optimizer(self.base.optimizer)
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._build_graph_compiler()
-        self.base._init_callbacks()
+    def predict(self) -> PredictionSummary:
+        """Generate the configured input file and return its committed summary."""
+        if self.base.config.run_mode != "predict":
+            raise ValueError("TextTrainer.predict() requires run_mode='predict'")
+        return run_prediction(self.base)
 
     def _build_model_assets(self) -> None:
-        """Build tokenizer-backed assets for text training."""
+        """Build tokenizer-backed assets from the top-level or dataset config.
+
+        Standalone prediction can configure assets without a dataset,
+        so the top-level ``model_assets`` section takes precedence and the
+        dataset section is only a compatibility fallback.
+        """
         config: TrainerConfig = self.base.config
-        if config.dataset is None:
-            raise ValueError("dataset must define a build target")
-        assets_config = config.dataset.model_assets
+        assets_config = self._resolve_assets_config()
+        if assets_config is None:
+            # Unconfigured assets are legal: pre-tokenized Indexed data needs no
+            # tokenizer, and training has always allowed that.
+            self.base.tokenizer = None
+            self.base.chat_template = None
+            self.base.model_assets = [self.base.model_config]
+            return
         tokenizer_target = assets_config.tokenizer
         if tokenizer_target is None:
             self.base.tokenizer = None
@@ -125,6 +223,71 @@ class TextTrainer:
             self.base.model_assets.append(self.base.tokenizer)
         if self.base.chat_template is not None:
             self.base.model_assets.append(self.base.chat_template)
+
+    @staticmethod
+    def _is_configured(assets: Any) -> bool:
+        """Whether an assets section carries an explicit tokenizer or template.
+
+        ``DatasetConfig.model_assets`` defaults to an empty ``ModelAssetsConfig``,
+        so presence alone says nothing: only a populated section is a user choice.
+        """
+        if assets is None:
+            return False
+        if getattr(assets, "tokenizer", None) is not None:
+            return True
+        return getattr(assets, "chat_template", None) is not None
+
+    @staticmethod
+    def _same_assets(left: Any, right: Any) -> bool:
+        """Compare two configured assets sections by their resolved target paths.
+
+        Targets are compared by ``_target_`` path and arguments rather than
+        object identity, so two YAML sections that spell the same tokenizer do
+        not conflict.
+        """
+
+        def signature(assets: Any) -> Any:
+            """Reduce one assets section to a comparable plain structure.
+
+            Args:
+                assets: Assets configuration exposing ``to_dict`` or tokenizer/template targets.
+
+            Returns:
+                Serialized configuration or normalized tokenizer and template target signatures.
+            """
+            if hasattr(assets, "to_dict"):
+                return assets.to_dict()
+            return {
+                "tokenizer": _target_signature(getattr(assets, "tokenizer", None)),
+                "chat_template": _target_signature(getattr(assets, "chat_template", None)),
+            }
+
+        return signature(left) == signature(right)
+
+    def _resolve_assets_config(self) -> Any:
+        """Return the effective model-assets section, or ``None`` if unconfigured.
+
+        Explicit top-level assets win; a dataset section is the compatibility
+        fallback. Declaring both with different values is a configuration
+        error rather than a silent pick.
+
+        Raises:
+            ValueError: Both sections are configured and disagree.
+        """
+        config: TrainerConfig = self.base.config
+        dataset_config = self.base.config.dataset
+        # ``model_assets`` is new; a legacy config object without it simply has no
+        # top-level assets, so the dataset section stays the only source.
+        top_assets = getattr(config, "model_assets", None)
+        top_level = top_assets if self._is_configured(top_assets) else None
+        from_dataset = getattr(dataset_config, "model_assets", None) if dataset_config is not None else None
+        from_dataset = from_dataset if self._is_configured(from_dataset) else None
+        if top_level is not None and from_dataset is not None and not self._same_assets(top_level, from_dataset):
+            raise ValueError(
+                "model_assets is configured both at the top level and under "
+                "dataset.model_assets with different values; configure one"
+            )
+        return top_level if top_level is not None else from_dataset
 
     def _build_data_transform(self) -> None:
         """Build the configured text sample transform."""
