@@ -18,20 +18,55 @@
 """enhanced with selective checkpoint support swap"""
 # pylint: disable=W0212, W0613, C0115, C0116, C0103, R1705
 from collections import defaultdict
+from contextlib import contextmanager
 from functools import partial
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
+from weakref import WeakSet
 
 import torch
 import torch.fx.traceback as fx_traceback
 from torch._functorch._aot_autograd.functional_utils import is_fun
-from torch.utils._pytree import tree_map
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves, tree_map
+from torch.utils._python_dispatch import (
+    TorchDispatchMode,
+    _get_current_dispatch_mode_stack,
+    is_traceable_wrapper_subclass,
+)
+
+from hyper_parallel.core.activation_memory.checkpoint_exclude import _ExcludeCache, _canonical_input_tensor
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 from hyper_parallel.core.activation_memory.swap import (  # patch code
     SwapManager,
     SwapTensor,
     Storage,
 )
+
+
+# Raw c10d schemas omit write annotations; these operators write argument 0.
+_C10D_WRITE_OPS = {
+    "allreduce_", "allreduce_coalesced_", "broadcast_", "reduce_",
+    "allgather_", "_allgather_base_", "allgather_coalesced_", "allgather_into_tensor_coalesced_",
+    "gather_", "gather_into_tensor_", "scatter_", "reduce_scatter_", "_reduce_scatter_base_",
+    "reduce_scatter_tensor_coalesced_", "alltoall_", "alltoall_base_", "recv_", "recv_any_source_",
+}
+
+
+def _storage_ids(tensor: torch.Tensor) -> Iterator[int]:
+    """Use physical storage identity, including DTensor local shards and views."""
+    tensor = _canonical_input_tensor(tensor)
+    if is_traceable_wrapper_subclass(tensor):
+        for name in tensor.__tensor_flatten__()[0]:
+            value = getattr(tensor, name)
+            if isinstance(value, torch.Tensor):
+                yield from _storage_ids(value)
+    else:
+        yield torch._C._storage_address(tensor)
+
+
+def _check_collective_policy(func: Any, policy: CheckpointPolicy) -> None:
+    """Require raw collectives to execute their writes and create a fresh Work."""
+    if policy != CheckpointPolicy.MUST_RECOMPUTE:
+        raise ValueError(f"SAC requires {func} to use MUST_RECOMPUTE for raw collective replay")
 
 
 def _is_compiling(func, args, kwargs):
@@ -153,6 +188,10 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
         self.policy_fn = policy_fn
         self.swap_storage = swap_storage
         self.storage = storage
+        self._saved_storages = set()
+        self._indexed_entries = {}
+        self.exclude_caches = WeakSet()
+        self.paused = False
         self.add_to_storage = False
         self.group_swap = group_swap
         self.cpu_pool = cpu_pool
@@ -160,17 +199,46 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
         self._swap_manager = SwapManager()
         self._group_prefix = ""
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if func in SAC_IGNORED_OPS:
-            return func(*args, **kwargs)
+    def _check_collective_writes(self, func: Any, args: tuple, kwargs: dict) -> None:
+        """Reject writes that would change a saved activation before replay."""
+        if func._schema.name.removeprefix("c10d::") not in _C10D_WRITE_OPS:
+            return
+        written = tree_leaves(args[0] if args else kwargs[func._schema.arguments[0].name])
+        # Cache lists are append-only during forward; index each entry once.
+        for op, entries in self.storage.items():
+            start = self._indexed_entries.get(op, 0)
+            if start == len(entries):
+                continue
+            for entry in tree_leaves(entries[start:]):
+                if isinstance(entry.val, torch.Tensor):
+                    self._saved_storages.update(_storage_ids(entry.val))
+            self._indexed_entries[op] = len(entries)
+        # Nested checkpoints may consume exclusion outputs, so inspect live entries.
+        excluded = set()
+        for cache in self.exclude_caches:
+            for tensor in cache.output_tensors():
+                excluded.update(_storage_ids(tensor))
+        if any(storage in self._saved_storages or storage in excluded
+               for tensor in written for storage in _storage_ids(tensor)):
+            raise RuntimeError(
+                f"SAC cannot replay {func} on a cached tensor or its alias. "
+                "Use an uncached buffer, a functional collective, or exclude the producer and collective together."
+            )
 
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
+        if self.paused or func in SAC_IGNORED_OPS:
+            return func(*args, **kwargs)
         policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=False),
                                 func, *args, **kwargs)
         if isinstance(policy, bool):
             policy = _policy_from_bool(policy)
 
         is_compiling = _is_compiling(func, args, kwargs)
+
+        if func.namespace == "c10d":
+            _check_collective_policy(func, policy)
+            self._check_collective_writes(func, args, kwargs)
 
         if is_compiling:
             # Overwrite each node's "recompute" tag to add in the user annotation.
@@ -227,18 +295,20 @@ class _CachedTorchDispatchMode(TorchDispatchMode):
         self.swap_storage = swap_storage
         self.storage = storage
         self.allow_cache_entry_mutation = allow_cache_entry_mutation
+        self.paused = False
         self._swap_cleared = False
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if func in SAC_IGNORED_OPS:
-            return func(*args, **kwargs)
-
         kwargs = {} if kwargs is None else kwargs
+        if self.paused or func in SAC_IGNORED_OPS:
+            return func(*args, **kwargs)
         policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=True),
                                 func, *args, **kwargs)
         if isinstance(policy, bool):
             policy = _policy_from_bool(policy)
 
+        if func.namespace == "c10d":
+            _check_collective_policy(func, policy)
         is_compiling = _is_compiling(func, args, kwargs)
 
         if not self._swap_cleared:
@@ -260,6 +330,24 @@ class _CachedTorchDispatchMode(TorchDispatchMode):
         else:
             out = func(*args, **kwargs)
         return out
+
+
+@contextmanager
+def _suspend_sac(exclude_cache: Optional[_ExcludeCache] = None) -> Iterator[None]:
+    """Pause the enclosing SAC modes for an independently saved region."""
+    modes = [
+        mode for mode in _get_current_dispatch_mode_stack()
+        if isinstance(mode, (_CachingTorchDispatchMode, _CachedTorchDispatchMode)) and not mode.paused
+    ]
+    for mode in modes:
+        mode.paused = True
+        if exclude_cache is not None and isinstance(mode, _CachingTorchDispatchMode):
+            mode.exclude_caches.add(exclude_cache)
+    try:
+        yield
+    finally:
+        for mode in modes:
+            mode.paused = False
 
 
 def create_selective_checkpoint_contexts(
@@ -284,7 +372,7 @@ def create_selective_checkpoint_contexts(
         allow_cache_entry_mutation (bool, optional): By default, an error is
             raised if any tensors cached by selective activation checkpoint are
             mutated in order to ensure correctness. If set to `True`, this check
-            is disabled.
+            is disabled for versioned mutations.
     Returns:
         A tuple of two context managers.
 

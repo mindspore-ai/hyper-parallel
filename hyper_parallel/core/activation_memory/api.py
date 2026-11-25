@@ -110,6 +110,9 @@ def checkpoint_exclude_wrapper(  # pylint: disable=redefined-outer-name
 ) -> Any:
     """Wrap a callable whose region is excluded from activation recomputation.
 
+    Outputs are reused during replay; keep any in-place collective that
+    writes them in the same excluded region as their producer.
+
     Args:
         module: The module or callable to exclude from recomputation.
         swap: Whether eligible outputs and non-recomputable saved tensors should
@@ -213,7 +216,12 @@ def ignore_sac_ops(ignore_ops: list) -> None:
 
 def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False,
                                          group_swap=False, cpu_pool=None):
-    """Create HyperParallel selective-checkpoint ``(forward_ctx, recompute_ctx)`` contexts."""
+    """Create HyperParallel selective-checkpoint ``(forward_ctx, recompute_ctx)`` contexts.
+
+    Raw c10d operators require MUST_RECOMPUTE and must not write to saved
+    storage, even with allow_cache_entry_mutation. Use an uncached buffer,
+    a functional collective, or exclude the producer and collective together.
+    """
     # pylint: disable=C0415
     from .sac import create_selective_checkpoint_contexts as _create_contexts
     return _create_contexts(
