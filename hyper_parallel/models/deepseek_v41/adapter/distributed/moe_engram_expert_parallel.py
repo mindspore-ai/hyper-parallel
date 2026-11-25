@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.modules.engram import local_token_mask
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
@@ -101,9 +102,15 @@ def _configure_router_statistics(gate: Any, mesh: Any, tp_mesh: Any, cp_mesh: An
         axis.get_group() for axis in (cp_mesh, tp_mesh)
         if axis is not None and axis.size() > 1
     )
+    # A local compute region can receive a TP submesh. Bias counts cover the
+    # entire data batch, so recover its DP axes from the job mesh.
+    statistics_mesh = mesh
+    if isinstance(mesh, DeviceMesh) and mesh.root_mesh is not None:
+        statistics_mesh = mesh.root_mesh
+    mesh_axes = statistics_mesh.mesh_dim_names or () if statistics_mesh is not None else ()
     dp_groups = tuple(
-        mesh[name].get_group() for name in (mesh.mesh_dim_names if mesh is not None else ())
-        if name in ("dp", "dp_replicate", "dp_shard") and mesh[name].size() > 1
+        statistics_mesh[name].get_group() for name in mesh_axes
+        if name in ("dp", "dp_replicate", "dp_shard") and statistics_mesh[name].size() > 1
     )
     gate.expert_bias_update_groups = dp_groups + sequence_groups
     return sequence_groups
@@ -255,7 +262,7 @@ def deepseek_v41_ep_compute_fn(
 
     Args:
         module: V4.1 MoE block exposing gate, experts, and shared_experts.
-        mesh: Full mesh supplying data-parallel bias statistics groups.
+        mesh: Region mesh whose root supplies data-parallel bias statistics groups.
         tp_mesh: Tensor-parallel mesh used to align router metadata and statistics.
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts.
@@ -381,7 +388,7 @@ def deepseek_v41_megamoe_compute_fn(
 
     Args:
         module: V4.1 MoE block with the MegaMoe expert replacement.
-        mesh: Full mesh supplying data-parallel bias statistics groups.
+        mesh: Region mesh whose root supplies data-parallel bias statistics groups.
         tp_mesh: Tensor-parallel mesh used to align router metadata and statistics.
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts, or None for EP=1.
