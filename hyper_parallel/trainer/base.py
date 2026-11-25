@@ -49,6 +49,7 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
+from hyper_parallel.auto_parallel.hyper_offload import OffloadSession
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
@@ -607,6 +608,11 @@ class BaseTrainer(Stateful, ABC):
         else:
             self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
+        offload = self.config.hyper_offload
+        self.hyper_offload_context = nullcontext()
+        if offload.enable:
+            self.hyper_offload_context = OffloadSession(offload)
+            logger.info("HyperOffload enabled: peak planner with communication masking; %s", offload)
         self.graph_compiler: Optional[GraphCompiler] = None
 
     def _build_graph_compiler(self) -> None:
@@ -891,7 +897,8 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None
             else nullcontext()
         )
-        with micro_step_context, aux_loss_scale_context():
+        offload_context = getattr(self, "hyper_offload_context", nullcontext())
+        with offload_context, micro_step_context, aux_loss_scale_context():
             micro_batch = self.preforward(micro_batch)
             # TextTrainer passes loss-only fields separately. Keep the legacy
             # BaseTrainer/VLM one-dictionary call contract working as well.
@@ -1253,6 +1260,7 @@ class BaseTrainer(Stateful, ABC):
     @recovery_train_loop
     def train(self) -> None:
         """Run the configured training loop."""
+        offload_context = getattr(self, "hyper_offload_context", None)
         try:
             config: TrainerConfig = self.config
             self.on_train_begin()
@@ -1305,8 +1313,16 @@ class BaseTrainer(Stateful, ABC):
                 logger.exception("Failed to save memory snapshot after training error.")
             finally:
                 self.abort_profilers()
+            if isinstance(offload_context, OffloadSession):
+                try:
+                    offload_context.close()
+                # Preserve the causal training error if session cleanup fails.
+                except BaseException:  # pylint: disable=broad-exception-caught
+                    logger.exception("Failed to close the HyperOffload session after training error.")
             raise
 
+        if isinstance(offload_context, OffloadSession):
+            offload_context.close()
         synchronize()
 
         self.destroy_distributed()

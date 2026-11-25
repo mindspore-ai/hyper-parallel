@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import unittest
 
-from hyper_parallel.auto_parallel.hyper_offload.api.config import OffloadConfig
+from hyper_parallel.auto_parallel.hyper_offload.api.config import HyperOffloadConfig, OffloadConfig
+from hyper_parallel.trainer.config.resolver import resolve_component
+from tests.common.mark_utils import arg_mark
 
 
 class TestOffloadConfig(unittest.TestCase):
@@ -68,3 +70,26 @@ class TestOffloadConfig(unittest.TestCase):
         c1 = OffloadConfig(max_resident_activation_mb=1)
         c2 = OffloadConfig(max_resident_activation_mb=2)
         self.assertNotEqual(c1, c2)
+
+
+class TestHyperOffloadConfigResolution(unittest.TestCase):
+    """Check runtime type resolution for configurations consumed by Trainer."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_serialized_config_resolves_runtime_annotations(self) -> None:
+        """Trainer configuration round trips resolve inherited planner annotations."""
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                config = resolve_component(
+                    {
+                        "enable": enabled,
+                        "max_resident_activation_mb": 2048,
+                        "max_offload_activation_mb": 4096,
+                        "planner": None,
+                    },
+                    annotation=HyperOffloadConfig,
+                    path="$.hyper_offload",
+                )
+                self.assertEqual(config, HyperOffloadConfig(
+                    enable=enabled, max_resident_activation_mb=2048, max_offload_activation_mb=4096,
+                ))

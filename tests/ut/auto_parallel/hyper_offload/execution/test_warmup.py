@@ -22,10 +22,8 @@ from unittest.mock import patch
 import torch
 
 from hyper_parallel.auto_parallel.hyper_offload.execution.warmup import WarmupExecutor
-from hyper_parallel.auto_parallel.hyper_offload.ir.trace import (
-    ActivationTrace,
-    TraceOp,
-)
+from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import ActivationTracker
+from hyper_parallel.auto_parallel.hyper_offload.ir.trace import ActivationTrace
 from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import PhysicalBuffer
 
 
@@ -54,6 +52,10 @@ class _FakeResidencyManager:
     def release_device(self, sid: int) -> None:
         self.calls.append(f"release_device({sid})")
         self._resident.pop(sid, None)
+
+    def release_host(self, sid: int) -> None:
+        """Record host-buffer retirement without allocating pinned memory."""
+        self.calls.append(f"release_host({sid})")
 
     def bind(self, sid: int, tensor: torch.Tensor) -> PhysicalBuffer:
         buf = PhysicalBuffer(device=tensor.device)
@@ -90,6 +92,25 @@ class TestWarmupExecutor(unittest.TestCase):
         self.assertEqual(self.executor.op_idx, -1)
         self.assertEqual(len(self.executor._ops), 0)  # pylint: disable=protected-access
         self.assertEqual(len(self.executor._guide), 0)  # pylint: disable=protected-access
+
+    def test_dead_temporaries_are_reclaimed_before_eviction(self) -> None:
+        """Warmup must not consume host capacity for tensors that no longer exist."""
+        live = self.executor.make_shadow(1, torch.ones(4))
+        dead = self.executor.make_shadow(2, torch.ones(1024))
+        del dead
+        self.executor._memory_limit_bytes = 16  # pylint: disable=protected-access
+        self.executor._enforce_budget({1})  # pylint: disable=protected-access
+        self.assertEqual(self.manager.resident_bytes, 16)
+        self.assertEqual(self.manager.calls, ["release_device(2)", "release_host(2)"])
+        self.assertEqual(live.storage_id, 1)
+
+    def test_raw_input_protects_a_dead_shadow_storage(self) -> None:
+        """A raw view in the current operator still protects its tracked storage."""
+        shadow = self.executor.make_shadow(3, torch.ones(4))
+        del shadow
+        self.executor._enforce_budget({3})  # pylint: disable=protected-access
+        self.assertEqual(self.manager.calls, [])
+        self.assertEqual(self.manager.resident_bytes, 16)
 
     def test_dispatch_records_trace_op(self) -> None:
         """dispatch should record a TraceOp after execution."""
@@ -173,8 +194,7 @@ class TestWarmupExecutor(unittest.TestCase):
         # Register two storages via make_shadow
         t1 = torch.randn(100)  # 400 bytes
         t2 = torch.randn(100)  # 400 bytes
-        executor.make_shadow(1, t1)
-        executor.make_shadow(2, t2)
+        live_shadows = (executor.make_shadow(1, t1), executor.make_shadow(2, t2))
 
         # Manually set _sid_produced_at_op so _enforce_budget can find them
         executor._sid_produced_at_op[1] = 0  # pylint: disable=protected-access
@@ -185,6 +205,7 @@ class TestWarmupExecutor(unittest.TestCase):
 
         # After eviction, resident_bytes should be at or under budget
         self.assertLessEqual(manager.resident_bytes, 16)
+        self.assertEqual([shadow.storage_id for shadow in live_shadows], [1, 2])
 
     def test_enforce_budget_protects_sids_raises_when_over_budget(self) -> None:
         """When all SIDs are protected and over budget, should raise RuntimeError."""
@@ -215,8 +236,7 @@ class TestWarmupExecutor(unittest.TestCase):
 
         t1 = torch.randn(200)  # 800 bytes
         t2 = torch.randn(200)  # 800 bytes
-        executor.make_shadow(1, t1)
-        executor.make_shadow(2, t2)
+        live_shadows = (executor.make_shadow(1, t1), executor.make_shadow(2, t2))
 
         # sid 1 produced at op 5 (newer), sid 2 at op 0 (older)
         executor._sid_produced_at_op[1] = 5  # pylint: disable=protected-access
@@ -231,6 +251,7 @@ class TestWarmupExecutor(unittest.TestCase):
         # frees 800 bytes, bringing resident_bytes to 800 which is <= 900.
         self.assertIsNotNone(manager.device_resident_size(1),
                              msg="sid 1 (newer, produced_at_op=5) should NOT have been evicted")
+        self.assertEqual([shadow.storage_id for shadow in live_shadows], [1, 2])
 
     def test_dispatch_inside_opaque_region_skips_recording(self) -> None:
         """When in opaque region, dispatch should not record trace ops."""
@@ -262,7 +283,6 @@ class TestWarmupExecutor(unittest.TestCase):
 
     def test_mutated_input_detected_as_write(self) -> None:
         """An in-place op (add_) should mark its mutated input as WRITE access."""
-        from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import ActivationTracker
 
         op = torch.ops.aten.add_.Tensor
 
@@ -287,11 +307,9 @@ class TestWarmupExecutor(unittest.TestCase):
         self.executor._tracker._activation_sids.add(sid)  # pylint: disable=protected-access
 
         self.executor.dispatch(lambda x: x + 1, (t,), {})
-        guide = self.executor._guide[0]  # pylint: disable=protected-access
         # The output tensor (x+1) is a new tensor with a different storage,
         # so even though t was tracked, the output won't match._
         # To verify the binding logic, use a mock on get_activation_sid.
-        from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import ActivationTracker
         with patch.object(ActivationTracker, "get_activation_sid", return_value=99):
             self.executor2 = WarmupExecutor(
                 residency_manager=_FakeResidencyManager(),
@@ -305,7 +323,6 @@ class TestWarmupExecutor(unittest.TestCase):
 
     def test_output_binding_with_non_tensor_leaf_skipped(self) -> None:
         """Non-tensor leaves in the output should be skipped in output_bindings."""
-        from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import ActivationTracker
 
         def mixed_output(x):
             return (x + 1, "string_leaf", 42)

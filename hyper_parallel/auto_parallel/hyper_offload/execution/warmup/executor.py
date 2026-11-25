@@ -26,13 +26,14 @@ Physical state transitions are delegated to
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.utils._pytree import tree_flatten
 
 from hyper_parallel.auto_parallel.hyper_offload.execution.base import BaseExecutor
 from hyper_parallel.auto_parallel.hyper_offload.runtime.timer import DeviceTimer
+from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import ActivationTracker
 from hyper_parallel.auto_parallel.hyper_offload.ir.replay import OpGuide
 from hyper_parallel.auto_parallel.hyper_offload.ir.trace import AccessKind, ActivationTrace, StorageAccess, TraceOp
@@ -63,12 +64,15 @@ class WarmupExecutor(BaseExecutor):
         residency_manager: ResidencyManager,
         memory_limit_bytes: int,
     ) -> None:
+        """Initialize activation tracking under the device-residency budget."""
         super().__init__(residency_manager)
         self._memory_limit_bytes = memory_limit_bytes
         self._tracker = ActivationTracker()
         self._timer = DeviceTimer()
         self._guide: list[OpGuide] = []
         self._ops: list[TraceOp] = []
+        self._input_bindings = {}
+        self._framework_allocation_bytes = 0
         #: sid -> the op index that first produced this activation.
         self._sid_produced_at_op: dict[int, int] = {}
 
@@ -78,6 +82,14 @@ class WarmupExecutor(BaseExecutor):
 
     def _enforce_budget(self, protected_sids: set[int]) -> None:
         """Evict warmup activations until resident bytes fit the configured budget."""
+        # The residency table owns buffers, not tensor lifetimes. Retire dead
+        # temporaries before considering live activations for host offload.
+        for sid, shadows in tuple(self._alive_shadows.items()):
+            if not shadows and sid not in protected_sids:
+                self.residency_manager.release_device(sid)
+                self.residency_manager.release_host(sid)
+                del self._alive_shadows[sid]
+                self._sid_produced_at_op.pop(sid, None)
         while self.residency_manager.resident_bytes > self._memory_limit_bytes:
             # Greedy: evict oldest first; within the same op, evict largest first.
             victim_sid: int | None = None
@@ -119,6 +131,11 @@ class WarmupExecutor(BaseExecutor):
                 protected_sids.add(sid)
         self._enforce_budget(protected_sids)
 
+        self._input_bindings = {
+            index: value.storage_id
+            for index, value in enumerate(self._last_flat_inputs[0])
+            if isinstance(value, ShadowTensor)
+        }
         self._timer.start()
 
     def on_op_end(self, result) -> Any:
@@ -131,13 +148,7 @@ class WarmupExecutor(BaseExecutor):
 
         op = TraceOp(name=func.__name__, duration_ms=op_duration_ms)
 
-        # --- Detect mutated (write) input tensors via func._schema ---
-        mutated_tensor_ids: set[int] = set()
-        if hasattr(func, "_schema") and func._schema.is_mutable:  # pylint: disable=protected-access
-            flat_args = iter_tensors((args, {}))
-            for idx, arg_info in enumerate(func._schema.arguments):  # pylint: disable=protected-access
-                if arg_info.alias_info is not None and arg_info.alias_info.is_write and idx < len(flat_args):  # pylint: disable=protected-access
-                    mutated_tensor_ids.add(id(flat_args[idx]))
+        mutated_tensor_ids = self._mutated_tensor_ids(func, args)
 
         seen: set[tuple[int, AccessKind]] = set()
 
@@ -153,7 +164,7 @@ class WarmupExecutor(BaseExecutor):
                 op.accesses.append(StorageAccess(self.op_idx, sid, kind))
 
         # --- Output accesses + bindings ---
-        leaves, _ = tree_flatten(result)
+        leaves, output_spec = tree_flatten(result)
         output_bindings: dict[int, int] = {}
 
         for leaf_index, t in enumerate(leaves):
@@ -178,12 +189,37 @@ class WarmupExecutor(BaseExecutor):
             name=func.__name__,
             output_leaf_count=len(leaves),
             output_bindings=output_bindings,
+            input_bindings=self._input_bindings,
         )
 
         self._ops.append(op)
         self._guide.append(guide)
 
-        return self.apply_shadows(result, output_bindings)
+        return self.apply_shadows(result, output_bindings, flattened=(leaves, output_spec))
+
+    @staticmethod
+    def _mutated_tensor_ids(func: Callable, args: tuple) -> set[int]:
+        """Identify write inputs from the operator schema."""
+        mutated_tensor_ids: set[int] = set()
+        if hasattr(func, "_schema") and func._schema.is_mutable:  # pylint: disable=protected-access
+            flat_args = iter_tensors((args, {}))
+            for idx, arg_info in enumerate(func._schema.arguments):  # pylint: disable=protected-access
+                if (
+                    arg_info.alias_info is not None
+                    and arg_info.alias_info.is_write
+                    and idx < len(flat_args)
+                ):
+                    mutated_tensor_ids.add(id(flat_args[idx]))
+
+        return mutated_tensor_ids
+
+    def record_framework_allocation(self, size_bytes: int) -> None:
+        """Remember framework workspace sizes without adopting their storage.
+
+        Args:
+            size_bytes: Fresh storage allocated by one framework operation.
+        """
+        self._framework_allocation_bytes = max(self._framework_allocation_bytes, size_bytes)
 
     def finish(self) -> tuple[ActivationTrace, list[OpGuide]]:
         """Finish warmup and return recorded trace and replay guide."""
@@ -196,6 +232,7 @@ class WarmupExecutor(BaseExecutor):
             memory_limit_bytes=self._memory_limit_bytes,
             d2h_bandwidth_gbps=d2h,
             h2d_bandwidth_gbps=h2d,
+            framework_allocation_bytes=self._framework_allocation_bytes,
         )
         guide = self._guide
 
@@ -207,5 +244,7 @@ class WarmupExecutor(BaseExecutor):
         self._sid_produced_at_op.clear()
         self._ops = []
         self._guide = []
+        self._input_bindings = {}
+        self._framework_allocation_bytes = 0
         self._tracker.clear_activations()
         super().reset()

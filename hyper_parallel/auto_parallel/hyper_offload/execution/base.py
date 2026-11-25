@@ -24,7 +24,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
-from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.utils._pytree import TreeSpec, tree_flatten, tree_unflatten
 
 from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 
@@ -64,7 +64,9 @@ class OpaqueRegionEnd(torch.autograd.Function):
     """Autograd function to mark the end of an opaque region."""
 
     @staticmethod
-    def forward(ctx: Any, executor: BaseExecutor, func_name: str, dummy: torch.Tensor, *outputs: Any) -> Any:  # pylint: disable=unused-argument
+    def forward(  # pylint: disable=unused-argument
+        ctx: Any, executor: BaseExecutor, func_name: str, dummy: torch.Tensor, *outputs: Any,
+    ) -> Any:
         """Forward pass for the end boundary.
 
         Wraps raw tensors into :class:`ShadowTensor` **inside** the
@@ -109,6 +111,7 @@ class BaseExecutor(ABC):
         self,
         residency_manager: ResidencyManager,
     ) -> None:
+        """Bind residency management and initialize operator tracing state."""
         self.residency_manager = residency_manager
         #: sid -> WeakSet of alive shadows (used only for ``retained_sids``
         #: computation at the end of warmup.
@@ -120,6 +123,7 @@ class BaseExecutor(ABC):
         self._last_func = None
         self._last_args = None
         self._last_kwargs = None
+        self._last_flat_inputs = None
         # Cached by apply_shadows for use in autograd boundaries.
         self._last_output_bindings: dict[int, int] | None = None
 
@@ -200,7 +204,7 @@ class BaseExecutor(ABC):
     # Dispatch (template method)
     # ------------------------------------------------------------------
 
-    def dispatch(self, func, args, kwargs):
+    def dispatch(self, func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
         """Dispatch *func* with *args*/*kwargs*.
 
         When the executor is inside an opaque region (e.g. executing the
@@ -227,7 +231,7 @@ class BaseExecutor(ABC):
     # Lifecycle hooks
     # ------------------------------------------------------------------
 
-    def on_op_begin(self, func, args, kwargs) -> None:
+    def on_op_begin(self, func: Callable[..., Any], args: tuple, kwargs: dict) -> None:
         """Lifecycle callback before the operator is executed.
 
         Caches *func*, *args*, *kwargs* so that :meth:`on_op_end`
@@ -238,6 +242,7 @@ class BaseExecutor(ABC):
         self._last_func = func
         self._last_args = args
         self._last_kwargs = kwargs
+        self._last_flat_inputs = tree_flatten((args, kwargs))
         self.op_idx += 1
 
     @abstractmethod
@@ -257,7 +262,10 @@ class BaseExecutor(ABC):
         to avoid redundant traversal.
         """
 
-    def apply_shadows(self, result: Any, bindings: dict[int, int]) -> Any:
+    def apply_shadows(
+        self, result: Any, bindings: dict[int, int],
+        *, flattened: tuple[list, TreeSpec] | None = None,
+    ) -> Any:
         """Replace result tensors with ShadowTensor instances per an explicit bindings map.
 
         Subclasses that have already computed the ``leaf_index → sid``
@@ -272,13 +280,17 @@ class BaseExecutor(ABC):
             result: The raw output pytree.
             bindings: Mapping ``leaf_index → storage_id``.  Only leaves
                 whose index appears in the map are shadowed.
+            flattened: Reuse the current output traversal when already available.
 
         Returns:
             A pytree of the same structure as *result* with eligible
             tensors replaced by :class:`ShadowTensor`.
 
         """
-        leaves, tree_spec = tree_flatten(result)
+        self._last_output_bindings = bindings
+        if not bindings:
+            return result
+        leaves, tree_spec = flattened if flattened is not None else tree_flatten(result)
         shadowed = list(leaves)
         for idx, leaf in enumerate(leaves):
             if idx in bindings and isinstance(leaf, torch.Tensor):
@@ -327,4 +339,9 @@ class BaseExecutor(ABC):
         self._opaque_depth = 0
         self.op_idx = -1
         self._alive_shadows.clear()
+        self._last_func = None
+        self._last_args = None
+        self._last_kwargs = None
+        self._last_flat_inputs = None
+        self._last_output_bindings = None
         self.residency_manager.clear_runtime()

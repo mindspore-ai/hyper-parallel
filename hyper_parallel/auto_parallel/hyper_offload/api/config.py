@@ -17,10 +17,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from hyper_parallel.auto_parallel.hyper_offload.planning.base import ResidencyPlanner
+from hyper_parallel.auto_parallel.hyper_offload.planning.base import ResidencyPlanner
 
 
 @dataclass
@@ -31,10 +29,28 @@ class OffloadConfig:
         max_resident_activation_mb: Maximum resident activation memory on device, in MiB.
         max_offload_activation_mb:  Maximum pinned host memory for offload buffers, in MiB.
             Defaults to 65536 (64 GiB).
-        planner: Optional residency planner implementation.
+        planner: Optional residency planner implementation. Defaults to peak planning
+            with communication masking.
 
     """
 
     max_resident_activation_mb: int = 1024
     max_offload_activation_mb: int = 65536
     planner: ResidencyPlanner | None = None
+
+
+# Python 3.10+ dataclass options are absent from the gate checker's older stdlib model.
+@dataclass(kw_only=True)  # pylint: disable=unexpected-keyword-arg
+class HyperOffloadConfig(OffloadConfig):
+    """Add an opt-in Trainer switch while reusing the offload budgets."""
+
+    enable: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate budgets before training allocates model memory."""
+        if not isinstance(self.enable, bool):
+            raise TypeError("hyper_offload.enable must be a bool")
+        for name in ("max_resident_activation_mb", "max_offload_activation_mb"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"hyper_offload.{name} must be a positive integer")
