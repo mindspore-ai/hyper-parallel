@@ -35,6 +35,7 @@ __all__ = [
     "DataLoaderConfig",
     "DatasetConfig",
     "DebugConfig",
+    "EvaluationConfig",
     "FSDP2Config",
     "MemoryConfig",
     "MixedPrecisionConfig",
@@ -63,6 +64,7 @@ from hyper_parallel.trainer.config.data import (
     DatasetConfig,
     ModelAssetsConfig,
 )
+from hyper_parallel.trainer.config.tasks import EvaluationConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,

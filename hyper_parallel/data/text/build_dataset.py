@@ -82,6 +82,8 @@ def build_online_text_mapping_dataset(
     transform: Callable[[Any], Any] | None = None,
     training_config: Any = None,
     sampler_type: str = "single",
+    train_valid_test_num_samples: Sequence[int] | None = None,
+    use_training_sample_plan: bool = True,
 ) -> Any:
     """Build an Online Mapping Dataset and apply its text transform.
 
@@ -93,6 +95,11 @@ def build_online_text_mapping_dataset(
         transform: Plaintext or conversation sample transform.
         training_config: Training plan providing the random seed and split sizes.
         sampler_type: Mapping sampler policy controlling source-level shuffle.
+        train_valid_test_num_samples: Optional explicit split sizes. When given,
+            the sizes are not derived from ``training_config``, so a standalone
+            evaluation can size its data without inventing a training run.
+        use_training_sample_plan: Derive sample targets from training_config when
+            true. False selects one natural finite pass without oversampling.
 
     Returns:
         A transformed Online Dataset on each DataLoader-owning rank.
@@ -106,8 +113,10 @@ def build_online_text_mapping_dataset(
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
-    train_valid_test_num_samples = None
-    if training_config is not None:
+    # Evaluation passes explicit sizes as upper bounds; training treats them as
+    # epoch targets that may repeat source samples.
+    clamp_split_sizes = not use_training_sample_plan
+    if use_training_sample_plan and train_valid_test_num_samples is None and training_config is not None:
         train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
     sample_filter = transform.is_valid_sample
     source_dataset = build_online_mapping_source(
@@ -116,6 +125,7 @@ def build_online_text_mapping_dataset(
         sample_filter=sample_filter,
         sampler_type=sampler_type,
         train_valid_test_num_samples=train_valid_test_num_samples,
+        clamp_split_sizes=clamp_split_sizes,
     )
     text_dataset = MappingTransformDataset.apply(source_dataset, transform)
     return text_dataset

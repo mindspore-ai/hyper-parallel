@@ -51,6 +51,22 @@ TextTrainer = _load_text_trainer()
 class TestTextTrainer(unittest.TestCase):
     """Verify text training streams prepared batches into callbacks."""
 
+    def test_eval_rejects_recovery_before_initializing_recovery_or_devices(self) -> None:
+        """Reject a training-only recovery session before its constructor runs."""
+        config = SimpleNamespace(
+            run_mode="eval", optimizer=None, dataset=object(), dataloader=object(),
+            evaluation=SimpleNamespace(mode="loss", metrics=[object()], dataset=None, dataloader=None),
+            compile=SimpleNamespace(enabled=False), activation_checkpoint=None,
+            hyper_offload=SimpleNamespace(enable=False),
+            high_availability=SimpleNamespace(worker_recovery=SimpleNamespace(enable=True)),
+        )
+        with patch("hyper_parallel.trainer.runtime.worker_recovery.RecoverySession") as recovery:
+            with patch.object(BaseTrainer, "_setup") as setup:
+                with self.assertRaisesRegex(ValueError, "worker_recovery"):
+                    TextTrainer(config)
+        recovery.assert_not_called()
+        setup.assert_not_called()
+
     def test_default_loss_uses_aligned_trainer_token_count(self) -> None:
         """Feature: Packed supervision and the default loss use the same token count.
         Description: Exercise first-token-only, unshifted and empty local targets.

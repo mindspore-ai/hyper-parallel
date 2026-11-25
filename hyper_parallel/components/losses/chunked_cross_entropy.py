@@ -248,7 +248,16 @@ class ChunkedCausalLMLoss(nn.Module):
     and returns :class:`ChunkedCausalLMOutput`. This module converts the local
     summed CE to one local token mean; global DP/CP weighting remains owned by
     ``mean_global_loss``.
+
+    When the model output carries an auxiliary loss with a nonzero coefficient,
+    its weighted term is folded into the reported training objective, so the reported
+    ``foundation`` statistic is no longer a pure NLL. ``statistic_is_lm_nll``
+    declares that per call, which lets evaluation refuse perplexity instead of
+    exponentiating an aux-contaminated value.
     """
+
+    #: The returned scalar is one local mean over the valid targets.
+    loss_normalization = "token_mean"
 
     def __init__(self, chunk_size: int = 1024, ignore_index: int = -100) -> None:
         """Initialize and validate the per-rank sequence chunk options."""
@@ -257,6 +266,23 @@ class ChunkedCausalLMLoss(nn.Module):
         self.chunk_size = chunk_size
         self.ignore_index = ignore_index
         self._model_is_bound = False
+        # Whether the most recent forward folded an auxiliary term, which
+        # decides if its value may be treated as a pure NLL statistic.
+        self._folded_aux = False
+
+    def statistic_is_lm_nll(self, key: str) -> bool | None:
+        """Declare whether one loss key contains only language-model NLL.
+
+        Args:
+            key: Loss-dict key, e.g. ``foundation_loss``.
+
+        Returns:
+            ``True`` for pure foundation NLL, ``False`` when it includes an
+            auxiliary term, or ``None`` for an unknown key.
+        """
+        if key.split("_loss", maxsplit=1)[0] == "foundation":
+            return not self._folded_aux
+        return None
 
     @staticmethod
     def _parallel_size(distributed_setup: Any, name: str) -> int:
@@ -384,13 +410,15 @@ class ChunkedCausalLMLoss(nn.Module):
         denominator = valid_token_count.clamp_min(1).to(loss_sum.dtype)
         local_loss = loss_sum / denominator
         aux_loss = _get_output_value(model_output, "aux_loss")
+        self._folded_aux = False
         if aux_loss is not None:
             if not isinstance(aux_loss, torch.Tensor) or aux_loss.numel() != 1:
                 raise ValueError("ChunkedCausalLMLoss aux_loss must be a scalar Tensor")
             aux_loss_coef = _get_output_value(model_output, "aux_loss_coef")
-            local_loss = local_loss + float(
-                0.0 if aux_loss_coef is None else aux_loss_coef
-            ) * aux_loss
+            coefficient = float(0.0 if aux_loss_coef is None else aux_loss_coef)
+            self._folded_aux = coefficient != 0.0
+            if self._folded_aux:
+                local_loss = local_loss + coefficient * aux_loss
         return torch.where(
             valid_token_count.ne(0),
             local_loss,
