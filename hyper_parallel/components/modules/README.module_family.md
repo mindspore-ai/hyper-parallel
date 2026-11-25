@@ -119,7 +119,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from hyper_parallel.components.modules.family import (
+from hyper_parallel.components.modules.module_family import (
     ModuleFamily,
     SelectorSpec,
     VariantRule,
@@ -200,7 +200,7 @@ plan_overrides:
 
 | 位置 | 职责 |
 | --- | --- |
-| [family.py](family.py) | 注册、白名单匹配与构造参数检查 |
+| [module_family.py](module_family.py) | 注册、白名单匹配、构造参数检查与成员构建 |
 | [grouped_experts.py](grouped_experts.py) | 内置 Family 登记、参数与路由契约 |
 | [mxfp8_grouped_swiglu.py](mxfp8_grouped_swiglu.py) | 两种低精模块的本地计算 |
 | [trainer/config/replacement.py](../../trainer/config/replacement.py) | 选型配置、复制与序列化 |

@@ -41,7 +41,7 @@ from hyper_parallel.trainer.config.optimization import (
     OptimizerSwapConfig,
 )
 from hyper_parallel.trainer.config.target import Target
-from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.components.modules.module_family import get_module_family
 from hyper_parallel.trainer.config.replacement import ReplacementTarget
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 

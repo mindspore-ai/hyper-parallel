@@ -20,8 +20,13 @@ from collections.abc import Mapping
 from typing import Any
 
 from torch import nn
-from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
-from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
+from hyper_parallel.components.modules.module_family import (
+    ModuleFamily,
+    SelectorSpec,
+    VariantRule,
+    build_family,
+    register_module_family,
+)
 from hyper_parallel.models.replacement import module_replacement
 
 

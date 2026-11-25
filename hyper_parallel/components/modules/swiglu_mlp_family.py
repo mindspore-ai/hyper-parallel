@@ -31,8 +31,13 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
-from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
+from hyper_parallel.components.modules.module_family import (
+    ModuleFamily,
+    SelectorSpec,
+    VariantRule,
+    build_family,
+    register_module_family,
+)
 
 
 def _validate_mlp_config(config: Any) -> None:

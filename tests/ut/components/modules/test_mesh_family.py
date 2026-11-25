@@ -25,7 +25,7 @@ from examples.torch.module_family import CausalAttention, DecoderConfig, FamilyD
 from examples.torch.module_family.attention.cp_attention import CPCausalAttention
 from examples.torch.module_family.grouped_experts.ep_grouped_experts import EPGroupedExperts
 from examples.torch.module_family.model import MODEL_SPEC
-from hyper_parallel.components.modules import family as registry
+from hyper_parallel.components.modules import module_family as registry
 from hyper_parallel.components.modules.module_family import FamilyRequest, get_family_build_info
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache, init_device_mesh
 from hyper_parallel.distributed import ShardingPlanner, apply_sharding_plan

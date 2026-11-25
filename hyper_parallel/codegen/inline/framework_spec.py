@@ -52,7 +52,7 @@ import inspect
 import textwrap
 from typing import Any, Callable, cast
 
-from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.components.modules.module_family import get_module_family
 
 from hyper_parallel.codegen.inline.component_source import render_component_source
 from hyper_parallel.codegen.inline.ir import (

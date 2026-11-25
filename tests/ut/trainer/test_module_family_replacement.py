@@ -24,9 +24,14 @@ import torch
 import yaml
 from torch import nn
 
-from hyper_parallel.components.modules import family as registry
+from hyper_parallel.components.modules import module_family as registry
 from hyper_parallel.auto_parallel._layer_census import replacement_specs
-from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
+from hyper_parallel.components.modules.module_family import (
+    ModuleFamily,
+    SelectorSpec,
+    VariantRule,
+    register_module_family,
+)
 from hyper_parallel.components.modules.mhc.mhc_family import MHCPost, PipelinedMhc
 from hyper_parallel.components.modules.mhc import MhcPostModule, PipelinedMhcModule
 from hyper_parallel.distributed.mesh import DistributedSetup

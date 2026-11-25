@@ -27,9 +27,8 @@ import torch
 from torch import nn
 from transformers import BertConfig
 
-from hyper_parallel.components.modules import family as family_registry
-from hyper_parallel.components.modules.family import VariantRule
-from hyper_parallel.components.modules.module_family import get_family_build_info
+from hyper_parallel.components.modules import module_family as family_registry
+from hyper_parallel.components.modules.module_family import VariantRule, get_family_build_info
 from hyper_parallel.models import HyperAutoModelForCausalLM, HyperAutoModelForSequenceClassification, registry
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.build_context import collect_module_contexts

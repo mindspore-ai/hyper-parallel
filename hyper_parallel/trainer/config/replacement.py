@@ -18,15 +18,16 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from hyper_parallel.components.modules.family import (
+from hyper_parallel.components.modules.module_family import (
+    FamilyRequest,
     SelectorSpec,
+    build_family,
     get_family_selector_specs,
     get_module_family,
     normalize_family_selectors,
     resolve_module_family_target,
 )
 from hyper_parallel.components.quantization.config import LowPrecisionDtypeScheme
-from hyper_parallel.components.modules.module_family import FamilyRequest, build_family
 from hyper_parallel.trainer.config.target import Target, _build_nested_targets
 
 

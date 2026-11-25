@@ -44,7 +44,7 @@ from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
 from hyper_parallel.codegen.emit.modeling import verify_recorded_patch_bundle
 from hyper_parallel.distributed.recipe_spec import inner_wrapper, ModuleShardingSpec
 from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
-from hyper_parallel.components.modules import family as registry
+from hyper_parallel.components.modules import module_family as registry
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.models import HyperAutoModelForCausalLM, module_build

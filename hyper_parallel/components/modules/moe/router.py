@@ -27,8 +27,13 @@ from torch.nn import functional as F
 from hyper_parallel.components.checkpoint.weight_conversion import ConversionOps, WeightConverter, WeightRenaming
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.losses.moe_aux_loss import sequence_load_balancing_loss
-from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
-from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
+from hyper_parallel.components.modules.module_family import (
+    ModuleFamily,
+    SelectorSpec,
+    VariantRule,
+    build_family,
+    register_module_family,
+)
 from hyper_parallel.components.modules.moe.moe_utils import (
     accumulate_router_load, local_router_metadata, router_sharding,
     update_router_bias, validate_router_layout,
