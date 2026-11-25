@@ -23,28 +23,6 @@ import sys
 
 import pytest
 
-from hyper_parallel.trainer import config as trainer_config
-
-
-_ACTIVATION_CHECKPOINT_CONFIG = trainer_config.ActivationCheckpointConfig
-
-
-def _activation_checkpoint_config_compat(*args, **kwargs):
-    """Fill replacement-schema sections for the unadapted RL resolver."""
-    mode = kwargs.get("mode", args[0] if args else None)
-    if mode in ("full", "hybrid") and len(args) < 2 and kwargs.get("full") is None:
-        kwargs["full"] = trainer_config.FullCheckpointConfig(recompute_layer=[0])
-    if mode in ("selective", "hybrid") and len(args) < 3 and kwargs.get("selective") is None:
-        selective_layer = 1 if mode == "hybrid" else 0
-        kwargs["selective"] = trainer_config.SelectiveCheckpointConfig(
-            recompute={"rl_ut_placeholder": [selective_layer]}
-        )
-    return _ACTIVATION_CHECKPOINT_CONFIG(*args, **kwargs)
-
-
-trainer_config.ActivationCheckpointConfig = _activation_checkpoint_config_compat
-
-
 # ``rl`` is an independent source root rather than an installed subpackage.
 # CI deploys the wheel separately from the test archive. Resolve the active package.
 _RL_SOURCE_ROOT = Path(find_spec("hyper_parallel").origin).parent / "rl"

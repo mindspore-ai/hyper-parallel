@@ -64,7 +64,7 @@ python3 examples/search_r1/launcher.py --devices 0,1,2,3,4,5,6,7 --steps 2 \
 ```
 
 启动器及`scripts/run_search_r1.sh DEVICE_IDS STEPS DATA_DIRECTORY --model MODEL_DIRECTORY`支持末尾YAML覆盖。
-启动时复用RL插件安装和已接受的采样器stream修补、DP协调器冷启动超时修补；依赖不匹配则失败。
+启动脚本在容器内安装 RL 插件并校验 vLLM 运行环境。
 本次不会覆盖已有实验目录；`container.json`记录实际训练容器ID，供宿主监控识别设备进程归属。
 `--backend-privileged`只用于可信训练后端，不用于Codex候选容器。
 训练HCCL端口为`62800-62900`，vLLM为`62600-62799`；设备检查与占用监控仍由实验运行环境负责。

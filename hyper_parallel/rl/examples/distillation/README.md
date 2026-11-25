@@ -64,7 +64,7 @@ to match the native HF initialization formula. Recomputing frequencies directly 
 that may change BF16 cos/sin at larger positions.
 Registration occurs before sharding and `to_empty`, covering checkpoint loading and random initialization. Repeated registration does not modify public classes or other instances.
 No changes to `hyper_parallel/core` or `hyper_parallel/models` are required.
-Instance-isolation and HF RoPE comparisons are in [RL materialization tests](../../tests/ut/test_materialization.py).
+Instance-isolation and HF RoPE comparisons are in [RL materialization tests](../../../../tests/ut/rl/trainer/test_materialization.py).
 The distillation examples use native-vLLM and record rollout probabilities separately from training-side recomputation. The old bit-exact gate has been removed; teacher-probability validity checks still block invalid updates and publication.
 Successful replay does not replace training, publication, and checkpoint acceptance. The lower-resource single-rank recipe is the default.
 
@@ -151,7 +151,7 @@ See official model descriptions for [Qwen3-14B](https://huggingface.co/Qwen/Qwen
 
 ## Validation and Recovery
 
-`PYTHONPATH=hyper_parallel/rl python -m pytest -q hyper_parallel/rl/tests/ut/test_materialization.py`
+`PYTHONPATH=hyper_parallel/rl python -m pytest -q tests/ut/rl/trainer/test_materialization.py`
 checks native HF frequencies, cos/sin, repeated materialization, and instance isolation.
 
 ```bash

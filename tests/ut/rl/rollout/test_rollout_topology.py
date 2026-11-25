@@ -105,7 +105,7 @@ def test_rollout_topology_rejects_invalid_ports(port: object) -> None:
         ({}, {"LOCAL_WORLD_SIZE": "4"}, "must match the Trainer world"),
         ({}, {"ASCEND_RT_VISIBLE_DEVICES": "0"}, "one visible NPU per trainer rank"),
         ({"visible_devices": "0,1"}, {}, "derives its physical NPUs"),
-        ({"deployment": "disjoint", "visible_devices": "4"}, {}, "DP x TP devices"),
+        ({"deployment": "disjoint", "visible_devices": "4"}, {}, "DP x PCP x TP devices"),
     ],
 )
 def test_rollout_topology_rejects_inconsistent_endpoint_or_world(
@@ -125,3 +125,13 @@ def test_rollout_topology_preserves_noncontiguous_device_order() -> None:
     assert topology.visible_devices == ("7", "3"), (
         f"Expected physical device order=('7', '3'), got={topology.visible_devices}"
     )
+
+
+@pytest.mark.parametrize("implementation", ["native", "unified"])
+@pytest.mark.parametrize("field", ["decode_context_parallel_size", "pipeline_parallel_size"])
+def test_rollout_topology_rejects_unintegrated_parallel_axes(implementation: str, field: str) -> None:
+    """Neither model selection may silently create an unsupported worker layout."""
+    config = {"deployment": "colocated", "model_implementation": implementation,
+              "data_parallel_size": 1, "tensor_parallel_size": 2, "port": 8200, field: 2}
+    with pytest.raises(ValueError, match=f"{field} must be 1"):
+        resolve_vllm_rollout_topology(config, {})

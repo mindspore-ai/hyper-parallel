@@ -26,7 +26,8 @@ communication, execution-service, and unknown errors must propagate, never silen
 
 Rollout Router Replay (R3) records sampled expert choices and replays them during Actor probability computation, training forward,
 and activation-checkpoint backward recomputation. Discrete expert IDs are replayed; weights are still computed from current router probabilities,
-with router/expert gradients participating normally in updates. Reference retains native routing, and `old_log_probs` retains original rollout values.
+with router/expert gradients participating normally in updates. Reference retains native routing. Sampling probabilities are retained in
+`rollout_log_probs`. The training anchor `old_log_probs` follows `train.old_log_prob_source`.
 
 R3 data transport and micro-batch scopes are generic RL capabilities, independent of datasets, reward rules, and agent call budgets.
 Only the Qwen3-MoE gate interface is currently adapted; arbitrary MoE models cannot enable it directly.
@@ -60,15 +61,13 @@ The recipe presets training TP2/EP2/EDP2 and rollout TP4/DP1; R3 remains off by 
 Enabling R3 does not adjust candidate counts, tool calls, context, generation budgets, evaluation, or saving.
 Do not configure `enable_return_routed_experts` separately; if set manually, it must agree with the R3 switch.
 
-The pinned environment is Transformers 5.5.4 and vLLM 0.23.0 / vLLM-Ascend 0.23.0.post1.
-The adapter distinguishes probability returns before Transformers 5.6 from logits returns starting at 5.6, preserving the native gate output contract.
-Changing Transformers still requires adapter and full-training validation; matching class names are insufficient. The pinned real-device environment remains unchanged.
-Current requirements:
+R3 uses colocated native vLLM, `raw_logprobs`, training CP=PP=1 and disabled EPLB.
+The adapter preserves the Transformers gate return contract, with probabilities before 5.6 and logits from 5.6 onward. Rollout settings depend on the image.
 
-- `model_implementation: native`, `deployment: colocated`, `enforce_eager: true`, `logprobs_mode: raw_logprobs`.
-- Disable EPLB and omit the removed consistency field; training CP=PP=1.
-- Rollout `data_parallel_size: 1`, with TP spanning the shared devices. This limitation comes from the Ascend capture DP-padding layout,
-  not training DP. When enabling R3 from the single-turn MoE recipe, also change rollout DP2/TP2 to DP1/TP4.
+- vLLM / vLLM-Ascend 0.30.0 uses model runner V2 to capture routes per DP replica. In the 16-NPU native GSM8K recipe,
+  set `--train.router_replay.mode=R3` to enable replay with TP2, multiple DP replicas and `FULL_DECODE_ONLY`. Set it to `disabled` to turn replay off.
+- With vLLM 0.23.0 / vLLM-Ascend 0.23.0.post1, capture requires rollout DP1 and `enforce_eager: true`, with TP spanning the colocated devices.
+  The four-device Codex recipe above uses this path and was validated with Transformers 5.5.4.
 
 Initialization threads and sleep level are independent: `--train.model_init_cpu_threads=8` temporarily changes only model-construction
 intra-op threads. `--rollout.vllm.sleep_level=2` discards old inference weights to reduce CPU memory,

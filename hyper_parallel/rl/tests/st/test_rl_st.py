@@ -18,7 +18,8 @@ import pytest
 
 from tests.common.mark_utils import arg_mark
 
-from .st_runtime import CASES, Case, run_case
+from .st_cases import CASES, Case
+from .st_runtime import run_case
 
 
 @arg_mark(

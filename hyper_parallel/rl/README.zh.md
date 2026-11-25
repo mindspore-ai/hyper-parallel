@@ -124,14 +124,6 @@ npu-smi info
 
 ## 🚀 快速开始
 
-八卡单轮GSM8K完整训练默认使用[50步配方与直接运行命令](examples/gsm8k/README.zh.md#运行训练)。
-相同6400训练题、500验证题、128题×8候选/步；默认开启生成阶段卸载及0.8/256推理加速。
-最新8×32GiB单轮/Codex均完成50步，严格验证reward分别为94.4%/93.0%。
-历史8×64GiB verl为91.4%，早于采样修复且硬件/运行时不同，不能据此归因同配置性能差异。
-训练配方及启动命令见[GSM8K 示例](examples/gsm8k/README.zh.md#训练配方)；当前32GiB verl固化配方仍缺完整验收。
-
-以下单步入口用于功能检查，保持各自设备数和短程预算。
-
 完成[环境准备](#安装与环境)后，从仓库根目录运行以下任一示例。替换宿主机路径，使用完整 Qwen3-4B checkpoint 与 tokenizer，并通过 `npu-smi info` 选择空闲、健康的设备；共用设备时依次运行。
 
 <!-- markdownlint-disable-next-line MD033 -->
@@ -139,21 +131,9 @@ npu-smi info
 
 ### 示例一：Qwen 基础训练
 
-**Qwen3-4B + GSM8K，四卡单步同步 GRPO。** 数据目录需包含 `train.parquet`、`test.parquet`，每行使用 `prompt` 和 `extra_info` 列；`extra_info` 提供答案，具体解析规则见[数据读取实现](rl/data/prompts.py)。
-
-```bash
-export HYPER_QWEN3_TP_MODEL_ROOT=/absolute/path/to/Qwen3-4B
-export HYPER_QWEN3_TP_DATA_ROOT=/absolute/path/to/gsm8k
-export HYPER_QWEN3_TP_RESULT_ROOT=/absolute/path/to/results/qwen
-export HYPER_QWEN3_TP_VISIBLE_DEVICES=0,1,2,3
-export HYPER_QWEN3_TP_TRAINER_TP=2
-export HYPER_QWEN3_TP_ROLLOUT_TP=2
-export HYPER_QWEN3_TP_MAX_STEPS=1
-export HYPER_QWEN3_TP_IMPLEMENTATION=native
-export HYPER_QWEN3_TP_WEIGHT_SYNC_STRATEGY=full_gather
-
-./hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_tp_docker.sh colocated
-```
+[Qwen3-4B GSM8K 示例](examples/gsm8k/README.zh.md#运行训练)提供 native 和 unified 八卡 GRPO 启动命令。两组均使用 6,400 道训练题，每步 128 题 × 8 个回答，在 500 道验证题上评估。第 50 步 native 为 94.4%，unified 为 93.0%。逐步曲线和性能口径见[实测结果](examples/gsm8k/README.zh.md#50-步结果)。
+早期的独立 Codex 运行达到 93.0%。历史 verl 使用当时的运行栈，在 8×64 GiB 上达到 91.4%。32 GiB verl 配方仍待完整验收。
+单步功能检查可在任一启动命令后追加 `--train.max_steps=1`。
 
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="agentic-example"></a>
@@ -339,14 +319,13 @@ Qwen3-MoE 的具体配置与同步边界见 [vLLM Rollout](docs/vllm_rollout.zh.
 ## 系统测试
 
 RL ST 位于 `hyper_parallel/rl/tests/st/`，暂不由主项目 `tests/torch/` 门禁收集。
-保留六个真实 NPU 场景及原有验收条件；主项目门禁通过不代表这些场景已执行。
-共享配方仍位于 `tests/common/rl_st_cases.py`，供 UT 和独立 ST 使用。
+用例配方、启动器和结果校验均与系统测试放在同一目录。可从完整仓库显式运行下面的 CPU 自检。
 
 以下命令从仓库根目录执行：
 
 ```bash
 # CPU 自检：不启动模型训练或 NPU 作业
-python -m pytest -q hyper_parallel/rl/tests/st/test_st_runtime.py hyper_parallel/rl/tests/st/test_st_support.py
+python -m pytest -q tests/ut/rl/utils/st_harness_checks.py
 
 # 手动执行真实 ST：仅在资源准备完毕后运行
 python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
@@ -417,9 +396,6 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 See [runtime architecture](docs/architecture.zh.md#rayless-asynchronous-grpo) for the
 single-node Qwen3 dense scope, launch entry, publication and recovery contracts.
 GSM8K, Search and SWE-Smith recipes live in `examples/fully_async/configs/`.
-The core contains five files, with a 1100 physical-line budget checked by
-`python -m pytest hyper_parallel/rl/tests/st/test_async_core_budget.py -q`.
-Shared helpers, examples and tests are counted separately. The synchronous loop remains independent.
 
 ## 共卡异步 GRPO
 

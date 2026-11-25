@@ -504,6 +504,18 @@ def test_shared_server_builds_command_and_isolated_environment(
     assert "RANK" not in environment
 
 
+def test_server_cpu_threads_are_isolated_from_training(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A launcher budget for CPU Adam must not multiply into every inference worker."""
+    engine = VLLMGenerationEngine(config={"deployment": "colocated"}, model=_model())
+    monkeypatch.setenv("OMP_NUM_THREADS", "14")
+    monkeypatch.setenv("MKL_NUM_THREADS", "14")
+    monkeypatch.setenv("HYPER_RL_VLLM_CPU_THREADS", "2")
+    environment = engine._server_environment("0,1")
+    assert environment["OMP_NUM_THREADS"] == "2", f"unexpected inference threads: {environment['OMP_NUM_THREADS']}"
+    assert environment["MKL_NUM_THREADS"] == "2", f"unexpected inference threads: {environment['MKL_NUM_THREADS']}"
+    assert os.environ["OMP_NUM_THREADS"] == "14", f"training threads changed: {os.environ['OMP_NUM_THREADS']}"
+
+
 def test_engine_computes_child_capacity_and_inprocess_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -916,6 +928,7 @@ def test_http_generate_tokens_routes_unseeded_and_batch_invariant_parents(
 def test_engine_exposes_weight_sync_strategy_and_streaming_stats() -> None:
     """Rollout forwards the retained publication status."""
     engine = object.__new__(VLLMGenerationEngine)
+    engine._unified_execution = None
     engine._weight_sync = SimpleNamespace(
         configured_strategy="full_gather",
         last_strategy="full_gather",

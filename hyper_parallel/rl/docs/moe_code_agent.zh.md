@@ -23,7 +23,8 @@ MoE 不支持 PPO、disjoint rollout 或 Hyper-vLLM。R3 尚未适配 DeepSeek r
 
 Rollout Router Replay（R3）记录采样时的 expert 选择，在 Actor 的概率计算、训练前向和
 activation checkpoint 反向重算时重放。重放的是离散 expert ID；权重仍根据当前 router 概率
-计算，router 和 expert 梯度正常参与更新。Reference 保持原生路由，`old_log_probs` 保留 rollout 原始值。
+计算，router 和 expert 梯度正常参与更新。Reference 保持原生路由。采样概率保存在 `rollout_log_probs`，
+训练锚点 `old_log_probs` 由 `train.old_log_prob_source` 决定。
 
 R3 的数据传递与微批作用域属于通用 RL 功能，与数据集、奖励规则和 Agent 调用预算独立。
 当前只有 Qwen3-MoE 的 gate 接口适配，并不表示任意 MoE 模型都可直接启用。
@@ -57,15 +58,12 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
 开启 R3 不会调整候选数、工具调用次数、上下文、生成预算、评测或保存设置。
 无需单独配置 `enable_return_routed_experts`；若手动设置，必须与 R3 开关一致。
 
-固定运行环境为 Transformers 5.5.4、vLLM 0.23.0 / vLLM-Ascend 0.23.0.post1。
-适配器区分 Transformers 5.6 前的概率返回值与 5.6 起的 logits 返回值，保留原生 gate 输出契约。
-更换 Transformers 版本仍须验证适配器及完整训练流程，不能仅依赖同名类；固定真机验证环境不变。
-当前要求：
+R3 使用共卡 native vLLM、`raw_logprobs`、训练 CP=PP=1，EPLB 关闭。路由适配器按 Transformers 的 gate 接口区分 5.6 前的概率返回值与 5.6 起的 logits 返回值。Rollout 配置取决于镜像。
 
-- `model_implementation: native`、`deployment: colocated`、`enforce_eager: true`、`logprobs_mode: raw_logprobs`。
-- 关闭 EPLB，不设置已删除的 consistency 字段；训练 CP=PP=1。
-- rollout `data_parallel_size: 1`，TP 覆盖共用设备；此限制来自该 Ascend capture 的 DP padding 布局，
-  不限制训练 DP。若从单轮 MoE 配方启用 R3，须同时将其 rollout DP2/TP2 改为 DP1/TP4。
+- vLLM / vLLM-Ascend 0.30.0 使用 V2 model runner 采集各 DP 副本的路由。16 卡 GSM8K 的 native 配方可通过
+  `--train.router_replay.mode=R3` 开启，保留 TP2、多 DP 和 `FULL_DECODE_ONLY`。设为 `disabled` 即关闭。
+- vLLM 0.23.0 / vLLM-Ascend 0.23.0.post1 的 capture 要求 rollout DP1、`enforce_eager: true`，TP 覆盖共用设备。
+  上述四卡 Codex 配方使用这条路径，历史验证使用 Transformers 5.5.4。
 
 初始化线程与睡眠级别可独立选择：`--train.model_init_cpu_threads=8` 仅临时调整模型构建的
 intra-op 线程；`--rollout.vllm.sleep_level=2` 丢弃旧推理权重以降低 CPU 内存占用，

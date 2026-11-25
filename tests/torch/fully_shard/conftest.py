@@ -17,10 +17,10 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def cleanup_all_gather_process_group(request):
-    """Release the all-gather worker's process groups before interpreter exit."""
+def cleanup_hsdp_worker_process_group(request):
+    """Release HSDP worker process groups before interpreter exit."""
     yield
-    if request.node.name != "test_hsdp_param_v2_all_gather_comm":
+    if request.path.name != "_test_hsdp_param.py":
         return
     # This conftest is also loaded by the lightweight launcher process.
     import torch.distributed as dist  # pylint: disable=import-outside-toplevel

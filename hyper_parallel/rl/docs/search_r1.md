@@ -64,7 +64,7 @@ python3 examples/search_r1/launcher.py --devices 0,1,2,3,4,5,6,7 --steps 2 \
 ```
 
 The launcher and `scripts/run_search_r1.sh DEVICE_IDS STEPS DATA_DIRECTORY --model MODEL_DIRECTORY` accept trailing YAML overrides.
-Startup reuses RL plugin installation and the accepted sampler stream fix and DP coordinator cold-start timeout patch; mismatched dependencies fail.
+The startup script installs the RL plugin and checks the vLLM runtime inside the container.
 Existing experiment directories are not overwritten. `container.json` records the actual training container ID so host monitoring can identify ownership of device processes.
 `--backend-privileged` applies only to the trusted training backend, never to Codex candidate containers.
 Training HCCL uses ports `62800-62900`; vLLM uses `62600-62799`. The experiment environment still owns device checks and utilization monitoring.

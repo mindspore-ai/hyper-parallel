@@ -68,7 +68,7 @@ class TestTokenLogProbs(unittest.TestCase):
                 result = build_role_model(runtime, setup, frozen=frozen)
                 self.assertIs(result, model)
                 target.build.assert_called_once_with(
-                    distributed_setup=setup, activation_checkpoint="full", peft_config=None,
+                    distributed_setup=setup, activation_checkpoint=runtime.activation_checkpoint, peft_config=None,
                 )
                 self.assertTrue(model.supports_token_log_probs)
                 self.assertTrue(all(left is right for left, right in zip(parameters, model.parameters())))

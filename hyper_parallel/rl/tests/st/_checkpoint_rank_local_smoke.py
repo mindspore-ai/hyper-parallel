@@ -24,12 +24,12 @@ from rl.trainer.checkpoint import CheckpointResources, RLCheckpointManager
 from rl.trainer.distributed import run_synchronized
 
 class Loader:
-    def __init__(self, rank):
-        self.position = rank + 7
+    def __init__(self, rank_id):
+        self.position = rank_id + 7
     def state_dict(self):
         return {"position": self.position}
-    def load_state_dict(self, value):
-        self.position = value["position"]
+    def load_state_dict(self, loaded_state):
+        self.position = loaded_state["position"]
 
 dist.init_process_group("gloo", timeout=timedelta(seconds=90))
 rank = dist.get_rank()
@@ -86,5 +86,5 @@ dist.all_gather_object(receipts, {"rank": rank, "passed": True, "optimizer_momen
 if rank == 0:
     assert receipts[0]["optimizer_moment"] != receipts[1]["optimizer_moment"]
     (root / "passed.json").write_text(json.dumps({"world_size": 2, "passed": True, "ranks": receipts}, indent=2))
-    print("Two-rank sequential save and full model/optimizer/RNG/dataloader resume passed.", flush=True)
+    print("Two-rank parallel save and full model/optimizer/RNG/dataloader resume passed.", flush=True)
 dist.destroy_process_group()

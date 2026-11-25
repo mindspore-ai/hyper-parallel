@@ -17,6 +17,7 @@
 import base64
 import binascii
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 import io
 import json
 from pathlib import Path
@@ -28,6 +29,14 @@ import torch
 from rl.data.contracts import RouterTrace
 
 _NPY_HEADER_LIMIT = 1024
+
+
+def uses_v2_router_capture() -> bool:
+    """The 0.30 Ascend runtime captures padded DP batches on model runner V2."""
+    try:
+        return version("vllm-ascend").split("+", 1)[0] == "0.30.0"
+    except PackageNotFoundError:
+        return False
 
 
 def _is_integer(value: Any) -> bool:
@@ -76,10 +85,10 @@ def _load_router_array(binary: bytes, token_count: int, spec: RouterCaptureSpec)
     """Validate the NPY header and byte count before loading bounded expert IDs."""
     source = io.BytesIO(binary)
     try:
-        version = np.lib.format.read_magic(source)
-        if version == (1, 0):
+        npy_version = np.lib.format.read_magic(source)
+        if npy_version == (1, 0):
             shape, _, dtype = np.lib.format.read_array_header_1_0(source, max_header_size=_NPY_HEADER_LIMIT)
-        elif version == (2, 0):
+        elif npy_version == (2, 0):
             shape, _, dtype = np.lib.format.read_array_header_2_0(source, max_header_size=_NPY_HEADER_LIMIT)
         else:
             raise ValueError("unsupported router capture NPY version")

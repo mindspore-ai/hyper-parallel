@@ -122,11 +122,7 @@ docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}} {{json .RepoDig
 容器入口加载 CANN，启动脚本调用 `docker/install_runtime.sh` 安装 RL 包并注册 vLLM 插件。
 手动 `docker exec` 或覆盖 `PYTHONPATH` 后，须在启动模型的同一 shell 中重新执行
 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`，保留 CANN Python 路径，确保 `import acl` 可用。
-`docker/patches/patch_sampler.py` 为已验证的 vLLM-Ascend 版本应用采样张量的 `record_stream` 修补，
-校验修改前后源码哈希、支持重复执行并记录结果，未知版本拒绝修改。GSM8K 启动器在容器内调用该工具。
-
-`docker/patches/vllm-dp-coordinator-timeout.patch` 将 vLLM DP Coordinator 的启动等待时间从 30 秒延长到 120 秒；
-GSM8K 的 TP 启动脚本会在容器中应用它。更新 vLLM 后应先确认补丁仍适用。
+GSM8K 八卡启动器会在容器内配置 native vLLM-Ascend 0.23 运行环境。
 具体运行步骤见 [Hyper-RL README](../README.zh.md)，系统测试见 [ST 指南](../README.zh.md#系统测试)。
 需要自定义镜像时，保留各启动脚本的 `HYPER_*_IMAGE` 和测试的 `RL_ST_*_IMAGE` 覆盖方式。
 

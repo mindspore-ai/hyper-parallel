@@ -283,7 +283,7 @@ agentic:
 
 仓库中的 [GSM8K 环境](../examples/gsm8k/agent.py)提供单轮问答和组合 calculator 的多轮任务，
 两条路径都通过同一个 `ENVIRONMENTS` registry 接入 Trainer。上面的 YAML 是 `agentic` 片段；
-基础训练配置见 [GRPO 基础配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml)和
+基础训练配置见 [GRPO 基础配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_native_50step.yaml)和
 [多轮配置](../examples/gsm8k/README.zh.md#奖励与-agent-交互)，训练入口为 [train_rl.py](../train_rl.py)。
 
 ### GSM8K 数值奖励
