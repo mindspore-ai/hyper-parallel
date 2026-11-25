@@ -30,8 +30,9 @@ from hyper_parallel.components.functional.lightning_indexer import (
 )
 from hyper_parallel.components.functional.sparse_flash_mla import (
     _attention_metadata, _SparseFlashMla, _load_attention_ops,
-    _device_lengths, csa_tnd_plan, pack_ranges,
+    csa_tnd_plan, pack_ranges,
 )
+from hyper_parallel.components.functional.sparse_attention_layout import _device_lengths
 from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad import (
     _SparseLightningIndexerKLLoss, _load_kl_ops, _stable_prediction_log, _teacher_bank, causal_attention_teacher,
     compressed_attention_teacher, gather_selected_keys, gather_selected_keys_fp32,

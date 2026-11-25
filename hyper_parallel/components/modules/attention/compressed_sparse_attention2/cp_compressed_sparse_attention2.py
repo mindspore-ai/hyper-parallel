@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import torch.distributed._functional_collectives as funcol
 
+import hyper_parallel.components.ops as local_ops
 from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
@@ -215,7 +216,7 @@ class _CPIndexer(CSA2Indexer):
         """Consume worker Q once and launch the inverse ID transfer."""
         query, weights, wave = prepared
         selected = self._select_indices(query, key, weights, None, 0, None, None, wave.route.segments)[0]
-        return wave.launch_result(selected[0])
+        return wave.launch_result(selected[0], restore_op=local_ops.prepare_indexer_topk_restore(selected[0]))
 
     @staticmethod
     @torch.no_grad()

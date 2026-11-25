@@ -14,11 +14,14 @@
 # ============================================================================
 """DSA sparse-attention indexer."""
 
+from __future__ import annotations
+
 from typing import Tuple
 
 import torch
 from einops import rearrange
 
+from hyper_parallel.components.functional.lightning_indexer import packed_lightning_indexer
 from hyper_parallel.tools.logging import get_logger
 
 logger = get_logger()
@@ -33,34 +36,40 @@ def _cann_lightning_indexer(
     sparse_count: int,
 ) -> torch.Tensor:
     """Call the ops-transformer LightningIndexer V2 with TND metadata."""
-    cu_q = torch.cat((actual_seq_qlen.new_zeros(1), actual_seq_qlen))
-    cu_k = torch.cat((actual_seq_klen.new_zeros(1), actual_seq_klen))
-    kwargs = {
-        "cu_seqlens_q": cu_q,
-        "cu_seqlens_k": cu_k,
-        "layout_q": "TND",
-        "layout_k": "TND",
-        "mask_mode": 3,
-        "cmp_ratio": 1,
-        "return_value": 0,
-    }
     # The package is optional and is needed only for this selected CANN path.
     from cann_ops_transformer.ops import (  # pylint: disable=import-outside-toplevel
-        lightning_indexer,
-        lightning_indexer_metadata,
+        lightning_indexer, lightning_indexer_metadata,
     )
 
-    kwargs["metadata"] = lightning_indexer_metadata(
+    cu_q = torch.cat((actual_seq_qlen.new_zeros(1), actual_seq_qlen))
+    cu_k = torch.cat((actual_seq_klen.new_zeros(1), actual_seq_klen))
+    metadata = lightning_indexer_metadata(
         query.shape[-2], key.shape[-2], query.shape[-1], sparse_count,
         cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, batch_size=cu_q.numel() - 1,
         max_seqlen_q=int((cu_q[1:] - cu_q[:-1]).max().item()),
         max_seqlen_k=int((cu_k[1:] - cu_k[:-1]).max().item()),
         layout_q="TND", layout_k="TND", mask_mode=3, cmp_ratio=1,
     )
+    kwargs = {"cu_seqlens_q": cu_q, "cu_seqlens_k": cu_k, "metadata": metadata,
+              "layout_q": "TND", "layout_k": "TND", "mask_mode": 3, "cmp_ratio": 1, "return_value": 0}
     indices, _ = lightning_indexer(
         query.contiguous(), key.contiguous(), weights.float().contiguous(), sparse_count, **kwargs,
     )
     return indices
+
+
+
+def _host_segments(host_lengths: tuple, query_rows: int, key_rows: int) -> tuple:
+    """Validate host endpoints and describe the corresponding native causal segments."""
+    q_ends, k_ends = (tuple(ends) for ends in host_lengths)
+    if (not q_ends or len(q_ends) != len(k_ends)
+            or q_ends[-1] != query_rows or k_ends[-1] != key_rows
+            or any(end <= start for ends in (q_ends, k_ends)
+                   for start, end in zip((0, *ends[:-1]), ends))):
+        raise ValueError("DSA host lengths must be positive paired cumulative ends covering Q and K")
+    segments = tuple((a, b, c, d, 0) for a, b, c, d in
+                     zip((0, *q_ends[:-1]), q_ends, (0, *k_ends[:-1]), k_ends))
+    return segments
 
 
 def dsa_indexer(
@@ -72,6 +81,8 @@ def dsa_indexer(
     sparse_count: int,
     *,
     backend: str = "cann",
+    host_lengths: tuple | None = None,
+    paged_key: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate top-k token indices for DSA sparse attention.
 
@@ -83,6 +94,9 @@ def dsa_indexer(
         actual_seq_kvlen: Cumulative key lengths as an int32 NPU tensor.
         sparse_count: Number of token indices selected for each query.
         backend: ``"cann"`` (default) or the legacy ``"omni"`` backend.
+        host_lengths: Optional matching host Q/K cumulative ends. CP passes its
+            immutable document plan to cache metadata without device reductions.
+        paged_key: Use shared LI pages; requires the CANN backend and host lengths.
 
     Returns:
         Top-k indices in ``[T, N_kv, K]`` int32 layout, followed by the query,
@@ -97,7 +111,15 @@ def dsa_indexer(
     merge_weight_tnd = rearrange(merge_weight, "b s n -> (b s) n")
     # Load only the selected optional backend so either can be used independently.
     # pylint: disable=import-outside-toplevel
-    if backend == "cann":
+    if paged_key and (backend != "cann" or host_lengths is None):
+        raise ValueError("Paged DSA Indexer requires CANN and host document lengths")
+    if backend == "cann" and host_lengths is not None:
+        segments = _host_segments(host_lengths, index_query_tnd.shape[0], index_key_tnd.shape[0])
+        topk_indices = dsa_indexer_select(
+            index_query_tnd.unsqueeze(0), index_key_tnd.unsqueeze(0), merge_weight_tnd.unsqueeze(0),
+            segments, sparse_count, paged_key=paged_key,
+        )
+    elif backend == "cann":
         topk_indices = _cann_lightning_indexer(
             index_query_tnd,
             index_key_tnd,
@@ -128,3 +150,19 @@ def dsa_indexer(
         )
     # pylint: enable=import-outside-toplevel
     return topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd
+
+
+@torch.no_grad()
+def dsa_indexer_select(query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
+                       segments: tuple, topk: int, *, paged_key: bool = False) -> torch.Tensor:
+    """Select worker queries with document-local IDs and the shared LI packing backend.
+
+    Args:
+        query: Worker queries [1,Q,H,D].
+        key: Unpacked key bank [1,K,1,D].
+        weights: Worker weights [1,Q,H].
+        segments: Worker query ranges and matching document causal key prefixes.
+        topk: Number of selected slots.
+        paged_key: Share pages instead of materializing each logical key prefix.
+    """
+    return packed_lightning_indexer(query, key.squeeze(2), weights, segments, topk, paged_key=paged_key)

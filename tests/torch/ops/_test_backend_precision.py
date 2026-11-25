@@ -81,7 +81,10 @@ def _require_implementation(family, variant, backend, device_type, sample):
         if reason is not None:
             pytest.skip(f"{family}.{variant}/{backend}: {reason}")
     try:
-        for package in _OPTIONAL_PACKAGES.get(backend, ()):
+        packages = _OPTIONAL_PACKAGES.get(backend, ())
+        if family == "indexer_topk_restore" and backend == "triton_ascend":
+            packages = ("triton.backends.ascend",)
+        for package in packages:
             require_package(package)
         implementation.load()
     except ImplementationUnavailable as error:

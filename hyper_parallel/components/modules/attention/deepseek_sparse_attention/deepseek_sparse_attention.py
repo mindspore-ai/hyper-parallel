@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any
 
@@ -32,6 +32,8 @@ from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
 from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
 from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
+from hyper_parallel.components.functional.sparse_attention_layout import cumulative_length_tensors
+from hyper_parallel.distributed.context_parallel.batch_plan import CPBatchPlanConfig
 from hyper_parallel.distributed.module_binding import ParallelBinding
 
 
@@ -42,6 +44,7 @@ class SparseAttentionSequenceMetadata:
     kv_prefix_length: int
     query_ends: torch.Tensor
     key_ends: torch.Tensor
+    host_lengths: tuple[tuple[int, ...], tuple[int, ...]] | None = field(default=None, kw_only=True)
 
     @property
     def sequence_lengths(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -74,8 +77,8 @@ class SparseAttentionSequenceMetadata:
             raise ValueError("Sparse attention requires the same number of packed Q and KV documents")
         return cls(
             local_seq_len,
-            torch.tensor(queries, dtype=torch.int32, device=device),
-            torch.tensor(keys, dtype=torch.int32, device=device),
+            *cumulative_length_tensors(tuple(queries), tuple(keys), device),
+            host_lengths=(tuple(queries), tuple(keys)),
         )
 
 
@@ -123,6 +126,28 @@ def _apply_index_rope(
     rotary_op = apply_rotary_pos_emb_interleave if interleaved else apply_rotary_pos_emb
     query_rot, key_rot = rotary_op(query_rot, key_rot, cos, sin, unsqueeze_dim=2)
     return torch.cat((query_rot, query_pass), dim=-1), torch.cat((key_rot, key_pass), dim=-1)
+
+
+def _apply_index_query_rope(query: torch.Tensor, embeddings: tuple | None,
+                            rotary_dim: int, interleaved: bool) -> torch.Tensor:
+    """Rotate only worker Q, preserving the owner's partial-RoPE arithmetic."""
+    if embeddings is None:
+        return query
+    # Optional NPU entry is needed only when executing rotary mathematics.
+    from torch_npu import npu_rotary_mul  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.components.functional.rotary_embedding import (  # pylint: disable=import-outside-toplevel
+        _apply_interleaved_rope,
+    )
+    cos, sin = embeddings
+    if cos.ndim == 2:
+        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+    rotary, passthrough = query.split((rotary_dim, query.shape[-1] - rotary_dim), dim=-1)
+    if interleaved:
+        cos = cos[..., :rotary_dim // 2].repeat_interleave(2, dim=-1).transpose(0, 1)
+        sin = sin[..., :rotary_dim // 2].repeat_interleave(2, dim=-1).transpose(0, 1)
+        return _apply_interleaved_rope(rotary, passthrough, cos, sin, 2)
+    rotated = npu_rotary_mul(rotary.clone(), cos.unsqueeze(2), sin.unsqueeze(2), rotary_mode="half")
+    return torch.cat((rotated, passthrough), dim=-1)
 
 
 def _absorb_query_projection(
@@ -189,6 +214,9 @@ class SparseAttentionInputs:
     attention_states: tuple[torch.Tensor, ...]
     metadata: SparseAttentionSequenceMetadata
     use_dense: bool
+    query_residual: torch.Tensor | None = None
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None
+    selected: torch.Tensor | None = None
 
 
 def _dense_flash_attention(
@@ -201,7 +229,8 @@ def _dense_flash_attention(
     need_stats: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run one TND FA and return dense-indexer statistics."""
-    query_ends, key_ends = (lengths.tolist() for lengths in sequence_lengths)
+    query_ends, key_ends = (lengths.tolist() if isinstance(lengths, torch.Tensor) else lengths
+                            for lengths in sequence_lengths)
     q_flat, k_flat, v_flat = (tensor.flatten(0, 1) for tensor in (query, key, value))
     num_heads = q_flat.shape[1]
     causal_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
@@ -545,6 +574,9 @@ class DeepseekSparseAttentionModule(nn.Module):
         module_fqn: str = "", context: Mapping[str, Any] | None = None,
         kv_cp_size: int = 1, kv_cp_strategy: str = "allgather",
         cp_comm_overlap: bool = False, dense_warmup: bool | None = None,
+        main_kv_comm: str = "all_gather", index_k_comm: str = "all_gather", main_kv_comm_fusion: bool = False,
+        indexer_load_balance: str = "none", indexer_balance_block_size: int | None = None,
+        indexer_zigzag_min_length: int | None = None, indexer_paged_k: bool = False,
     ) -> None:
         """Construct native sparse attention parameters, convert a source, or promote a local member.
 
@@ -558,6 +590,13 @@ class DeepseekSparseAttentionModule(nn.Module):
             kv_cp_strategy: KV transport, currently allgather.
             cp_comm_overlap: Submit key-bank gathers asynchronously when enabled.
             dense_warmup: None follows the mutable training stage; bool pins it.
+            main_kv_comm: all_gather or document-prefix all_to_all_v for main banks.
+            main_kv_comm_fusion: Merge latent KV and RoPE K transport; disabled by default.
+            index_k_comm: Independent all_gather or all_to_all_v for Index K.
+            indexer_load_balance: Sparse selection allocation: none, zigzag, greedy or hybrid.
+            indexer_balance_block_size: Greedy/hybrid block length, default 2048.
+            indexer_zigzag_min_length: Hybrid long-document threshold.
+            indexer_paged_k: Share LI physical pages between logical key prefixes.
         """
         super().__init__()
         del module_fqn
@@ -573,6 +612,21 @@ class DeepseekSparseAttentionModule(nn.Module):
         self.kv_cp_size, self.kv_cp_strategy = kv_cp_size, kv_cp_strategy
         self.cp_comm_overlap = cp_comm_overlap
         self._dense_warmup_override = dense_warmup
+        plan_config = CPBatchPlanConfig(
+            kv_cp_size, 0, ratios=(1,), windows=(), mode=indexer_load_balance,
+            block_size=indexer_balance_block_size, zigzag_min_length=indexer_zigzag_min_length,
+            main_kv_comm=main_kv_comm, index_k_comm=index_k_comm,
+        )
+        if not isinstance(indexer_paged_k, bool):
+            raise ValueError("indexer_paged_k must be a bool")
+        if not isinstance(main_kv_comm_fusion, bool):
+            raise ValueError("main_kv_comm_fusion must be a bool")
+        self.main_kv_comm_fusion = main_kv_comm_fusion
+        self.main_kv_comm, self.index_k_comm = main_kv_comm, index_k_comm
+        self.indexer_load_balance = indexer_load_balance
+        self.indexer_balance_block_size = plan_config.block_size
+        self.indexer_zigzag_min_length = indexer_zigzag_min_length
+        self.indexer_paged_k = indexer_paged_k
         if isinstance(module, DeepseekSparseAttentionModule):
             self._reuse_local_member(module)
         else:
@@ -782,28 +836,66 @@ class DeepseekSparseAttentionModule(nn.Module):
             device=hidden_states.device, actual_seq_len=actual_seq_len, kwargs=kwargs,
         )
 
-    def prepare_attention(
+    def _project_local_inputs(
         self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         *, use_dense: bool,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Run projections and both independent RoPE conventions on local tokens."""
+    ) -> tuple:
+        """Retain qr for optional selection transport without re-running its projection."""
         q_resid, states = self._project_attention_states(hidden_states, use_dense=use_dense)
         query, latent_kv, query_rope, key_rope = states
         query_rope, key_rope = _apply_attention_rope(
             query_rope, key_rope, position_embeddings, interleaved=self.rotary_interleaved,
         )
         index_states = self._project_index_states(hidden_states, q_resid, position_embeddings)
-        return index_states, (query, latent_kv, query_rope, key_rope)
+        return q_resid, index_states, (query, latent_kv, query_rope, key_rope)
+
+    def prepare_attention(
+        self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        *, use_dense: bool,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Run projections and both independent RoPE conventions on local tokens.
+
+        Args:
+            hidden_states: Local hidden states in batch-sequence-hidden layout.
+            position_embeddings: Cosine/sine tensors for local original-position RoPE.
+            use_dense: Whether this invocation uses dense warm-up instead of sparse attention.
+        """
+        _, index_states, states = self._project_local_inputs(hidden_states, position_embeddings, use_dense=use_dense)
+        return index_states, states
 
     def prepare_attention_inputs(
         self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         metadata: SparseAttentionSequenceMetadata, *, use_dense: bool,
     ) -> SparseAttentionInputs:
-        """Prepare local operands while retaining one invocation's resolved mode."""
-        index_states, attention_states = self.prepare_attention(
-            hidden_states, position_embeddings, use_dense=use_dense,
-        )
-        return SparseAttentionInputs(index_states, attention_states, metadata, use_dense)
+        """Prepare invocation-owned operands, including qr for no-grad selection.
+
+        Args:
+            hidden_states: Local hidden states in batch-sequence-hidden layout.
+            position_embeddings: Cosine/sine tensors for local original-position RoPE.
+            metadata: Prepared document and communication metadata for this invocation.
+            use_dense: Whether this invocation uses dense warm-up instead of sparse attention.
+        """
+        qr, index_states, states = self._project_local_inputs(hidden_states, position_embeddings, use_dense=use_dense)
+        return SparseAttentionInputs(index_states, states, metadata, use_dense, qr, position_embeddings)
+
+    @torch.no_grad()
+    def project_worker_index_query(
+        self, query_residual: torch.Tensor, embeddings: tuple | None, owner_rows: int,
+    ) -> torch.Tensor:
+        """Keep the owner's GEMM row shape and rotary convention at the TopK boundary.
+
+        Args:
+            query_residual: Received detached low-rank Q rows in worker task order.
+            embeddings: Matching original-position cosine/sine rows, or None.
+            owner_rows: Original local Q length used by the owner's BF16 projection.
+        """
+        projected = []
+        for chunk in query_residual.split(owner_rows, dim=1):
+            padded = torch.nn.functional.pad(chunk, (0, 0, 0, owner_rows - chunk.shape[1]))
+            projected.append(self.indexer.wq_b(padded)[:, :chunk.shape[1]])
+        query = projected[0] if len(projected) == 1 else torch.cat(projected, dim=1)
+        query = query.view(1, query_residual.shape[1], self.num_index_heads, self.index_head_dim)
+        return _apply_index_query_rope(query, embeddings, self.qk_rope_head_dim, self.index_rotary_interleaved)
 
     def exchange_attention(self, inputs: SparseAttentionInputs) -> SparseAttentionInputs:
         """Return ready operands; local attention needs no sequence exchange."""
@@ -812,20 +904,37 @@ class DeepseekSparseAttentionModule(nn.Module):
     def run_attention(
         self, index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
         sequence_lengths: tuple[torch.Tensor, torch.Tensor], *, use_dense: bool,
+        selected: torch.Tensor | None = None, host_lengths: tuple | None = None,
     ) -> torch.Tensor:
-        """Execute the shared dense/sparse kernel and restore local-head output."""
+        """Execute the shared dense/sparse kernel and restore local-head output.
+
+        Args:
+            index_states: Owner Index Q, Index K and head weights.
+            attention_states: Main query, latent KV and rotary query/key states.
+            sequence_lengths: Device cumulative document ends for query and key.
+            use_dense: Whether this invocation uses dense warm-up instead of sparse attention.
+            selected: Optional precomputed document-local TopK returned to the owner.
+            host_lengths: Matching host cumulative ends, avoiding device synchronization.
+        """
         if use_dense:
             return _deepseek_v32_dense_attention(
-                self, index_states, attention_states, sequence_lengths,
+                self, index_states, attention_states, host_lengths or sequence_lengths,
             ).flatten(2)
-        topk, *flattened = dsa_indexer(
-            *index_states, *sequence_lengths, self.index_topk, backend="cann",
-        )
+        # SFA forward, detached KL teacher and SFA backward share one layout.
+        # Saving the original strided views would repeat these large copies.
+        query, key, query_rope, key_rope = attention_states
+        attention_states = (query.contiguous(), key, query_rope.contiguous(), key_rope)
+        if selected is None:
+            selected, *_ = dsa_indexer(
+                *index_states, *sequence_lengths, self.index_topk, backend="cann", host_lengths=host_lengths,
+            )
+        flattened = tuple(tensor.flatten(0, 1) for tensor in index_states)
+        topk = selected
         output, maximum, total = dsa_sparse_attention(
-            *attention_states, topk, self.scaling, *sequence_lengths, backend="cann",
+            *attention_states, topk, self.scaling, *sequence_lengths, backend="cann", pad_output=False,
         )
         output = self._apply_auxiliary_loss(
-            output, tuple(flattened), attention_states, topk, (maximum, total), *sequence_lengths,
+            output, flattened, attention_states, topk, (maximum, total), *(host_lengths or sequence_lengths),
         )
         heads = output.shape[2]
         weight = self.kv_b_proj.weight.view(
@@ -848,7 +957,17 @@ class DeepseekSparseAttentionModule(nn.Module):
         position_ids: torch.Tensor | None = None,
         actual_seq_len: torch.Tensor | Sequence[int] | None = None, **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
-        """Run causal or packed sparse attention while retaining the Transformers output ABI."""
+        """Run causal or packed sparse attention while retaining the Transformers output ABI.
+
+        Args:
+            hidden_states: Local hidden states in batch-sequence-hidden layout.
+            position_embeddings: Cosine/sine tensors for local original-position RoPE.
+            attention_mask: Optional causal-mask carrier; document ends define isolation.
+            past_key_values: Reserved cache argument; training does not accept a KV cache.
+            position_ids: Optional original token positions for the model rotary contract.
+            actual_seq_len: Global cumulative document ends supplied by the caller.
+            kwargs: Additional sequence metadata and optional immutable CP batch plan.
+        """
         use_dense = self.use_dense_attention()
         position_ids = self.prepare_position_ids(hidden_states, position_ids)
         metadata = self.preflight_attention(
@@ -861,6 +980,7 @@ class DeepseekSparseAttentionModule(nn.Module):
         inputs = self.exchange_attention(inputs)
         output = self.run_attention(
             inputs.index_states, inputs.attention_states, inputs.metadata.sequence_lengths, use_dense=inputs.use_dense,
+            selected=inputs.selected, host_lengths=inputs.metadata.host_lengths,
         )
         del inputs
         return self.project_output(output), None

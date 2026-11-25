@@ -14,6 +14,8 @@
 # ============================================================================
 """DSA sparse-attention indexer KL loss."""
 
+from __future__ import annotations
+
 from typing import Any, Tuple
 
 import torch
@@ -35,8 +37,8 @@ def _sparse_indexer_kl_loss_grad(
     scale: float,
     query_rope: torch.Tensor | None,
     key_rope: torch.Tensor | None,
-    actual_seq_qlen: torch.Tensor | None,
-    actual_seq_klen: torch.Tensor | None,
+    actual_seq_qlen: torch.Tensor | tuple[int, ...] | None,
+    actual_seq_klen: torch.Tensor | tuple[int, ...] | None,
     layout: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute teacher, indexer gradients and summed KL inside CANN."""
@@ -51,8 +53,8 @@ def _sparse_indexer_kl_loss_grad(
         softmax_sum.contiguous(), scale,
         query_rope=None if query_rope is None else query_rope.contiguous(),
         key_rope=None if key_rope is None else key_rope.contiguous(),
-        actual_seq_qlen=None if actual_seq_qlen is None else actual_seq_qlen.tolist(),
-        actual_seq_klen=None if actual_seq_klen is None else actual_seq_klen.tolist(),
+        actual_seq_qlen=actual_seq_qlen.tolist() if isinstance(actual_seq_qlen, torch.Tensor) else actual_seq_qlen,
+        actual_seq_klen=actual_seq_klen.tolist() if isinstance(actual_seq_klen, torch.Tensor) else actual_seq_klen,
         layout=layout, sparse_mode=3,
     )
 
@@ -73,13 +75,32 @@ class _DSAKLLoss(torch.autograd.Function):
         softmax_sum: torch.Tensor,
         query_rope: torch.Tensor,
         key_rope: torch.Tensor,
-        actual_seq_qlen: torch.Tensor,
-        actual_seq_kvlen: torch.Tensor,
+        actual_seq_qlen: torch.Tensor | tuple[int, ...],
+        actual_seq_kvlen: torch.Tensor | tuple[int, ...],
         scale: float,
         loss_coeff: float,
         backend: str,
     ) -> torch.Tensor:
-        """Compute the KL loss and save its precomputed indexer gradients."""
+        """Compute the KL loss and save its precomputed indexer gradients.
+
+        Args:
+            ctx: Autograd context retaining the explicit gradient bridge.
+            index_query: Indexer query states used to compute selection scores.
+            index_key: Indexer key states in the corresponding document bank.
+            merge_weight: Per-query Indexer head mixing weights.
+            query: Main-attention queries defining the detached teacher.
+            key: Main-attention keys defining the detached teacher.
+            topk_indices: Document-local sparse key indices; invalid slots are negative.
+            softmax_max: Per-head teacher logit maxima returned by attention.
+            softmax_sum: Per-head teacher exponential sums returned by attention.
+            query_rope: Rotary part of the main-attention queries.
+            key_rope: Rotary part of the main-attention keys.
+            actual_seq_qlen: Cumulative query document ends without a leading zero.
+            actual_seq_kvlen: Cumulative key document ends without a leading zero.
+            scale: Main-attention logit scaling factor.
+            loss_coeff: Multiplier applied to the token-mean auxiliary loss.
+            backend: Selected native operator implementation.
+        """
         divisor = query.size(0)
         if divisor == 0:
             raise ValueError("DSA KL requires at least one valid query token")
@@ -156,8 +177,8 @@ def dsa_kl_loss(
     softmax_sum: torch.Tensor,
     query_rope: torch.Tensor,
     key_rope: torch.Tensor,
-    actual_seq_qlen: torch.Tensor,
-    actual_seq_kvlen: torch.Tensor,
+    actual_seq_qlen: torch.Tensor | tuple[int, ...],
+    actual_seq_kvlen: torch.Tensor | tuple[int, ...],
     scale: float,
     loss_coeff: float,
     *,
@@ -169,9 +190,27 @@ def dsa_kl_loss(
     tensors returned by :func:`dsa_indexer`. ``topk_indices``, ``softmax_max``,
     and ``softmax_sum`` come from :func:`dsa_sparse_attention`. The MLA query,
     key, and rotary states use TND layout; sequence lengths are cumulative
-    int32 tensors, following the custom-operator call contract.
+    int32 tensors, following the custom-operator call contract. The CANN backend
+    also accepts matching host tuples, avoiding device-to-host length copies.
     The result is a scalar auxiliary loss. The keyword-only ``backend`` selects
     ``"cann"`` (default) or ``"omni"`` for the legacy implementation.
+
+    Args:
+        index_query: Indexer query states used to compute selection scores.
+        index_key: Indexer key states in the corresponding document bank.
+        merge_weight: Per-query Indexer head mixing weights.
+        query: Main-attention queries defining the detached teacher.
+        key: Main-attention keys defining the detached teacher.
+        topk_indices: Document-local sparse key indices; invalid slots are negative.
+        softmax_max: Per-head teacher logit maxima returned by attention.
+        softmax_sum: Per-head teacher exponential sums returned by attention.
+        query_rope: Rotary part of the main-attention queries.
+        key_rope: Rotary part of the main-attention keys.
+        actual_seq_qlen: Cumulative query document ends without a leading zero.
+        actual_seq_kvlen: Cumulative key document ends without a leading zero.
+        scale: Main-attention logit scaling factor.
+        loss_coeff: Multiplier applied to the token-mean auxiliary loss.
+        backend: Selected native operator implementation.
     """
     if backend not in ("cann", "omni"):
         raise ValueError(f"backend must be 'cann' or 'omni', got {backend!r}")

@@ -23,6 +23,7 @@ from .impl.deepseek_sparse_attention import register_deepseek_sparse_attention
 from .impl.gdn import register_gdn
 from .impl.grouped_matmul import register_grouped_matmul
 from .impl.grouped_swiglu import register_grouped_swiglu
+from .impl.indexer_topk_restore import register_indexer_topk_restore
 from .impl.kda import register_kda
 from .impl.mhc_post import register_mhc_post
 from .impl.moe_router import register_moe_router
@@ -47,6 +48,7 @@ register_gdn(builtin_registry)
 register_kda(builtin_registry)
 register_moe_router(builtin_registry)
 register_moe_token_reorder(builtin_registry)
+register_indexer_topk_restore(builtin_registry)
 register_mome(builtin_registry)
 register_sinkhorn(builtin_registry)
 register_dsa_indexer(builtin_registry)

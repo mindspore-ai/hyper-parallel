@@ -423,3 +423,43 @@ def linear_attention_cases(dtype: torch.dtype, hardware: bool = False) -> list[P
                                        (inputs.tensor(1, length, 2, width), inputs.tensor(1, length, 2, width),
                                         inputs.tensor(1, length, 2, width), gate, beta), kwargs, dtype))
     return cases
+
+
+def _indexer_restore_call(selected, received, rows, output_rows):
+    output = selected.new_empty((output_rows, selected.shape[1]))
+    return operators.indexer_topk_restore(selected, received, rows, output)
+
+
+def _indexer_restore_reference(selected, received, rows, output_rows):
+    values = [None] * output_rows
+    for source, target in zip(rows[0].tolist(), rows[1].tolist()):
+        values[target] = selected[source]
+    for source, target in enumerate(rows[2].tolist()):
+        values[target] = received[source]
+    return torch.stack(values) if values else selected.new_empty((0, selected.shape[1]))
+
+
+def indexer_restore_cases(dtype: torch.dtype, hardware: bool = False) -> list[PrecisionCase]:
+    """Cover disjoint return routes, sentinel slots and all bits of integer IDs."""
+    cases = []
+    dtypes = (dtype,) if dtype in (torch.int32, torch.int64) else (torch.int32, torch.int64)
+    for integer_dtype in dtypes:
+        width = 2048 if hardware else 17
+        high = 2**40 if integer_dtype == torch.int64 else 2**24
+        selected = (torch.arange(5 * width, dtype=integer_dtype).reshape(5, width) + high)
+        received = (torch.arange(3 * width, dtype=integer_dtype).reshape(3, width) + high + 100)
+        selected[:, ::7] = -1
+        received[:, ::5] = -1
+        for name, sources, local, remote in (
+            ("mixed", [4, 1], [3, 0], [4, 2, 1]),
+            ("local", [4, 1], [1, 0], []),
+            ("remote", [], [], [2, 0, 1]),
+            ("empty", [], [], []),
+        ):
+            rows = tuple(torch.tensor(values, dtype=torch.int64) for values in (sources, local, remote))
+            cases.append(PrecisionCase(
+                "indexer_topk_restore", "standard", f"{name}_{integer_dtype}",
+                _indexer_restore_call, _indexer_restore_reference,
+                (selected, received[:len(remote)], rows, len(local) + len(remote)),
+            ))
+    return cases
