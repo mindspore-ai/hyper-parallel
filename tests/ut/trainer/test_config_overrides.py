@@ -31,6 +31,8 @@ from hyper_parallel.trainer.config import MemoryConfig, ProfilingConfig
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
 
+from tests.common.mark_utils import arg_mark
+
 
 def _sample_model(  # pylint: disable=unused-argument
     width: int,
@@ -104,6 +106,18 @@ class TestConfigOverrides(unittest.TestCase):
             config = parse_training_args([str(yaml_path)])
         self.assertTrue(config.high_availability.worker_recovery.enable)
         self.assertEqual(config.high_availability.worker_recovery.controller_port, 8000)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_interleaved_pipeline_checkpoint_options(self) -> None:
+        """Feature: Checkpoint policy for an interleaved text Trainer.
+        Description: Parse the pipeline schedule with DCP or with direct HF export.
+        Expectation: DCP is accepted and incomplete stage-local HF export is rejected before launch.
+        """
+        options = ("--accelerator.pp_size=2", "--pipeline.schedule=interleaved_1f1b")
+        config = self._parse(*options, "--checkpoint.save_ckpt=true")
+        self.assertEqual(config.pipeline.local_stage_count, 2)
+        with self.assertRaisesRegex(ValueError, "HF export"):
+            self._parse(*options, "--checkpoint.save_hf_weights=true")
 
     def test_reads_yaml_without_overrides(self) -> None:
         """YAML values survive, and the callable default is filled in."""
