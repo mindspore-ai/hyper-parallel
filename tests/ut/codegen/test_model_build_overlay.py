@@ -315,6 +315,61 @@ class TestModelBuildOverlay(unittest.TestCase):
         self.addCleanup(handle.stop)
         register_linear_family()
 
+    def test_build_entries_preserve_backend_without_reading_device_ordinal(self):
+        """Both native entry points must reach meta observation without initializing an accelerator."""
+        for backend in ("cpu", "cuda"):
+            for entry in ("from_config", "from_pretrained"):
+                with self.subTest(backend=backend, entry=entry):
+                    config = FamilyModelConfig()
+                    setup = DistributedSetup(mesh_context=MeshContext())
+                    publisher = "hyper_parallel.codegen.model_build_overlay.ensure_codegen_artifact_from_snapshot"
+                    with patch.object(auto_model, "get_device_type", return_value=backend), \
+                            patch.object(auto_model, "get_device_id", side_effect=AssertionError("device ordinal")), \
+                            patch.object(auto_model, "_load_pretrained_config", return_value=config), \
+                            patch(publisher), use_codegen_model_build_overlay(CodegenBuildSession()):
+                        build = getattr(HyperAutoModelForCausalLM, entry)
+                        model = build(
+                            config if entry == "from_config" else "config-only-model",
+                            model_factory=_MethodModel, torch_dtype=torch.float32, distributed_setup=setup,
+                        )
+                        self.assertEqual(model._hp_module_build_context["device_type"], backend)
+                        self.assertTrue(all(value.device.type == "meta" for value in model.parameters()))
+
+    def test_device_query_is_restored_after_observation_and_failures(self):
+        """Offline construction must not replace native device resolution after its scope ends."""
+        original_build = auto_model._BaseHyperAutoModelClass.__dict__["_build_model"]
+        for failure in (None, "construction", "publication"):
+            with self.subTest(failure=failure):
+                native_query = Mock(return_value=torch.device("cuda", 3))
+                session = CodegenBuildSession()
+                publisher = "hyper_parallel.codegen.model_build_overlay.ensure_codegen_artifact_from_snapshot"
+                with patch.object(auto_model, "_current_device", native_query), \
+                        patch.object(auto_model, "get_device_type", return_value="cuda"), \
+                        patch(publisher, side_effect=RuntimeError("publication") if failure == "publication" else None):
+                    try:
+                        with use_codegen_model_build_overlay(session) as result:
+                            self.assertEqual(auto_model._current_device(), torch.device("cuda"))
+                            native_query.assert_not_called()
+                            if failure == "construction":
+                                raise RuntimeError("construction")
+                            if failure == "publication":
+                                # Exercise the exception raised by the actual publication callback.
+                                HyperAutoModelForCausalLM.from_config(
+                                    FamilyModelConfig(), model_factory=_MethodModel,
+                                    torch_dtype=torch.float32, distributed_setup=DistributedSetup(),
+                                )
+                    except RuntimeError as exc:
+                        self.assertEqual(str(exc), failure)
+                    else:
+                        if failure == "publication":
+                            self.assertEqual(result.snapshot.failure.reason, "publication")
+                        else:
+                            self.assertIsNone(failure)
+                    self.assertIsNone(result.model)
+                    self.assertIs(auto_model._current_device, native_query)
+                    self.assertEqual(auto_model._current_device(), torch.device("cuda", 3))
+                    self.assertIs(auto_model._BaseHyperAutoModelClass.__dict__["_build_model"], original_build)
+
     def test_outer_factory_publishes_only_after_success_and_restores_overlay(self):
         """Factory-tail facts are included; an outer failure cannot publish an early bundle."""
         original_build = auto_model._BaseHyperAutoModelClass.__dict__["_build_model"]

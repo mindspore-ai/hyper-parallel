@@ -62,6 +62,11 @@ def _codegen_model_init_context() -> Iterator[None]:
         yield
 
 
+def _codegen_current_device() -> torch.device:
+    """Preserve the target backend without querying an ordinal that lazily initializes it."""
+    return torch.device(auto_model.get_device_type())
+
+
 def _record_source(
     session: CodegenBuildSession,
     model: Any,
@@ -366,6 +371,7 @@ def use_codegen_model_build_overlay(
     """
     model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
     original = model_class.__dict__["_build_model"]
+    original_device = auto_model._current_device  # pylint: disable=protected-access
     result = CodegenModelBuildResult()
     pending = []
 
@@ -377,6 +383,7 @@ def use_codegen_model_build_overlay(
     model_class._build_model = classmethod(  # pylint: disable=protected-access
         _codegen_build_model(session, artifact_dir, result, _defer if defer_publish else None)
     )
+    auto_model._current_device = _codegen_current_device  # pylint: disable=protected-access
     try:
         yield result
         if pending:
@@ -389,6 +396,7 @@ def use_codegen_model_build_overlay(
         pending.clear()
         result.model = None
         model_class._build_model = original  # pylint: disable=protected-access
+        auto_model._current_device = original_device  # pylint: disable=protected-access
 
 
 __all__ = ["CodegenModelBuildResult", "use_codegen_model_build_overlay"]
