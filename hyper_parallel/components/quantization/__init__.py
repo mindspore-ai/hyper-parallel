@@ -14,6 +14,9 @@
 # ============================================================================
 """Low-precision quantization: config, tensors, quantizers, functions, modules."""
 
+import importlib
+from typing import TYPE_CHECKING, Any
+
 from hyper_parallel.components.quantization.config import (
     LowPrecisionConfig,
     LowPrecisionDtypeScheme,
@@ -41,10 +44,7 @@ from hyper_parallel.components.quantization.ops import (
     validate_fake_w4a8_gmm_runtime,
     validate_w4a8_gmm_runtime,
 )
-from hyper_parallel.components.quantization.modules import (
-    GroupedExperts,
-    LowPrecisionLinear,
-)
+from hyper_parallel.components.quantization.modules import GroupedExperts
 from hyper_parallel.components.quantization.quantizers import (
     HiFloat8Quantizer,
     MXFP8Quantizer,
@@ -62,6 +62,9 @@ from hyper_parallel.components.quantization.tensor import (
     W4A8Tensor,
     W4A8TensorStorage,
 )
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.quantization.modules import LowPrecisionLinear
 
 __all__ = [
     "HiFloat8NpuOps",
@@ -101,3 +104,12 @@ __all__ = [
     "validate_w4a8_gmm_runtime",
     "validate_fake_w4a8_gmm_runtime",
 ]
+
+def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
+    """Defer the Linear compatibility export to avoid a cycle with its canonical package."""
+    if name != "LowPrecisionLinear":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    modules_pkg = importlib.import_module("hyper_parallel.components.quantization.modules")
+    value = getattr(modules_pkg, name)
+    globals()[name] = value
+    return value
