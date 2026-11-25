@@ -1,0 +1,83 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    - pkg://hyper_parallel.integration.verl.yaml
+
+defaults:
+  - /ppo_trainer
+  - override /model_engine: hyper_parallel
+  - _self_
+
+data:
+  train_files: ${oc.env:TRAIN_DATA_PATH}
+  val_files: ${oc.env:VAL_DATA_PATH}
+  max_prompt_length: 2048
+  max_response_length: 8192
+  train_batch_size: 16
+  dataloader_num_workers: 0
+  filter_overlong_prompts: false
+
+algorithm:
+  adv_estimator: grpo
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:MODEL_PATH}
+  actor:
+    ppo_mini_batch_size: ${data.train_batch_size}
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: ${cp_token_budget:${data.max_prompt_length},${data.max_response_length},${actor_rollout_ref.actor.engine.trainer_config.accelerator.cp_size}}
+    engine:
+      param_offload: true
+      optimizer_offload: true
+      dtype: float32
+      recipe_path: ${oc.env:HYPER_PARALLEL_RECIPE}
+      trainer_config:
+        accelerator:
+          tp_size: 2
+          cp_size: 4
+          ep_size: 8
+          sequence_parallel: true
+          loss_parallel: true
+        fsdp_config:
+          edp_shard_size: 2
+          mix_precision:
+            param_dtype: bfloat16
+            reduce_dtype: float32
+            output_dtype: bfloat16
+          requires_grad_sync: false
+        optimizer:
+          _target_: hyper_parallel.components.optim.AdamW
+          adamw_config:
+            adamw_lr: 1.0e-6
+            adamw_weight_decay: 0.01
+            adamw_betas: [0.9, 0.999]
+            adamw_eps: 1.0e-8
+        lr_scheduler:
+          lr_decay_style: constant
+          lr_config:
+            lr: 1.0e-6
+            lr_warmup_steps: 0
+  rollout:
+    name: vllm
+    gpu_memory_utilization: 0.85
+    tensor_model_parallel_size: 4
+    data_parallel_size: 4
+    expert_parallel_size: 16
+    max_model_len: ${cp_token_budget:${data.max_prompt_length},${data.max_response_length},1}
+    n: 16
+
+skip:
+  rollout_tq:
+    dump_dir: ${oc.env:ROLLOUT_CACHE_DIR}
+
+trainer:
+  total_epochs: 1
+  project_name: hp_mcore_precision
+  experiment_name: qwen3_moe_full48
+  logger:
+    - console
+  n_gpus_per_node: 16
+  val_before_train: false
+  test_freq: 5
