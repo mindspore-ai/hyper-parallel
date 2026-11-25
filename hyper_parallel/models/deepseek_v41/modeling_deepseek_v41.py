@@ -82,6 +82,7 @@ from hyper_parallel.components.modules.engram.host_engram_table import HostEngra
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
+    encode_image_features,
 )
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 
@@ -774,7 +775,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             return
         super()._init_weights(module)
         _initialize_v41_owned_module(module, self.config.initializer_range)
-        if isinstance(module, DeepseekV41Model) and module.vision is not None:
+        if isinstance(module, DeepseekV41Model) and getattr(module, "image_start", None) is not None:
             nn.init.normal_(module.image_start, mean=0.0, std=self.config.initializer_range)
             nn.init.normal_(module.image_end, mean=0.0, std=self.config.initializer_range)
             nn.init.normal_(module.image_newline, mean=0.0, std=self.config.initializer_range)
@@ -794,37 +795,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         executes per image because V4.1 applies bidirectional attention only
         inside a single image grid; no image may attend to another image.
         """
-        if self.vision is None or self.aligner is None:
-            raise ValueError("received image inputs but V4.1 vision is disabled")
-        image_count = image_vit_grid_hw.shape[0]
-        required_shapes = {
-            "image_patch_offsets": image_patch_offsets.numel() == image_count + 1,
-            "image_llm_grid_hw": image_llm_grid_hw.shape == image_vit_grid_hw.shape,
-            "image_batch_indices": image_batch_indices.numel() == image_count,
-            "image_token_starts": image_token_starts.numel() == image_count,
-        }
-        invalid = [name for name, valid in required_shapes.items() if not valid]
-        if invalid:
-            raise ValueError(f"inconsistent V4.1 image metadata: {', '.join(invalid)}")
-        if pixel_values.ndim != 4:
-            raise ValueError("pixel_values must have shape [total_patches, 3, patch, patch]")
-        image_records = []
-        for image_index in range(image_count):
-            patch_start = int(image_patch_offsets[image_index])
-            patch_end = int(image_patch_offsets[image_index + 1])
-            vit_height, vit_width = (int(value) for value in image_vit_grid_hw[image_index])
-            llm_height, llm_width = (int(value) for value in image_llm_grid_hw[image_index])
-            batch_index = int(image_batch_indices[image_index])
-            token_start = int(image_token_starts[image_index])
-            vision_features = self.vision(pixel_values[patch_start:patch_end], vit_height, vit_width)
-            image_features = self.aligner(vision_features, vit_height, vit_width)
-            if image_features.shape[0] != llm_height * llm_width:
-                raise ValueError(
-                    f"aligner/image-token count mismatch for image {image_index}: "
-                    f"{image_features.shape[0]} versus {llm_height * llm_width}"
-                )
-            image_records.append((batch_index, token_start, llm_height, llm_width, image_features))
-        return image_records
+        return encode_image_features(self.vision, self.aligner, pixel_values, image_patch_offsets,
+                                     image_vit_grid_hw, image_llm_grid_hw, image_batch_indices, image_token_starts)
 
     def _merge_image_embeddings(
             self,
@@ -974,6 +946,27 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             inputs_embeds = inputs_embeds + anchor.to(inputs_embeds.dtype) * 0.0
         return inputs_embeds
 
+    def _prepare_decoder_inputs(self, input_ids, inputs_embeds, position_ids, kwargs):
+        """Prepare rotary and packed-sequence metadata for the local decoder layers."""
+        if position_ids is None:
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+        position_embeddings = {
+            "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
+            "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
+        }
+        packed_sequence = kwargs.get("packed_seq_params")
+        if packed_sequence is not None:
+            if not isinstance(packed_sequence, SharedPackedSequence):
+                raise TypeError("packed_seq_params must be SharedCompressedPackedSequence")
+            packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
+            kwargs["packed_seq_params"] = packed_sequence
+
+            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
+            kwargs["router_sequence_ids"] = sequence_ids
+            kwargs["router_num_sequences"] = sequence_capacity
+        segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
+        return position_ids, position_embeddings, segment_start_mask
+
     def _run_decoder_layers(
             self,
             hidden_states: torch.Tensor,
@@ -988,8 +981,10 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             engram_token_mask: torch.Tensor | None,
             image_mask: torch.Tensor | None,
             dspark_layer_ids: tuple[int, ...],
+            pending_mhc: tuple[torch.Tensor, ...] = (),
+            finish_mhc: bool = True,
             **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         """Run decoder boundaries and collect detached DSpark targets.
 
         Args:
@@ -1004,21 +999,25 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             engram_token_mask: Mask selecting tokens with Engram contributions.
             image_mask: Mask selecting visual tokens.
             dspark_layer_ids: Layers whose outputs supervise the drafter.
+            pending_mhc: Shifted FFN output and mixing tensors from the previous stage.
+            finish_mhc: Apply the last deferred FFN residual on the output stage.
             **kwargs: Additional decoder-layer keyword arguments.
 
         Returns:
             Completed residual streams and final input-mixing coefficients.
         """
-        shifted_mhc_layers = [_uses_shifted_mhc(layer) for layer in self.layers]
+        shifted_mhc_layers = [_uses_shifted_mhc(layer) for layer in self.layers.children()]
         if any(shifted_mhc_layers) and not all(shifted_mhc_layers):
             raise RuntimeError("shifted mHC must replace every retained V4.1 boundary")
         shifted_mhc = all(shifted_mhc_layers)
         previous_output = post_mix = residual_mix = None
-        if shifted_mhc:
+        if pending_mhc:
+            previous_output, post_mix, residual_mix = pending_mhc
+        elif shifted_mhc:
             previous_output = torch.zeros_like(hidden_states[:, :, 0])
             post_mix = torch.zeros_like(pre_mix)
             residual_mix = _identity_residual_mix(pre_mix)
-        for layer_index, layer in enumerate(self.layers):
+        for layer_index, layer in enumerate(self.layers.children()):
             if shifted_mhc:
                 previous_output, hidden_states, pre_mix, post_mix, residual_mix = layer(
                     hidden_states,
@@ -1059,6 +1058,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                         target_hidden = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
                     self.dspark_target_hiddens.append(_hc_pre(target_hidden, pre_mix).detach())
         if shifted_mhc:
+            if not finish_mhc:
+                return hidden_states, pre_mix, previous_output, post_mix, residual_mix
             hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
         return hidden_states, pre_mix
 
@@ -1128,23 +1129,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
         image_mask = None if token_types is None else token_types >= 0
         engram_token_mask = None if image_mask is None else ~image_mask
-        if position_ids is None:
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
-        position_embeddings = {
-            "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-            "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
-        }
-        packed_sequence = kwargs.get("packed_seq_params")
-        if packed_sequence is not None:
-            if not isinstance(packed_sequence, SharedPackedSequence):
-                raise TypeError("packed_seq_params must be SharedCompressedPackedSequence")
-            packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
-            kwargs["packed_seq_params"] = packed_sequence
-
-            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
-            kwargs["router_sequence_ids"] = sequence_ids
-            kwargs["router_num_sequences"] = sequence_capacity
-        segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
+        position_ids, position_embeddings, segment_start_mask = self._prepare_decoder_inputs(
+            input_ids, inputs_embeds, position_ids, kwargs,
+        )
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0

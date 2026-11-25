@@ -126,6 +126,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
     Note:
         This class builds the schedule ordering and registers the ``MPIPE_*``
         execution handlers implemented by :class:`MPipeTransposeExecutor`.
+        HSDP decoder stages require a singleton sharding mesh and prefix backward on stage zero.
     """
 
     # Each rank runs one transposed preprocess forward, so every rank needs its
@@ -196,8 +197,10 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
                 f"overflow_mode must be 'full' or 'min', got {overflow_mode!r}"
             )
         stages = self._check_stages(stages)
-        if any(stage.all_hsdp_schedulers for stage in stages):
-            raise ValueError("MPipe does not support HSDP pipeline stages")
+        for stage in stages:
+            for scheduler in stage.all_hsdp_schedulers:
+                if owner_backward or scheduler.mesh is None or scheduler.mesh.size() != 1:
+                    raise ValueError("MPipe HSDP stages require singleton meshes and stage-zero prefix backward")
         self._overflow_mode = overflow_mode
         # ``preprocess_module`` is the resolved block to transpose (first T text
         # layers, the visual tower, or a param-free identity for dataload-only).

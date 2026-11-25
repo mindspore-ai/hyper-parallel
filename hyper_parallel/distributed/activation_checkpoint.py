@@ -16,7 +16,7 @@
 
 import logging
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Sequence
 
 from torch import nn
@@ -99,6 +99,34 @@ class _ActivationPlan:
     full_cpu_pool_mb: Optional[int]
     selective_group_swap: bool
     selective_cpu_pool_mb: Optional[int]
+
+    def for_stage(self, model: nn.Module) -> "_ActivationPlan":
+        """Keep this stage's targets under their validated global layer numbers.
+
+        Args:
+            model: Pruned and sharded stage. Its layer container has changed
+                but retained modules still have their original qualified names.
+        """
+        modules = dict(model.named_modules(remove_duplicate=False))
+
+        def _local_targets(targets):
+            return tuple(
+                replace(target, parent=modules[target.module_fqn.rpartition(".")[0]], module=modules[target.module_fqn])
+                for target in targets if target.module_fqn in modules
+            )
+
+        return replace(
+            self,
+            full_layers=tuple(
+                (index, replace(block, parent=modules[block.container_fqn], module=modules[block.fqn]))
+                for index, block in self.full_layers if block.fqn in modules
+            ),
+            full_save_targets=_local_targets(self.full_save_targets),
+            full_swap_targets=_local_targets(self.full_swap_targets),
+            selective_recompute_targets=_local_targets(self.selective_recompute_targets),
+            selective_recompute_model_targets=_local_targets(self.selective_recompute_model_targets),
+            selective_swap_targets=_local_targets(self.selective_swap_targets),
+        )
 
 
 @dataclass(frozen=True)
@@ -1013,12 +1041,15 @@ def _apply_activation_checkpointing(
     model: nn.Module,
     activation_checkpoint: Optional[Any],
     enable_compile: bool = False,
+    *,
+    plan: Optional[_ActivationPlan] = None,
 ) -> nn.Module:
     """Apply one normalized activation-checkpoint configuration atomically.
 
     ``None`` and ``mode=off`` are no-ops. Full mode checkpoints every
     discovered transformer layer when no ``full`` sub-configuration is given.
     Selective and hybrid modes retain their explicit module-target semantics.
+    A supplied plan carries globally validated targets rebound to the local pipeline stage.
     Legacy string modes are intentionally unsupported.
     """
     if activation_checkpoint is None or getattr(activation_checkpoint, "mode", None) == "off":
@@ -1033,7 +1064,8 @@ def _apply_activation_checkpointing(
         raise ValueError(
             "activation_checkpoint modes full, selective, and hybrid are not supported with torch.compile"
         )
-    plan = _resolve_activation_plan(model, activation_checkpoint)
+    if plan is None:
+        plan = _resolve_activation_plan(model, activation_checkpoint)
     disable_native_checkpointing = getattr(model, "gradient_checkpointing_disable", None)
     if callable(disable_native_checkpointing):
         disable_native_checkpointing()

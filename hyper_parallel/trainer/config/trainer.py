@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, List, Literal, Optional
 
 from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
+from hyper_parallel.models.pipeline import PipelineConfig
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.high_availability.config import HighAvailabilityConfig
 from hyper_parallel.components.ops.catalog import builtin_registry
@@ -87,6 +88,7 @@ class TrainerConfig:
     stress_detect: StressDetectConfig = field(default_factory=StressDetectConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     ops: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -101,12 +103,7 @@ class TrainerConfig:
                 "compile.enabled=true is not supported with activation_checkpoint.mode="
                 f"{self.activation_checkpoint.mode}"
             )
-        if (
-            self.compile.enabled
-            and not self.compile.selects_graph_compiler()
-            and self.accelerator.pp_size > 1
-        ):
-            raise ValueError("compile is not supported together with pipeline parallelism")
+        self._validate_pipeline()
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(
@@ -114,6 +111,19 @@ class TrainerConfig:
                 "fsdp_config.mix_precision.reduce_dtype='float32'; "
                 f"got {reduce_dtype!r}"
             )
+
+    def _validate_pipeline(self) -> None:
+        """Check the eager schedule against the mesh, compiler and checkpoint format."""
+        eager_pipeline = self.accelerator.pp_size > 1 and not self.compile.selects_graph_compiler()
+        if self.compile.enabled and eager_pipeline:
+            raise ValueError("compile is not supported together with pipeline parallelism")
+        if self.pipeline.schedule in ("interleaved_1f1b", "mpipe") and not eager_pipeline:
+            raise ValueError(f"{self.pipeline.schedule} requires eager Trainer PP with pp_size > 1")
+        if self.pipeline.schedule == "mpipe" and (self.accelerator.tp_size != 1 or self.accelerator.cp_size != 1
+                                                  or self.accelerator.encoder_parallel.enabled):
+            raise ValueError("MPipe VLM training requires TP1, CP1 and encoder_parallel disabled")
+        if self.checkpoint.save_hf_weights and eager_pipeline:
+            raise ValueError("HF export cannot gather eager pipeline stages. Use checkpoint.save_ckpt for DCP")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the resolved trainer configuration for logging."""

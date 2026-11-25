@@ -41,12 +41,13 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.pipeline import partition_model
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
 )
 from hyper_parallel.distributed.activation_checkpoint import (
-    _apply_activation_checkpointing,
+    _ActivationPlan, _apply_activation_checkpointing, _resolve_activation_plan,
 )
 from hyper_parallel.distributed.compile import (
     _resolve_compile_config,
@@ -470,6 +471,7 @@ def _apply_activation_features(
     model: nn.Module,
     activation_checkpoint: Optional[Any],
     compile_for_execution: bool,
+    pipeline_plan: Optional[_ActivationPlan] = None,
 ) -> nn.Module:
     """Apply the unified activation-checkpoint configuration."""
     activation_checkpoint_mode = getattr(activation_checkpoint, "mode", None)
@@ -478,6 +480,7 @@ def _apply_activation_features(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
+            plan=pipeline_plan,
         )
         adapter_spec = resolve_model_adapter(model)
         provider = getattr(adapter_spec, "activation_checkpointing", None)
@@ -769,16 +772,22 @@ def apply_model_infrastructure(
 
     _apply_model_method_replacements(model, distributed_setup, low_precision_config)
 
+    pipeline_plan = None
+    pipeline_config = getattr(distributed_setup, "pipeline_config", None)
+    if (pipeline_config is not None and getattr(mesh, "pp_size", 1) > 1
+            and (compile_config is None or not compile_config.selects_graph_compiler())):
+        if activation_checkpoint is not None and activation_checkpoint.mode != "off":
+            pipeline_plan = _resolve_activation_plan(model, activation_checkpoint)
+        partition_model(model, mesh, pipeline_config, distributed_setup.pipeline_chunk_index)
+
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(
         model, mesh, sharding_planner, is_hf_model, validate_placement,
     )
 
-    model = _apply_activation_features(
-        model,
-        activation_checkpoint,
-        compile_for_execution,
-    )
+    if pipeline_plan is not None:
+        pipeline_plan = pipeline_plan.for_stage(model)
+    model = _apply_activation_features(model, activation_checkpoint, compile_for_execution, pipeline_plan)
     external = _create_external_state(
         model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,
         validate_placement, compile_for_execution, distributed_setup, fsdp2_manager,
