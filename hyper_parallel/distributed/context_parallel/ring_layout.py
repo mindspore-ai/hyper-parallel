@@ -17,9 +17,9 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from dataclasses import dataclass, field
-from itertools import accumulate, groupby
+from dataclasses import dataclass
 from functools import lru_cache
+from itertools import accumulate, groupby
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -68,38 +68,6 @@ class PrunedRingPlan:
     local_blocks: tuple[AttentionBlock, ...]
     local_batches: tuple
     hops: tuple[int, ...]
-
-
-@dataclass
-class RingAttentionTrace:
-    """Optional device events per Ring round; synchronize only when reading timings.
-
-    Events accumulate until the caller clears them after completion. Tracing does not add
-    barriers or synchronize devices inside attention. Timings include each round's
-    launches, block computation and waits, but exclude surrounding redistribution.
-    """
-
-    events: list = field(default_factory=list)
-
-    def begin(self) -> Any:
-        """Record the beginning of a round on the current NPU stream."""
-        event = torch.npu.Event(enable_timing=True)
-        event.record()
-        return event
-
-    def end(self, phase: str, step: int, begin: Any) -> None:
-        """Record completion after dependencies have been placed on the stream."""
-        event = torch.npu.Event(enable_timing=True)
-        event.record()
-        self.events.append((phase, step, begin, event))
-
-    def timings(self) -> list[dict]:
-        """Wait for recorded work and return milliseconds for each phase/round."""
-        result = []
-        for phase, step, begin, end in self.events:
-            end.synchronize()
-            result.append({"phase": phase, "step": step, "milliseconds": begin.elapsed_time(end)})
-        return result
 
 
 def _document_ranges(tasks):

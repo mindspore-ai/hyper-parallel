@@ -37,7 +37,7 @@ import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed.context_parallel.ring_layout import (
-    PrunedRingPlan, RingAttentionTrace, pruned_ring_plan, redistribute_ring_qkv, redistribute_ring_rows,
+    PrunedRingPlan, pruned_ring_plan, redistribute_ring_qkv, redistribute_ring_rows,
     ring_task_plan,
 )
 from hyper_parallel.distributed.context_parallel.ring_transport import (
@@ -180,12 +180,11 @@ def _merge_blocks(state, block, input_layout):
     )
 
 
-def _ring_forward(query, key, value, ring, causal, scale, input_layout, overlap, trace=None):
+def _ring_forward(query, key, value, ring, causal, scale, input_layout, overlap):
     exchange = _RingExchange((key, value), ring)
     current_key, current_value = key, value
     state = None
     for step in range(ring.size):
-        begin = trace.begin() if trace is not None else None
         if overlap and step + 1 < ring.size:
             exchange.launch((current_key, current_value))
         owner = (ring.rank - step) % ring.size
@@ -201,12 +200,10 @@ def _ring_forward(query, key, value, ring, causal, scale, input_layout, overlap,
         if step + 1 < ring.size:
             current_key, current_value = (exchange.wait() if overlap
                                           else exchange.rotate((current_key, current_value)))
-        if trace is not None:
-            trace.end("forward", step, begin)
     return state[0].to(query.dtype), state[1], state[2]
 
 
-def _ring_backward(saved, grad_output, ring, causal, scale, input_layout, overlap, trace=None):
+def _ring_backward(saved, grad_output, ring, causal, scale, input_layout, overlap):
     query, key, value, output, maximum, denominator = saved
     grad_query = torch.zeros_like(query, dtype=torch.float32)
     grad_key = torch.zeros_like(key, dtype=torch.float32)
@@ -215,7 +212,6 @@ def _ring_backward(saved, grad_output, ring, causal, scale, input_layout, overla
     grad_exchange = _RingExchange((grad_key, grad_value), ring)
     current_key, current_value = key, value
     for step in range(ring.size):
-        begin = trace.begin() if trace is not None else None
         if overlap and step + 1 < ring.size:
             kv_exchange.launch((current_key, current_value))
         owner = (ring.rank - step) % ring.size
@@ -247,8 +243,6 @@ def _ring_backward(saved, grad_output, ring, causal, scale, input_layout, overla
                 grad_key, grad_value = grad_exchange.wait()
         else:
             grad_key, grad_value = grad_exchange.rotate((grad_key, grad_value))
-        if trace is not None:
-            trace.end("backward", step, begin)
     return grad_query.to(query.dtype), grad_key.to(key.dtype), grad_value.to(value.dtype)
 
 
@@ -384,19 +378,16 @@ def _forward_blocks(query, key, value, state, blocks, scale, layout, batches):
             target.copy_(source)
 
 
-def _planned_forward(query, key, value, ring, scale, layout, overlap, plan, trace):
+def _planned_forward(query, key, value, ring, scale, layout, overlap, plan):
     exchange = _RingExchange((key, value), ring)
     state = _empty_state(query, layout)
     for step in range(ring.size):
-        begin = trace.begin() if trace is not None else None
         if overlap and step + 1 < ring.size:
             exchange.launch((key, value))
         owner = (ring.rank - step) % ring.size
         _forward_blocks(query, key, value, state, plan.blocks[owner], scale, layout, plan.batches[owner])
         if step + 1 < ring.size:
             key, value = exchange.wait() if overlap else exchange.rotate((key, value))
-        if trace is not None:
-            trace.end("forward", step, begin)
     return state[0].to(query.dtype), state[1], state[2]
 
 
@@ -428,13 +419,12 @@ def _backward_blocks(saved, grad_output, key, value, grad_query, blocks, scale, 
     return delta_key, delta_value
 
 
-def _planned_backward(saved, grad_output, ring, scale, layout, overlap, plan, trace):
+def _planned_backward(saved, grad_output, ring, scale, layout, overlap, plan):
     query, key, value = saved[:3]
     grad_query, grad_key, grad_value = (torch.zeros_like(tensor, dtype=torch.float32) for tensor in saved[:3])
     exchange = _RingExchange((key, value), ring)
     grad_exchange = _RingExchange((grad_key, grad_value), ring)
     for step in range(ring.size):
-        begin = trace.begin() if trace is not None else None
         if overlap and step + 1 < ring.size:
             exchange.launch((key, value))
         owner = (ring.rank - step) % ring.size
@@ -454,8 +444,6 @@ def _planned_backward(saved, grad_output, ring, scale, layout, overlap, plan, tr
                 grad_key, grad_value = grad_exchange.wait()
         else:
             grad_key, grad_value = grad_exchange.rotate((grad_key, grad_value))
-        if trace is not None:
-            trace.end("backward", step, begin)
     return grad_query.to(query.dtype), grad_key.to(key.dtype), grad_value.to(value.dtype)
 
 
@@ -468,12 +456,11 @@ def _launch_pruned(exchange, packet, overlap, step):
     return received
 
 
-def _pruned_forward(query, key, value, ring, scale, overlap, plan, trace):
+def _pruned_forward(query, key, value, ring, scale, overlap, plan):
     initial = _pack_ring_kv((key, value), plan.source_spans, ring, plan.counts)
     exchange = _PackedRingExchange(key, plan, ring, _communication_stream(query.device, False))
     state, packet = _empty_state(query, "TND"), initial
     for step in range(max(plan.hops) + 1):
-        begin = trace.begin() if trace is not None else None
         following = exchange.launch(packet, step) if overlap and step < max(plan.hops) else None
         blocks, batches = (plan.local_blocks, plan.local_batches) if step == 0 else (
             plan.blocks[packet.owner], plan.batches[packet.owner])
@@ -487,8 +474,6 @@ def _pruned_forward(query, key, value, ring, scale, overlap, plan, trace):
         packet = following
         if step == max(plan.hops):
             exchange.finish(initial)
-        if trace is not None:
-            trace.end("forward", step, begin)
     return state[0].to(query.dtype), state[1], state[2]
 
 
@@ -529,7 +514,7 @@ def _restore_pruned_gradient(local_gradients, gradient, ring, plan):
     gradient.consumed_now()
 
 
-def _pruned_backward(saved, grad_output, ring, scale, overlap, plan, trace):
+def _pruned_backward(saved, grad_output, ring, scale, overlap, plan):
     query, key, value = saved[:3]
     grad_query, grad_key, grad_value = (torch.zeros_like(tensor, dtype=torch.float32) for tensor in saved[:3])
     initial = _pack_ring_kv((key, value), plan.source_spans, ring, plan.counts)
@@ -538,7 +523,6 @@ def _pruned_backward(saved, grad_output, ring, scale, overlap, plan, trace):
     grad_exchange = _PackedRingExchange(grad_key, plan, ring, _communication_stream(query.device, True))
     packet, gradient = initial, grad_initial
     for step in range(max(plan.hops) + 1):
-        begin = trace.begin() if trace is not None else None
         following = exchange.launch(packet, step) if overlap and step < max(plan.hops) else None
         delta = _pruned_delta(saved, grad_output, grad_query, packet, plan, scale, step)
         _pruned_accumulate(gradient, delta, (grad_key, grad_value), ring, plan, step)
@@ -553,8 +537,6 @@ def _pruned_backward(saved, grad_output, ring, scale, overlap, plan, trace):
             _restore_pruned_gradient((grad_key, grad_value), grad_initial, ring, plan)
             exchange.finish(initial)
             grad_exchange.finish(grad_initial)
-        if trace is not None:
-            trace.end("backward", step, begin)
     return tuple(grad.to(tensor.dtype) for grad, tensor in zip((grad_query, grad_key, grad_value), saved[:3]))
 
 
@@ -565,19 +547,19 @@ class _RingAttention(torch.autograd.Function):
     def forward(
         ctx: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
         ring: _RingContext, causal: bool, scale: float, input_layout: str, overlap: bool,
-        plan: Any = None, trace: RingAttentionTrace | None = None,
+        plan: Any = None,
     ) -> torch.Tensor:
         """Save only local inputs, the final output and global softmax statistics."""
         query, key, value = (tensor.contiguous() for tensor in (query, key, value))
         if isinstance(plan, PrunedRingPlan):
-            output, maximum, denominator = _pruned_forward(query, key, value, ring, scale, overlap, plan, trace)
+            output, maximum, denominator = _pruned_forward(query, key, value, ring, scale, overlap, plan)
         elif plan is None:
             output, maximum, denominator = _ring_forward(
-                query, key, value, ring, causal, scale, input_layout, overlap, trace,
+                query, key, value, ring, causal, scale, input_layout, overlap,
             )
         else:
             output, maximum, denominator = _planned_forward(
-                query, key, value, ring, scale, input_layout, overlap, plan, trace,
+                query, key, value, ring, scale, input_layout, overlap, plan,
             )
         ctx.save_for_backward(query, key, value, output, maximum, denominator)
         ctx.ring = ring
@@ -586,7 +568,6 @@ class _RingAttention(torch.autograd.Function):
         ctx.input_layout = input_layout
         ctx.overlap = overlap
         ctx.plan = plan
-        ctx.trace = trace
         return output
 
     @staticmethod
@@ -595,15 +576,15 @@ class _RingAttention(torch.autograd.Function):
         """Sum local dQ and circulate dKV without a CP-size averaging factor."""
         if isinstance(ctx.plan, PrunedRingPlan):
             gradients = _pruned_backward(ctx.saved_tensors, grad_output.contiguous(), ctx.ring, ctx.scale,
-                                         ctx.overlap, ctx.plan, ctx.trace)
+                                         ctx.overlap, ctx.plan)
         elif ctx.plan is None:
             gradients = _ring_backward(
                 ctx.saved_tensors, grad_output.contiguous(), ctx.ring, ctx.causal, ctx.scale, ctx.input_layout,
-                ctx.overlap, ctx.trace,
+                ctx.overlap,
             )
         else:
             gradients = _planned_backward(ctx.saved_tensors, grad_output.contiguous(), ctx.ring, ctx.scale,
-                                          ctx.input_layout, ctx.overlap, ctx.plan, ctx.trace)
+                                          ctx.input_layout, ctx.overlap, ctx.plan)
         return (*gradients, *(None for _ in range(len(ctx.needs_input_grad) - 3)))
 
 
