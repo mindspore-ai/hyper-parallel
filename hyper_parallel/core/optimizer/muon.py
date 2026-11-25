@@ -102,8 +102,10 @@ _PackedShardUpdates = Dict[
     Tuple[int, ...], Tuple[torch.Tensor, List[Tuple[torch.nn.Parameter, int, int]]]
 ]
 _AssignmentEntry = Tuple[int, HSDPGroupAssignment]
+_ShardPipelineKey = Tuple[torch.device, Tuple[dist.ProcessGroup, ...], Tuple[dist.ProcessGroup, ...]]
 _LocalQueueKey = Tuple[int, torch.device]
 _LocalBatches = Deque[List[torch.nn.Parameter]]
+_LocalWindowQuotas = Dict[_LocalQueueKey, Deque[int]]
 
 
 @dataclass
@@ -135,6 +137,7 @@ _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "zero_rms_scale_mode": "zero",
     "apply_lr_in_update": False,
     "fsdp_overlap": False,
+    "fsdp_overlap_local_schedule": "greedy",
 }
 
 
@@ -152,6 +155,7 @@ class _MuonAdvancedOptions:
     zero_rms_scale_mode: str
     apply_lr_in_update: bool
     fsdp_overlap: bool
+    fsdp_overlap_local_schedule: str
 
 
 def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOptions:
@@ -307,6 +311,9 @@ class Muon(BaseDistributedOptimizer):
                 Reshape and NS transform callbacks may run in a different order
                 across parameters. Custom momentum and post-update callbacks
                 use the serial schedule.
+            fsdp_overlap_local_schedule: Use "greedy" to take one local batch at
+                each opportunity or "even" to distribute them across the step's
+                communication windows. Set consistently on all ranks.
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
@@ -316,6 +323,8 @@ class Muon(BaseDistributedOptimizer):
         advanced = _resolve_muon_advanced_options(advanced_options)
         if not isinstance(advanced.fsdp_overlap, bool):
             raise TypeError("fsdp_overlap must be a bool")
+        if advanced.fsdp_overlap_local_schedule not in ("greedy", "even"):
+            raise ValueError("fsdp_overlap_local_schedule must be 'greedy' or 'even'")
         if momentum_mode not in ("legacy", "vanilla"):
             raise ValueError(
                 f"momentum_mode must be 'legacy' or 'vanilla', got {momentum_mode!r}"
@@ -359,6 +368,7 @@ class Muon(BaseDistributedOptimizer):
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
         self.fsdp_overlap = advanced.fsdp_overlap
+        self.fsdp_overlap_local_schedule = advanced.fsdp_overlap_local_schedule
         self._shard_pipeline_streams: Dict[torch.device, Tuple[Any, Any]] = {}
         self.reset_optimizer_parameters()
 
@@ -450,13 +460,21 @@ class Muon(BaseDistributedOptimizer):
             assignments, local_batches = self._plan_overlap_batches(assignments)
         self._process_no_comm_params(local_batches)
 
-        for key, run in groupby(assignments, self._shard_pipeline_key):
+        runs = groupby(assignments, self._shard_pipeline_key)
+        shard_runs = {}
+        quotas = None
+        if self.fsdp_overlap_local_schedule == "even" and any(local_batches.values()):
+            runs = [(key, list(run)) for key, run in runs]
+            shard_runs, quotas = self._plan_local_overlap_windows(runs, local_batches)
+
+        for run_idx, (key, run) in enumerate(runs):
             if key is None:
                 for group_idx, assignment in run:
                     self._process_serial_assignment(group_idx, assignment, broadcaster)
             else:
                 device, _, _ = key
-                self._process_shard_pipeline(self._iter_shard_batches(run), device, broadcaster, local_batches)
+                batches = iter(shard_runs[run_idx]) if quotas is not None else self._iter_shard_batches(run)
+                self._process_shard_pipeline(batches, device, broadcaster, local_batches, quotas)
         for (group_idx, _), queue in local_batches.items():
             while queue:
                 self._run_local_batch(group_idx, queue)
@@ -488,6 +506,35 @@ class Muon(BaseDistributedOptimizer):
         """Plan local work while keeping pending entries free of temporary tensors."""
         for shape_group in self._group_by_shape([param for param in params if param.grad is not None]).values():
             queue.extend(self._split_into_memory_safe_batches(shape_group, shard_size=1))
+
+    def _plan_local_overlap_windows(
+            self,
+            runs: List[Tuple[Optional[_ShardPipelineKey], List[_AssignmentEntry]]],
+            local_batches: Dict[_LocalQueueKey, _LocalBatches],
+    ) -> Tuple[Dict[int, List[_ShardBatch]], _LocalWindowQuotas]:
+        """Count each run's initial gather and each shard batch's broadcast."""
+        shard_runs = {}
+        counts = defaultdict(int)
+        for run_idx, (key, run) in enumerate(runs):
+            if key is None:
+                continue
+            device = key[0]
+            batches = list(self._iter_shard_batches(run))
+            shard_runs[run_idx] = batches
+            if batches:
+                counts[batches[0].group_idx, device] += 1
+            for batch in batches:
+                counts[batch.group_idx, device] += 1
+
+        quotas = {}
+        for key, windows in counts.items():
+            num_local = len(local_batches.get(key, ()))
+            if num_local:
+                quotas[key] = deque(
+                    (index + 1) * num_local // windows - index * num_local // windows
+                    for index in range(windows)
+                )
+        return shard_runs, quotas
 
     def _process_no_comm_params(self, local_batches: Dict[_LocalQueueKey, _LocalBatches]) -> None:
         """Use the same local queue for parameters outside HSDP assignments."""
@@ -522,6 +569,16 @@ class Muon(BaseDistributedOptimizer):
                 group = self.param_groups[group_idx]
                 self._process_unshard_params(group, self._update_muon_momentum(group, queue.popleft()))
 
+    def _run_local_window(
+            self, group_idx: int, queue: Optional[_LocalBatches], quotas: Optional[Deque[int]],
+    ) -> None:
+        """Submit the local work allotted to this independent communication window."""
+        if quotas is None:
+            self._run_local_batch(group_idx, queue)
+        elif quotas:
+            for _ in range(quotas.popleft()):
+                self._run_local_batch(group_idx, queue)
+
     def _step_assignments(self) -> Iterator[_AssignmentEntry]:
         """Yield assignments in the original round-robin optimizer group order."""
         by_group = []
@@ -552,7 +609,7 @@ class Muon(BaseDistributedOptimizer):
 
     def _shard_pipeline_key(
             self, entry: Tuple[int, HSDPGroupAssignment],
-    ) -> Optional[Tuple[torch.device, Tuple[dist.ProcessGroup, ...], Tuple[dist.ProcessGroup, ...]]]:
+    ) -> Optional[_ShardPipelineKey]:
         """Only look ahead across consecutive assignments with the same communication groups."""
         _, assignment = entry
         if not self.fsdp_overlap or self.momentum_update_fn is not None or self.post_update_fn is not None:
@@ -593,13 +650,16 @@ class Muon(BaseDistributedOptimizer):
     def _process_shard_pipeline(
             self, batches: Iterator[_ShardBatch], device: torch.device, broadcaster: AsyncReplicateBroadcaster,
             local_batches: Dict[_LocalQueueKey, _LocalBatches],
+            quotas: Optional[_LocalWindowQuotas],
     ) -> None:
         """Overlap each batch's NS with its neighbors' collectives using two in-flight batches."""
         first = next(batches)
         second = next(batches, None)
         if second is None:
-            queue = local_batches.get((first.group_idx, device))
-            overlap_work = partial(self._run_local_batch, first.group_idx, queue) if queue else None
+            key = first.group_idx, device
+            queue = local_batches.get(key)
+            windows = quotas.get(key) if quotas is not None else None
+            overlap_work = partial(self._run_local_window, first.group_idx, queue, windows) if queue else None
             self._process_serial_assignment(first.group_idx, first.assignment, broadcaster, overlap_work)
             return
 
@@ -614,7 +674,7 @@ class Muon(BaseDistributedOptimizer):
         try:
             apply_done = self._run_shard_pipeline(
                 chain((first, second), batches), backend, compute_stream, comm_stream, apply_stream,
-                broadcaster, local_batches, device, buffers,
+                broadcaster, local_batches, device, buffers, quotas,
             )
         except Exception:
             # The caller still owns the scratch storage while queued work drains.
@@ -629,11 +689,18 @@ class Muon(BaseDistributedOptimizer):
             apply_stream: Any, broadcaster: AsyncReplicateBroadcaster,
             local_batches: Dict[_LocalQueueKey, _LocalBatches],
             device: torch.device, buffers: _ShardPipelineBuffers,
+            quotas: Optional[_LocalWindowQuotas],
     ) -> Any:
         """Enqueue the stages while keeping the collective order identical across ranks."""
         first = next(batches)
+
+        def run_local(group_idx: int) -> None:
+            key = group_idx, device
+            windows = quotas.get(key) if quotas is not None else None
+            self._run_local_window(group_idx, local_batches.get(key), windows)
+
         current = self._prepare_shard_batch(first, backend, comm_stream, buffers, 0)
-        self._run_local_batch(first.group_idx, local_batches.get((first.group_idx, device)))
+        run_local(first.group_idx)
         previous = None
         apply_done = None
         for index, following in enumerate(chain(batches, (None,))):
@@ -650,7 +717,7 @@ class Muon(BaseDistributedOptimizer):
                 local_group = previous.batch.group_idx
                 # The next shard NS is already queued on the compute stream.
                 # Independent local work can cover the rest of the older broadcast.
-                self._run_local_batch(local_group, local_batches.get((local_group, device)))
+                run_local(local_group)
                 apply_done = self._apply_pipeline_batch(previous, backend, apply_stream, compute_stream, broadcaster)
 
             # Put the next gather ahead of this broadcast on the communication
@@ -671,7 +738,7 @@ class Muon(BaseDistributedOptimizer):
             previous = _BroadcastShardBatch(batch, packed, works)
             current = prefetched
 
-        self._run_local_batch(batch.group_idx, local_batches.get((batch.group_idx, device)))
+        run_local(batch.group_idx)
         return self._apply_pipeline_batch(previous, backend, apply_stream, compute_stream, broadcaster)
 
     def _apply_pipeline_batch(
