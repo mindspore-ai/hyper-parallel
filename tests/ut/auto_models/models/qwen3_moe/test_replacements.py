@@ -25,7 +25,6 @@ matrix is testable on CPU-only checkouts (Gate-1).
 """
 # pylint: disable=wrong-import-position
 
-import os
 import sys
 import types
 import unittest.mock
@@ -35,8 +34,10 @@ from torch import nn
 
 from hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement import (
     _validate_batched_experts_contract,
+    replace_qwen3_moe_flash_attention,
     replace_qwen3_moe_grouped_experts,
 )
+from hyper_parallel.models.registry import get_model_adapter
 
 
 def test_batched_layout_is_accepted(batched_experts):
@@ -100,3 +101,36 @@ def test_factory_delegates_batched_layout_to_grouped_experts(batched_experts):
     assert module is batched_experts, "case: module"
     assert module_fqn == "model.layers.0.mlp.experts", "case: module_fqn"
     assert context == {"tp": None}, "case: context"
+
+
+def test_attention_replaces_q_and_k_norms() -> None:
+    """Apply both native norm replacements beneath the new GQA module."""
+    source = nn.Module()
+    attention = nn.Module()
+    attention.q_norm = nn.Identity()
+    attention.k_norm = nn.Identity()
+    original_norms = (attention.q_norm, attention.k_norm)
+    new_norms = (nn.Identity(), nn.Identity())
+    module_name = "hyper_parallel.components.modules"
+    components = types.ModuleType(module_name)
+    build_attention = unittest.mock.Mock(return_value=attention)
+    build_norm = unittest.mock.Mock(side_effect=new_norms)
+    vars(components).update(GroupedQueryAttention=build_attention, RMSNorm=build_norm)
+    context = {}
+    with unittest.mock.patch.dict(sys.modules, {module_name: components}):
+        result = replace_qwen3_moe_flash_attention(module=source, module_fqn="layer.attn", context=context)
+    assert result is attention, "replacement must return the GQA module"
+    assert (attention.q_norm, attention.k_norm) == new_norms, "both norm children must be replaced"
+    build_attention.assert_called_once_with(module=source, module_fqn="layer.attn", context=context)
+    build_norm.assert_has_calls([
+        unittest.mock.call(module=module, module_fqn=f"layer.attn.{name}", context=context)
+        for name, module in zip(("q_norm", "k_norm"), original_norms)
+    ])
+    assert build_norm.call_count == 2, "only Q and K norms should be replaced"
+
+
+def test_lazy_loss_and_codegen_providers() -> None:
+    """Resolve the registered loss and shared codegen implementations on demand."""
+    spec = get_model_adapter("qwen3_moe")
+    assert spec.loss().__name__ == "hyper_parallel.models.qwen3_moe.adapter.runtime.chunked_loss", "Qwen3-MoE loss"
+    assert spec.codegen().__name__ == "hyper_parallel.models.qwen3.adapter.codegen", "shared Qwen3 codegen"

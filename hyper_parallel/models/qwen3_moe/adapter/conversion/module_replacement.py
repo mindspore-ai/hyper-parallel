@@ -75,11 +75,17 @@ def replace_qwen3_moe_flash_attention(
     # Lazy: the modules package wraps NPU-only functional backends.
     from hyper_parallel.components.modules import GroupedQueryAttention  # pylint: disable=C0415
 
-    return GroupedQueryAttention(
+    attention = GroupedQueryAttention(
         module=module,
         module_fqn=module_fqn,
         context=context,
     )
+    # The parent factory owns norm children, avoiding overlapping replacements.
+    for name in ("q_norm", "k_norm"):
+        setattr(attention, name, replace_qwen3_moe_rms_norm(
+            module=getattr(attention, name), module_fqn=f"{module_fqn}.{name}", context=context,
+        ))
+    return attention
 
 
 def _validate_batched_experts_contract(module: nn.Module, module_fqn: str) -> None:
