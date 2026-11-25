@@ -31,7 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.swiglu_mlp_family import (
+from hyper_parallel.components.modules.mlp.swiglu_mlp import (
     SwiGLUMLPModule, _validate_mlp_config, local_swiglu, _activation_settings,
 )
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family

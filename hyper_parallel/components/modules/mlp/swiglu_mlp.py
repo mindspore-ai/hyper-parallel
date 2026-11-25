@@ -24,15 +24,12 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
 )
-
-from hyper_parallel.components.checkpoint import ConcatenateWithSections
-from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
-from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
 
 
 def _validate_mlp_config(config: Any) -> None:
@@ -370,24 +367,9 @@ class W1W2SwiGLUMLPModule(nn.Module):
         return []
 
 
-@module_replacement
-def SwiGLUMLP(  # pylint: disable=invalid-name
-    *, config: Any = None, module: nn.Module | None = None,
-    module_fqn: str = "", context: Mapping[str, Any] | None = None, mesh: Any = None,
-    activation_dtype: str | None = None, swiglu_limit: float | None = None,
-    state_layout: str = "linear_fc",
-) -> nn.Module:
-    """Construct a tracked MLP from complete config or separate source projections."""
-    return build_family(SwiGLUMLP, config=config, module=module, module_fqn=module_fqn,
-                        context=context, mesh=mesh, activation_dtype=activation_dtype,
-                        swiglu_limit=swiglu_limit, state_layout=state_layout)
-
-
-register_module_family(ModuleFamily(
-    name="swiglu_mlp", baseline=SwiGLUMLP,
-    variants={"local": "hyper_parallel.components.modules.swiglu_mlp_family.SwiGLUMLPModule",
-              "w1_w2": "hyper_parallel.components.modules.swiglu_mlp_family.W1W2SwiGLUMLPModule"},
-    selector_specs={"state_layout": SelectorSpec(str, "linear_fc")},
-    variant_rules=(VariantRule({"state_layout": "w1_w2", "parallel": False}, "w1_w2"),),
-    default_variant="local",
-))
+__all__ = [
+    "SwiGLUMLPModule",
+    "W1W2SwiGLUMLPModule",
+    "local_swiglu",
+    "swiglu_activation",
+]
