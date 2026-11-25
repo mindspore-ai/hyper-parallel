@@ -13,11 +13,9 @@
 #     --output-dir ./kimi_k26_demo_data --num-samples 1024
 
 model:
-  _target_: hyper_parallel.models.kimi_k26.adapter.validation.cropped_model.build_cropped_kimi_vlm
+  _target_: hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: moonshotai/Kimi-K2.6
-  config_path: moonshotai/Kimi-K2.6
-  num_hidden_layers: 61
-  n_routed_experts: 384
+  load_base_model: false
   trust_remote_code: false          # processor 走 native（image_grid_thw 协议）
   local_files_only: false
   torch_dtype: bfloat16
@@ -28,7 +26,9 @@ model:
   # also leaves the gradient all-reduce, and autograd stops at its output -- its backward
   # pass and saved activations disappear. Pattern is an fnmatch glob on the FQN; a pattern
   # that matches nothing raises instead of silently leaving the tower trainable.
-  freeze_patterns: ["model.vision_tower*"]
+  freeze_config: ["model.vision_tower*"]
+
+model_init_dtype: float32
 
 training:
   train_iters: 6
@@ -54,6 +54,10 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
   dp_shard_size: 128
   edp_shard_size: 4
   enable_offload: false
@@ -65,76 +69,6 @@ fsdp_config:
   backward_prefetch_depth: 3
   comm_fusion: false
 
-plan_overrides:
-  # seq2048 variant: the seq4096 run OOM'd at step 0 (54.59GB allocated on NPU,
-  # i.e. our own working set, vs 44.25GB for the text-tower-only full run).
-  # NB: the 166 vision-tower leaf specs below are required whenever EP >= 1
-  # (their role-based boundaries collapse under whole-tower replication, so the
-  # planner needs explicit per-leaf parameter specs to pass the coverage check).
-  # FSDP-only runs (ep_size: 1, e.g. the train_kimi_vlm demo) do not need them.
-  # 文本塔全部 norm 换成融合 NPU RMSNorm（61 层 x 4 处 + 最终 norm）。
-  # 每个 pattern 至少命中一个模块；省略 source_type 时从命中对象读取实际类型。
-  # 因此 FQN 写全；RMSNorm 组件复用源模块的 weight/eps（state_dict 与切分均不变）。
-  - match:
-      - "model.language_model.*.input_layernorm"
-      - "model.language_model.*.post_attention_layernorm"
-      - "model.language_model.*.self_attn.q_a_layernorm"
-      - "model.language_model.*.self_attn.kv_a_layernorm"
-      - model.language_model.norm
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.RMSNorm
-        use_fused_ops: true
-
-  # 文本塔保留原始 router 和共享专家，仅由专家族执行路由专家计算与 EP 运输。
-  # 当前配置 first_k_dense_replace=1，只匹配第 1 层开始的 MoE 专家。
-  - match: "model.language_model.layers.[123456789]*.mlp.experts"
-    replace:
-      kind: module
-      implementation: hyper_parallel.components.modules.GroupedExperts
-
-  # 视觉塔 27 层 × 6 个模块在 TP 下全部 replicate：用 glob 收敛，等价于逐层展开的 162 条。
-  # 本模型 FQN 空间里 layers.<i> 下只有 attn.* / mlp.*，`*` 跨点号不会命中别的子模块。
-  - match: model.vision_tower.layers.*.attn.q_proj
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.vision_tower.layers.*.attn.k_proj
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.vision_tower.layers.*.attn.v_proj
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.vision_tower.layers.*.attn.proj
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.vision_tower.layers.*.mlp.fc1
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.vision_tower.layers.*.mlp.fc2
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.vision_tower.patch_embed.proj
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.vision_tower.patch_embed.pos_emb
-    params:
-      position_embeddings: {tp: replicate}
-  - match: model.mm_projector.in_proj
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: model.mm_projector.out_proj
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
 mixed_precision:
   enabled: false
 
@@ -162,7 +96,7 @@ dataset:
   data_transform:
     # Eager (padding) Kimi transform: encodes one sample and pads it to max_seq_len,
     # which is the shape the fixed-sample throughput arms below measure.
-    _target_: hyper_parallel.models.kimi_k26.adapter.data.transform_fn.build_kimi_omni_transform
+    _target_: hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn.build_kimi_omni_transform
     max_seq_len: 8192
     # ARM H: align the image budget with MindSpeed-MM. Their kimi_k3 config sets
     # image_max_pixels: 262144 (=512*512) and resizes by sqrt(max_px/(w*h)) before
@@ -204,6 +138,7 @@ dataloader:
 
 optimizer:
   _target_: hyper_parallel.components.optim.builders.AdamW
+  fp32_main_params: true
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     adamw_lr: 1.0e-5
@@ -237,7 +172,7 @@ profiler:
   rank_ids: [0]
 
 loss_fn:
-  # 家族子类：Omni 多模态 batch 只带 raw labels，这里按 next-token 语义推导 shift_labels
-  # 后交给框架的 ChunkedCausalLMLoss（预移位契约）；不改框架代码。
-  _target_: hyper_parallel.models.kimi_k26.adapter.loss.KimiChunkedCausalLMLoss
+  # Omni batches supply raw labels; the public loss owns the next-token shift.
+  _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss
   chunk_size: 4096
+  labels_are_shifted: false

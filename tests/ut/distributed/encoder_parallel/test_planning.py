@@ -22,7 +22,11 @@ import torch
 from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderWorkItem
 from hyper_parallel.distributed.encoder_parallel.exchange import FeatureExchangeMode, select_feature_exchange
-from hyper_parallel.distributed.encoder_parallel.mesh import decoder_coordinates, encoder_coordinates
+from hyper_parallel.distributed.encoder_parallel.mesh import (
+    decoder_coordinates,
+    encoder_coordinates,
+    select_encoder_domain_size,
+)
 from hyper_parallel.distributed.encoder_parallel.planning import (
     DecoderSequenceLayout,
     assign_lpt,
@@ -120,13 +124,26 @@ class TestEncoderPlanning(unittest.TestCase):
         """Feature: Encoder-CP configuration validation.
 
         Description: Reject invalid degrees and removed single-choice settings.
-        Expectation: Only enabled and encoder_cp_size remain public inputs.
+        Expectation: Configuration accepts only enabled, encoder_cp_size and resource_domain.
         """
         for size in (0, True):
-            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "encoder_cp_size must be a positive integer"):
+            with self.subTest(size=size), self.assertRaisesRegex(
+                ValueError, "encoder_cp_size must be a positive integer"
+            ):
                 EncoderParallelConfig(encoder_cp_size=size)
         for name, value in (("mode", "sequence_sharded"),
                             ("balance_by", "attention_flops"),
                             ("validate_metadata", True)):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unknown encoder_parallel keys"):
                 EncoderParallelConfig.from_mapping({name: value})
+
+    def test_resource_domain_selection(self) -> None:
+        """Keep automatic communication domains minimal while allowing explicit global pooling."""
+        for decoder, encoder, job, expected in ((2, 4, 16, 4), (8, 4, 16, 8), (6, 4, 12, 12)):
+            with self.subTest(decoder=decoder, encoder=encoder):
+                self.assertEqual(select_encoder_domain_size(
+                    decoder_size=decoder, job_size=job, encoder_cp_size=encoder, resource_domain="auto"), expected)
+        self.assertEqual(select_encoder_domain_size(
+            decoder_size=2, job_size=16, encoder_cp_size=2, resource_domain="global"), 16)
+        with self.assertRaisesRegex(ValueError, "resource domain"):
+            select_encoder_domain_size(decoder_size=2, job_size=16, encoder_cp_size=4, resource_domain="decoder")

@@ -34,7 +34,8 @@ def validate_sparse_attention_family(*, config: Any, module: nn.Module | None, c
     """Check logical topology before allocating native or replacement parameters."""
     # Local/meta construction can retain a CP request before the job topology exists.
     cp_size = context.get("cp_size")
-    if cp_size is not None and member.arguments.get("kv_cp_size", 1) != cp_size:
+    requested = member.arguments.get("kv_cp_size")
+    if cp_size is not None and requested is not None and requested != cp_size:
         raise ValueError("kv_cp_size must equal the job cp_size")
     config = config if module is None else module.config
     if member.axis_sizes["pp"] > 1:
@@ -117,7 +118,7 @@ def sparse_attention_parallel_spec(*, module: nn.Module, member: Any) -> Paralle
 def DeepseekSparseAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None,
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather",
+    kv_cp_size: int | None = None, kv_cp_strategy: str = "allgather",
     cp_comm_overlap: bool = False, dense_warmup: bool | None = None,
 ) -> nn.Module:
     """Build a local or CP member while retaining V3.2 source and checkpoint contracts.
@@ -128,7 +129,7 @@ def DeepseekSparseAttention(  # pylint: disable=invalid-name
         module_fqn: Source path supplied by the replacement executor.
         context: Logical job topology used for family selection.
         mesh: Optional existing MeshContext for shared layout planning and binding.
-        kv_cp_size: KV domain size; must equal the job CP size for this implementation.
+        kv_cp_size: None follows the job CP size; an explicit value must match it.
         kv_cp_strategy: KV transport; currently only allgather is supported.
         cp_comm_overlap: Submit all key-bank gathers before waiting when true; defaults to False.
         dense_warmup: None follows the mutable model stage; bool pins the stage.

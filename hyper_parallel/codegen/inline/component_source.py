@@ -22,15 +22,22 @@ import inspect
 import textwrap
 from typing import Any, Callable
 
+from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
 from hyper_parallel.codegen.inline.attention import (
-    render_attention_class, _component_dependencies, _referenced_global_names, _strip_annotations,
-)
-from hyper_parallel.codegen.inline.recognition import (
-    _assigned_once, _closure_source_bindings, _companion_attr_bindings, _function_source_qualname,
-    _nested_forward_body, _wrapper_definition,
+    _component_dependencies,
+    _referenced_global_names,
+    _strip_annotations,
+    render_attention_class,
 )
 from hyper_parallel.codegen.inline.expansion import ExpandedSource
-from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
+from hyper_parallel.codegen.inline.recognition import (
+    _assigned_once,
+    _closure_source_bindings,
+    _companion_attr_bindings,
+    _function_source_qualname,
+    _nested_forward_body,
+    _wrapper_definition,
+)
 from hyper_parallel.distributed.recipe_spec import WRAPPER_CONTEXT
 
 
@@ -129,7 +136,7 @@ def _unchanged_component_base(node: ast.AST) -> str | None:
     return module if ast.dump(node) == ast.dump(expected) else None
 
 
-__all__ = ["render_component_source", "observe_wrapper_source"]
+__all__ = ["render_component_source", "render_replacement_source", "observe_wrapper_source"]
 
 
 def observe_wrapper_source(
@@ -275,3 +282,5 @@ def _context_getattr_arguments(value: ast.expr) -> list[ast.expr]:
             and len(value.args) in (2, 3) and not value.keywords):
         return value.args
     return []
+
+render_replacement_source = render_component_source

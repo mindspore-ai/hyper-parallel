@@ -80,9 +80,9 @@ _MODEL_PATH_ALIASES = ("pretrained_model_name_or_path", "config_path")
 # runs.  One line a family, and the entry is the declaration that the two are
 # a pair.
 _CONFIG_FACTORIES = {
-    "hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model."
+    "hyper_parallel.models.deepseek_v41.validation.cropped_model."
     "build_cropped_deepseek_v41":
-        "hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model."
+        "hyper_parallel.models.deepseek_v41.validation.cropped_model."
         "build_deepseek_v41_validation_config",
 }
 

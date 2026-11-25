@@ -28,9 +28,9 @@ from torch import nn
 
 from hyper_parallel.components.modules.engram import EngramModule
 from hyper_parallel.distributed.mesh import MeshContext
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
+from hyper_parallel.components.modules.engram.host_state import HostEngramState
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
-from hyper_parallel.models.deepseek_v41.adapter.optim.host_sparse import HostSparseOptimizerCoordinator
+from hyper_parallel.components.modules.engram.host_optimizer import HostSparseOptimizerCoordinator
 from hyper_parallel.models.external_state import CheckpointRuntime
 
 
@@ -162,7 +162,7 @@ def _run_host_engram(backend, device_type):
         initial[2] = torch.tensor([1.0, 1.0] if ep_rank == 0 else [2.0, 2.0])
         torch.utils.swap_tensors(table.weight, nn.Parameter(initial))
         model = _Model(table, device)
-        state = DeepseekV41HostState(model, {"embed": table}, mesh)
+        state = HostEngramState(model, {"embed": table}, mesh)
         sparse = torch.optim.SparseAdam([table.weight], lr=0.1, betas=(0.9, 0.95), eps=1.0e-6)
         coordinator = HostSparseOptimizerCoordinator(_DenseOptimizer(model.dense), sparse, state.tables)
         state.optimizer = coordinator
@@ -264,7 +264,7 @@ def test_host_engram_ep1_generalization_gloo():
             with torch.no_grad():
                 reference.weight.copy_(initial)
             model = _Model(table, torch.device("cpu"))
-            state = DeepseekV41HostState(model, {"embed": table}, mesh)
+            state = HostEngramState(model, {"embed": table}, mesh)
             sparse = torch.optim.SparseAdam([table.weight], lr=0.1)
             state.optimizer = HostSparseOptimizerCoordinator(
                 _DenseOptimizer(model.dense), sparse, state.tables,
@@ -321,7 +321,7 @@ def test_host_engram_pp_empty_stage_gloo():
             model = nn.Module()
             model.dense = nn.Parameter(torch.ones(1))
         model.dense.grad = torch.tensor([3.0 if rank == 0 else 5.0])
-        state = DeepseekV41HostState(model, tables, mesh)
+        state = HostEngramState(model, tables, mesh)
         state.optimizer = HostSparseOptimizerCoordinator(_DenseOptimizer(model.dense), sparse, tables)
         state.sparse_optimizer = sparse
         prepared = state.prepare_optimizer_step(max_norm=0)

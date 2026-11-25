@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib import import_module
 from typing import Any
 
@@ -40,14 +41,16 @@ def validate_gated_mla_family(*, config: Any, module: nn.Module | None, context:
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     strategy: str = "expanded_ulysses", overlap: bool = False,
-    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather", fuse_latent_qkv: bool = True,
+    source_contract: str = "tuple",
 ) -> nn.Module:
     """Consume family-only options; the saved request retains them for CP preparation."""
     # Resolve after family registration; concrete members import this module's layout validators.
     implementation = import_module('.gated_multi_latent_attention', __package__).GatedMultiLatentAttentionModule
 
     del module_fqn, context, strategy, overlap, ulysses_degree, kv_exchange
-    return implementation(config=config, module=module)
+    return implementation(config=config, module=module, fuse_latent_qkv=fuse_latent_qkv,
+                          source_contract=source_contract)
 
 
 @module_replacement
@@ -55,7 +58,8 @@ def GatedMultiLatentAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Any = None, mesh: Any = None,
     strategy: str = "expanded_ulysses", overlap: bool = False,
-    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather", fuse_latent_qkv: bool = True,
+    source_contract: str = "tuple",
 ) -> nn.Module:
     """Build the local gated NoPE MLA member.
 
@@ -75,7 +79,14 @@ def GatedMultiLatentAttention(  # pylint: disable=invalid-name
     """
     return build_family(GatedMultiLatentAttention, config=config, module=module,
                         module_fqn=module_fqn, context=context, mesh=mesh,
-                        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange)
+                        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
+                        fuse_latent_qkv=fuse_latent_qkv, source_contract=source_contract)
+
+
+def gated_mla_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> Any:
+    """Declare the actual source result ports alongside all gated MLA parameter layouts."""
+    layout = mla_sharding(module=module, module_fqn=module_fqn, member=member, context=context)
+    return replace(layout, out_names=("output",)) if module.source_contract == "tensor" else layout
 
 
 register_module_family(ModuleFamily(
@@ -89,5 +100,5 @@ register_module_family(ModuleFamily(
     )},
     default_variant="local", parallel_axis="cp",
     variant_rules=(VariantRule({"parallel": True}, "cp"),),
-    sharding=mla_sharding, validate=validate_gated_mla_family, parallel_spec=mla_local_parallel_spec,
+    sharding=gated_mla_sharding, validate=validate_gated_mla_family, parallel_spec=mla_local_parallel_spec,
 ))

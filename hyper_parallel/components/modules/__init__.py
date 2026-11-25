@@ -25,32 +25,55 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from hyper_parallel.components.modules.attention.multi_latent_attention import (
-        MultiLatentAttention, MultiLatentAttentionModule,
-    )
-    from hyper_parallel.components.modules.attention.gated_multi_latent_attention import (
-        GatedMultiLatentAttention, GatedMultiLatentAttentionModule,
-    )
-    from hyper_parallel.components.modules.common.mtp import (
-        MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
-    )
     from hyper_parallel.components.modules.attention.deepseek_sparse_attention import (
-        CPDeepseekSparseAttentionModule, DeepseekSparseAttention, DeepseekSparseAttentionModule,
-    )
-    from hyper_parallel.components.modules.attention.grouped_query_attention import (
-        GroupedQueryAttention,
+        CPDeepseekSparseAttentionModule,
+        DeepseekSparseAttention,
+        DeepseekSparseAttentionModule,
     )
     from hyper_parallel.components.modules.attention.gated_grouped_query_attention import (
         GatedGroupedQueryAttention,
     )
-    from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts_family import GroupedExperts
+    from hyper_parallel.components.modules.attention.gated_multi_latent_attention import (
+        GatedMultiLatentAttention,
+        GatedMultiLatentAttentionModule,
+    )
+    from hyper_parallel.components.modules.attention.grouped_query_attention import (
+        GroupedQueryAttention,
+    )
+    from hyper_parallel.components.modules.attention.multi_latent_attention import (
+        MultiLatentAttention,
+        MultiLatentAttentionModule,
+    )
+    from hyper_parallel.components.modules.common.mtp import (
+        MTPLayer,
+        MTPOutput,
+        MultiTokenPrediction,
+        build_mtp,
+    )
+    from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm
+    from hyper_parallel.components.modules.common.swiglu_mlp import SwiGLUMLP
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
-    from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm
+    from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts_family import GroupedExperts
     from hyper_parallel.components.modules.moe.shared_expert import SharedExpert
-    from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
+    "ScoreCorrectedTopKRouter": "moe.grouped_topk_router",
+    "ScoreCorrectedTopKRouterModule": "moe.grouped_topk_router",
+    "ChannelDeltaAttention": "attention.channel_delta_attention",
+    "ChannelDeltaAttentionModule": "attention.channel_delta_attention",
+    "IndependentExperts": "moe.independent_experts",
+    "IndependentExpertsModule": "moe.independent_experts",
+    "SiTUMLP": "common.situ_mlp",
+    "SiTUMLPModule": "common.situ_mlp",
+    "SpatialPatchProjection": "vision.spatial_patch_projection",
+    "SpatialPatchProjectionModule": "vision.spatial_patch_projection",
+    "LearnedAxialVisionTransformer": "vision.learned_axial_vision_transformer",
+    "LearnedAxialVisionTransformerModule": "vision.learned_axial_vision_transformer",
+    "AxialVisionTransformer": "vision.axial_vision_transformer",
+    "AxialVisionTransformerModule": "vision.axial_vision_transformer",
+    "CausalLMHead": "common.causal_lm_head",
+    "CausalLMHeadModule": "common.causal_lm_head",
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
     "Gate": "moe.router",
     "GateModule": "moe.router",
@@ -66,8 +89,8 @@ _EXPORT_TO_MODULE = {
     "MHCPre": "mhc",
     "MHCPost": "mhc",
     "PipelinedMhc": "mhc",
-    "SwiGLUMLPModule": "swiglu_mlp_family",
-    "SwiGLUMLP": "swiglu_mlp_family",
+    "SwiGLUMLPModule": "common.swiglu_mlp",
+    "SwiGLUMLP": "common.swiglu_mlp",
     "SharedExpertModule": "moe.shared_expert",
     "SharedExpert": "moe.shared_expert",
     "RMSNormModule": "common.rms_norm",

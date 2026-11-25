@@ -33,51 +33,13 @@ from torch import nn
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
     SharedCompressedAttentionState,
 )
-from hyper_parallel.models.deepseek_v41.adapter.validation import (
-    shared_state_trace as shared_state_trace_module,
+from hyper_parallel.models.deepseek_v41.validation import shared_state_trace as shared_state_trace_module
+from hyper_parallel.models.deepseek_v41.validation.model_validation_spec import (
+    _run_native_module_parity,
 )
-from hyper_parallel.models.deepseek_v41.adapter.validation.shared_state_trace import (
+from hyper_parallel.models.deepseek_v41.validation.shared_state_trace import (
     begin_shared_state_trace,
     finish_shared_state_trace,
-)
-from hyper_parallel.tools.model_integration.checkpoint_coverage import build_checkpoint_coverage
-from hyper_parallel.tools.model_integration.data_contract import (
-    modality_gradient_parameters,
-    validate_observed_forward_fields,
-)
-from hyper_parallel.tools.model_integration.evidence_store import (
-    EvidenceStore,
-    find_repository_root,
-)
-from hyper_parallel.tools.model_integration.structure_inventory import (
-    build_model_inventory,
-    diff_inventories,
-    inspect_local_model_assets,
-)
-from hyper_parallel.tools.model_integration.manifest import ManifestError, load_manifest
-from hyper_parallel.tools.model_integration.module_parity import ParityContext, run_module_parity
-from hyper_parallel.tools.model_integration import case_compare
-from hyper_parallel.tools.model_integration import tensor_probes
-from hyper_parallel.tools.model_integration.case_compare import (
-    compare_checkpoint_layouts,
-    compare_parameter_probes,
-    compare_scalar_curves,
-    summarize_performance,
-)
-from hyper_parallel.tools.model_integration.case_matrix import generate_validation_cases
-from hyper_parallel.tools.model_integration.tensor_probes import InputIdentityRecorder
-from hyper_parallel.tools.model_integration.schemas import (
-    FindingSeverity,
-    IntegrationState,
-    ModelIntegrationFinding,
-)
-from hyper_parallel.tools.model_integration.integration_validator import (
-    resolve_model_validation_spec,
-    validate_final_model,
-    validate_state_invariants,
-)
-from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (
-    _run_native_module_parity,
 )
 from hyper_parallel.models.validation_spec import (
     CheckpointValidationSpec,
@@ -88,8 +50,44 @@ from hyper_parallel.models.validation_spec import (
     SharedStateValidationSpec,
     StateInvariantSpec,
 )
+from hyper_parallel.tools.model_integration import case_compare
 from hyper_parallel.tools.model_integration import cli as model_integration_cli
+from hyper_parallel.tools.model_integration import tensor_probes
+from hyper_parallel.tools.model_integration.case_compare import (
+    compare_checkpoint_layouts,
+    compare_parameter_probes,
+    compare_scalar_curves,
+    summarize_performance,
+)
+from hyper_parallel.tools.model_integration.case_matrix import generate_validation_cases
+from hyper_parallel.tools.model_integration.checkpoint_coverage import build_checkpoint_coverage
 from hyper_parallel.tools.model_integration.cli import main as model_integration_main
+from hyper_parallel.tools.model_integration.data_contract import (
+    modality_gradient_parameters,
+    validate_observed_forward_fields,
+)
+from hyper_parallel.tools.model_integration.evidence_store import (
+    EvidenceStore,
+    find_repository_root,
+)
+from hyper_parallel.tools.model_integration.integration_validator import (
+    resolve_model_validation_spec,
+    validate_final_model,
+    validate_state_invariants,
+)
+from hyper_parallel.tools.model_integration.manifest import ManifestError, load_manifest
+from hyper_parallel.tools.model_integration.module_parity import ParityContext, run_module_parity
+from hyper_parallel.tools.model_integration.schemas import (
+    FindingSeverity,
+    IntegrationState,
+    ModelIntegrationFinding,
+)
+from hyper_parallel.tools.model_integration.structure_inventory import (
+    build_model_inventory,
+    diff_inventories,
+    inspect_local_model_assets,
+)
+from hyper_parallel.tools.model_integration.tensor_probes import InputIdentityRecorder
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config.training import ModelIntegrationConfig
 from hyper_parallel.trainer.runtime.model_integration import TrainerModelIntegrationSession
@@ -538,7 +536,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 return SimpleNamespace(returncode=7, stdout="", stderr="crashed")
 
             with mock.patch(
-                "hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec.subprocess.run",
+                "hyper_parallel.models.deepseek_v41.validation.model_validation_spec.subprocess.run",
                 side_effect=_failed_process,
             ):
                 report = _run_native_module_parity(context)

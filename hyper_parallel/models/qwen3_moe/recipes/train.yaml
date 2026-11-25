@@ -19,6 +19,8 @@ model:
     _target_: hyper_parallel.models._transformers.packed_attention.register_npu_packed_attention
   force_hf: true
 
+model_init_dtype: float32
+
 training:
   train_iters: 3
   train_samples: null
@@ -40,6 +42,10 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
   dp_shard_size: 8
   replicate_params: []
   reshard_after_forward: true
@@ -48,34 +54,6 @@ fsdp_config:
   forward_prefetch_depth: 1
   backward_prefetch_depth: 1
   comm_fusion: false
-
-plan_overrides:
-  - match:
-      - "*.input_layernorm"
-      - "*.post_attention_layernorm"
-      - model.norm
-    replace:
-      kind: module
-      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
-      implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm
-  - match: "*.self_attn"
-    replace:
-      kind: module
-      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
-      implementation:
-        _target_: hyper_parallel.components.modules.GroupedQueryAttention
-        # U=1 selects KV AllGather when cp_size>1; U=cp_size selects pure Ulysses.
-        # Other divisors select Ulysses + KV AllGather. overlap defaults to false.
-        ulysses_degree: 1
-  # The experts module is always the same grouped-GEMM implementation;
-  # enabling EP changes only token dispatch/combine around this boundary.
-  - match: "model.layers.*.mlp.experts"
-    replace:
-      kind: module
-      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
-      implementation:
-        _target_: hyper_parallel.components.modules.GroupedExperts
 
 mixed_precision:
   enabled: false
@@ -140,6 +118,7 @@ dataloader:
 
 optimizer:
   _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
   no_decay_params: [bias, norm, ln_]
   muon_config:
     muon_lr: 3.0e-5

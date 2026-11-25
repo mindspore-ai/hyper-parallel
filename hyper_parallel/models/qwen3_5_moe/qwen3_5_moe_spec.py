@@ -1,0 +1,224 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Qwen3.5 MoE text and VLM identities with complete public vision and hybrid-attention families."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import replace
+from functools import partial
+from typing import Any
+
+from torch import nn
+
+from hyper_parallel.components.checkpoint.export_policy import export_text_checkpoint
+from hyper_parallel.components.modules import (
+    AxialVisionTransformer,
+    CausalLMHead,
+    GatedDeltaNet,
+    GatedGroupedQueryAttention,
+    GroupedExperts,
+    OffsetRMSNorm,
+    RotaryEmbedding,
+)
+from hyper_parallel.components.modules.common.swiglu_mlp import SwiGLUMLP
+from hyper_parallel.core.fully_shard.api import HSDPModule
+from hyper_parallel.distributed.encoder_parallel.contracts import EncoderParallelAdapterSpec
+from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.registry import register_custom_model, register_model_adapter
+from hyper_parallel.models.replacement import ModuleReplacementRequest
+
+
+def get_replacement_rules(
+    *, model: nn.Module, context: Mapping[str, Any], backend: str = "eager", conv_backend: str = "eager",
+    ulysses_degree: int | None = None, use_fused_ops: bool = False, use_grouped_gemm: bool = False,
+) -> tuple[ModuleReplacementRequest, ...]:
+    """Declare actual hybrid layer roles and replace the entire visual boundary when present."""
+    del context
+    conditional = hasattr(model.config, "vision_config")
+    config = model.config.text_config if conditional else model.config
+    prefix = "model.language_model" if conditional else "model"
+    rules = [
+        ModuleReplacementRequest(
+            match=(prefix + ".rotary_emb",), target=RotaryEmbedding, kwargs={"mrope_interleaved": True}
+        ),
+        ModuleReplacementRequest(
+            match=(prefix + ".layers.*.mlp.experts",), target=GroupedExperts,
+            kwargs={"use_grouped_gemm": use_grouped_gemm}
+        ),
+        ModuleReplacementRequest(
+            match=(prefix + ".layers.*.mlp.shared_expert",), target=SwiGLUMLP, kwargs={"state_layout": "separate"}
+        ),
+        ModuleReplacementRequest(
+            match=(
+                prefix + ".layers.*.input_layernorm",
+                prefix + ".layers.*.post_attention_layernorm",
+                prefix + ".norm",
+            ),
+            target=OffsetRMSNorm,
+            kwargs={"use_fused_ops": use_fused_ops},
+        ),
+        ModuleReplacementRequest(match=("lm_head",), target=CausalLMHead),
+    ]
+    full = tuple(
+        f"{prefix}.layers.{index}.self_attn"
+        for index, kind in enumerate(config.layer_types)
+        if kind == "full_attention"
+    )
+    linear = tuple(
+        f"{prefix}.layers.{index}.linear_attn"
+        for index, kind in enumerate(config.layer_types)
+        if kind == "linear_attention"
+    )
+    if full:
+        rules.append(
+            ModuleReplacementRequest(
+                match=full, target=GatedGroupedQueryAttention,
+                kwargs={"fuse_qkv": False, "use_fused_ops": use_fused_ops, "ulysses_degree": ulysses_degree}
+            )
+        )
+    if linear:
+        rules.append(ModuleReplacementRequest(
+            match=linear, target=GatedDeltaNet,
+            kwargs={"backend": backend, "conv_backend": conv_backend, "ulysses_degree": ulysses_degree},
+        ))
+    if conditional:
+        rules.append(ModuleReplacementRequest(match=("model.visual",), target=AxialVisionTransformer))
+    return tuple(rules)
+
+
+def get_fsdp_wrap_modules(model: nn.Module) -> tuple[str, ...]:
+    """Expose complete visual blocks and merger as independent FSDP execution units."""
+    visual = getattr(model.model, "visual", None)
+    if visual is None:
+        return ()
+    return tuple(f"model.visual.blocks.{index}" for index in range(len(visual.blocks))) + ("model.visual.merger",)
+
+
+def get_fsdp_excluded_subtrees(model: nn.Module) -> tuple[str, ...]:
+    """Keep the visual container outside generic language-decoder inference."""
+    return ("model.visual",) if hasattr(model.model, "visual") else ()
+
+
+def get_fsdp_execution_order(model: nn.Module, module_fqns: tuple[str, ...]) -> tuple[str, ...]:
+    """Follow the source VLM's embedding-before-vision first-forward execution order."""
+    del model
+    embedding = "model.language_model.embed_tokens"
+    return (
+        (embedding,) + tuple(name for name in module_fqns if name != embedding)
+        if embedding in module_fqns
+        else module_fqns
+    )
+
+
+def parameter_sharding_rules() -> list[tuple[list[str], Any]]:
+    """Keep the scalar shared-expert output gate replicated."""
+    # Planner discovery imports specifications, so role lookup must wait until invocation.
+    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=import-outside-toplevel
+        ParamRole,
+    )
+
+    return [(["shared_expert_gate"], ParamRole.REPLICATED)]
+
+
+def get_encoder_parallel_spec() -> EncoderParallelAdapterSpec:
+    """Declare complete public vision ownership and its dataset token contract."""
+    # Optional vision support stays outside text-only specification discovery.
+    from hyper_parallel.components.modules.vision.axial_vision_transformer import (  # pylint: disable=C0415
+        AxialVisionEncoderRuntime,
+        CPVisionAttention,
+    )
+
+    def bind(model: nn.Module) -> AxialVisionEncoderRuntime:
+        """Bind public encoder execution to the architecture's image-token identity."""
+        if isinstance(model.model, HSDPModule):
+            raise NotImplementedError("Encoder execution requires child FSDP units rather than the complete model core")
+        return AxialVisionEncoderRuntime(model.model.visual, model.config.image_token_id)
+
+    return EncoderParallelAdapterSpec(("model.visual",), "model.visual.blocks.*.attn", CPVisionAttention, bind)
+
+
+MODEL_SPEC = ModelAdapterSpec(
+    architecture="Qwen3_5MoeForConditionalGeneration",
+    encoder_parallel=get_encoder_parallel_spec,
+    model_type="qwen3_5_moe",
+    replacements=get_replacement_rules,
+    sharding_rules=parameter_sharding_rules,
+    fsdp_wrap_modules=get_fsdp_wrap_modules,
+    fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
+    fsdp_execution_order=get_fsdp_execution_order,
+)
+TEXT_SPEC = ModelAdapterSpec(
+    architecture="Qwen3_5MoeForCausalLM",
+    model_type="qwen3_5_moe_text",
+    replacements=get_replacement_rules,
+    sharding_rules=parameter_sharding_rules,
+    checkpoint_export=export_text_checkpoint,
+)
+
+
+def build_model_spec(
+    *, multimodal: bool = False, backend: str = "triton", conv_backend: str = "triton",
+    ulysses_degree: int | None = None, use_fused_ops: bool = True, use_grouped_gemm: bool = True,
+) -> ModelAdapterSpec:
+    """Select execution options while keeping source boundaries and module families in this spec.
+
+    Args:
+        multimodal: Select the conditional-generation identity instead of the text identity.
+        backend: Gated DeltaNet recurrence backend.
+        conv_backend: Gated DeltaNet causal convolution backend.
+        ulysses_degree: None uses pure Ulysses; one uses state CP and full-attention KV all-gather.
+        use_fused_ops: Enable the public normalization and gated-attention fused kernels.
+        use_grouped_gemm: Enable the public routed-expert grouped GEMM implementation.
+
+    Returns:
+        An independent specification for this build; registered defaults remain portable.
+    """
+    return replace(
+        MODEL_SPEC if multimodal else TEXT_SPEC,
+        replacements=partial(
+            get_replacement_rules, backend=backend, conv_backend=conv_backend,
+            ulysses_degree=ulysses_degree, use_fused_ops=use_fused_ops, use_grouped_gemm=use_grouped_gemm,
+        ),
+    )
+
+
+register_model_adapter(MODEL_SPEC)
+register_model_adapter(TEXT_SPEC)
+
+register_custom_model(
+    "Qwen3_5MoeForCausalLM", "hyper_parallel.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeForCausalLM"
+)
+register_custom_model(
+    "Qwen3_5MoeForConditionalGeneration",
+    "hyper_parallel.models.qwen3_5_moe.modeling_qwen3_5_moe",
+    "Qwen3_5MoeForConditionalGeneration",
+)
+
+
+LEGACY_TARGETS = {
+    "hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel.replace_vision_attention": (
+        "hyper_parallel.components.modules.vision.axial_vision_transformer.replace_axial_vision_attention", {},
+    ),
+    "hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel.get_encoder_parallel_spec": (
+        "hyper_parallel.models.qwen3_5_moe.qwen3_5_moe_spec.get_encoder_parallel_spec", {},
+    ),
+    "hyper_parallel.models.qwen3_5_moe.adapter.vlm.build_qwen_vlm": (
+        "hyper_parallel.models.qwen3_5_moe.modeling_qwen3_5_moe.build_qwen_vlm", {},
+    ),
+    "hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn": (
+        "hyper_parallel.distributed.expert_parallel.recipes.gated_shared_topk_router_ep_compute_fn", {},
+    ),
+}

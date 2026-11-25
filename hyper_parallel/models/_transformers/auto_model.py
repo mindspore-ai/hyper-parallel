@@ -17,7 +17,6 @@
 Following design doc 01_hf_compatibility_layer.md §6.
 Stub — provides from_pretrained/from_config as entry points.
 """
-# pylint: disable=forbidden-backend-import
 
 import importlib
 import logging
@@ -196,6 +195,8 @@ def _resolve_module_construction(kwargs, hf_config, distributed_setup, dtype):
     """Consume model construction arguments and create one shared build context."""
     factory = kwargs.pop("model_factory", None)
     spec = resolve_effective_model_spec(hf_config, kwargs.pop("model_spec", None))
+    if spec is not None and spec.source_import is not None:
+        spec.source_import()
     context = build_module_context(
         distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec, config=hf_config,
     )
@@ -209,6 +210,7 @@ class _BaseHyperAutoModelClass:
     """
 
     @classmethod
+
     def _from_pretrained_parent_class(cls, *args, **kwargs):
         """Delegate to the parent HuggingFace AutoModel class.
 
@@ -220,6 +222,7 @@ class _BaseHyperAutoModelClass:
         return super().from_pretrained(*args, **kwargs)  # pylint: disable=E1101
 
     @classmethod
+
     def _from_config_parent_class(cls, *args, **kwargs):
         """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
         parent_classes = (
@@ -233,6 +236,7 @@ class _BaseHyperAutoModelClass:
         raise TypeError(f"{cls.__name__} has no supported Hugging Face AutoModel parent")
 
     @classmethod
+
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
@@ -320,6 +324,7 @@ class _BaseHyperAutoModelClass:
         return model
 
     @classmethod
+
     def from_config(  # pylint: disable=unused-argument
         cls,
         config: PretrainedConfig,
@@ -358,10 +363,7 @@ class _BaseHyperAutoModelClass:
             fp8_config: Optional FP8 configuration.
             compile_config: Optional compilation settings.
             freeze_config: Optional parameter-freezing rules.
-            activation_checkpoint: Activation checkpointing policy.
-            swap_inputs: Enable input swapping.
-            allow_cache_entry_mutation: Permit cache-entry mutation during replay.
-            activation_swap: Activation swapping policy.
+            activation_checkpoint: Unified activation-checkpoint configuration.
             model_init_dtype: Random initialization dtype before mixed precision.
             **kwargs: Additional model or infrastructure construction arguments.
 
@@ -404,6 +406,7 @@ class _BaseHyperAutoModelClass:
         )
 
     @classmethod
+
     def _build_model(
         cls,
         pretrained_model_name_or_path,
@@ -540,6 +543,15 @@ def _resolve_dit_provider(provider: Any = None, model_type: Optional[str] = None
     return provider
 
 
+def _attach_dit_model_spec(model: torch.nn.Module, distributed_setup: Any, model_type: Optional[str]) -> None:
+    """Retain the selected family for Diffusers configs without HF identity fields."""
+    if model_type is not None:
+        attach_build_context(model, build_module_context(
+            distributed_setup, model_spec=get_model_adapter(model_type),
+            config=getattr(model, "config", None), device=_current_device(),
+        ))
+
+
 resolve_dit_provider = _resolve_dit_provider
 
 
@@ -561,9 +573,7 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
         peft_config: Optional[Any] = None,
         torch_dtype: Union[str, torch.dtype] = "bfloat16",
         attn_implementation: str = "sdpa",
-        activation_checkpoint: Optional[str] = None,
-        swap_inputs: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         compile_config: Optional[Union[CompileConfig, dict]] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         validate_placement: bool = False,
@@ -593,20 +603,14 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
         )
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         is_meta_device = checkpoint_path is not None or world_size > 1
-        from contextlib import nullcontext  # pylint: disable=import-outside-toplevel
-        from transformers.modeling_utils import ContextManagers  # pylint: disable=import-outside-toplevel
-        try:
-            from transformers.modeling_utils import no_init_weights  # pylint: disable=import-outside-toplevel
-        except ImportError:
-            from transformers.initialization import no_init_weights  # pylint: disable=import-outside-toplevel
-        from hyper_parallel import init_empty_weights  # pylint: disable=import-outside-toplevel
-        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+        init_ctx = _model_init_context(is_meta_device)
         with init_ctx:
             if checkpoint_path is not None:
                 model = provider.build_model(config)
             else:
                 build_from_config = getattr(provider, "build_from_config", provider.build_model)
                 model = build_from_config(config)
+        _attach_dit_model_spec(model, distributed_setup, model_type)
         model = apply_model_infrastructure(
             model,
             mesh=distributed_setup.mesh_context,
@@ -622,8 +626,6 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
             validate_placement=validate_placement,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
         )
         model.train()
@@ -639,9 +641,7 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
         distributed_setup: Optional[DistributedSetup] = None,
         peft_config: Optional[Any] = None,
         compile_config: Optional[Union[CompileConfig, dict]] = None,
-        activation_checkpoint: Optional[str] = None,
-        swap_inputs: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         validate_placement: bool = False,
         **kwargs: Any,
@@ -659,17 +659,11 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
         is_meta_device = (
             torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         ) > 1
-        from contextlib import nullcontext  # pylint: disable=import-outside-toplevel
-        from transformers.modeling_utils import ContextManagers  # pylint: disable=import-outside-toplevel
-        try:
-            from transformers.modeling_utils import no_init_weights  # pylint: disable=import-outside-toplevel
-        except ImportError:
-            from transformers.initialization import no_init_weights  # pylint: disable=import-outside-toplevel
-        from hyper_parallel import init_empty_weights  # pylint: disable=import-outside-toplevel
-        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+        init_ctx = _model_init_context(is_meta_device)
         with init_ctx:
             build_from_config = getattr(provider, "build_from_config", provider.build_model)
             model = build_from_config(config, **kwargs)
+        _attach_dit_model_spec(model, distributed_setup, model_type)
         model = apply_model_infrastructure(
             model,
             mesh=distributed_setup.mesh_context,
@@ -684,8 +678,6 @@ class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
             validate_placement=validate_placement,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
         )
         model.train()

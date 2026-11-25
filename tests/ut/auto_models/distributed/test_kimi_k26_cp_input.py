@@ -31,21 +31,21 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 import torch
 from torch import nn
 
-from hyper_parallel.models.kimi_k26.adapter.distributed.context_parallel import (
-    bind_context_parallel,
-    build_cp_attention_mask,
-)
+from hyper_parallel.models.kimi_k26.dataset_adapter import KimiVLMParallelBatch
+from hyper_parallel.models.kimi_k26.modeling_kimi_k26 import KimiLanguageModel, bind_context_parallel
+from hyper_parallel.distributed.context_parallel.attention import build_cp_attention_mask
 
 
-class _RecordingLanguageModel(nn.Module):
+class _RecordingLanguageModel(KimiLanguageModel):
     """Text tower stand-in that records the kwargs it is entered with."""
 
     def __init__(self) -> None:
         """Initialize an empty call log."""
-        super().__init__()
+        # Initialize registries without allocating the inherited HF architecture a second time.
+        nn.Module.__init__(self)  # pylint: disable=non-parent-init-called
         self.calls = []
 
-    def forward(self, **kwargs: Any) -> Any:
+    def _run_language(self, **kwargs: Any) -> Any:
         """Record one call and return the kwargs unchanged."""
         self.calls.append(dict(kwargs))
         return kwargs
@@ -175,7 +175,7 @@ class TestBindContextParallel(unittest.TestCase):
                     cp_rank * local_len, (cp_rank + 1) * local_len
                 ).unsqueeze(0).expand(kwargs["inputs_embeds"].shape[0], -1)
                 self.assertTrue(torch.equal(call["position_ids"], expected_positions))
-                self.assertEqual(tuple(call["attention_mask"].shape), (2, 1, local_len, seq_len))
+                self.assertEqual(tuple(call["attention_mask"].shape), (2, 1, seq_len, seq_len))
                 self.assertNotIn("input_ids", call)
                 self.assertIsNone(call["past_key_values"])
                 self.assertFalse(call["use_cache"])
@@ -184,11 +184,22 @@ class TestBindContextParallel(unittest.TestCase):
         """Rebinding a sharded tower keeps the already-installed forward."""
         model = _FakeModel()
         bind_context_parallel(model, _FakeMesh(2, 0))
-        installed = vars(model.model.language_model)["forward"]
+        installed = type(model.model.language_model).forward
 
         bind_context_parallel(model, _FakeMesh(2, 0))
 
-        self.assertIs(vars(model.model.language_model)["forward"], installed)
+        self.assertIs(type(model.model.language_model).forward, installed)
+        self.assertNotIn("forward", vars(model.model.language_model))
+
+    def test_cp_preserves_explicit_global_positions(self):
+        """Caller-owned offsets and packed position resets survive local slicing."""
+        model = _FakeModel()
+        bind_context_parallel(model, _FakeMesh(2, 1))
+        kwargs = _make_kwargs()
+        kwargs["position_ids"] = torch.tensor([[8, 9, 0, 1, 2, 0, 1, 2]]).expand(2, -1)
+        model.model.language_model(**kwargs)
+        torch.testing.assert_close(model.model.language_model.calls[-1]["position_ids"],
+                                   kwargs["position_ids"][:, 4:], rtol=0, atol=0)
 
     def test_forward_requires_inputs_embeds(self):
         """The media scatter must run before the text tower is entered."""
@@ -218,3 +229,37 @@ class TestBindContextParallel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKimiMultimodalDatasetCP(unittest.TestCase):
+    """Check global media fusion inputs and next-token targets crossing CP windows."""
+
+    def test_full_media_inputs_and_globally_shifted_local_targets(self) -> None:
+        """Keep every media placeholder while supervising each global next-token pair exactly once."""
+        ids = torch.tensor([[1, 32, 32, 2, 3, 4, 5, 0]])
+        labels = torch.tensor([[-100, -100, -100, 2, 3, 4, 5, -100]])
+        pixels = torch.randn(4, 3, 2, 2)
+        targets, masks = [], []
+        selection = labels.ne(-100)
+        selection[:, 4] = False
+        for rank in range(2):
+            batcher = KimiVLMParallelBatch.__new__(KimiVLMParallelBatch)
+            batcher.batch_transport = None
+            batcher.parallel_context = SimpleNamespace(cp_world_size=2, cp_rank=rank, build_on_rank=lambda: True)
+            batcher.tp_broadcaster = SimpleNamespace(broadcast=lambda batch, **_: batch)
+            batcher.runtime_input_adapter = None
+            model, loss = batcher(None, external_batch={
+                "input_ids": ids, "labels": labels, "attention_mask": ids.ne(0), "pixel_values": pixels,
+                "loss_mask": selection,
+            })
+            torch.testing.assert_close(model["input_ids"], ids)
+            self.assertIs(model["pixel_values"], pixels)
+            self.assertNotIn("labels", model)
+            self.assertEqual(model["kimi_cp_coordinates"], (2, rank))
+            torch.testing.assert_close(model["chunk_loss_targets"], loss["shift_labels"])
+            targets.append(loss["shift_labels"])
+            torch.testing.assert_close(model["chunk_loss_mask"], loss["loss_mask"])
+            masks.append(loss["loss_mask"])
+        torch.testing.assert_close(torch.cat(masks, dim=1),
+                                   torch.tensor([[False, False, True, False, True, True, False, False]]))
+        torch.testing.assert_close(torch.cat(targets, dim=1), torch.tensor([[-100, -100, 2, 3, 4, 5, -100, -100]]))

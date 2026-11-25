@@ -1,7 +1,7 @@
 # Wan2.1 T2V 14B full-parameter finetuning through AutoModels DiTTrainer.
 
 model:
-  _target_: hyper_parallel.models._transformers.HyperAutoModelForDiT.from_pretrained
+  _target_: hyper_parallel.models.HyperAutoModelForDiT.from_pretrained
   model_type: wan
   pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
   transformer_subfolder: transformer
@@ -21,7 +21,7 @@ model:
     cfg_negative_prob: 0.1
     transformer_dtype: bfloat16
 
-model_init_dtype: bfloat16
+model_init_dtype: float32
 
 training:
   train_iters: 1500
@@ -61,25 +61,12 @@ fsdp_config:
   backward_prefetch_depth: 1
   comm_fusion: false
 
-plan_overrides:
-  - match:
-      - "blocks.*.attn1"
-      - "blocks.*.attn2"
-    replace:
-      kind: module
-      source_type: diffusers.models.transformers.transformer_wan.WanAttention
-      implementation:
-        _target_: hyper_parallel.models.wan.adapter.replacements.replace_wan_attention_backend
-        backend: _native_npu
-
 mixed_precision:
   enabled: false
 
 activation_checkpoint:
   mode: full
-  swap_inputs: false
 
-activation_swap: none
 
 compile:
   enabled: false
@@ -123,6 +110,7 @@ dataloader:
 
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
   no_decay_params: []
   adamw_config:
     adamw_lr: 1.0e-5

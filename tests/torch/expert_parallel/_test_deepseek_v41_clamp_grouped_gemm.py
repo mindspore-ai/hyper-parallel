@@ -23,7 +23,7 @@ import torch_npu  # pylint: disable=unused-import
 from torch.nn import functional
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
 
-from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+from hyper_parallel.models.deepseek_v41.components.modality_moe import (
     _deepseek_v41_grouped_expert_forward,
 )
 

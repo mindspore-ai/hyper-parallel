@@ -30,7 +30,7 @@ from hyper_parallel import DTensor, SkipDTensorDispatch, distribute_tensor, init
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.components.optim import Sinkhorn as SinkhornBuilder
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
-from hyper_parallel.models.deepseek_v41.adapter.optim.headwise_muon import build_reshape_fn
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import build_muon_reshape_fn as build_reshape_fn
 from hyper_parallel.core.optimizer.sinkhorn import Sinkhorn
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 
@@ -74,7 +74,8 @@ def _run_sinkhorn_layout(mesh, placements, shape, distribute=distribute_tensor):
             optimizer.step()
         torch.testing.assert_close(reference.grad, gradient, rtol=0, atol=0)
         torch.testing.assert_close(param.grad.to_local(), local_gradient, rtol=0, atol=0)
-        expected_local = distribute(reference.detach().clone(), mesh, placements).to_local()
+        # Torch exposes this runtime callable through a native or generated descriptor.
+        expected_local = distribute(reference.detach().clone(), mesh, placements).to_local()  # pylint: disable=not-callable
         torch.testing.assert_close(param.to_local(), expected_local, rtol=3e-5, atol=2e-6)
         state = optimizer.state[param]["momentum_buffer"]
         if not isinstance(state, (DTensor, TorchDTensor)):

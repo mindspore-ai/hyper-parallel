@@ -14,9 +14,9 @@
 # ============================================================================
 """CPU image packing, bounded TP transport, and local rotary positions."""
 
+import unittest
 from types import SimpleNamespace
 from typing import Any, Iterator, Mapping
-import unittest
 from unittest.mock import Mock, patch
 
 import torch
@@ -27,7 +27,7 @@ from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelCo
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderLocalInputs
 from hyper_parallel.distributed.encoder_parallel.planning import assign_lpt, build_segments
 from hyper_parallel.distributed.encoder_parallel.transport import EncoderParallelBatchTransport
-from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41VisionBridge
+from hyper_parallel.models.deepseek_v41.components.vision_transformer import DeepseekV41VisionBridge
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -65,6 +65,8 @@ class TestEncoderTransport(unittest.TestCase):
     def _runtime(self, cp_size: int = 2, tp_size: int = 1) -> SimpleNamespace:
         """Provide pure planning geometry and a recorded finalize operation."""
         return SimpleNamespace(
+            cross_decoder_parents=False, parent_rank=0,
+            parent_mesh=SimpleNamespace(size=lambda: cp_size * tp_size),
             bridge=self.bridge, config=EncoderParallelConfig(enabled=True, encoder_cp_size=2),
             mesh_context=SimpleNamespace(cp_size=cp_size, tp_size=tp_size, cp_rank=0,
                                          tp_rank=0, sequence_parallel=False),
@@ -114,6 +116,7 @@ class TestEncoderTransport(unittest.TestCase):
         buckets = assign_lpt(self.items, 2, 2)
         broadcasts = []
         for rank in range(4):
+            runtime.parent_rank = rank
             bucket, cp_rank = divmod(rank, 2)
             segments = build_segments(buckets[bucket], cp_rank, 2)
             plan = SimpleNamespace(local_segments=segments, buckets=buckets)
@@ -195,3 +198,13 @@ class TestEncoderTransport(unittest.TestCase):
                 _, inputs = transport(batch, broadcaster)
         pack.assert_not_called()
         self.assertEqual(inputs, {"encoder_parallel_plan": plan})
+
+    def test_empty_resource_domain_uses_one_synthetic_dtype(self) -> None:
+        """An active job may contain an all-empty domain with differently typed source bundles."""
+        transport = EncoderParallelBatchTransport(runtime=self._runtime())
+        plan = SimpleNamespace(buckets=((), ()))
+        with patch("hyper_parallel.distributed.encoder_parallel.transport.collect_decoder_metadata") as gather:
+            for dtype in (torch.float64, torch.float32, torch.bfloat16):
+                actual = transport._payload_dtype(plan, dtype)  # pylint: disable=protected-access
+                self.assertEqual(actual, torch.float32)
+        gather.assert_not_called()

@@ -37,6 +37,10 @@ from hyper_parallel.models import module_build, replacement as replacement_api
 
 def _prepare_model_source_compat(adapter: Any) -> None:
     """Run an optional model-owned compatibility hook before construction."""
+    prepare_source = getattr(adapter, "source_import", None) if adapter is not None else None
+    if prepare_source is not None:
+        prepare_source()
+        return
     loader = getattr(adapter, "codegen", None) if adapter is not None else None
     provider = loader() if loader is not None else None
     prepare = getattr(provider, "prepare_model_import", None)
@@ -263,6 +267,7 @@ def _codegen_build_model(
     on_observed: Optional[Callable[[Any], None]] = None,
 ):
     """Create the classmethod used only while the CLI constructs a meta model."""
+
     def _build_model(
         cls,
         pretrained_model_name_or_path,

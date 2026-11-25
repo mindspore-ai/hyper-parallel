@@ -1,13 +1,22 @@
 # Eight-rank Qwen3.8-27B: FSDP + GDN state P2P CP + attention KV all-gather CP.
 
 model:
+  # Source boundaries and public module families are declared by the model spec.
+  model_spec:
+    _target_: hyper_parallel.models.qwen3_5.qwen3_5_spec.build_model_spec
+    multimodal: false
+    backend: triton
+    conv_backend: eager
+    ulysses_degree: 1
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /home/chaoran/models/Qwen3.8-27B
+  pretrained_model_name_or_path: /path/to/Qwen3.8-27B
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
   attn_implementation:
     _target_: hyper_parallel.models._transformers.packed_attention.register_npu_packed_attention
   force_hf: true
+
+model_init_dtype: float32
 
 training:
   train_iters: 100
@@ -37,7 +46,7 @@ fsdp_config:
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
+    cast_forward_inputs: false
   replicate_params: []
   reshard_after_forward: true
   reshard_after_backward: true
@@ -45,27 +54,6 @@ fsdp_config:
   forward_prefetch_depth: 1
   backward_prefetch_depth: 1
   comm_fusion: false
-
-plan_overrides:
-  # Use the high-performance fused GDN forward/backward path.
-  - match: "*.linear_attn"
-    replace:
-      kind: module
-      source_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
-      exact_type: true
-      implementation:
-        _target_: hyper_parallel.components.modules.GatedDeltaNet
-        backend: triton
-        conv_backend: eager
-        ulysses_degree: 1
-  - match: "*.self_attn"
-    replace:
-      kind: module
-      source_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Attention
-      exact_type: true
-      implementation:
-        _target_: hyper_parallel.components.modules.GatedGroupedQueryAttention
-        ulysses_degree: 1
 
 mixed_precision:
   enabled: false
@@ -90,7 +78,7 @@ dataset:
       reasoning_effort: medium
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
-      pretrained_model_name_or_path: /home/chaoran/models/Qwen3.8-27B
+      pretrained_model_name_or_path: /path/to/Qwen3.8-27B
       local_files_only: true
       use_fast: true
       trust_remote_code: false
@@ -100,7 +88,7 @@ dataset:
     text_keys: messages
     max_seq_len: 4096
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  data_path: /home/chaoran/datasets/decif-30k.jsonl
+  data_path: /path/to/datasets/decif-30k.jsonl
   data_config:
     dataset_type: mapping
     hf_dataset_name: null
@@ -118,7 +106,7 @@ dataloader:
     source_type: online
     attention_mode: compressed
     runtime_input_adapter:
-      _target_: hyper_parallel.models.qwen3_5.adapter.data.runtime.Qwen35PackedRuntime
+      _target_: hyper_parallel.data.batching.packed_sequence_dataset_adapter.PackedSequenceDatasetAdapter
     # One conversation still comes from GDNCPDataCollator; lengths avoid an S*S mask.
   sampler_type: cyclic
   data_rearrange_map: null

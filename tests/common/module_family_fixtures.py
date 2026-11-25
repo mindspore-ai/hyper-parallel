@@ -64,11 +64,13 @@ class LocalLinear(nn.Module):
             self.bias.fill_(0.25)
 
     @staticmethod
+
     def make_transforms() -> list:
         """Declare that canonical checkpoint parameters need no conversion."""
         return []
 
     # Preserve the nn.Linear input keyword across local and parallel replacements.
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Evaluate the complete mathematical operation.
 
@@ -108,6 +110,7 @@ class StatefulLocalLinear(LocalLinear):
         self.samples_seen = state["samples_seen"]
 
     # Preserve the nn.Linear input keyword across local and parallel replacements.
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Apply the stored output calibration to ordinary linear computation.
 
@@ -131,6 +134,7 @@ class LocalLinearBlock(nn.Module):
         self.alias = self.projection
 
     # Keep the input port shared with this fixture family's Linear layout provider.
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Use the nested family through an ordinary child call.
 
@@ -145,11 +149,13 @@ class ParallelLinearBlock(LocalLinearBlock):
 
 
 # Public family entries retain constructor-style names for stable target paths.
+@module_replacement
 def LinearBlockFamily(  # pylint: disable=invalid-name
-    *, config: LinearConfig, context: Mapping[str, Any] | None = None,
+    *, config: LinearConfig | None = None, module: nn.Module | None = None,
+    module_fqn: str = "", context: Mapping[str, Any] | None = None,
 ) -> nn.Module:
-    """Construct the nested test family without source replacement."""
-    return build_family(LinearBlockFamily, config=config, context=context)
+    """Construct the nested test family through the shared family protocol."""
+    return build_family(LinearBlockFamily, config=config, module=module, module_fqn=module_fqn, context=context)
 
 
 # Public family entries retain constructor-style names for stable target paths.

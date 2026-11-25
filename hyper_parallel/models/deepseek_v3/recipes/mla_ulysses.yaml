@@ -7,8 +7,11 @@ model:
   attn_implementation: eager
   force_hf: true
 
+model_init_dtype: float32
+
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
   adamw_config:
     lr: 1.0e-5
     adamw_lr: 1.0e-5
@@ -19,21 +22,10 @@ accelerator:
   sequence_parallel: false  # Optional TP sequence parallelism; both MLA strategies support enabling it.
   loss_parallel: false
 
-plan_overrides:
-  - match: "model.layers.*.self_attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.MultiLatentAttention
-        strategy: expanded_ulysses
-        overlap: false  # Enable forward and supported backward communication overlap.
-        # At TP1: 1 selects KV AllGather; intermediate CP divisors select Ulysses x AllGather.
-        # ulysses_degree: 2
-
 fsdp_config:
   dp_shard_size: 4
   reshard_after_forward: true
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
+    cast_forward_inputs: false

@@ -50,30 +50,6 @@ fsdp_config:
   backward_prefetch_depth: 1
   comm_fusion: false
 
-plan_overrides:
-  - match:
-      - "*.input_layernorm"
-      - "*.post_attention_layernorm"
-      - model.norm
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
-  - match: "*.self_attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.DeepseekSparseAttention
-        kv_cp_size: 2
-        kv_cp_strategy: allgather
-        cp_comm_overlap: true
-        dense_warmup: null
-  - match: "*.mlp.experts"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.GroupedExperts
-
 mixed_precision:
   enabled: false
 

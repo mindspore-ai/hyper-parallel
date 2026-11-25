@@ -25,6 +25,7 @@ from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperConnection
 
+from hyper_parallel.components.modules import PipelinedMhc
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.distributed.encoder_parallel.attention import (
@@ -37,9 +38,8 @@ from hyper_parallel.models._transformers.model_builder import (
     _apply_activation_features,
     validate_model_init_dtype,
 )
-from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41VisionBridge
-from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
-from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
+from hyper_parallel.models.deepseek_v41.components.modality_router import ModalityTopKRouter
+from hyper_parallel.models.deepseek_v41.components.vision_transformer import DeepseekV41VisionBridge
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41PipelinedHyperConnection,
     DeepseekV41TopKRouter,
@@ -262,14 +262,15 @@ class TestFusedModulePrecision(unittest.TestCase):
             initializer_range=0.02, hc_mult=4, hc_sinkhorn_iters=20,
             hc_eps=1.0e-6, rms_norm_eps=1.0e-6,
         )
-        model.gate = DeepseekV41MegaGate(
+        model.gate = ModalityTopKRouter(
+            use_fused_ops=True,
             module=DeepseekV41TopKRouter(config), module_fqn="gate", context={},
         )
         source_mhc = DeepseekV41PipelinedHyperConnection(DeepseekV4HyperConnection(config))
         for parameter in source_mhc.parameters():
             nn.init.normal_(parameter, std=0.02)
             parameter.grad = torch.randn_like(parameter)
-        model.mhc = DeepseekV41HyperMegaMhc(module=source_mhc, module_fqn="mhc", context={})
+        model.mhc = PipelinedMhc(module=source_mhc, module_fqn="mhc", shifted=True, use_fused_ops=True)
         for name, parameter in source_mhc.named_parameters():
             self.assertIs(dict(model.mhc.named_parameters())[name], parameter)
         values = {name: parameter.detach().clone() for name, parameter in model.mhc.named_parameters()}

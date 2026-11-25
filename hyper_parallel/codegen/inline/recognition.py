@@ -30,19 +30,20 @@ is covered the moment its runtime factory exists.
 from __future__ import annotations
 
 import ast
-from collections.abc import Collection
-from copy import deepcopy
-from dataclasses import dataclass
-from functools import lru_cache
 import inspect
 import os
 import symtable
 import sys
 import textwrap
+from collections.abc import Collection
+from copy import deepcopy
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
-from hyper_parallel.distributed.recipe_spec import WRAPPER_CONTEXT
 from hyper_parallel.codegen.inline.attention import _strip_annotations
+from hyper_parallel.distributed.recipe_spec import WRAPPER_CONTEXT
+from hyper_parallel.models.registry import resolve_legacy_model_target
 
 
 def _function_source_qualname(function: Any) -> str:
@@ -253,6 +254,8 @@ def inner_wrapper_target(
     factory_path: str | None, *, construction_kwargs: tuple[str, ...] = (),
 ) -> InnerWrapperTarget | None:
     """Recover an inner wrapper's emitted helper contract from its source."""
+    if factory_path:
+        factory_path, _ = resolve_legacy_model_target(factory_path)
     source = _wrapper_factory_ast(factory_path)
     if source is None:
         return None

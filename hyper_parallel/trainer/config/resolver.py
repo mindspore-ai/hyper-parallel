@@ -31,6 +31,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import MISSING, fields, is_dataclass, replace
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
+from hyper_parallel.models.registry import resolve_legacy_model_target
 from hyper_parallel.trainer.config.data import (
     DataLoaderConfig,
     DatasetConfig,
@@ -44,7 +45,6 @@ from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.components.modules.family import get_module_family
 from hyper_parallel.trainer.config.replacement import ReplacementTarget
 from hyper_parallel.trainer.config.trainer import TrainerConfig
-
 
 _NONE_TYPE: type = types.NoneType  # pylint: disable=no-member
 _UNION_TYPE: type = types.UnionType  # pylint: disable=no-member
@@ -75,6 +75,7 @@ def import_target(target_path: str, *, location: str) -> object:
     if not isinstance(target_path, str) or not target_path.strip():
         raise ConfigResolutionError(location, "_target_ must be a non-empty dotted path")
 
+    target_path, _ = resolve_legacy_model_target(target_path)
     parts = target_path.split(".")
     if any(not part for part in parts):
         raise ConfigResolutionError(location, f"invalid target path {target_path!r}")
@@ -623,7 +624,11 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
         raise ConfigResolutionError(path, "target section is missing required _target_")
 
     target_path = node["_target_"]
-    target = import_target(target_path, location=f"{path}._target_")
+    canonical_path, defaults = (
+        resolve_legacy_model_target(target_path) if isinstance(target_path, str) else (target_path, {})
+    )
+    node = {**defaults, **node}
+    target = import_target(canonical_path, location=f"{path}._target_")
     try:
         signature = inspect.signature(target)
     except (TypeError, ValueError) as exc:
@@ -658,7 +663,11 @@ def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
     if not isinstance(node, Mapping) or "_target_" not in node:
         raise ConfigResolutionError(path, "replacement requires a mapping with _target_")
     target_path = node["_target_"]
-    requested = import_target(target_path, location=f"{path}._target_")
+    if not isinstance(target_path, str) or not target_path.strip():
+        raise ConfigResolutionError(f"{path}._target_", "_target_ must be a non-empty dotted path")
+    canonical_path, defaults = resolve_legacy_model_target(target_path)
+    node = {**defaults, **node}
+    requested = import_target(canonical_path, location=f"{path}._target_")
     if get_module_family(requested) is None:
         return _resolve_target(node, path=path)
     try:
@@ -688,7 +697,7 @@ def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
             # Deferred family factories receive these resources from model preparation.
             # Constructor defaults must not become serialized user request arguments.
             normalized = {name: value for name, value in normalized.items()
-                          if name not in {"module", "module_fqn", "context", "mesh"}}
+                          if name in selected._kwargs}
         return selected.replace(**normalized)
     except (ValueError, TypeError, ImportError, AttributeError) as exc:
         raise ConfigResolutionError(path, str(exc)) from exc

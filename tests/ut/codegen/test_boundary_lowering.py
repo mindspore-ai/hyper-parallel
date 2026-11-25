@@ -33,11 +33,11 @@ the identical byte string.
 from __future__ import annotations
 
 import ast
-from functools import wraps
 import importlib
-from pathlib import Path
-from importlib import util
 import sys
+from functools import wraps
+from importlib import util
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -45,19 +45,17 @@ import pytest
 import torch
 from torch import nn
 
-import hyper_parallel
-from hyper_parallel.distributed.recipe_spec import inner_wrapper
-from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
-from hyper_parallel.components.modules import GatedDeltaNet, NativeRMSNormModule, RMSNormModule
-
 from hyper_parallel.codegen.emit.modeling import _verify_recorded_patch_materialization
-from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
-from hyper_parallel.codegen.emit.snapshot_patches import emission_patches_from_snapshot_payload
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
+from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
+from hyper_parallel.codegen.emit.snapshot_patches import emission_patches_from_snapshot_payload
+from hyper_parallel.codegen.inline import replacement_pass
+from hyper_parallel.codegen.inline.component_source import render_component_source
 from hyper_parallel.codegen.inline.framework_spec import (
     _cp_strategy_spec,
     _ignored_constructor_parameters,
+    cp_dispatch_shell_body,
     observed_constructor_spec,
     strategy_spec_for,
 )
@@ -71,7 +69,7 @@ from hyper_parallel.codegen.inline.ir import (
     SourceObservation,
 )
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
-from hyper_parallel.codegen.inline import replacement_pass
+from hyper_parallel.codegen.inline.observations import collect_source_observations
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.pipeline import (
     _add_recorded_forward_host_imports,
@@ -80,13 +78,22 @@ from hyper_parallel.codegen.inline.pipeline import (
     render_inline_modeling_with_plan,
     render_inline_strategies_for_source_unit,
 )
-from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
 from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
-from hyper_parallel.codegen.inline.framework_spec import cp_dispatch_shell_body
-from hyper_parallel.codegen.inline.observations import collect_source_observations
 from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.components.modules import (
+    AxialVisionTransformer,
+    GatedDeltaNet,
+    GroupedQueryAttention,
+    NativeRMSNormModule,
+    RMSNormModule,
+)
+from hyper_parallel.components.modules.module_family import FamilyRequest, resolve_family
+from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
+from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
+from hyper_parallel.distributed.recipe_spec import inner_wrapper
+from hyper_parallel.models.qwen3_vl_moe.qwen3_vl_moe_spec import MODEL_SPEC as QWEN_VL_SPEC
 from tests.common.mark_utils import arg_mark
 
 SOURCE_TEXT = '''\
@@ -646,16 +653,29 @@ def wrapper({parameters}):
 
 
 def test_helper_mesh_keyword_uses_live_native_boundary(monkeypatch, tmp_path):
-    """The actual async wrapper forwards the current mesh, not generation rank zero."""
-    owner = "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.context_parallel"
-    spec = _cp_strategy_spec(owner + ".qwen3_vl_moe_async_ulysses_cp_wrapper")
+    """A model-owned wrapper forwards the live boundary mesh instead of generation rank zero."""
+    owner = "model_owned_mesh_helper"
+    wrapper_source = """
+def kernel(module, hidden_states, position_embeddings, attention_mask, past_key_values=None, *, cp_mesh, **kwargs):
+    return None
+
+def wrapper(target_module, cp_mesh):
+    original_forward = target_module.forward
+    def cp_forward(hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+        return kernel(target_module, hidden_states, position_embeddings, attention_mask,
+                      past_key_values, cp_mesh=cp_mesh, **kwargs)
+    return _ForwardRewriteRequest(target_module, cp_forward)
+"""
+    monkeypatch.setattr("hyper_parallel.codegen.inline.recognition._module_source_tree",
+                        lambda _: ast.parse(wrapper_source))
+    spec = _cp_strategy_spec(owner + ".wrapper")
     calls = []
 
     def kernel(module, *args, cp_mesh, **kwargs):
         calls.append((module, args, cp_mesh, kwargs))
         return cp_mesh.get_local_rank()
 
-    monkeypatch.setitem(sys.modules, owner, SimpleNamespace(_async_ulysses_forward=kernel))
+    monkeypatch.setitem(sys.modules, owner, SimpleNamespace(kernel=kernel))
     source = """
 class Host:
     def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
@@ -680,56 +700,19 @@ class Host:
         assert calls[-1] == (host, (3, (4, 5), None, None), mesh, {"token": 7})
 
 
-def test_native_text_input_closure_shards_each_rank(monkeypatch, tmp_path):
-    """The real VL closure preserves slicing and empty input independently of the working directory."""
+def test_native_vl_components_use_public_cp_without_text_forward_rewrite(monkeypatch, tmp_path):
+    """Whole attention and vision families replace the removed model-specific CP wrappers."""
     monkeypatch.chdir(tmp_path)
-    owner = "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.context_parallel"
-    package_root = Path(hyper_parallel.__file__).resolve().parent
-    wrapper_file = package_root / "models/qwen3_vl_moe/adapter/distributed/context_parallel.py"
-    helper = next(node for node in ast.parse(wrapper_file.read_text(encoding="utf-8")).body
-                  if isinstance(node, ast.FunctionDef) and node.name == "_slice_dense_visual_features")
-    helper_path = tmp_path / "visual_helper.py"
-    helper_path.write_text("import torch\n" + ast.unparse(helper), encoding="utf-8")
-    helper_spec = util.spec_from_file_location("visual_helper", helper_path)
-    helper_module = util.module_from_spec(helper_spec)
-    helper_spec.loader.exec_module(helper_module)
-    monkeypatch.setitem(sys.modules, owner, helper_module)
-    spec = _cp_strategy_spec(owner + ".qwen3_vl_moe_text_input_cp_wrapper")
-    source = """
-import torch
-class Host:
-    def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
-                inputs_embeds=None, use_cache=None, visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs):
-        return inputs_embeds, position_ids, visual_pos_masks, deepstack_visual_embeds, kwargs
-"""
-    patches = InlinePatchSet(imports=list(spec.imports), forward_extracts=[
-        ForwardExtractPatch("Host", "forward", spec.subclass_shell),
-    ])
-    path = tmp_path / "text_input.py"
-    path.write_text(apply_patch_set(source, patches), encoding="utf-8")
-    module_spec = util.spec_from_file_location("text_input", path)
-    module = util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(module)
-    host = module.Host()
-    mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 0)
-    host._hp_boundary = SimpleNamespace(compiled=SimpleNamespace(mesh={"cp": mesh}, mesh_dim_names=("cp",)))
-    values = torch.arange(8).reshape(1, 4, 2)
-    positions = torch.arange(4).reshape(1, 4)
-    mask = torch.tensor([[True, False, True, False]])
-    features = torch.tensor([[10], [20]])
-    for rank in (0, 1):
-        mesh.get_local_rank = lambda value=rank: value
-        output = host.forward(inputs_embeds=values, position_ids=positions, visual_pos_masks=mask,
-                              deepstack_visual_embeds=[features], token=7)
-        assert torch.equal(output[0], values[:, rank * 2:(rank + 1) * 2])
-        assert torch.equal(output[1], positions[:, rank * 2:(rank + 1) * 2])
-        assert torch.equal(output[2], mask[:, rank * 2:(rank + 1) * 2])
-        assert torch.equal(output[3][0], features[rank:rank + 1])
-        assert output[4] == {"token": 7}
-    assert host.forward()[0] is None
-    with pytest.raises(ValueError, match="divisible"):
-        host.forward(inputs_embeds=values[:, :3])
-
+    model = SimpleNamespace(config=SimpleNamespace(vision_config=object()))
+    requests = QWEN_VL_SPEC.replacements(model=model, context={"cp_size": 2})
+    attention = next(request for request in requests if request.target is GroupedQueryAttention)
+    assert any(request.target is AxialVisionTransformer for request in requests)
+    assert QWEN_VL_SPEC.context_parallel is None
+    member = resolve_family(FamilyRequest(attention.target, attention.kwargs), context={"cp_size": 2})
+    assert member.constructor.__name__ == "CPGroupedQueryAttentionModule"
+    rendered = render_component_source(member.constructor)
+    assert all("models.qwen3_vl_moe.adapter" not in statement for statement in rendered.imports)
+    assert "super().forward" in rendered.source
 
 
 def test_helper_keyword_does_not_leak_factory_module_globals(monkeypatch):

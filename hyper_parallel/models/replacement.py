@@ -30,8 +30,8 @@ from torch import nn
 
 from hyper_parallel.components.modules.family import resolve_module_family_target
 from hyper_parallel.components.modules.module_family import (
-    FamilyRequest, _module_aliases, _validate_initialization_contract,
-    build_family, get_family_build_info, get_module_family,
+    FamilyRequest, get_family_build_info, _module_aliases, _validate_initialization_contract,
+    build_family, get_module_family,
 )
 from hyper_parallel.models.build_context import collect_module_contexts
 
@@ -282,6 +282,7 @@ class ModuleReplacementTarget:
     spec: ModuleReplacementSpec
 
     @property
+
     def source(self) -> nn.Module:
         """Resolve the original module or reject a plan whose source expired."""
         source = self.source_ref()
@@ -834,10 +835,21 @@ def apply_module_replacements(
 def _factory_for_request(request: ModuleReplacementRequest) -> ModuleReplacementFactory:
     """Resolve a request target and bind selectors through the shared family resolver."""
     @module_replacement
+
     def factory(*, module: nn.Module, module_fqn: str, context: Mapping[str, Any]) -> nn.Module:
         """Construct one already-composed source boundary using its preserved request."""
         family = get_module_family(request.target)
         if family is not None and family.default_variant is not None:
+            info = get_family_build_info(module)
+            if info is not None and info.origin == "direct":
+                # The model builder imports this replacement engine; defer the reverse edge until construction.
+                from hyper_parallel.models.module_build import (  # pylint: disable=import-outside-toplevel,cyclic-import
+                    _reconfigure_direct_family,
+                )
+
+                return _reconfigure_direct_family(
+                    module, FamilyRequest(request.target, request.kwargs), module_fqn=module_fqn, context=context,
+                )
             return build_family(
                 FamilyRequest(request.target, request.kwargs),
                 module=module, module_fqn=module_fqn, context=context,
@@ -859,6 +871,21 @@ def _request_matches(aliases: dict, request: ModuleReplacementRequest, cache: di
     return matches
 
 
+def _validate_direct_reconfiguration(module, paths, aliases, direct_ids):
+    """Reject rebuilding children whose independent ownership or runtime state would be lost."""
+    for child in module.modules():
+        if child is not module and id(child) in direct_ids:
+            raise ValueError(f"native family reconfiguration at {paths} overlaps a nested direct family")
+        if any("hook" in name and isinstance(value, Mapping) and value
+               for name, value in vars(child).items()):
+            raise ValueError(f"native family reconfiguration at {paths} cannot migrate existing module hooks")
+        if child is not module:
+            child_paths = aliases[id(child)][1]
+            if any(not any(not parent or path.startswith(parent + ".") for parent in paths)
+                   for path in child_paths):
+                raise ValueError(f"native family reconfiguration at {paths} would break an external module alias")
+
+
 def _compose_request_layer(aliases, requests, selected, direct_ids, cache, *, explicit):
     """Compose one precedence layer without allocating candidate modules."""
     current_ids = set()
@@ -867,8 +894,19 @@ def _compose_request_layer(aliases, requests, selected, direct_ids, cache, *, ex
             raise TypeError("replacement providers must return ModuleReplacementRequest objects")
         for identity, (module, paths) in _request_matches(aliases, request, cache).items():
             if identity in direct_ids:
-                if explicit:
+                if not explicit:
+                    continue
+                info = get_family_build_info(module)
+                if info.request.target is not request.target:
                     raise ValueError(f"explicit replacement conflicts with directly constructed family at {paths}")
+                if identity in current_ids:
+                    raise ValueError(f"duplicate user replacement for aliases {paths}")
+                arguments = {**info.request.kwargs, **request.kwargs}
+                current_ids.add(identity)
+                if arguments == dict(info.request.kwargs):
+                    continue
+                _validate_direct_reconfiguration(module, paths, aliases, direct_ids)
+                selected[identity] = (module, replace(request, kwargs=arguments, match=paths))
                 continue
             if any(id(child) in direct_ids for child in module.modules()):
                 raise ValueError(f"parent replacement at {paths} overlaps a directly constructed family")

@@ -12,9 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Qwen2-MoE model family package.
-
-Minimal family: only planner sharding rules are declared (see
-``adapter/registration.py``); the family uses HF-native modeling code with
-the generic replacements/templates.
-"""
+"""Qwen2-MoE identity; the root spec selects public decoder families for HF-native models."""

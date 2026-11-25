@@ -25,8 +25,8 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph, run_traced_graph
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer as attention
-from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
-from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss
+from hyper_parallel.models.deepseek_v41.dataset_adapter import DeepseekV41DatasetAdapter
+from hyper_parallel.models.deepseek_v41.components.modality_router import sequence_load_balancing_loss
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.runtime.model_integration import DisabledModelIntegrationSession
@@ -38,7 +38,7 @@ def _inputs(
 ) -> dict:
     """Build metadata using the standard adapter, optionally with compression."""
     ids = torch.arange(boundaries[-1]).unsqueeze(0)
-    runtime = DeepseekV41Runtime(
+    runtime = DeepseekV41DatasetAdapter(
         include_position_ids=False, include_image_sequence_start=False,
         compress_ratios=compress_ratios,
     )
@@ -104,7 +104,7 @@ class TestPackingOnlyGraph(unittest.TestCase):
         """The production dispatch invokes model-owned conversion only in graph mode."""
         for graph in (False, True):
             with self.subTest(graph=graph):
-                runtime = DeepseekV41Runtime(include_position_ids=False, include_image_sequence_start=False)
+                runtime = DeepseekV41DatasetAdapter(include_position_ids=False, include_image_sequence_start=False)
                 inputs = _inputs([0, 3, 8], graph=False)
                 trainer = BaseTrainer.__new__(BaseTrainer)
                 trainer.config = SimpleNamespace(training=SimpleNamespace(empty_cache_before_backward=False))
@@ -150,7 +150,7 @@ class TestPackingOnlyGraph(unittest.TestCase):
     def test_graph_preparation_does_not_mutate_eager_inputs(self) -> None:
         """Preparing graph inputs leaves the source usable by eager compression."""
         source = _inputs([0, 3, 8], graph=False)
-        runtime = DeepseekV41Runtime(
+        runtime = DeepseekV41DatasetAdapter(
             include_position_ids=False, include_image_sequence_start=False,
         )
         prepared = runtime.prepare_graph_inputs(source)

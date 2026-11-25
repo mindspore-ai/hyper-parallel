@@ -23,7 +23,7 @@ from torch import nn
 
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed._builder.tp_collective_lowering import TPExecutionOp
-from hyper_parallel.models.deepseek_v41.adapter import registration  # pylint: disable=unused-import
+from hyper_parallel.models.deepseek_v41 import deepseek_v41_spec as registration  # pylint: disable=unused-import
 
 
 class TestEncoderPrecision(TestCase):

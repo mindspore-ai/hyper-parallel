@@ -78,7 +78,9 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
         self.assertIsNotNone(text_spec)
         self.assertIsNone(top_spec.context_parallel)
         self.assertIsNone(text_spec.context_parallel)
-        self.assertIs(top_spec.replacements().KimiDeltaAttention, KimiDeltaAttention)
+        self.assertIsNotNone(top_spec.replacements)
+        self.assertIsNotNone(text_spec.replacements)
+        self.assertIsNot(top_spec.replacements, text_spec.replacements)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

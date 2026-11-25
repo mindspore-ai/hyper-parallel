@@ -50,7 +50,8 @@ def _has_vlm_chain() -> bool:
     install without libhccl).
     """
     try:
-        from transformers import AutoProcessor  # noqa: F401
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from transformers import AutoProcessor  # noqa: F401  # pylint: disable=import-outside-toplevel,unused-import
     except ImportError:
         return False
     return True
@@ -88,7 +89,8 @@ def _image(size, color=(16, 32, 64)):
 
 def _transform(image_max_pixels):
     """Build the transform over the stub processor for one pixel budget."""
-    from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import KimiVLMChatTransform
+    # Resolve the optional multimodal stack only when this test path is selected.
+    from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import KimiVLMChatTransform  # pylint: disable=import-outside-toplevel
 
     return KimiVLMChatTransform(processor=_StubProcessor(),
                                 image_max_pixels=image_max_pixels)
@@ -212,7 +214,8 @@ class TestImageMaxPixelsOption(unittest.TestCase):
 
     def test_builder_forwards_the_option_and_patch_rounding_is_gone(self):
         """The builder wires ``image_max_pixels`` and no patch grid is needed."""
-        from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import (
+        # Resolve the optional multimodal stack only when this test path is selected.
+        from hyper_parallel.models.kimi_k26.dataset_preprocessing.transform_fn import (  # pylint: disable=import-outside-toplevel
             KimiVLMChatTransform,
             build_kimi_vlm_data_transform,
         )

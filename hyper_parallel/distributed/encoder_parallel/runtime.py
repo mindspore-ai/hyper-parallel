@@ -18,14 +18,15 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
-from hyper_parallel.core.dtensor._utils import differentiable_variable_all_gather
+from hyper_parallel.components.modules.module_family import get_family_build_info
+from hyper_parallel.core.dtensor._utils import create_group, differentiable_variable_all_gather
 from hyper_parallel.distributed.encoder_parallel.attention import (
     EncoderAttentionContext,
     activate_encoder_attention,
@@ -44,7 +45,11 @@ from hyper_parallel.distributed.encoder_parallel.exchange import (
     select_feature_exchange,
     unpack_records,
 )
-from hyper_parallel.distributed.encoder_parallel.mesh import derive_reshaped_submesh
+from hyper_parallel.distributed.encoder_parallel.mesh import (
+    collect_decoder_metadata,
+    derive_reshaped_submesh,
+    select_encoder_domain_size,
+)
 from hyper_parallel.distributed.encoder_parallel.planning import (
     DecoderSequenceLayout,
     assign_lpt,
@@ -91,7 +96,18 @@ def validate_attention_replacement(model: nn.Module, spec: EncoderParallelAdapte
                          if fnmatch.fnmatchcase(name, spec.attention_pattern))
     recorded = set(getattr(model, "_hp_replaced_module_fqns", ()) or ())
     recorded_visual = {name for name in recorded if fnmatch.fnmatchcase(name, spec.attention_pattern)}
-    missing = sorted(expected - recorded_visual)
+
+    def owned_by_complete_family(name: str) -> bool:
+        """Accept class-owned attention inside a declared parameter-owning family."""
+        prefix = name.rsplit(".", 1)[0]
+        while prefix:
+            info = get_family_build_info(model.get_submodule(prefix))
+            if info is not None and info.resolved.family.sharding is not None:
+                return True
+            prefix = prefix.rsplit(".", 1)[0] if "." in prefix else ""
+        return False
+
+    missing = sorted(name for name in expected - recorded_visual if not owned_by_complete_family(name))
     unexpected = sorted(recorded_visual - expected)
     wrong_type = sorted(name for name in expected
                         if not isinstance(model.get_submodule(name), spec.replacement_attention_type))
@@ -128,6 +144,7 @@ class EncoderParallelPlan:
     destinations: dict[int, tuple[int, ...]]
     local_segments: tuple[EncoderSegment, ...]
     k_fsdp_max: int
+    decoder_items: tuple[EncoderWorkItem, ...] = ()
 
     def _gather_features(self, hidden: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """All-gather each local segment and trim dummy padding."""
@@ -193,6 +210,8 @@ class EncoderParallelPlan:
         """
         if not self.active:
             return [], None
+        if self.runtime.cross_decoder_parents and not isinstance(image_inputs, EncoderLocalInputs):
+            raise ValueError("Cross-parent encoder execution requires transported EncoderLocalInputs")
         records, prototype, local_anchor = self._execute_local(image_inputs)
         mode = self.runtime.feature_exchange_mode
         exchange_mesh = self.runtime.tp_mesh if mode in (
@@ -222,29 +241,51 @@ class EncoderParallelRuntime:
         validate_encoder_execution_options(
             {**execution_options, "loss_parallel": mesh_context.loss_parallel}, self.bridge,
         )
-        parent_size = mesh_context.cp_size * mesh_context.tp_size
         if mesh_context.pp_size != 1:
             raise NotImplementedError("v1 requires pp_size=1")
-        if parent_size % config.encoder_cp_size:
-            raise ValueError("encoder_cp_size must divide cp_size*tp_size")
         validate_ulysses_head_divisibility(encoder_cp_size=config.encoder_cp_size,
                                            head_counts=self.bridge.head_counts,
                                            attention_pattern=spec.attention_pattern, model=model)
+        decoder_size = mesh_context.cp_size * mesh_context.tp_size
+        parent_size = select_encoder_domain_size(
+            decoder_size=decoder_size, job_size=mesh_context.device_mesh.size(),
+            encoder_cp_size=config.encoder_cp_size, resource_domain=config.resource_domain,
+        )
+        self.cross_decoder_parents = parent_size > decoder_size
+        if dist.is_initialized():
+            # Reuse the job control group before deriving independent resource groups.
+            create_group(mesh_context.device_mesh.mesh.flatten().tolist())
+        self.global_mesh = mesh_context.device_mesh.flatten("encoder_global")
+        self.decoder_mesh = mesh_context.device_mesh[("cp", "tp")].flatten("encoder_decoder_parent")
         self.expected = validate_attention_replacement(model, spec)
-        self.parent_rank = mesh_context.cp_rank * mesh_context.tp_size + mesh_context.tp_rank
+        self.encoder_dp_size = parent_size // config.encoder_cp_size
+        self._bind_resource_domain(parent_size, decoder_size)
+        self.parent_rank = self.parent_mesh.get_local_rank()
         self.encoder_cp_rank = self.parent_rank % config.encoder_cp_size
         self.encoder_dp_rank = self.parent_rank // config.encoder_cp_size
-        self.encoder_dp_size = parent_size // config.encoder_cp_size
-        self.parent_mesh = mesh_context.device_mesh[("cp", "tp")].flatten("encoder_parent")
-        encoder_mesh = derive_reshaped_submesh(
-            mesh_context.device_mesh, source_dims=("cp", "tp"),
-            target_sizes=(self.encoder_dp_size, config.encoder_cp_size),
-            target_names=("encoder_dp", "encoder_cp"),
-        )
-        self.encoder_cp_mesh = encoder_mesh["encoder_cp"]
         self.tp_mesh = mesh_context.device_mesh["tp"]
-        self.global_mesh = mesh_context.device_mesh.flatten("encoder_global")
-        self.feature_exchange_mode = select_feature_exchange(mesh_context)
+        self.feature_exchange_mode = select_feature_exchange(mesh_context, parent_size=parent_size)
+
+    def _bind_resource_domain(self, parent_size: int, decoder_size: int) -> None:
+        """Derive resource groups without coupling the planning protocol to topology."""
+        root = self.mesh_context.device_mesh
+        if parent_size == decoder_size:
+            encoder_mesh = derive_reshaped_submesh(
+                root, source_dims=("cp", "tp"),
+                target_sizes=(self.encoder_dp_size, self.config.encoder_cp_size),
+                target_names=("encoder_dp", "encoder_cp"),
+            )
+        else:
+            dimensions = tuple(root.mesh_dim_names)
+            if dimensions[-2:] != ("cp", "tp"):
+                raise ValueError("Independent encoder domains require canonical trailing CP/TP rank order")
+            encoder_mesh = derive_reshaped_submesh(
+                root, source_dims=dimensions,
+                target_sizes=(root.size() // parent_size, self.encoder_dp_size, self.config.encoder_cp_size),
+                target_names=("encoder_domain", "encoder_dp", "encoder_cp"),
+            )
+        self.parent_mesh = encoder_mesh[("encoder_dp", "encoder_cp")].flatten(f"encoder_parent_{parent_size}")
+        self.encoder_cp_mesh = encoder_mesh["encoder_cp"]
 
     def preflight_batch(self, batch: Mapping[str, Any]
                         ) -> tuple[tuple[EncoderWorkItem, ...], DecoderSequenceLayout]:
@@ -272,7 +313,8 @@ class EncoderParallelRuntime:
         """
         marker = torch.tensor(int(bool(items)), device=self.model.device if hasattr(self.model, "device")
                               else next(self.model.parameters()).device)
-        if dist.is_initialized() and self.parent_mesh.size() > 1:
+        metadata_invalid = False
+        if dist.is_initialized() and self.decoder_mesh.size() > 1:
             signature = tuple(
                 (item.item_id, item.batch_index, item.sequence_length, item.output_rows,
                  item.decoder_token_start, item.decoder_token_length, item.payload_start, item.payload_stop,
@@ -282,20 +324,20 @@ class EncoderParallelRuntime:
             digest = hashlib.sha256(repr((layout.cp_local_length, signature)).encode()).digest()
             digest_value = int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
             local_digest = torch.tensor(digest_value, dtype=torch.int64, device=marker.device)
-            peer_digests = [torch.empty_like(local_digest) for _ in range(self.parent_mesh.size())]
-            dist.all_gather(peer_digests, local_digest, group=self.parent_mesh.get_group())
-            if any(int(peer.item()) != digest_value for peer in peer_digests):
-                raise ValueError("image metadata differs across decoder parent ranks")
+            peer_digests = [torch.empty_like(local_digest) for _ in range(self.decoder_mesh.size())]
+            dist.all_gather(peer_digests, local_digest, group=self.decoder_mesh.get_group())
+            metadata_invalid = any(int(peer.item()) != digest_value for peer in peer_digests)
+        invalid = torch.tensor(int(metadata_invalid), device=marker.device)
+        if dist.is_initialized() and self.global_mesh.size() > 1:
+            dist.all_reduce(invalid, op=dist.ReduceOp.MAX, group=self.global_mesh.get_group())
+        if bool(invalid.item()):
+            raise ValueError("image metadata differs across decoder parent ranks")
         if dist.is_initialized() and self.global_mesh.size() > 1:
             dist.all_reduce(marker, op=dist.ReduceOp.MAX, group=self.global_mesh.get_group())
         active = bool(marker.item())
+        decoder_items = items
+        items, destinations = self._collect_decoder_items(items, layout, device=marker.device)
         buckets = assign_lpt(items, self.encoder_dp_size, self.config.encoder_cp_size)
-        layouts = {rank: DecoderSequenceLayout.build(mesh_context=self.mesh_context,
-                                                     cp_local_length=layout.cp_local_length,
-                                                     cp_rank=rank // self.mesh_context.tp_size,
-                                                     tp_rank=rank % self.mesh_context.tp_size)
-                   for rank in range(self.mesh_context.cp_size * self.mesh_context.tp_size)}
-        destinations = build_destinations(items, layouts)
         segments = build_segments(buckets[self.encoder_dp_rank], self.encoder_cp_rank,
                                   self.config.encoder_cp_size)
         slot_count = torch.tensor(len(buckets[self.encoder_dp_rank]), device=marker.device)
@@ -306,7 +348,34 @@ class EncoderParallelRuntime:
             active=active, decoder_layout=layout, buckets=buckets,
             destinations=destinations, local_segments=segments,
             k_fsdp_max=max(1, int(slot_count.item())),
+            decoder_items=decoder_items,
         )
+
+    def _collect_decoder_items(self, items: tuple[EncoderWorkItem, ...],
+                               layout: DecoderSequenceLayout, *, device: torch.device) -> tuple:
+        """Normalize source identity and token ownership for every resource domain."""
+        decoder_size = self.mesh_context.cp_size * self.mesh_context.tp_size
+        peers = collect_decoder_metadata(
+            (layout.cp_local_length, items), decoder_size=decoder_size, parent_mesh=self.parent_mesh, device=device,
+        )
+        global_items, destinations = [], {}
+        for index, metadata in enumerate(peers):
+            if metadata is None:
+                raise ValueError("encoder domain is missing a decoder leader's metadata")
+            source_length, source_items = metadata
+            source_rank = index * decoder_size
+            layouts = {
+                source_rank + cp * self.mesh_context.tp_size + tp: DecoderSequenceLayout.build(
+                    mesh_context=self.mesh_context, cp_local_length=source_length, cp_rank=cp, tp_rank=tp,
+                )
+                for cp in range(self.mesh_context.cp_size) for tp in range(self.mesh_context.tp_size)
+            }
+            scoped = tuple(replace(item, item_id=len(global_items) + offset, source_rank=source_rank)
+                           for offset, item in enumerate(source_items))
+            destinations.update(build_destinations(scoped, layouts))
+            global_items.extend(scoped)
+        return tuple(global_items), destinations
+
 
 
 def build_encoder_parallel_runtime(*, config: EncoderParallelConfig, mesh_context: Any,

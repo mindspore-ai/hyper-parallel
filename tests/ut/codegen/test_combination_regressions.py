@@ -25,7 +25,7 @@ from hyper_parallel.codegen.planner_overlay import (
 )
 from hyper_parallel.distributed._builder.planner import _LEAF_SEGMENT_GUARD, ShardingPlanner
 from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
-from hyper_parallel.models.kimi_k3.adapter.policies.sharding import (
+from hyper_parallel.models.kimi_k3.kimi_k3_spec import (
     build_parameter_sharding_rules as kimi_rules,
 )
 from hyper_parallel.models._transformers import auto_model, model_builder

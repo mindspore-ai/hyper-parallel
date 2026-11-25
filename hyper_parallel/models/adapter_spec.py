@@ -90,6 +90,8 @@ class ModelAdapterSpec:
             Encoder-DP/Encoder-CP bridge.
         sharding: provider returning complete module-owned parameter and activation layouts.
         native_parallel: provider declaring explicit CP/EP stage protocols without replacing modules.
+        dit: Optional[Callable[..., Any]] = None
+    source_import: optional compatibility hook run before source model import in training and codegen.
         codegen: lazy provider for model-owned source compatibility and source
             renderers used only while exporting a generated bundle.
         dit: provider returning a DiT-family construction adapter. Diffusers
@@ -119,3 +121,4 @@ class ModelAdapterSpec:
     sharding: Optional[Callable[..., Any]] = None
     native_parallel: Optional[Callable[..., Any]] = None
     dit: Optional[Callable[..., Any]] = None
+    source_import: Optional[Callable[[], None]] = None
