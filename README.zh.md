@@ -47,6 +47,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 📣 最新消息
 
+- [Nov. 26, 2026]: [HyperParallel 加速 VeOmni 昇腾训练](https://github.com/ByteDance-Seed/VeOmni)
 - [Oct. 15, 2026]: [DeepSeek-V4.1-Flash 模型支持](docs/deepseek_v41_article/README.zh.md)
 - [Oct, 9, 2026]: [moonshotai/Kimi-K2.6 模型支持](hyper_parallel/models/kimi_k26/README.zh.md)
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](examples/training_demo/README.md#full-pretrained-model)
