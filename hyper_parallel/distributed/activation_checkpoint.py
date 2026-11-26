@@ -1044,4 +1044,5 @@ __all__ = [
     "_apply_activation_checkpointing",
     "_find_transformer_block_modules",
     "_find_transformer_layer_container_infos",
+    "_flatten_layer_container_infos",
 ]

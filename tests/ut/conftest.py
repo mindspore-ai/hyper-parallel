@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-import importlib
 import os
+from typing import Iterator
 from unittest import mock
 
 import pytest
@@ -78,7 +78,7 @@ class NoAcceleratorGuard:
 
         return _guarded
 
-    def start(self):
+    def start(self) -> None:
         """Install the guard patches."""
         for target in self._DEVICE_TARGETS:
             patcher = mock.patch(target, self._fail(target))
@@ -94,7 +94,7 @@ class NoAcceleratorGuard:
             patcher.start()
             self._patchers.append(patcher)
 
-    def stop(self):
+    def stop(self) -> None:
         """Restore every patched entry point."""
         while self._patchers:
             self._patchers.pop().stop()
@@ -109,7 +109,7 @@ class NoAcceleratorGuard:
 
 
 @pytest.fixture
-def no_accelerator():
+def no_accelerator() -> Iterator[NoAcceleratorGuard]:
     """Activate :class:`NoAcceleratorGuard` for one test."""
     guard = NoAcceleratorGuard()
     guard.start()
@@ -153,7 +153,10 @@ def _preload_libgomp_early_for_static_tls() -> None:
 _preload_libgomp_early_for_static_tls()
 
 
-def pytest_configure(config) -> None:  # pylint: disable=unused-argument
-    """Install UT compatibility and initialize the shared Torch binding."""
-    importlib.import_module("tests.ut.compile.conftest")
+def pytest_configure(config: pytest.Config) -> None:  # pylint: disable=unused-argument
+    """Initialize the shared tensor binding.
+
+    Args:
+        config: Pytest configuration object (unused).
+    """
     import hyper_parallel.core.dtensor.dtensor  # noqa: F401 pylint: disable=unused-import,C0415

@@ -282,9 +282,10 @@ class GraphCompiler:
             # runs as plain graph mode without sharding.
             self._init_device_mesh(self._mesh_context)
 
-        # Activation checkpointing must resolve its scope and run the adapter's
-        # runtime hook BEFORE tracing: the hook configures state the model's
-        # forward reads. The pass receives the same scope so the hook runs once.
+        # Activation checkpointing must resolve its scope BEFORE tracing so
+        # block discovery happens once. The pass receives the same scope; a
+        # directly injected scope's optional runtime hook also runs here, before
+        # the model's forward reads the state it configures.
         ac_scope = None
         if self.pass_config.ac_mode != "off":
             ac_scope = prepare_activation_checkpoint(self.model, self.pass_config)

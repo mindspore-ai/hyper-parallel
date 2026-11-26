@@ -38,7 +38,6 @@ __all__ = [
     "INDUCTOR_MODES",
     "DP_MODES",
     "AC_MODES",
-    "AC_REGION_SOURCES",
     "ACTIVATION_SWAP_MODES",
     "normalize_dp_mode",
     "build_pass_config_from_trainer_config",
@@ -47,7 +46,7 @@ __all__ = [
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 _LOG = logging.getLogger(__name__)
 
@@ -81,17 +80,13 @@ _DP_MODE_ALIASES = {
 }
 
 # Static-graph activation checkpointing modes for ``ActivationCheckpointPass``,
-# mirroring the dynamic ``ActivationCheckpointConfig.mode`` vocabulary:
+# a strict subset of the dynamic ``ActivationCheckpointConfig.mode``
+# vocabulary (``hybrid`` has no static-graph equivalent and is rejected):
 #   "off"       - save every forward activation (no recompute pass)
 #   "full"      - recompute every checkpoint-scoped module op in backward
-#   "selective" - save compute/communication intensive ops, recompute the rest
+#   "selective" - eager-aligned target selection: recompute only the declared
+#                 module/region targets, save everything else
 AC_MODES = ("off", "full", "selective")
-
-# Where the recompute-region shape comes from, mirroring
-# ``ActivationCheckpointSelection.source``. ``default`` selects whole blocks
-# (and lets ``full`` auto-upgrade to a model-owned RecomputePolicy);
-# ``model_adapter_safe_regions`` requires an adapter-declared region.
-AC_REGION_SOURCES = ("default", "model_adapter_safe_regions")
 
 # Dynamic-graph activation-swap modes reused by graph mode. ``attention``
 # offloads saved activations inside ``self_attn`` modules to host memory
@@ -135,7 +130,7 @@ class GradientReduction:
             raise ValueError("Gradient divisor must be a positive integer")
 
     @property
-    def scale(self) -> float | None:
+    def scale(self) -> Optional[float]:
         """Return the pre-reduction multiplier, or None for an identity scale."""
         return 1.0 / self.divisor if self.divisor > 1 else None
 
@@ -263,21 +258,24 @@ class PassConfig:
             section by ``build_pass_config_from_trainer_config``. ``"off"``
             (default) saves every forward activation; ``"full"`` recomputes
             every checkpoint-scoped module op in backward; ``"selective"``
-            saves the shared compute/communication operator set and
-            recomputes the rest.
+            recomputes only the eager-aligned module/region targets carried by
+            ``ac_selective_*`` and saves everything else.
+        ac_selective_recompute_regions: Layer-relative selective recompute
+            targets as ``(module_path, layer_indices)`` pairs, mirroring
+            ``activation_checkpoint.selective.recompute``. Only
+            ``ac_mode="selective"`` may set this.
+        ac_selective_recompute_modules: Model-root-relative selective recompute
+            module paths, mirroring model-level selective ``recompute``
+            targets. Only ``ac_mode="selective"`` may set this.
         ac_layer_count: Optional layer selector: checkpoint only the first
             ``ac_layer_count`` discovered transformer blocks (the same
             HuggingFace-marker discovery the eager path uses). Mutually
-            exclusive with ``ac_layer_indices``.
+            exclusive with ``ac_layer_indices`` and with target-based
+            ``"selective"``.
         ac_layer_indices: Optional explicit zero-based indices into the
             discovered transformer blocks; only nodes inside the selected
-            blocks recompute. Mutually exclusive with ``ac_layer_count``.
-        ac_region_source: Where the recompute-region shape comes from, one of
-            ``AC_REGION_SOURCES``. ``"default"`` selects whole blocks (and
-            lets ``full`` auto-upgrade to a model-owned ``RecomputePolicy``);
-            ``"model_adapter_safe_regions"`` requires an adapter-declared
-            region and its ``exclude_patterns``. Projected from the trainer
-            selection's ``source``.
+            blocks recompute. Mutually exclusive with ``ac_layer_count`` and
+            with target-based ``"selective"``.
         ac_save_forward_all_gather: Save forward (TP/SP/CP) all-gathers instead
             of replaying them during backward recompute. Graph-mode only;
             defaults to ``True``, so static-graph recompute does not duplicate
@@ -330,7 +328,8 @@ class PassConfig:
     ac_mode: str = "off"
     ac_layer_count: Optional[int] = None
     ac_layer_indices: Optional[List[int]] = None
-    ac_region_source: str = "default"
+    ac_selective_recompute_regions: Optional[List[Tuple[str, List[int]]]] = None
+    ac_selective_recompute_modules: Optional[List[str]] = None
     ac_save_forward_all_gather: bool = True
     activation_swap: str = "none"
     offload_budget_gb: float = 64.0
@@ -361,14 +360,6 @@ class PassConfig:
         """Validate the activation checkpointing mode and layer selectors."""
         if not isinstance(self.ac_mode, str) or self.ac_mode not in AC_MODES:
             raise ValueError(f"ac_mode must be one of {AC_MODES}, got {self.ac_mode!r}")
-        if (
-            not isinstance(self.ac_region_source, str)
-            or self.ac_region_source not in AC_REGION_SOURCES
-        ):
-            raise ValueError(
-                f"ac_region_source must be one of {AC_REGION_SOURCES}, "
-                f"got {self.ac_region_source!r}"
-            )
         if not isinstance(self.ac_save_forward_all_gather, bool):
             raise ValueError("ac_save_forward_all_gather must be a bool")
         self._validate_ac_layer_count()
@@ -378,14 +369,67 @@ class PassConfig:
                 "ac_layer_count and ac_layer_indices are mutually exclusive; "
                 "set exactly one"
             )
-        if (
-            self.ac_mode != "off"
-            and self.ac_region_source == "model_adapter_safe_regions"
-            and (self.ac_layer_count is None and self.ac_layer_indices is None)
-        ):
+        self._validate_ac_selective()
+
+    def _validate_ac_selective(self) -> None:
+        """Validate eager-aligned selective module/region targets."""
+        regions = self.ac_selective_recompute_regions
+        modules = self.ac_selective_recompute_modules
+        if self.ac_mode != "selective":
+            if regions is not None or modules is not None:
+                raise ValueError(
+                    "ac_selective_recompute_regions / "
+                    "ac_selective_recompute_modules require ac_mode='selective'"
+                )
+            return
+        if self.ac_layer_count is not None or self.ac_layer_indices is not None:
             raise ValueError(
-                "ac_region_source=model_adapter_safe_regions requires exactly "
-                "one of ac_layer_count or ac_layer_indices"
+                "ac_mode='selective' selects layers through its targets; "
+                "ac_layer_count / ac_layer_indices are not allowed"
+            )
+        if not regions and not modules:
+            raise ValueError(
+                "ac_mode='selective' requires at least one recompute target in "
+                "ac_selective_recompute_regions or ac_selective_recompute_modules"
+            )
+        for region in regions or ():
+            self._validate_selective_region(region)
+        for module_path in modules or ():
+            self._validate_selective_module(module_path)
+
+    @staticmethod
+    def _validate_selective_region(region: Any) -> None:
+        """Validate one ``(module_path, layer_indices)`` selective target."""
+        if not isinstance(region, (list, tuple)) or len(region) != 2:
+            raise ValueError(
+                "ac_selective_recompute_regions must be a non-empty list of "
+                f"(module_path, layer_indices) pairs, got {region!r}"
+            )
+        module_path, layer_indices = region
+        if not isinstance(module_path, str) or not module_path:
+            raise ValueError(
+                "ac_selective_recompute_regions entry must name a module path, "
+                f"got {region!r}"
+            )
+        if not isinstance(layer_indices, (list, tuple)) or not layer_indices:
+            raise ValueError(
+                "ac_selective_recompute_regions entry must list layer indices, "
+                f"got {region!r}"
+            )
+        for index in layer_indices:
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                raise ValueError(
+                    "ac_selective_recompute_regions layer indices must be "
+                    f"non-negative integers, got {region!r}"
+                )
+
+    @staticmethod
+    def _validate_selective_module(module_path: Any) -> None:
+        """Validate one model-root selective module target."""
+        if not isinstance(module_path, str) or not module_path:
+            raise ValueError(
+                "ac_selective_recompute_modules must be a non-empty list of "
+                f"module paths, got {module_path!r}"
             )
 
     def _validate_ac_layer_count(self) -> None:
@@ -550,6 +594,120 @@ class PassConfig:
             )
 
 
+def _selective_recompute_targets(
+    selective_config: Any,
+) -> Tuple[Optional[List[Tuple[str, List[int]]]], Optional[List[str]]]:
+    """Normalize a selective config's recompute targets for the graph pass."""
+    if selective_config is None:
+        return None, None
+    regions = [
+        (region.module_path, list(region.layers))
+        for region in getattr(selective_config, "recompute_regions", ())
+    ]
+    modules = [
+        target.module_path
+        for target in getattr(selective_config, "recompute_modules", ())
+    ]
+    return (regions or None), (modules or None)
+
+
+def _full_recompute_layer_indices(full_config: Any) -> Optional[List[int]]:
+    """Read the full-mode layer selector from a full config.
+
+    Prefers the normalized ``recompute_layers`` field. Duck-typed configs that
+    only carry the raw ``recompute_layer`` list are accepted when it already
+    holds integer indices; range strings must go through
+    ``FullCheckpointConfig`` so ``recompute_layers`` is normalized first.
+    """
+    if full_config is None:
+        return None
+    recompute_layers = getattr(full_config, "recompute_layers", None)
+    if recompute_layers is not None:
+        return list(recompute_layers) or None
+    recompute_layer = getattr(full_config, "recompute_layer", None)
+    if not recompute_layer:
+        return None
+    if any(
+        isinstance(index, bool) or not isinstance(index, int)
+        for index in recompute_layer
+    ):
+        raise ValueError(
+            "activation_checkpoint.full.recompute_layer contains ranges; pass a "
+            "resolved FullCheckpointConfig so recompute_layers is normalized"
+        )
+    return list(recompute_layer)
+
+
+def _project_activation_checkpoint(
+    ac_config: Any,
+) -> Tuple[
+    str,
+    Optional[List[int]],
+    Optional[List[Tuple[str, List[int]]]],
+    Optional[List[str]],
+]:
+    """Project the trainer AC section onto graph-mode AC fields.
+
+    Returns ``(ac_mode, ac_layer_indices, recompute_regions,
+    recompute_modules)``; see ``build_pass_config_from_trainer_config`` for the
+    projection contract.
+    """
+    if ac_config is None or getattr(ac_config, "mode", None) in (None, "off"):
+        return "off", None, None, None
+    ac_mode = ac_config.mode
+    if ac_mode == "hybrid":
+        raise ValueError(
+            "activation_checkpoint.mode=hybrid is not supported in graph "
+            "mode; use mode=full or mode=selective"
+        )
+    ac_layer_indices = None
+    ac_regions = None
+    ac_modules = None
+    if ac_mode == "full":
+        full_config = getattr(ac_config, "full", None)
+        ac_layer_indices = _full_recompute_layer_indices(full_config)
+        if _has_full_exclusions(full_config):
+            _LOG.warning(
+                "activation_checkpoint.full.exclude_region is not supported in "
+                "graph mode; excluded modules will still be recomputed."
+            )
+    if ac_mode == "selective":
+        selective_config = getattr(ac_config, "selective", None)
+        ac_regions, ac_modules = _selective_recompute_targets(selective_config)
+        if getattr(selective_config, "swap_regions", ()):
+            _LOG.warning(
+                "activation_checkpoint.selective.swap is not supported in "
+                "graph mode yet; swap targets will be ignored."
+            )
+        if not ac_regions and not ac_modules:
+            raise ValueError(
+                "activation_checkpoint.selective requires at least one "
+                "recompute target in graph mode; selective.swap-only "
+                "configs are not supported yet"
+            )
+    if getattr(ac_config, "swap_inputs", False):
+        _LOG.warning(
+            "activation_checkpoint.swap_inputs is not supported in graph "
+            "mode; input swapping will be disabled."
+        )
+    if getattr(ac_config, "allow_cache_entry_mutation", False):
+        _LOG.info(
+            "activation_checkpoint.allow_cache_entry_mutation has no "
+            "effect in graph mode; ignoring it."
+        )
+    return ac_mode, ac_layer_indices, ac_regions, ac_modules
+
+
+def _has_full_exclusions(full_config: Any) -> bool:
+    """Return whether a full config declares save/swap exclusion regions."""
+    if full_config is None:
+        return False
+    return bool(
+        getattr(full_config, "save_regions", ())
+        or getattr(full_config, "swap_regions", ())
+    )
+
+
 def build_pass_config_from_trainer_config(
     config: Any,
     *,
@@ -567,9 +725,17 @@ def build_pass_config_from_trainer_config(
     flow and deliberately not copied.
 
     The dynamic ``activation_checkpoint`` section is projected onto the
-    static-graph AC fields: ``mode`` becomes ``ac_mode`` and a
-    ``model_adapter_safe_regions`` selection contributes its layer
-    selectors. ``swap_inputs`` and ``allow_cache_entry_mutation`` have no
+    static-graph AC fields: ``mode`` becomes ``ac_mode``, the full-mode
+    ``recompute_layer`` selector becomes ``ac_layer_indices``, and
+    ``selective.recompute`` targets become ``ac_selective_recompute_*`` so
+    graph selective recomputes the same modules as the eager path.
+    ``mode=hybrid`` has no static-graph equivalent (graph AC applies one
+    policy per scope) and is rejected. ``selective.swap`` targets have no
+    graph-mode equivalent yet and are ignored with a warning.
+    ``full.exclude_region`` save/swap regions are likewise not projected, so
+    graph full mode recomputes those modules too and warns when the config
+    declared exclusions.
+    ``swap_inputs`` and ``allow_cache_entry_mutation`` have no
     static-graph counterpart (no eager checkpoint cache) and are ignored
     with a warning when set, mirroring the dynamic compile path. The
     top-level dynamic ``activation_swap`` field is projected onto
@@ -599,28 +765,14 @@ def build_pass_config_from_trainer_config(
         )
     fsdp_degree = config.fsdp_config.dp_shard_size if fsdp_enabled else None
 
-    ac_mode = "off"
-    ac_layer_count = None
-    ac_layer_indices = None
-    ac_region_source = "default"
-    ac_config = getattr(config, "activation_checkpoint", None)
-    if ac_config is not None and getattr(ac_config, "mode", None) not in (None, "off"):
-        ac_mode = ac_config.mode
-        selection = getattr(ac_config, "selection", None)
-        ac_region_source = getattr(selection, "source", "default")
-        if ac_region_source == "model_adapter_safe_regions":
-            ac_layer_count = getattr(selection, "layer_count", None)
-            ac_layer_indices = getattr(selection, "layer_indices", None)
-        if getattr(ac_config, "swap_inputs", False):
-            _LOG.warning(
-                "activation_checkpoint.swap_inputs is not supported in graph "
-                "mode; input swapping will be disabled."
-            )
-        if getattr(ac_config, "allow_cache_entry_mutation", False):
-            _LOG.info(
-                "activation_checkpoint.allow_cache_entry_mutation has no "
-                "effect in graph mode; ignoring it."
-            )
+    (
+        ac_mode,
+        ac_layer_indices,
+        ac_selective_recompute_regions,
+        ac_selective_recompute_modules,
+    ) = _project_activation_checkpoint(
+        getattr(config, "activation_checkpoint", None)
+    )
 
     return PassConfig(
         enable_overlap=enable_overlap,
@@ -637,9 +789,10 @@ def build_pass_config_from_trainer_config(
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
         ac_mode=ac_mode,
-        ac_layer_count=ac_layer_count,
+        ac_layer_count=None,
         ac_layer_indices=ac_layer_indices,
-        ac_region_source=ac_region_source,
+        ac_selective_recompute_regions=ac_selective_recompute_regions,
+        ac_selective_recompute_modules=ac_selective_recompute_modules,
         activation_swap=getattr(config, "activation_swap", "none"),
         offload_budget_gb=getattr(compile_config, "offload_budget_gb", 64.0),
         offload_prefetch_n_layers=getattr(

@@ -63,25 +63,26 @@ below).
   rebuilt during backward instead of being held across the whole step
 - Reuses the dynamic-graph configuration vocabulary
   (`hyper_parallel/trainer/config` `activation_checkpoint:` section):
-  `mode: off / full / selective` maps to `ac_mode`, a
-  `selection.source=model_adapter_safe_regions` block contributes its
-  `layer_count` / `layer_indices` selectors, and `swap_inputs` /
-  `allow_cache_entry_mutation` are ignored with a warning (no eager
-  checkpoint cache exists in graph mode)
+  `mode: off / full / selective` maps to `ac_mode` (graph mode rejects
+  `hybrid`, which has no one-policy-per-scope equivalent), the full-mode
+  `recompute_layer` selector becomes `ac_layer_indices`, and the selective
+  `recompute` module/region targets become `ac_selective_recompute_*`, so
+  graph selective recomputes the same modules as the eager path.
+  `swap_inputs` / `allow_cache_entry_mutation` are ignored with a warning (no
+  eager checkpoint cache exists in graph mode), and `selective.swap` /
+  `full.exclude_region` save/swap regions are not supported yet and are
+  ignored with a warning
 - The recompute scope and the per-layer boundary units are the discovered
   transformer blocks — the same HuggingFace-marker discovery the eager path
   requires — so a model is AC-eligible in both modes under the same
   contract. Nodes outside the blocks (embedding, head, the `train_fn` loss
-  chain) always stay saved, and the adapter's `RecomputePolicy`
-  (`model_adapter_safe_regions`) narrows the selected blocks to its region
-  patterns with `exclude_patterns` pulled back out of the recompute. `full`
-  with the default selection upgrades to that policy automatically,
-  matching the eager path, and its `on_applied` runtime hook runs before
-  tracing
-- `"full"` recomputes every scoped node; `"selective"` saves the shared
-  compute/communication operator set from
-  `hyper_parallel/distributed/activation_checkpoint.py` (matmuls, attention,
-  collectives) and recomputes the rest
+  chain) always stay saved. For `full`, without a selector every discovered
+  block recomputes; `ac_layer_count` / `ac_layer_indices` narrow the scope to
+  the chosen blocks. For `selective`, only the declared target modules
+  recompute
+- `"full"` recomputes every scoped node; `"selective"` recomputes every node
+  inside the declared target modules and saves everything else, matching the
+  eager module/region wrapping semantics
 - Always saved regardless of mode: RNG ops (the graph cannot replay random
   state), in-place mutations, their forward consumers, and the mutated
   tensor's forward readers, SymInt scalars, and nodes read forward across a
@@ -99,13 +100,22 @@ Trainer configuration (graph mode reuses the eager section):
 
 ```yaml
 activation_checkpoint:
-  mode: full            # off (default) / full / selective
-  selection:
-    source: model_adapter_safe_regions
-    layer_count: 8      # or layer_indices: [0, 2, 4]
+  mode: full            # off (default) / full / selective (hybrid is rejected)
+  full:
+    recompute_layer: [0, 1, 2, 3]   # projected to ac_layer_indices
+# or, matching the eager selective targets:
+# mode: selective
+# selective:
+#   recompute:
+#     mlp: [0, 1]      # layer-relative module targets -> ac_selective_recompute_regions
+#     norm: [2]
 ```
 
-Or drive it directly: `PassConfig(ac_mode="selective", ac_layer_count=8)`.
+`full.recompute_layer` follows the trainer schema (integer indices and closed
+ranges such as `"1-3"`); graph mode consumes the normalized indices.
+
+Or drive it directly: `PassConfig(ac_mode="full", ac_layer_count=8)` or
+`PassConfig(ac_mode="selective", ac_selective_recompute_regions=[("mlp", [0, 1])])`.
 Layer selectors require the model to advertise the HuggingFace
 `gradient_checkpointing` marker on a repeated block container (the same
 contract as the eager path).
@@ -441,7 +451,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | FSDP / DDP / HSDP | Implemented | `FSDPPass`; `PassConfig.dp_mode` selects the mode |
 | PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b` / `interleaved_1f1b` / `vpp`), including VPP via `pp_chunks > 1`; pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
 | TP (+ SP / LP) | Via `mesh_context` | TP collectives are baked into automodel boundary forwards; graph mode reuses the mesh |
-| Activation checkpoint | Implemented | `ActivationCheckpointPass` (`ac_mode: full` / `selective`); reuses the eager `activation_checkpoint` config (mode, safe-region selection) |
+| Activation checkpoint | Implemented | `ActivationCheckpointPass` (`ac_mode: full` / `selective`); reuses the eager `activation_checkpoint` config (full-mode layer selector, selective recompute targets) |
 | Activation offload | Implemented | `CpuOffloadPass`; reuses the dynamic `activation_swap: attention` config, offloads saved attention activations to host with a largest-first budget |
 | PP + HSDP / PP + TP | Planned | HSDP needs a 3-D mesh; TP-in-stage needs per-stage TP collectives in the graph |
 | EP | Implemented (limited) | Expert parameters shard over the `edp_shard` axis and optionally gradient-reduce over `edp_replicate`; requires a `MeshContext` with `fsdp_moe_mesh`, `fsdp_enabled=True`, and `PP=1`. CP is supported (it joins the expert data-parallel domain); dense HSDP may compose with expert EDP replication |
