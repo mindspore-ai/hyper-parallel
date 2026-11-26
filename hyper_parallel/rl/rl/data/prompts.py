@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
 
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 
 from rl.data.contracts import Message, PromptRecord
@@ -228,6 +229,32 @@ def validate_chat_template_kwargs(value: Optional[Mapping[str, Any]]) -> dict[st
     return options
 
 
+def _read_prompt_frame(path: Path, max_samples: Optional[int]) -> pd.DataFrame:
+    """Read only the requested Parquet prefix before converting it to Python records."""
+    if max_samples is not None and max_samples <= 0:
+        raise ValueError(f"max_samples must be positive or null, got {max_samples}")
+    if max_samples is None:
+        frame = pd.read_parquet(path)
+    else:
+        with pq.ParquetFile(path) as parquet:
+            batch = next(parquet.iter_batches(batch_size=max_samples), None)
+            frame = batch.to_pandas() if batch is not None else pd.DataFrame()
+    return frame
+
+
+def _select_metadata_columns(columns: set[str], metadata_columns: Optional[Sequence[str]]) -> tuple[str, ...]:
+    """Validate explicitly retained metadata before constructing records."""
+    selected_metadata = tuple(metadata_columns or ())
+    if any(not isinstance(column, str) or not column.strip() for column in selected_metadata):
+        raise ValueError("data.metadata_columns must contain non-empty column names")
+    if len(set(selected_metadata)) != len(selected_metadata):
+        raise ValueError("data.metadata_columns must not contain duplicates")
+    missing_metadata = sorted(set(selected_metadata) - columns)
+    if missing_metadata:
+        raise ValueError(f"Prompt parquet is missing metadata columns: {missing_metadata}")
+    return selected_metadata
+
+
 class PromptDataset:
     """Read tokenized prompt records from supported text parquet layouts."""
 
@@ -240,6 +267,7 @@ class PromptDataset:
         return cls(
             parquet_path=str(config[f"{split}_path"]), tokenizer=tokenizer,
             max_prompt_length=int(config["max_prompt_length"]),
+            max_prompt_bytes=config.get("max_prompt_bytes", 8 * 1024 * 1024),
             max_samples=None if limit is None else int(limit),
             row_adapter=config.get("row_adapter"), metadata_columns=config.get("metadata_columns"),
             chat_template_kwargs=config.get("chat_template_kwargs"),
@@ -258,8 +286,16 @@ class PromptDataset:
         row_adapter: Optional[str] = None,
         metadata_columns: Optional[Sequence[str]] = None,
         chat_template_kwargs: Optional[Mapping[str, Any]] = None,
+        max_prompt_bytes: int = 8 * 1024 * 1024,
     ) -> None:
-        """Load and validate a tokenized prompt dataset from parquet."""
+        """Load prompts, bounding adapted source text before template rendering.
+
+        ``max_prompt_bytes`` can be increased explicitly for larger adapted messages.
+        Oversized messages are rejected rather than silently truncated.
+        """
+        if isinstance(max_prompt_bytes, bool) or not isinstance(max_prompt_bytes, int) or max_prompt_bytes <= 0:
+            raise ValueError("max_prompt_bytes must be a positive integer")
+        self._max_prompt_bytes = max_prompt_bytes
         self._chat_template_kwargs = validate_chat_template_kwargs(chat_template_kwargs)
         path = Path(parquet_path)
         if not path.is_file():
@@ -272,20 +308,12 @@ class PromptDataset:
             if not isinstance(prompt_instruction, str) or not prompt_instruction.strip():
                 raise ValueError("prompt_instruction must be non-empty text when provided")
             prompt_instruction = prompt_instruction.strip()
-        frame = pd.read_parquet(path)
+        frame = _read_prompt_frame(path, max_samples)
         if frame.empty:
             raise ValueError(f"Prompt parquet contains no rows: {path}")
         self._row_adapter = _load_row_adapter(row_adapter, prompt_column, answer_column, prompt_instruction)
         columns = set(str(column) for column in frame.columns)
-        selected_metadata = tuple(metadata_columns or ())
-        if any(not isinstance(column, str) or not column.strip() for column in selected_metadata):
-            raise ValueError("data.metadata_columns must contain non-empty column names")
-        if len(set(selected_metadata)) != len(selected_metadata):
-            raise ValueError("data.metadata_columns must not contain duplicates")
-        missing_metadata = sorted(set(selected_metadata) - columns)
-        if missing_metadata:
-            raise ValueError(f"Prompt parquet is missing metadata columns: {missing_metadata}")
-        self._metadata_columns = selected_metadata
+        self._metadata_columns = _select_metadata_columns(columns, metadata_columns)
         self._prompt_column = _pick_column(
             columns, prompt_column, _PROMPT_COLUMN_CANDIDATES, "prompt", self._row_adapter is None
         )
@@ -299,12 +327,6 @@ class PromptDataset:
                 "found; expected reward_model.ground_truth or one of "
                 f"{list(_ANSWER_COLUMN_CANDIDATES)}, available={sorted(columns)}"
             )
-        if max_samples is not None:
-            if max_samples <= 0:
-                raise ValueError(
-                    f"max_samples must be positive or null, got {max_samples}"
-                )
-            frame = frame.iloc[:max_samples]
         self._records = frame.to_dict("records")
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
@@ -314,19 +336,37 @@ class PromptDataset:
         """Return the number of prompt samples."""
         return len(self._records)
 
+    def _validate_message_bytes(self, messages: Sequence[Message], index: int) -> None:
+        """Bound source text before joining, rendering, or native tokenizer allocations."""
+        remaining = self._max_prompt_bytes - max(0, len(messages) - 1)
+        for message in messages:
+            if len(message.content) > remaining:
+                raise ValueError(f"Adapted prompt {index} exceeds max_prompt_bytes={self._max_prompt_bytes}")
+            for start in range(0, len(message.content), 65536):
+                remaining -= len(message.content[start:start + 65536].encode("utf-8"))
+                if remaining < 0:
+                    raise ValueError(f"Adapted prompt {index} exceeds max_prompt_bytes={self._max_prompt_bytes}")
+
     def _tokenize(self, prompt: str, index: int, messages: Optional[tuple[Message, ...]] = None) -> tuple[Any, Any]:
         """Tokenize one prompt and enforce its configured length bound."""
+        if messages is not None:
+            self._validate_message_bytes(messages, index)
         encoded = self._tokenizer.apply_chat_template(
             ([{"role": message.role, "content": message.content} for message in messages]
              if messages is not None else [{"role": "user", "content": prompt}]),
             add_generation_prompt=True,
             tokenize=True,
-            truncation=messages is None,
-            max_length=self._max_prompt_length,
+            truncation=True,
+            max_length=self._max_prompt_length + (messages is not None),
             return_dict=True,
             tokenizer_kwargs={"return_attention_mask": True},
             **self._chat_template_kwargs,
         )
+        # One extra token detects an oversized adapted prompt without materializing full tensors.
+        if messages is not None and len(encoded["input_ids"]) > self._max_prompt_length:
+            raise ValueError(
+                f"Adapted prompt {index} exceeds max_prompt_length={self._max_prompt_length}; preprocess it"
+            )
         input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long)
         attention_mask = torch.tensor(
             encoded.get("attention_mask", [1] * len(encoded["input_ids"])),
@@ -336,10 +376,6 @@ class PromptDataset:
             raise ValueError(
                 f"Tokenizer returned invalid input_ids for sample {index}: "
                 f"shape={input_ids.shape}"
-            )
-        if messages is not None and input_ids.numel() > self._max_prompt_length:
-            raise ValueError(
-                f"Adapted prompt {index} exceeds max_prompt_length={self._max_prompt_length}; preprocess it"
             )
         if attention_mask.shape != input_ids.shape:
             raise ValueError(
@@ -363,6 +399,7 @@ class PromptDataset:
             raise ValueError("data.row_adapter returned invalid messages")
         if not isinstance(adapted.metadata, dict):
             raise ValueError("data.row_adapter metadata must be a dictionary")
+        self._validate_message_bytes(adapted.messages, index)
         prompt = "\n".join(message.content for message in adapted.messages)
         input_ids, attention_mask = self._tokenize(prompt, index, tuple(adapted.messages))
         return {
@@ -522,6 +559,7 @@ class StatefulPromptSource:
 
     def __init__(self, config: Mapping[str, Any], tokenizer: Any, seed: int,
                  state: dict | None = None) -> None:
+        """Initialize or restore the single-owner prompt stream."""
         dataset = PromptDataset.from_config(config, tokenizer)
         self.loader, self.sampler = build_train_dataloader(
             dataset, functools.partial(collate_prompt_samples, pad_token_id=tokenizer.pad_token_id),

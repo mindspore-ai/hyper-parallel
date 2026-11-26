@@ -25,6 +25,7 @@ import pytest
 import yaml
 
 import rl
+from rl.data import prompts as data_source
 
 import rl.config.validate as config_module
 
@@ -91,17 +92,28 @@ def test_adapter_preserves_private_tests_messages_and_id(task_data: tuple) -> No
     assert record.metadata["source_row"] == 0
     assert record.metadata["input_ids"].tolist() == list(range(1, 7))
     assert tokenizer.messages == [{"role": item.role, "content": item.content} for item in record.messages]
-    assert tokenizer.truncation is False
+    assert tokenizer.truncation is True
     assert "7 9" not in sample["prompt"]
 
 
-def test_adapter_rejects_overlong_prompt_without_truncating(task_data: tuple) -> None:
-    """Task semantics must not change silently when the prompt budget is too small."""
+@pytest.mark.parametrize("limits,error", [
+    ({"max_prompt_length": 3}, "max_prompt_length"),
+    ({"max_prompt_length": 32, "max_prompt_bytes": 4}, "max_prompt_bytes"),
+])
+def test_adapter_rejects_overlong_prompt_before_allocation(
+    task_data: tuple, monkeypatch: pytest.MonkeyPatch, limits: dict, error: str,
+) -> None:
+    """Reject oversized messages before materializing either token tensor."""
     path, tokenizer = task_data
-    dataset = PromptDataset(str(path), tokenizer, 3, row_adapter=f"{__name__}:adapt_row")
-    with pytest.raises(ValueError, match="exceeds max_prompt_length"):
+    dataset = PromptDataset(str(path), tokenizer, row_adapter=f"{__name__}:adapt_row", **limits)
+
+    def reject_tensor(*_args, **_kwargs):
+        raise AssertionError("premature tensor allocation")
+
+    monkeypatch.setattr(data_source.torch, "tensor", reject_tensor)
+    with pytest.raises(ValueError, match=error):
         _ = dataset[0]
-    assert tokenizer.truncation is False
+    assert tokenizer.truncation is (True if error == "max_prompt_length" else None)
 
 
 @pytest.mark.parametrize("overrides", [

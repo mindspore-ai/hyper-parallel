@@ -31,6 +31,15 @@ DEFAULT_SOURCE = (
 )
 
 
+def _sha256(path: Path) -> str:
+    """Hash a dataset without retaining a second whole-file buffer."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _builtin(value: Any) -> Any:
     if hasattr(value, "tolist"):
         return _builtin(value.tolist())
@@ -108,6 +117,27 @@ def split_samples(frame: pd.DataFrame, train_count: int, test_count: int, seed: 
     return train, test
 
 
+def _build_manifest(args, source: Path, frame: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame) -> dict:
+    """Record dataset identity using bounded streaming digests."""
+    return {
+        "split_protocol": "independent_sources" if args.validation_input else "single_source_holdout",
+        "additional_sources": [{"path": str(path.resolve()),
+                                "sha256": _sha256(path)}
+                               for path in args.additional_input],
+        "validation_source": ({"path": str(args.validation_input.resolve()),
+                               "sha256": _sha256(args.validation_input)}
+                              if args.validation_input else None),
+        "source": str(source.resolve()), "source_url": args.source_url if args.input is None else None,
+        "source_sha256": _sha256(source), "source_rows": len(frame),
+        "seed": args.seed, "train_samples": len(train), "test_samples": len(test),
+        "preserved_test": str(args.preserve_test) if args.preserve_test else None,
+        "split_overlap": len(set(train.question_id) & set(test.question_id)),
+        "sha256": {name: _sha256(args.output_dir / f"{name}.parquet")
+                   for name in ("train", "test")},
+    }
+
+
+
 def main() -> None:
     """Download or convert one source, then create disjoint train and test files."""
     parser = argparse.ArgumentParser()
@@ -152,22 +182,7 @@ def main() -> None:
         train, test = split_samples(frame, args.train_samples, args.test_samples, args.seed, heldout)
     for name, split in (("train", train), ("test", test)):
         split.to_parquet(args.output_dir / f"{name}.parquet", index=False)
-    manifest = {
-        "split_protocol": "independent_sources" if args.validation_input else "single_source_holdout",
-        "additional_sources": [{"path": str(path.resolve()),
-                                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-                               for path in args.additional_input],
-        "validation_source": ({"path": str(args.validation_input.resolve()),
-                               "sha256": hashlib.sha256(args.validation_input.read_bytes()).hexdigest()}
-                              if args.validation_input else None),
-        "source": str(source.resolve()), "source_url": args.source_url if args.input is None else None,
-        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "source_rows": len(frame),
-        "seed": args.seed, "train_samples": len(train), "test_samples": len(test),
-        "preserved_test": str(args.preserve_test) if args.preserve_test else None,
-        "split_overlap": len(set(train.question_id) & set(test.question_id)),
-        "sha256": {name: hashlib.sha256((args.output_dir / f"{name}.parquet").read_bytes()).hexdigest()
-                   for name in ("train", "test")},
-    }
+    manifest = _build_manifest(args, source, frame, train, test)
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"prepared train={args.train_samples} test={args.test_samples} at {args.output_dir}")
 

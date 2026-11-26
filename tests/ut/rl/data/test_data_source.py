@@ -15,6 +15,8 @@
 """CPU unit tests for prompt loading, tokenization, collation, and records."""
 
 import sys
+import hashlib
+import runpy
 from types import ModuleType
 from pathlib import Path
 from typing import Any
@@ -215,3 +217,34 @@ def test_prompt_template_options_reach_the_actual_tokenizer(monkeypatch: pytest.
     for options in ({"max_length": 1000000}, {"tokenize": False}, "invalid"):
         with pytest.raises(ValueError, match="chat_template_kwargs"):
             PromptDataset(str(path), Tokenizer(), 32, chat_template_kwargs=options)
+
+
+def test_sample_limit_avoids_full_parquet_read(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A small sample limit reads only its prefix and preserves the returned records."""
+    path = tmp_path / "limited.parquet"
+    data_source.pd.DataFrame({"prompt": ["one", "two", "three"], "answer": ["1", "2", "3"]}).to_parquet(
+        path, row_group_size=1,
+    )
+
+    def reject_full_read(unused_path):
+        raise AssertionError("full-table read")
+
+    monkeypatch.setattr(data_source.pd, "read_parquet", reject_full_read)
+    dataset = PromptDataset(str(path), _Tokenizer(), 8, max_samples=2)
+    assert [dataset[index]["ground_truth"] for index in range(len(dataset))] == ["1", "2"]
+
+
+def test_manifest_digest_is_streamed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Streaming hashes preserve the original digest across block boundaries."""
+    source = Path(data_source.__file__).resolve().parents[2] / "examples/search_r1/prepare_data.py"
+    digest = runpy.run_path(str(source))["_sha256"]
+    path = tmp_path / "data"
+
+    def reject_full_read(unused_path):
+        raise AssertionError("whole-file read")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_full_read)
+    for length in (0, 17, 2 * 1024 * 1024 + 13):
+        content = b"x" * length
+        path.write_bytes(content)
+        assert digest(path) == hashlib.sha256(content).hexdigest()
