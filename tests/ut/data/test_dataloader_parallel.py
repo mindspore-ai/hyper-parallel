@@ -68,7 +68,7 @@ class TestDataLoaderWorkerRecovery(unittest.TestCase):
             snapshot = source_state.capture()
             list(iterator)
             expected = iter(loader)
-            target_state.restore(snapshot)
+            target_state.restore(snapshot["rank_state"], snapshot["replica_state"])
             iterator = iter(restored)
             target_state.restore_pending_rng()
             list(iterator)
@@ -104,14 +104,14 @@ class TestDataLoaderWorkerRecovery(unittest.TestCase):
                     expected = [next(iterator) for _ in range(3)]
                     for _ in range(2):
                         old_iterator = iterator
-                        state_codec.restore(state)
+                        state_codec.restore(state["rank_state"], state["replica_state"])
                         self.assertTrue(all(not worker.is_alive() for worker in old_iterator._workers))
                         iterator = iter(loader)
                         state_codec.restore_pending_rng()
                         torch.testing.assert_close(loader.generator.get_state(), generator_state, rtol=0, atol=0)
                         for batch in expected:
                             torch.testing.assert_close(next(iterator), batch)
-                    replacement_codec.restore(state)
+                    replacement_codec.restore(state["rank_state"], state["replica_state"])
                     restored = iter(replacement)
                     replacement_codec.restore_pending_rng()
                     torch.testing.assert_close(replacement.generator.get_state(), generator_state, rtol=0, atol=0)

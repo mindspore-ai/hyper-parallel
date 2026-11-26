@@ -272,14 +272,26 @@ class ModelOptimizerState:
         return torch.zeros_like(parameter, dtype=entry["dtype"])
 
     def rank_state(self) -> dict[str, Any]:
-        """Retain rank-local buffers on their original device and small extra metadata."""
-        extra = {name: clone_metadata(module.get_extra_state()) for name, module in self.extra_modules.items()}
-        return {"buffers": {name: local_tensor(buffer).detach().clone() for name, buffer in self.buffers.items()},
-                "extra": extra}
+        """Capture independent CPU copies of rank-local buffers and small extra metadata."""
+        extra = {
+            name: clone_metadata(module.get_extra_state()) for name, module in self.extra_modules.items()
+        }
+        return {
+            "buffers": {
+                name: local_tensor(buffer).detach().to(device="cpu", copy=True)
+                for name, buffer in self.buffers.items()
+            },
+            "extra": extra
+        }
 
     @torch.no_grad()
-    def restore_rank_state(self, buffers: Mapping[str, torch.Tensor], extra: Mapping[str, Any]) -> None:
-        """Restore rank-owned device buffers, then align computation and main parameters."""
+    def restore_model_state(self, buffers: Mapping[str, torch.Tensor], extra: Mapping[str, Any]) -> None:
+        """Restore buffers and extra state, align main parameters, and clear interrupted gradients.
+
+        Args:
+            buffers: Rank-owned CPU buffer snapshots.
+            extra: Rank-owned module extra-state snapshots.
+        """
         for name, buffer in self.buffers.items():
             local_tensor(buffer).copy_(buffers[name])
         for name, module in self.extra_modules.items():
@@ -333,42 +345,59 @@ class TrainState:
 
     def capture(self) -> dict[str, Any]:
         """Snapshot separate rank-owned and replica-equivalent state groups."""
-        rank_state = self._capture_rng()
-        rank_state["loader"] = self.loader.state_dict()
-        return clone_metadata({
-            "rank_state": rank_state,
-            "replica_state": {name: provider.state_dict() for name, provider in self.replica_providers.items()},
-        })
+        rng_state = self._capture_rng()
+        rank_state = {
+            **rng_state,
+            "loader": self.loader.state_dict()
+        }
+        return clone_metadata(
+            {
+                "rank_state": rank_state,
+                "replica_state": {
+                    name: provider.state_dict() for name, provider in self.replica_providers.items()
+                },
+            }
+        )
 
     def _capture_rng(self) -> dict[str, Any]:
         """Read random state without exporting loader or replica-provider state."""
         return {
-            "rng": {"python": random.getstate(), "numpy": np.random.get_state(),
-                    "torch": torch.get_rng_state(),
-                    "device": self.device.get_rng_state() if self.device is not None else None},
-            "generators": {name: generator.get_state() for name, generator in self.generators.items()},
+            "rng": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "device": self.device.get_rng_state() if self.device is not None else None
+            },
+            "generators": {
+                name: generator.get_state() for name, generator in self.generators.items()
+            },
         }
 
-    def restore(self, state: Mapping[str, Any]) -> None:
+    def restore(self, rank_state: Mapping[str, Any], replica_state: Mapping[str, Any]) -> None:
         """Restore loader/providers and stage RNG until iterator reconstruction finishes.
 
         Args:
-            state: Rank-specific loader/RNG state and replica-equivalent provider snapshot.
+            rank_state: Rank-specific loader, RNG and generator snapshot.
+            replica_state: Replica-equivalent training provider snapshot.
 
         Note:
             The training main thread must call restore_pending_rng after startup/epoch callbacks
             and iterator construction, before consuming training data.
         """
-        if set(state["replica_state"]) != set(self.replica_providers):
+        if set(replica_state) != set(self.replica_providers):
             raise RuntimeError("replica training state provider schema mismatch")
-        rank_state = state["rank_state"]
         if set(rank_state["generators"]) != set(self.generators):
             raise RuntimeError("custom RNG generator schema mismatch")
         if self.loader.load_state_dict(copy.deepcopy(rank_state["loader"])) is False:
             raise RuntimeError("data loader refused the consumed-data cursor rollback")
         for name, provider in self.replica_providers.items():
-            provider.load_state_dict(copy.deepcopy(state["replica_state"][name]))
-        self._pending_rng_state = clone_metadata({"rng": rank_state["rng"], "generators": rank_state["generators"]})
+            provider.load_state_dict(copy.deepcopy(replica_state[name]))
+        self._pending_rng_state = clone_metadata(
+            {
+                "rng": rank_state["rng"],
+                "generators": rank_state["generators"]
+            }
+        )
 
     def restore_pending_rng(self) -> None:
         """Apply pending RNG once after callbacks and iterator reconstruction.

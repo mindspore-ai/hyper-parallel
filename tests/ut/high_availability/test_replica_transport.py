@@ -16,7 +16,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -28,14 +28,14 @@ from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, FSDPMeshInfo, MixedPrecisionPolicy
 from hyper_parallel.high_availability.config import WorkerRecoveryConfig
 from hyper_parallel.high_availability.group_registry import GroupDescriptor, GroupRegistry
-from hyper_parallel.high_availability.recovery_state import ModelOptimizerState
+from hyper_parallel.high_availability.recovery_state import ModelOptimizerState, clone_metadata
 from hyper_parallel.high_availability.replica_topology import (
     ReplicaTopology, device_replica_ranks, model_replica_candidates,
 )
 from hyper_parallel.high_availability.replica_transport import (
     DeviceMetadataBank,
-    ReplicaTransport,
     deserialize_metadata,
+    ReplicaTransport,
     serialize_metadata,
 )
 from hyper_parallel.core.optimizer.adamw import AdamW
@@ -225,26 +225,100 @@ class TestMetadataGroupReuse(unittest.TestCase):
 class TestDeviceMetadataBank(unittest.TestCase):
     """The persistent bank has rank metadata, never model or optimizer values."""
 
-    def test_owner_metadata_and_bounded_versions(self):
-        """Feature: Exact-step rank metadata with bounded retained versions.
+    def test_owned_snapshots_are_not_copied_again(self):
+        """Keep owned CPU snapshots even when the worker uses another device."""
+        bank = DeviceMetadataBank(0, torch.device("meta"))
+        buffer = torch.tensor([8.0])
+        snapshot = {"state": {"rank_state": {"rng": torch.tensor([8])},
+                          "replica_state": {"scheduler": {"step": 8}}}, "extra": {}}
+        snapshot_metadata = {**snapshot, "buffers": {"counter": buffer}}
+        training_state = snapshot_metadata["state"]
+        rank_metadata = snapshot_metadata.copy()
+        rank_metadata.pop("state")
+        rank_metadata["rank_state"] = training_state["rank_state"]
+        bank.put_snapshot(8, rank_metadata, training_state["replica_state"])
+        self.assertIs(bank._replica_snapshot["state"], snapshot["state"]["replica_state"])
+        self.assertIs(bank.get_rank_metadata(0, 8)["rank_state"],
+                      snapshot["state"]["rank_state"])
+        recovered = bank.get_rank_metadata(0, 8)
+        replica_state = bank.get_replica_state(8)
+        self.assertIs(recovered["buffers"]["counter"], buffer)
+        self.assertEqual(buffer.device, torch.device("cpu"))
+        self.assertIs(replica_state, snapshot["state"]["replica_state"])
+        self.assertIs(recovered["rank_state"], snapshot["state"]["rank_state"])
+        self.assertIs(recovered, rank_metadata)
+        self.assertNotIn("replica_state", bank.get_rank_metadata(0, 8)["rank_state"])
+        self.assertEqual(recovered["rank_state"]["rng"].item(), 8)
+        self.assertEqual(replica_state["scheduler"]["step"], 8)
+
+    def test_local_snapshots_skip_encoding_and_replace_previous_snapshot(self):
+        """Keep only the latest independent CPU snapshot and buffers without encoding or transfers."""
+        bank = DeviceMetadataBank(0, torch.device("cpu"))
+        buffer = torch.tensor([8.0])
+        with patch("hyper_parallel.high_availability.replica_transport.metadata_to_device") as to_device, \
+                patch("hyper_parallel.high_availability.replica_transport.serialize_metadata") as encode, \
+                patch("hyper_parallel.high_availability.replica_transport.deserialize_metadata") as decode:
+            for step in (7, 8, 9):
+                metadata = {"state": {"rank_state": {"rng": torch.tensor([step]), "loader": {"cursor": step}},
+                                      "replica_state": {"scheduler": {"step": step}}},
+                            "extra": {"counter": step}}
+                snapshot_metadata = {**clone_metadata(metadata), "buffers": {"counter": buffer}}
+                training_state = snapshot_metadata["state"]
+                rank_metadata = snapshot_metadata.copy()
+                rank_metadata.pop("state")
+                rank_metadata["rank_state"] = training_state["rank_state"]
+                bank.put_snapshot(step, rank_metadata, training_state["replica_state"])
+                metadata["state"]["rank_state"]["rng"].zero_()
+                metadata["state"]["rank_state"]["loader"]["cursor"] = -1
+                metadata["state"]["replica_state"]["scheduler"]["step"] = -1
+                metadata["extra"]["counter"] = -1
+            saved = bank.get_rank_metadata(0, 9)
+            replica_state = bank.get_replica_state(9)
+            self.assertEqual(saved["rank_state"]["rng"].item(), 9)
+            self.assertEqual(saved["rank_state"]["loader"]["cursor"], 9)
+            self.assertEqual(replica_state["scheduler"]["step"], 9)
+            self.assertEqual(saved["extra"]["counter"], 9)
+            self.assertIs(saved["rank_state"],
+                          bank.get_rank_metadata(0, 9)["rank_state"])
+            self.assertNotIn("replica_state", bank.get_rank_metadata(0, 9)["rank_state"])
+            self.assertIs(bank.get_rank_metadata(0, 9)["buffers"]["counter"], buffer)
+            self.assertIsInstance(bank.get_rank_metadata(0, 9), dict)
+            for step in (7, 8):
+                with self.assertRaisesRegex(RuntimeError, "exact training metadata unavailable"):
+                    bank.get_rank_metadata(0, step)
+            to_device.assert_not_called()
+            encode.assert_not_called()
+            decode.assert_not_called()
+
+    def test_owner_metadata_retains_only_latest_snapshot(self):
+        """Feature: Exact-step rank metadata with one retained snapshot.
 
         Description: Commit three snapshots with empty replica-provider mappings.
-        Expectation: Owner metadata remains readable and the oldest version is unavailable.
+        Expectation: Only the latest owner metadata remains readable; earlier steps are unavailable.
         """
         bank = DeviceMetadataBank(1, torch.device("cpu"))
         for step in (7, 8, 9):
-            bank.put(step, {"state": {"rank_state": {"rng_owner": 1, "cursor": step},
-                                       "replica_state": {}}}, {})
-        self.assertEqual(set(bank.get(1, 8)), {"owner", "step", "payload", "buffers"})
-        metadata = deserialize_metadata(bank.get(1, 8)["payload"].numpy().tobytes())
-        self.assertEqual(metadata["state"]["rank_state"]["rng_owner"], 1)
-        with self.assertRaisesRegex(RuntimeError, "unavailable"):
-            bank.get(1, 7)
+            snapshot_metadata = {
+                "state": {"rank_state": {"rng_owner": 1, "cursor": step}, "replica_state": {}},
+                "extra": {},
+                "buffers": {},
+            }
+            training_state = snapshot_metadata["state"]
+            rank_metadata = snapshot_metadata.copy()
+            rank_metadata.pop("state")
+            rank_metadata["rank_state"] = training_state["rank_state"]
+            bank.put_snapshot(step, rank_metadata, training_state["replica_state"])
+        self.assertEqual(set(bank.get_rank_metadata(1, 9)), {"rank_state", "extra", "buffers"})
+        metadata = bank.get_rank_metadata(1, 9)
+        self.assertEqual(metadata["rank_state"]["rng_owner"], 1)
+        for step in (7, 8):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                bank.get_rank_metadata(1, step)
 
     def test_donor_providers_stay_local_while_target_rank_state_is_mirrored(self):
         """Feature: Separation of replica state from rank-owned mirrored state.
 
-        Description: Save a mapping of scheduler/progress snapshots and install a peer's rank payload.
+        Description: Save a mapping of scheduler/progress snapshots and install a peer's rank encoded_metadata.
         Expectation: Shared state stays local until repair and merges with exact peer RNG/cursor/extra.
         """
         bank = DeviceMetadataBank(0, torch.device("cpu"))
@@ -253,23 +327,30 @@ class TestDeviceMetadataBank(unittest.TestCase):
                                                   "rng": {"python": "rank0-rng"}},
                                   "replica_state": {"scheduler": {"step": step}, "progress": {"step": step}}},
                         "extra": {"owner": 0}}
-            bank.put(step, metadata, {})
+            snapshot_metadata = {**clone_metadata(metadata), "buffers": {}}
+            training_state = snapshot_metadata["state"]
+            rank_metadata = snapshot_metadata.copy()
+            rank_metadata.pop("state")
+            rank_metadata["rank_state"] = training_state["rank_state"]
+            bank.put_snapshot(step, rank_metadata, training_state["replica_state"])
             metadata["state"]["replica_state"]["scheduler"]["step"] = -1
-        local = deserialize_metadata(bank.get(0, 8)["payload"].numpy().tobytes())
-        self.assertNotIn("replica_state", local["state"])
-        self.assertEqual(local["state"]["rank_state"]["rng"]["python"], "rank0-rng")
-        target = {"state": {"rank_state": {"loader": {"owner": 1, "position": 8},
-                                           "rng": {"python": "rank1-rng"}}}, "extra": {"owner": 1}}
-        payload = torch.frombuffer(bytearray(serialize_metadata(target)), dtype=torch.uint8)
-        bank.install(1, 8, payload, {})
-        combined = bank.metadata(1, 8)["state"]
-        self.assertEqual(combined["rank_state"]["rng"]["python"], "rank1-rng")
-        self.assertEqual(combined["rank_state"]["loader"], {"owner": 1, "position": 8})
-        self.assertEqual(combined["replica_state"], {"scheduler": {"step": 8}, "progress": {"step": 8}})
-        self.assertEqual(bank.metadata(1, 8)["extra"], {"owner": 1})
-        bank.install(1, 7, payload, {})
+        local = bank.get_rank_metadata(0, 9)
+        self.assertNotIn("replica_state", local["rank_state"])
+        self.assertEqual(local["rank_state"]["rng"]["python"], "rank0-rng")
+        target = {"rank_state": {"loader": {"owner": 1, "position": 9},
+                                           "rng": {"python": "rank1-rng"}}, "extra": {"owner": 1}}
+        bank.store_rank_snapshot(1, 9, {**target, "buffers": {}})
+        rank_metadata = bank.get_rank_metadata(1, 9)
+        replica_state = bank.get_replica_state(9)
+        self.assertEqual(rank_metadata["rank_state"]["rng"]["python"], "rank1-rng")
+        self.assertEqual(rank_metadata["rank_state"]["loader"], {"owner": 1, "position": 9})
+        self.assertEqual(replica_state, {"scheduler": {"step": 9}, "progress": {"step": 9}})
+        self.assertEqual(bank.get_rank_metadata(1, 9)["extra"], {"owner": 1})
+        bank.store_rank_snapshot(1, 7, {**target, "buffers": {}})
+        with self.assertRaisesRegex(RuntimeError, "exact training metadata unavailable"):
+            bank.get_rank_metadata(1, 9)
         with self.assertRaisesRegex(RuntimeError, "exact replica provider metadata unavailable"):
-            bank.metadata(1, 7)
+            bank.get_replica_state(7)
 
 
 class TestDirectDeviceTransport(unittest.TestCase):
@@ -345,18 +426,16 @@ class TestDirectDeviceTransport(unittest.TestCase):
         optimizer.zero_grad()
 
     def test_mirror_all_gathers_only_complete_replicas_in_actual_group_order(self):
-        """Feature: Metadata all-gather on an exact replica process group.
-
-        Description: Gather unequal payloads and buffers in a group's unsorted rank order.
-        Expectation: Peer owners are correct, local snapshots stay intact, and padding is allocated only when needed.
-        """
-        for peer_size in (2, 19):
-            with self.subTest(peer_size=peer_size):
+        """Mirror complete rank metadata, transmitting buffers outside the encoded fields."""
+        for padding in (0, 10000):
+            with self.subTest(padding=padding):
                 bank = DeviceMetadataBank(0, torch.device("cpu"))
-                original = torch.tensor([3, 4], dtype=torch.uint8)
-                peer = torch.arange(peer_size, dtype=torch.uint8)
+                metadata = {"rank_state": {}, "extra": {"padding": "x" * 100}}
+                peer_metadata = {"rank_state": {}, "extra": {"padding": "x" * padding}}
+                peer = torch.frombuffer(bytearray(serialize_metadata(peer_metadata)), dtype=torch.uint8)
                 local_buffer = torch.tensor([3.0])
-                bank.install(0, 8, original, {"counter": local_buffer})
+                rank_metadata = {**metadata, "buffers": {"counter": local_buffer}}
+                bank.store_rank_snapshot(0, 8, rank_metadata)
                 inputs = []
                 group = object()
                 work = SimpleNamespace(wait=lambda **kwargs: None)
@@ -383,16 +462,94 @@ class TestDirectDeviceTransport(unittest.TestCase):
                     distributed.barrier.return_value = work
                     channel = ReplicaTransport(group, bank, object(), torch.device("cpu"))
                     channel.mirror_metadata(8)
-                    distributed.new_group.assert_not_called()
                     self.assertEqual(distributed.all_gather.call_count, 3)
                     distributed.barrier.assert_called_once_with(group=group, async_op=True)
-                    distributed.batch_isend_irecv.assert_not_called()
-                self.assertEqual(inputs[1].data_ptr() == original.data_ptr(), peer_size == 2)
-                self.assertEqual(bank.get(0, 8)["payload"].data_ptr(), original.data_ptr())
-                self.assertIs(bank.get(0, 8)["buffers"]["counter"], local_buffer)
-                torch.testing.assert_close(bank.get(0, 8)["payload"], original, rtol=0, atol=0)
-                torch.testing.assert_close(bank.get(4, 8)["payload"], peer, rtol=0, atol=0)
-                torch.testing.assert_close(bank.get(4, 8)["buffers"]["counter"], torch.tensor([55.0]))
+                local_length = int(inputs[0].item())
+                encoded_fields = deserialize_metadata(inputs[1][:local_length])
+                self.assertEqual(encoded_fields, metadata)
+                self.assertNotIn("buffers", encoded_fields)
+                self.assertIs(bank.get_rank_metadata(0, 8), rank_metadata)
+                received = bank.get_rank_metadata(4, 8)
+                self.assertEqual(received["rank_state"], peer_metadata["rank_state"])
+                self.assertEqual(received["extra"], peer_metadata["extra"])
+                torch.testing.assert_close(received["buffers"]["counter"], torch.tensor([55.0]))
+
+    def test_repair_reuses_donor_metadata_when_mirroring_is_disabled(self):
+        """Skip normal-step communication and repair from the donor's exact local snapshot."""
+        _, _, state = self._build("adamw", torch.float32)
+        _, _, target_state = self._build("adamw", torch.float32)
+        bank, target_bank = (DeviceMetadataBank(rank, torch.device("cpu")) for rank in (0, 1))
+        metadata = {"state": {"rank_state": {"rng": {"python": "shared-rng"}},
+                              "replica_state": {"scheduler": {"step": 8}}}, "extra": {}}
+        snapshot_metadata = {**metadata, "buffers": {}}
+        training_state = snapshot_metadata["state"]
+        rank_metadata = snapshot_metadata.copy()
+        rank_metadata.pop("state")
+        rank_metadata["rank_state"] = training_state["rank_state"]
+        bank.put_snapshot(8, rank_metadata, training_state["replica_state"])
+        messages = []
+        with patch("hyper_parallel.high_availability.replica_transport.dist") as distributed:
+            distributed.get_process_group_ranks.return_value = [0, 1]
+            distributed.send.side_effect = lambda tensor, **kwargs: messages.append(tensor.clone())
+            distributed.recv.side_effect = lambda tensor, **kwargs: tensor.copy_(messages.pop(0))
+            sender = ReplicaTransport(object(), bank, state, torch.device("cpu"), mirror_metadata=False)
+            receiver = ReplicaTransport(object(), target_bank, target_state, torch.device("cpu"),
+                                        mirror_metadata=False)
+            sender.mirror_metadata(8)
+            distributed.all_gather.assert_not_called()
+            distributed.send.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "exact training metadata unavailable"):
+                sender.send(1, 9)
+            distributed.send.assert_not_called()
+            sender.send(1, 8)
+            receiver.receive(0, 8)
+        self.assertFalse(messages)
+        self.assertEqual(target_bank.get_rank_metadata(1, 8), rank_metadata)
+        self.assertEqual(target_bank.get_replica_state(8), training_state["replica_state"])
+        self.assertIsInstance(target_bank.get_rank_metadata(1, 8), dict)
+        with self.assertRaisesRegex(RuntimeError, "exact training metadata unavailable"):
+            bank.get_rank_metadata(1, 8)
+
+    def test_repair_receives_cpu_buffer_snapshots_without_mutating_model(self):
+        """Keep received buffers as CPU snapshots until the unified rollback stage."""
+        bank, target_bank = (DeviceMetadataBank(rank, torch.device("cpu")) for rank in (0, 1))
+        expected = torch.tensor([8.0, 9.0])
+        metadata = {"rank_state": {}, "extra": {}, "buffers": {"counter": expected}}
+        bank.put_snapshot(8, metadata, {})
+        destination = torch.zeros_like(expected)
+        pointer = destination.data_ptr()
+        sender_state = MagicMock()
+        sender_state.metadata.return_value = {}
+        sender_state.tensor_items.return_value = []
+        sender_state.buffers = {"counter": torch.zeros_like(expected)}
+        receiver_state = MagicMock()
+        receiver_state.metadata.return_value = {}
+        receiver_state.tensor_items.return_value = []
+        receiver_state.buffers = {"counter": SimpleNamespace(_local_tensor=destination)}
+        messages = []
+        with patch("hyper_parallel.high_availability.replica_transport.dist") as distributed:
+            distributed.get_process_group_ranks.return_value = [0, 1]
+            distributed.send.side_effect = lambda tensor, **kwargs: messages.append(tensor.clone())
+            distributed.recv.side_effect = lambda tensor, **kwargs: tensor.copy_(messages.pop(0))
+            sender = ReplicaTransport(object(), bank, sender_state, torch.device("cpu"), mirror_metadata=False)
+            receiver = ReplicaTransport(object(), target_bank, receiver_state, torch.device("cpu"),
+                                        mirror_metadata=False)
+            receiver_tensor = receiver._receive_tensor
+            with patch.object(receiver, "_receive_tensor", wraps=receiver_tensor) as receive_tensor:
+                sender.send(1, 8)
+                receiver.receive(0, 8)
+                self.assertNotEqual(receive_tensor.call_args_list[-1].args[0].data_ptr(), pointer)
+            torch.testing.assert_close(sender_state.buffers["counter"], torch.zeros_like(expected))
+            receiver.send(0, 8)
+            sender.receive(1, 8)
+        self.assertFalse(messages)
+        torch.testing.assert_close(destination, torch.zeros_like(expected))
+        torch.testing.assert_close(sender_state.buffers["counter"], torch.zeros_like(expected))
+        saved = target_bank.get_rank_metadata(1, 8)["buffers"]["counter"]
+        self.assertEqual(saved.device, torch.device("cpu"))
+        self.assertNotEqual(saved.data_ptr(), pointer)
+        torch.testing.assert_close(saved, expected)
+        torch.testing.assert_close(bank.get_rank_metadata(0, 8)["buffers"]["counter"], expected)
 
     def test_repair_combines_target_rng_with_exact_donor_scheduler(self):
         """Feature: Replica-provider reconstruction during device repair.
@@ -403,11 +560,19 @@ class TestDirectDeviceTransport(unittest.TestCase):
         _, _, state = self._build("adamw", torch.float32)
         _, _, target_state = self._build("adamw", torch.float32)
         bank, target_bank = (DeviceMetadataBank(rank, torch.device("cpu")) for rank in (0, 1))
-        bank.put(8, {"state": {"rank_state": {"rng": {"python": "rank0-rng"}},
-                               "replica_state": {"scheduler": {"step": 8}}},
-                     "extra": {}}, {})
-        target = {"state": {"rank_state": {"rng": {"python": "rank1-rng"}}}, "extra": {}}
-        bank.install(1, 8, torch.frombuffer(bytearray(serialize_metadata(target)), dtype=torch.uint8), {})
+        snapshot_metadata = {
+            "state": {"rank_state": {"rng": {"python": "rank0-rng"}},
+                      "replica_state": {"scheduler": {"step": 8}}},
+            "extra": {},
+            "buffers": {},
+        }
+        training_state = snapshot_metadata["state"]
+        rank_metadata = snapshot_metadata.copy()
+        rank_metadata.pop("state")
+        rank_metadata["rank_state"] = training_state["rank_state"]
+        bank.put_snapshot(8, rank_metadata, training_state["replica_state"])
+        target = {"rank_state": {"rng": {"python": "rank1-rng"}}, "extra": {}}
+        bank.store_rank_snapshot(1, 8, {**target, "buffers": {}})
         messages = []
         with patch("hyper_parallel.high_availability.replica_transport.dist") as distributed:
             distributed.get_process_group_ranks.return_value = [0, 1]
@@ -418,11 +583,11 @@ class TestDirectDeviceTransport(unittest.TestCase):
             sender.send(1, 8)
             receiver.receive(0, 8)
         self.assertFalse(messages)
-        self.assertEqual(target_bank.metadata(1, 8)["state"],
-                         {"rank_state": {"rng": {"python": "rank1-rng"}},
-                          "replica_state": {"scheduler": {"step": 8}}})
-        target_metadata = deserialize_metadata(target_bank.get(1, 8)["payload"].numpy().tobytes())
-        self.assertNotIn("replica_state", target_metadata["state"])
+        self.assertEqual(target_bank.get_rank_metadata(1, 8)["rank_state"],
+                         {"rng": {"python": "rank1-rng"}})
+        self.assertEqual(target_bank.get_replica_state(8), {"scheduler": {"step": 8}})
+        target_metadata = target_bank.get_rank_metadata(1, 8)
+        self.assertNotIn("replica_state", target_metadata["rank_state"])
 
     def test_device_send_restores_adamw_muon_and_low_precision_main_state(self):
         """Feature: Direct device-state repair with an empty replica-provider mapping.
@@ -443,12 +608,18 @@ class TestDirectDeviceTransport(unittest.TestCase):
                 target, target_optimizer, target_state = self._build(kind, dtype)
                 bank = DeviceMetadataBank(0, torch.device("cpu"))
                 target_bank = DeviceMetadataBank(1, torch.device("cpu"))
-                bank.put(8, {"state": {"rank_state": {"rng": {"python": "rank0-rng"}},
-                                       "replica_state": {}}, "extra": {}}, {})
-                target_metadata = {"state": {"rank_state": {"rng": {"python": "rank1-rng"}}}, "extra": {}}
-                payload = torch.frombuffer(bytearray(serialize_metadata(target_metadata)),
-                                           dtype=torch.uint8)
-                bank.install(1, 8, payload, {})
+                snapshot_metadata = {
+                    "state": {"rank_state": {"rng": {"python": "rank0-rng"}}, "replica_state": {}},
+                    "extra": {},
+                    "buffers": {},
+                }
+                training_state = snapshot_metadata["state"]
+                rank_metadata = snapshot_metadata.copy()
+                rank_metadata.pop("state")
+                rank_metadata["rank_state"] = training_state["rank_state"]
+                bank.put_snapshot(8, rank_metadata, training_state["replica_state"])
+                target_metadata = {"rank_state": {"rng": {"python": "rank1-rng"}}, "extra": {}}
+                bank.store_rank_snapshot(1, 8, {**target_metadata, "buffers": {}})
                 messages, pointers = [], []
 
                 def _send(tensor, context=(messages, pointers), **kwargs):
@@ -471,14 +642,14 @@ class TestDirectDeviceTransport(unittest.TestCase):
                 self.assertFalse(messages)
                 for (_, actual), (_, expected) in zip(target_state.tensor_items(), state.tensor_items()):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                target_state.restore_rank_state({}, {})
+                target_state.restore_model_state({}, {})
                 self._step(model, optimizer)
                 self._step(target, target_optimizer)
                 for (_, actual), (_, expected) in zip(target_state.tensor_items(), state.tensor_items()):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                metadata = deserialize_metadata(target_bank.get(1, 8)["payload"].numpy().tobytes())
-                self.assertEqual(metadata["state"], {"rank_state": {"rng": {"python": "rank1-rng"}}})
-                self.assertEqual(target_bank.metadata(1, 8)["state"]["replica_state"], {})
+                metadata = target_bank.get_rank_metadata(1, 8)
+                self.assertEqual(metadata["rank_state"], {"rng": {"python": "rank1-rng"}})
+                self.assertEqual(target_bank.get_replica_state(8), {})
 
 
 class TestCPUOffloadRepair(unittest.TestCase):
@@ -557,10 +728,15 @@ class TestCPUOffloadRepair(unittest.TestCase):
             pointer = target_param._sharded_param_data.data_ptr()
             bank = DeviceMetadataBank(0, torch.device("cpu"))
             target_bank = DeviceMetadataBank(1, torch.device("cpu"))
-            bank.put(8, {"state": {"rank_state": {}, "replica_state": {}}, "extra": {}}, {})
-            payload = torch.frombuffer(bytearray(serialize_metadata({"state": {"rank_state": {}}, "extra": {}})),
-                                       dtype=torch.uint8)
-            bank.install(1, 8, payload, {})
+            snapshot_metadata = {
+                "state": {"rank_state": {}, "replica_state": {}}, "extra": {}, "buffers": {},
+            }
+            training_state = snapshot_metadata["state"]
+            rank_metadata = snapshot_metadata.copy()
+            rank_metadata.pop("state")
+            rank_metadata["rank_state"] = training_state["rank_state"]
+            bank.put_snapshot(8, rank_metadata, training_state["replica_state"])
+            bank.store_rank_snapshot(1, 8, {"rank_state": {}, "extra": {}, "buffers": {}})
             messages = []
             with patch("hyper_parallel.high_availability.replica_transport.dist") as distributed:
                 distributed.get_process_group_ranks.return_value = [0, 1]
@@ -570,7 +746,7 @@ class TestCPUOffloadRepair(unittest.TestCase):
                 receiver = ReplicaTransport(object(), target_bank, target_state, torch.device("cpu"))
                 sender.send(1, 8)
                 receiver.receive(0, 8)
-            target_state.restore_rank_state({}, {})
+            target_state.restore_model_state({}, {})
             self.assertIs(target.weight, identity)
             self.assertEqual(target_param._sharded_param_data.data_ptr(), pointer)
             self.assertEqual(target.weight._local_tensor.data_ptr(), pointer)

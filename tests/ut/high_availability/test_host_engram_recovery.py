@@ -198,7 +198,7 @@ class TestHostEngramRecovery(unittest.TestCase):
                         self.assertEqual(target_optimizer.state, "ACCUMULATING")
                         self.assertIsNone(target.embed.pending)
                     self._repair(donor_state, target_state, step)
-                    target_state.restore_rank_state({}, {})
+                    target_state.restore_model_state({}, {})
                     self.assertIs(target.embed.weight, parameter)
                     self.assertEqual(target_state.metadata(), donor_state.metadata())
                     self.assertEqual(target_optimizer.state, "ACCUMULATING")
@@ -216,8 +216,13 @@ class TestHostEngramRecovery(unittest.TestCase):
         """Exercise the native repair header and payload order through a CPU message queue."""
         bank = DeviceMetadataBank(0, torch.device("cpu"))
         metadata = {"state": {"rank_state": {}, "replica_state": {}}, "extra": {}}
-        bank.put(step, metadata, {})
-        bank.install(1, step, bank.get(0, step)["payload"], {})
+        snapshot_metadata = {**metadata, "buffers": {}}
+        training_state = snapshot_metadata["state"]
+        rank_metadata = snapshot_metadata.copy()
+        rank_metadata.pop("state")
+        rank_metadata["rank_state"] = training_state["rank_state"]
+        bank.put_snapshot(step, rank_metadata, training_state["replica_state"])
+        bank.store_rank_snapshot(1, step, {**bank.get_rank_metadata(0, step), "buffers": {}})
         target_bank = DeviceMetadataBank(1, torch.device("cpu"))
         messages = []
         with patch("hyper_parallel.high_availability.replica_transport.dist") as distributed, \

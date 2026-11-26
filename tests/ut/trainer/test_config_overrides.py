@@ -76,6 +76,7 @@ class TestConfigOverrides(unittest.TestCase):
         """Resolve the nested recovery switch and Controller endpoint overrides."""
         config = self._parse()
         self.assertFalse(config.high_availability.worker_recovery.enable)
+        self.assertTrue(config.high_availability.worker_recovery.mirror_metadata)
         config = self._parse(
             "--high_availability.worker_recovery.enable=true",
             "--high_availability.worker_recovery.controller_ip=127.0.0.1",
@@ -87,7 +88,10 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertEqual(recovery.controller_port, 18000)
         self.assertEqual(config.to_dict()["high_availability"]["worker_recovery"], {
             "enable": True, "controller_ip": "127.0.0.1", "controller_port": 18000,
+            "mirror_metadata": True,
         })
+        config = self._parse("--high_availability.worker_recovery.mirror_metadata=false")
+        self.assertFalse(config.high_availability.worker_recovery.mirror_metadata)
 
     def test_worker_recovery_yaml(self) -> None:
         """Parse nested recovery YAML and preserve the default Controller port."""
@@ -95,6 +99,7 @@ class TestConfigOverrides(unittest.TestCase):
   worker_recovery:
     enable: true
     controller_ip: 127.0.0.1
+    mirror_metadata: false
 """
         with tempfile.TemporaryDirectory() as tmpdir:
             yaml_path = Path(tmpdir) / "train.yaml"
@@ -103,6 +108,7 @@ class TestConfigOverrides(unittest.TestCase):
             )
             config = parse_training_args([str(yaml_path)])
         self.assertTrue(config.high_availability.worker_recovery.enable)
+        self.assertFalse(config.high_availability.worker_recovery.mirror_metadata)
         self.assertEqual(config.high_availability.worker_recovery.controller_port, 8000)
 
     def test_reads_yaml_without_overrides(self) -> None:
