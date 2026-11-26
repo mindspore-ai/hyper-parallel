@@ -35,6 +35,7 @@ from hyper_parallel.components.modules.attention.deepseek_sparse_attention.deeps
 from hyper_parallel.components.modules.module_family import FamilyRequest, build_family
 from hyper_parallel.distributed.module_binding import ParallelBinding
 from hyper_parallel.models.module_build import prepare_model_components
+from tests.common.mark_utils import arg_mark
 
 
 def _config() -> SimpleNamespace:
@@ -88,8 +89,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         self.addCleanup(torch.set_rng_state, torch.get_rng_state())
         torch.manual_seed(7)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_config_selects_local_and_cp_members(self) -> None:
-        """The public factory constructs local and CP members directly from config."""
+        """Feature: DSA native family construction.
+
+        Description: Construct local and CP members directly from native config.
+        Expectation: The selected member type and parameter dimensions match the requested topology.
+        """
         for cp_size, expected_type in ((1, DeepseekSparseAttentionModule), (2, CPDeepseekSparseAttentionModule)):
             with self.subTest(cp_size=cp_size):
                 module = DeepseekSparseAttention(
@@ -101,8 +107,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                 self.assertEqual(module.index_topk, 1024)
                 self.assertEqual({parameter.device.type for parameter in module.parameters()}, {"cpu"})
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_defaults_match_factory_and_deferred_requests(self) -> None:
-        """YAML requests that omit arguments receive the documented constructor defaults."""
+        """Feature: DSA family default options.
+
+        Description: Construct immediate and deferred requests without optional CP arguments.
+        Expectation: Both paths retain the documented KV transport and overlap defaults.
+        """
         expected = {
             "kv_cp_size": 1, "kv_cp_strategy": "allgather", "cp_comm_overlap": False,
         }
@@ -115,8 +126,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                 self.assertIs(type(module), DeepseekSparseAttentionModule)
                 self.assertEqual({name: getattr(module, name) for name in expected}, expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_promotion_preserves_parameters_and_eval_mode(self) -> None:
-        """Promoting a loaded local member reuses its Parameters and training mode."""
+        """Feature: DSA deferred CP promotion.
+
+        Description: Promote a loaded local member to its CP implementation.
+        Expectation: Parameters, values and evaluation mode are preserved.
+        """
         source = DeepseekSparseAttention(config=_config()).eval()
         parameters = dict(source.named_parameters())
         values = {name: parameter.detach().clone() for name, parameter in parameters.items()}
@@ -130,8 +146,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
             self.assertIs(parameter, parameters[name])
             torch.testing.assert_close(parameter, values[name], rtol=0, atol=0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_deferred_cp_preparation_preserves_parameters_and_options(self) -> None:
-        """CPU and meta construction can record KV CP before the job topology exists."""
+        """Feature: Deferred DSA topology preparation.
+
+        Description: Record CP options during CPU or meta construction and bind them later.
+        Expectation: Promotion preserves parameters, options and module mode.
+        """
         for device in ("cpu", "meta"):
             with self.subTest(device=device):
                 config = _config()
@@ -152,8 +173,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                     self.assertIs(parameter, parameters[name])
                     self.assertEqual(parameter.device.type, device)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_rejects_inconsistent_topology_and_unsupported_options(self) -> None:
-        """KV AllGather degrees must match the job; unrelated CP options are not exposed."""
+        """Feature: DSA CP topology validation.
+
+        Description: Pass mismatched CP degrees, invalid KV sizes and removed options.
+        Expectation: Unsupported requests fail during construction or deferred preparation.
+        """
         for cp_size, options in ((2, {}), (1, {"kv_cp_size": 2}), (4, {"kv_cp_size": 2})):
             for deferred in (False, True):
                 with self.subTest(cp_size=cp_size, options=options, deferred=deferred), self.assertRaises(ValueError):
@@ -176,15 +202,46 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                 with self.assertRaises(TypeError):
                     FamilyRequest(DeepseekSparseAttention, {name: value})
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_binding_rejects_an_incompatible_runtime_degree(self) -> None:
-        """Physical CP binding also validates a concrete member's requested KV degree."""
+        """Feature: DSA runtime binding validation.
+
+        Description: Bind a CP member to a runtime group with a different degree.
+        Expectation: The incompatible CP context is rejected before attention execution.
+        """
         module = CPDeepseekSparseAttentionModule(config=_config(), kv_cp_size=2)
         context = Mock(size=4, mesh=object())
         with self.assertRaises(ValueError):
             module.bind_parallel(ParallelBinding(mesh_binding=Mock(), cp_context=context))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_attention_mask_does_not_gate_local_or_cp_preflight(self) -> None:
+        """Feature: DSA ignores the Transformers attention-mask carrier.
+
+        Description: Pass a mask whose dimensions differ from the local DSA sequence on TP and CP.
+        Expectation: Local metadata validation uses sequence lengths, not the external mask shape.
+        """
+        hidden_states = torch.zeros(1, 8, _config().hidden_size)
+        local_mask = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+        module = DeepseekSparseAttention(config=_config(), context={"tp_size": 2})
+        module._validate_forward_inputs(hidden_states, local_mask, None, None, {})
+
+        cp_module = DeepseekSparseAttention(
+            config=_config(), context={"tp_size": 2, "cp_size": 2}, kv_cp_size=2,
+        )
+        cp_module._cp_context = SimpleNamespace(size=2, rank=1)
+        metadata = cp_module.preflight_attention(
+            hidden_states, local_mask, None, None, None, {}, use_dense=False,
+        )
+        self.assertEqual(metadata.query_ends.tolist(), [8])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_comm_overlap_selects_gather_scheduling(self) -> None:
-        """The renamed option reaches synchronous or asynchronous key-bank transport."""
+        """Feature: DSA CP key-bank scheduling.
+
+        Description: Select synchronous or overlapped key-bank gathering.
+        Expectation: Each mode uses its expected transport and preserves selected banks.
+        """
         bank = torch.arange(8, device="cpu").reshape(1, 8, 1, 1)
         local = bank[:, :4]
         metadata = build_cp_sequence_metadata(
@@ -216,8 +273,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                     self.assertEqual(context.gather_sequence.call_count, 3)
                     context.launch_gather_sequence.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_sequence_metadata_preserves_packed_documents(self) -> None:
-        """Local endpoints and CP causal prefixes retain the same document boundaries."""
+        """Feature: DSA CP TND metadata.
+
+        Description: Project global TND boundaries into compact rank-local query and KV segments.
+        Expectation: Query endpoints, causal key ranges and compact bank lengths match each rank's token order.
+        """
         for actual_seq_len, expected_ends in ((None, [8, 16]), ([6, 16], [6, 16])):
             with self.subTest(actual_seq_len=actual_seq_len):
                 metadata = SparseAttentionSequenceMetadata.build(
@@ -227,20 +289,31 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                 for endpoints in metadata.sequence_lengths:
                     torch.testing.assert_close(endpoints, torch.tensor(expected_ends, dtype=torch.int32))
 
-        for rank, query_ends, key_ends in ((0, [4, 8], [4, 10]), (1, [2, 4, 8], [6, 8, 18])):
+        expected = (
+            ([4, 8], [4, 10], ((0, 4), (6, 12))),
+            ([2, 4, 8], [6, 8, 18], ((0, 6), (6, 8), (6, 16))),
+        )
+        for rank, (query_ends, key_ends, key_ranges) in enumerate(expected):
             with self.subTest(cp_rank=rank):
                 metadata = build_cp_sequence_metadata(
                     batch_size=2, local_seq_len=4, device=torch.device("cpu"),
                     cp_size=2, cp_rank=rank, actual_seq_len=[6, 16],
                 )
-                self.assertEqual(metadata.kv_prefix_length, (rank + 1) * 4)
+                self.assertEqual(metadata.kv_prefix_length, key_ends[-1])
                 torch.testing.assert_close(metadata.query_ends, torch.tensor(query_ends, dtype=torch.int32))
                 torch.testing.assert_close(metadata.key_ends, torch.tensor(key_ends, dtype=torch.int32))
+                self.assertEqual(metadata.key_ranges, key_ranges)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_packed_candidates_match_global_causal_documents(self) -> None:
-        """Every local query sees its complete document prefix and no future keys."""
+        """Feature: DSA CP packed causal key selection.
+
+        Description: Compare selected key banks with global token IDs over aligned and split TND documents.
+        Expectation: Every local query sees its document prefix and no future or cross-document keys.
+        """
         cases = (
             (2, 8, 1, [6, 16]), (2, 8, 2, [8, 16]), (2, 8, 2, [6, 16]),
+            (1, 4096, 2, [384, 1280, 2880, 4096]),
             (2, 16, 4, [14, 32]), (3, 8, 2, [6, 14, 24]), (3, 8, 2, [24]),
         )
         for batch, length, cp_size, ends in cases:
@@ -259,8 +332,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                                     _causal_keys(metadata, key_bank, query_index), expected, rtol=0, atol=0,
                                 )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_cross_row_document_first_query_has_one_candidate(self) -> None:
-        """The reported query 3584 selects itself, not 1024 future candidates."""
+        """Feature: DSA CP documents crossing batch rows.
+
+        Description: Inspect the first query in a packed document spanning two rows.
+        Expectation: It selects its own causal prefix and no future tokens.
+        """
         bank = torch.arange(8192, device="cpu").reshape(2, 4096, 1, 1)
         for overlap in (False, True):
             with self.subTest(overlap=overlap):
@@ -274,8 +352,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     self.assertEqual(min(actual.numel(), 1024), min(query_id - 3584 + 1, 1024))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_repeated_key_prefixes_accumulate_backward(self) -> None:
-        """Duplicated KV prefixes sum adjoints into the original global keys."""
+        """Feature: DSA CP repeated KV-prefix gradients.
+
+        Description: Reuse gathered causal prefixes from multiple local queries.
+        Expectation: Backward accumulates every selected-key contribution at its source token.
+        """
         for rank in (0, 1):
             for overlap in (False, True):
                 with self.subTest(rank=rank, overlap=overlap):
@@ -294,17 +377,48 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                         expected[document_start:query_id + 1] += 3
                     torch.testing.assert_close(bank.grad.flatten(), expected, rtol=0, atol=0)
 
-    def test_cp_rejects_zero_query_documents_on_every_rank(self) -> None:
-        """Unsupported packed partitions fail before any rank starts communication."""
-        for rank in (0, 1):
-            with self.subTest(cp_rank=rank), self.assertRaisesRegex(ValueError, "zero-query packed documents"):
-                build_cp_sequence_metadata(
-                    batch_size=1, local_seq_len=4, device=torch.device("cpu"),
-                    cp_size=2, cp_rank=rank, actual_seq_len=[4, 8],
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_cp_rejects_mismatched_packed_q_k_boundaries(self) -> None:
+        """Feature: DSA CP packed-document pairing.
+
+        Description: Provide different TND document endpoints for self-attention Q and KV.
+        Expectation: Reject ambiguous document-to-prefix pairing before communication.
+        """
+        with self.assertRaisesRegex(ValueError, "matching packed Q and KV document boundaries"):
+            build_cp_sequence_metadata(
+                batch_size=1, local_seq_len=4, device=torch.device("cpu"), cp_size=2, cp_rank=0,
+                kwargs={"actual_seq_qlen": [3, 8], "actual_seq_kvlen": [4, 8]},
+            )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_cp_compacts_zero_query_documents_in_tnd(self) -> None:
+        """Feature: DSA CP zero-query TND fragments.
+
+        Description: Project the 4096-token TND example whose document edges do not align with CP=2.
+        Expectation: Drop empty local Q fragments and retain each non-empty query's causal KV range.
+        """
+        expected = (
+            ([384, 1280, 2048], [384, 1280, 2048], ((0, 384), (384, 1280), (1280, 2048))),
+            ([832, 2048], [1600, 2816], ((1280, 2880), (2880, 4096))),
+        )
+        for rank, (query_ends, key_ends, key_ranges) in enumerate(expected):
+            with self.subTest(cp_rank=rank):
+                metadata = build_cp_sequence_metadata(
+                    batch_size=1, local_seq_len=2048, device=torch.device("cpu"),
+                    cp_size=2, cp_rank=rank, actual_seq_len=[384, 1280, 2880, 4096],
                 )
 
+                torch.testing.assert_close(metadata.query_ends, torch.tensor(query_ends, dtype=torch.int32))
+                torch.testing.assert_close(metadata.key_ends, torch.tensor(key_ends, dtype=torch.int32))
+                self.assertEqual(metadata.key_ranges, key_ranges)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_indexer_weights_scale_without_intermediate_bf16_rounding(self) -> None:
-        """The 32-head, 128-dimension scale equals an exact division by 64."""
+        """Feature: DSA indexer merge-weight precision.
+
+        Description: Scale BF16 merge weights for the 32-head, 128-dimension indexer.
+        Expectation: FP32 intermediate scaling matches division by the exact scale factor.
+        """
         config = _config()
         config.dtype = torch.bfloat16
         config.index_n_heads, config.index_head_dim = 32, 128
