@@ -184,6 +184,20 @@ class TestParamGroupHelpers(unittest.TestCase):
         torch.testing.assert_close(local_input, torch.tensor([1.0, 2.0, 3.0, 4.0]))
         self.assertIs(full_output, output)
 
+    def test_reduce_scatter_batches_padded_dim_zero_gradients(self):
+        """A whole-bucket pack widens BF16 gradients and zero-pads each rank row."""
+        grads = [torch.arange(10, dtype=torch.bfloat16).reshape(5, 2),
+                 torch.arange(3, dtype=torch.bfloat16)]
+        params = [SimpleNamespace(hsdp_placement=Shard(0), padded_sharded_param_size=size)
+                  for size in (torch.Size((3, 2)), torch.Size((2,)))]
+        output = torch.empty(16, dtype=torch.float32)
+        with patch.object(torch, "_chunk_cat", wraps=torch._chunk_cat) as chunk_cat:
+            reduce_scatter_copy_in(params, grads, output, 2)
+        chunk_cat.assert_called_once()
+        expected = torch.tensor([[0, 1, 2, 3, 4, 5, 0, 1],
+                                 [6, 7, 8, 9, 0, 0, 2, 0]], dtype=torch.float32)
+        self.assertTrue(torch.equal(output.view(2, -1), expected))
+
     def test_reduce_scatter_copy_in_supports_mixed_placements(self):
         """Reduce-scatter packing should support mixed shard dimensions."""
         dim0_grad = torch.arange(8, dtype=torch.float32).view(4, 2)

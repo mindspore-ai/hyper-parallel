@@ -407,6 +407,21 @@ def reduce_scatter_copy_in(
             f"{len(hsdp_params)} params and {len(unsharded_grads)} grads"
         )
     packed_rows = reduce_scatter_input.view(world_size, -1)
+    # Pack directly into contiguous rank rows; narrow per-parameter output
+    # views otherwise prevent the backend's mixed-dtype ChunkCat fast path.
+    if len(unsharded_grads) > 1 and packed_rows.is_contiguous():
+        dtype = unsharded_grads[0].dtype
+        compatible = all(
+            param.hsdp_placement.dim == 0 and grad.is_contiguous()
+            and grad.dtype == dtype and grad.dim() > 0 and grad.numel() > 0
+            and ((grad.size(0) + world_size - 1) // world_size) * (grad.numel() // grad.size(0))
+            == param.padded_sharded_param_size.numel()
+            for param, grad in zip(hsdp_params, unsharded_grads)
+        )
+        if compatible and packed_rows.size(1) == sum(p.padded_sharded_param_size.numel() for p in hsdp_params):
+            with torch.no_grad():
+                torch._chunk_cat(unsharded_grads, dim=0, num_chunks=world_size, out=packed_rows)
+            return
     column_offset = 0
     with torch.no_grad():
         for hsdp_param, unsharded_grad in zip(hsdp_params, unsharded_grads):
