@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
+from rl.agentic.core.session_lifecycle import ReleasedSessions
 from rl.agentic.codex.protocol import CodexResponsesProtocol
 from rl.agentic.codex.cli_contract import prepare_isolated_request, tool_argument_failure
 from rl.tool_protocol.protocol import inspect_tool_response
@@ -163,7 +164,7 @@ class _State:
         self.idle = threading.Condition(self.lock)
         self.backend_slots = threading.BoundedSemaphore(max_inflight_requests)
         self.sessions: dict[str, _Session] = {}
-        self.released_sessions: set[str] = set()
+        self.released_sessions = ReleasedSessions()
         self.closing = False
         self.policy_gate = policy_gate
         self.active_policy_version: int | None = None
@@ -977,15 +978,19 @@ class CodexGateway:
 
     def close(self) -> None:
         """Stop request serving and release the listening socket."""
-        if self._thread is None:
-            self._server.server_close()
-            return
-        self._server.shutdown()
         try:
-            self._server.state.drain()
+            if self._thread is None:
+                self._server.server_close()
+                return
+            self._server.shutdown()
+            try:
+                self._server.state.drain()
+            finally:
+                self._server.server_close()
+            self._thread.join(timeout=10.0)
+            if self._thread.is_alive():
+                raise RuntimeError("Codex gateway thread did not stop")
+            self._thread = None
         finally:
-            self._server.server_close()
-        self._thread.join(timeout=10.0)
-        if self._thread.is_alive():
-            raise RuntimeError("Codex gateway thread did not stop")
-        self._thread = None
+            with self._server.state.lock:
+                self._server.state.released_sessions.close()

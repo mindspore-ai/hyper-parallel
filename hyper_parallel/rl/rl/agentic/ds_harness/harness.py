@@ -20,6 +20,8 @@ import asyncio
 import importlib
 import importlib.metadata
 import json
+import logging
+import sys
 import os
 import shutil
 import time
@@ -27,7 +29,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 from urllib.parse import urlparse
 
 from rl.agentic.core.program_runner import (
@@ -42,8 +44,10 @@ from rl.agentic.core.program_runner import (
 from rl.agentic.core.types import RewardResult
 from rl.agentic.ds_harness.gateway import DeepSeekGateway
 from rl.data.contracts import PromptRecord, Trajectory
+logger = logging.getLogger(__name__)
+
 DEFAULT_DEEPSEEK_HARNESS_VERSION = "0.1.1rc1"
-RewardCallable = Callable[[str, PromptRecord], float | RewardResult]
+RewardCallable = Callable[[str, PromptRecord], Union[float, RewardResult]]
 _MAX_GENERATION_PREFIX_REWRITE = 16
 
 
@@ -187,9 +191,9 @@ class DeepSeekAgentProgram:
             session_id
         )
         timeout = float(self.config.get("request_timeout", 600.0))
-        registered = False
+        registration = None
         try:
-            await asyncio.to_thread(
+            registration = asyncio.create_task(asyncio.to_thread(
                 _http_json,
                 "POST",
                 f"{self.admin_url}/internal/sessions",
@@ -201,8 +205,8 @@ class DeepSeekAgentProgram:
                     "generation": self._generation_settings(),
                 },
                 timeout,
-            )
-            registered = True
+            ))
+            await asyncio.shield(registration)
             started = time.perf_counter()
             final_answer, finish_reason, events = await asyncio.to_thread(
                 self._run_harness,
@@ -251,14 +255,18 @@ class DeepSeekAgentProgram:
                 },
             )
         finally:
-            if registered:
-                await asyncio.to_thread(
-                    _http_json,
-                    "DELETE",
-                    f"{self.admin_url}/internal/sessions/{session_id}",
-                    None,
-                    timeout,
-                )
+            failed = sys.exc_info()[0] is not None
+            if registration is not None:
+                # A cancelled await does not stop its thread; delete only after POST settles.
+                await asyncio.gather(registration, return_exceptions=True)
+                try:
+                    await asyncio.to_thread(
+                        _http_json, "DELETE", f"{self.admin_url}/internal/sessions/{session_id}", None, timeout,
+                    )
+                except Exception:
+                    if not failed:
+                        raise
+                    logger.exception("Secondary error releasing DeepSeek session %s", session_id)
 
     def _score_capture(
         self, final_answer: str, finish_reason: str, captured: Mapping[str, Any],
