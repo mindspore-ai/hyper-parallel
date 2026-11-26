@@ -53,12 +53,10 @@ class TestRingPruneBalance(unittest.TestCase):
 
     def test_balanced_queries_stay_inside_each_documents_source_subring(self):
         cases = (((5, 11), 2), ((3, 5, 16), 4), ((7, 13, 4), 6))
-        for (lengths, size), mode in product(cases, ("zigzag", "greedy", "hybrid")):
+        for (lengths, size), mode in product(cases, ("none", "zigzag")):
             with self.subTest(lengths=lengths, size=size, mode=mode):
                 assignments = query_task_plan_in_document_rings(
-                    lengths, size, mode, causal=True,
-                    **({"block_size": 2} if mode in ("greedy", "hybrid") else {}),
-                    zigzag_min_length=8 if mode == "hybrid" else None,
+                    lengths, size, mode,
                 )
                 boundaries = _boundaries(lengths)
                 owners = {}
@@ -76,13 +74,10 @@ class TestRingPruneBalance(unittest.TestCase):
     def test_combined_plan_preserves_every_attention_pair_and_prunes_exact_keys(self):
         cases = (((24,), 4), ((5, 11), 2), ((3, 5, 16), 4), ((7, 13, 4), 6))
         for (lengths, size), mode, causal in product(
-                cases, ("none", "zigzag", "greedy", "hybrid"), (False, True)):
+                cases, ("none", "zigzag"), (False, True)):
             with self.subTest(lengths=lengths, size=size, mode=mode, causal=causal):
-                kwargs = {"block_size": 2} if mode in ("greedy", "hybrid") else {}
-                if mode == "hybrid":
-                    kwargs["zigzag_min_length"] = 8
                 assignments = query_task_plan_in_document_rings(
-                    lengths, size, mode, causal=causal, **kwargs,
+                    lengths, size, mode,
                 )
                 boundaries = _boundaries(lengths)
                 global_tokens = [
@@ -140,8 +135,8 @@ class TestRingPruneBalance(unittest.TestCase):
     def test_invalid_subring_plans_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "equal contiguous"):
             query_task_plan_in_document_rings((5, 10), 4, "zigzag")
-        with self.assertRaisesRegex(ValueError, "hybrid"):
-            query_task_plan_in_document_rings((8,), 2, "hybrid")
+        with self.assertRaisesRegex(ValueError, "none or zigzag"):
+            query_task_plan_in_document_rings((8,), 2, "greedy")
 
     def test_attention_batches_separate_repeated_query_rows(self):
         """A query's KV fragments must merge in separate native FA calls."""

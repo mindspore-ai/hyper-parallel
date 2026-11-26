@@ -618,8 +618,8 @@ def _validate_inputs(query, key, value, causal, input_layout, overlap):
         raise ValueError("ring_attention currently requires all inputs on the same NPU")
 
 
-def _prepare_task_plan(query, layout, size, rank, causal, mode, lengths, block_size, threshold,
-                       workers=None, document_subrings=False):
+def _prepare_task_plan(query, layout, size, rank, causal, load_balance, lengths,
+                       document_subrings=False):
     tokens = query.shape[_token_axis(layout)] * size
     if layout == "TND":
         if (not isinstance(lengths, tuple) or not lengths
@@ -628,8 +628,8 @@ def _prepare_task_plan(query, layout, size, rank, causal, mode, lengths, block_s
             raise ValueError("TND requires global document_lengths as a host tuple summing to global tokens")
     elif lengths is not None:
         raise ValueError("document_lengths requires TND layout")
-    return ring_task_plan((tokens,) if lengths is None else lengths, size if workers is None else workers,
-                          rank, mode, causal, block_size, threshold, document_subrings=document_subrings)
+    return ring_task_plan((tokens,) if lengths is None else lengths, size, rank, load_balance, causal,
+                          document_subrings=document_subrings)
 
 
 def _validate_pruning(prune_documents):
@@ -694,7 +694,7 @@ def ring_attention(
     scale = query.shape[-1] ** -0.5
     prune_documents = prune_documents and input_layout == "TND"
     plan = _prepare_task_plan(query, input_layout, ring.size, ring.rank, causal, load_balance,
-                              document_lengths, None, None, document_subrings=prune_documents)
+                              document_lengths, document_subrings=prune_documents)
     if prune_documents:
         if load_balance != "none":
             query, key, value = redistribute_ring_qkv(

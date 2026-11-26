@@ -32,13 +32,11 @@ class TestQueryBalance(unittest.TestCase):
         for lengths in ((48,), (32, 16), (1, 3, 5, 23), (10, 182, 64), (1,) * 16):
             for size in (1, 2, 4, 8):
                 for causal in (False, True):
-                    for mode in ("none", "zigzag", "greedy", "hybrid"):
+                    for mode in ("none", "zigzag"):
                         with self.subTest(lengths=lengths, size=size, causal=causal, mode=mode):
-                            block = min(4, sum(lengths) // size) if mode in ("greedy", "hybrid") else None
-                            threshold = 8 if mode == "hybrid" else None
                             pairs = []
                             for rank in range(size):
-                                plan = ring_task_plan(lengths, size, rank, mode, causal, block, threshold)
+                                plan = ring_task_plan(lengths, size, rank, mode, causal)
                                 query_rows = _rows(plan.assignments[rank])
                                 for owner, blocks in enumerate(plan.blocks):
                                     key_rows = _rows(plan.assignments[owner])
@@ -58,9 +56,8 @@ class TestQueryBalance(unittest.TestCase):
     def test_route_delivers_original_positions_and_inverts(self):
         lengths, size = (1, 3, 5, 23), 8
         boundaries, local = (0, *accumulate(lengths)), sum(lengths) // size
-        for mode in ("none", "zigzag", "greedy", "hybrid"):
-            plan = query_task_plan(lengths, size, mode, block_size=2 if mode in ("greedy", "hybrid") else None,
-                                   zigzag_min_length=8 if mode == "hybrid" else None)
+        for mode in ("none", "zigzag"):
+            plan = query_task_plan(lengths, size, mode)
             routes = [query_route(plan, lengths, rank) for rank in range(size)]
             workers = [[None] * route.query_count for route in routes]
             for owner, route in enumerate(routes):
@@ -80,24 +77,15 @@ class TestQueryBalance(unittest.TestCase):
 
     def test_fast_path_and_capacity(self):
         for size in (2, 4, 8):
-            for mode in ("zigzag", "hybrid"):
-                plan = ring_task_plan((128 * size,), size, 0, mode, True,
-                                      zigzag_min_length=128 if mode == "hybrid" else None)
-                self.assertTrue(plan.fast_zigzag)
-                self.assertTrue(all(len(blocks) == 1 for blocks in plan.blocks))
-        for mode in ("greedy", "hybrid"):
-            plans = query_task_plan((10, 182, 64), 8, mode, block_size=8,
-                                    zigzag_min_length=128 if mode == "hybrid" else None)
-            self.assertTrue(all(sum(task.length for task in tasks) <= 64 for tasks in plans))
+            plan = ring_task_plan((128 * size,), size, 0, "zigzag", True)
+            self.assertTrue(plan.fast_zigzag)
+            self.assertTrue(all(len(blocks) == 1 for blocks in plan.blocks))
 
     def test_disjoint_queries_and_bounded_packed_keys(self):
         for lengths in ((256,), (1, 7, 67, 181), (65536,)):
-            for mode in ("none", "zigzag", "greedy", "hybrid"):
+            for mode in ("none", "zigzag"):
                 for rank in range(8):
-                    plan = ring_task_plan(lengths, 8, rank, mode, True,
-                                          block_size=min(256, sum(lengths) // 8)
-                                          if mode in ("greedy", "hybrid") else None,
-                                          zigzag_min_length=128 if mode == "hybrid" else None)
+                    plan = ring_task_plan(lengths, 8, rank, mode, True)
                     for blocks, batches in zip(plan.blocks, plan.batches):
                         queries = [row for block in blocks for row in range(block.query_start, block.query_end)]
                         self.assertEqual(len(queries), len(set(queries)))
@@ -108,7 +96,7 @@ class TestQueryBalance(unittest.TestCase):
 
     def test_invalid_metadata(self):
         for lengths, size, options in (((0, 8), 2, {}), ((7,), 2, {}), ((8,), 0, {}),
-                                       ((8,), 2, {"mode": "hybrid"}), ((8,), 2, {"block_size": 2}),
-                                       ((8,), 2, {"mode": "greedy", "block_size": 5})):
+                                       ((8,), 2, {"load_balance": "hybrid"}),
+                                       ((8,), 2, {"load_balance": "greedy"})):
             with self.subTest(lengths=lengths, options=options), self.assertRaises(ValueError):
                 query_task_plan(lengths, size, **options)

@@ -184,8 +184,7 @@ def _block_batches(blocks, capacity):
 
 @lru_cache(maxsize=128)
 def ring_task_plan(
-        lengths: tuple[int, ...], size: int, rank: int, mode: str, causal: bool,
-        block_size: int | None = None, zigzag_min_length: int | None = None,
+        lengths: tuple[int, ...], size: int, rank: int, load_balance: str, causal: bool,
         document_subrings: bool = False,
 ) -> RingTaskPlan:
     """Build exact document-local masks and an equal-capacity transport plan.
@@ -195,11 +194,10 @@ def ring_task_plan(
     Padding equalizes transport capacity only and never enters a kernel.
     """
     planner = query_task_plan_in_document_rings if document_subrings else query_task_plan
-    assignments = planner(lengths, size, mode, causal=causal, block_size=block_size,
-                           zigzag_min_length=zigzag_min_length)
+    assignments = planner(lengths, size, load_balance)
     route = query_route(assignments, lengths, rank)
     local = sum(lengths) // size
-    paired = mode == "zigzag" or (mode == "hybrid" and lengths[0] >= zigzag_min_length)
+    paired = load_balance == "zigzag"
     fast = paired and causal and len(lengths) == 1 and lengths[0] % (2 * size) == 0
     if fast:
         half = local // 2
@@ -224,7 +222,7 @@ def pruned_ring_plan(lengths: tuple[int, ...], size: int, rank: int, causal: boo
     """
     if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < size:
         raise ValueError("rank must belong to the CP group")
-    query_assignments = assignments or query_task_plan_in_document_rings(lengths, size, "none", causal=causal)
+    query_assignments = assignments or query_task_plan_in_document_rings(lengths, size, "none")
     if len(query_assignments) != size:
         raise ValueError("Ring task assignments must have one entry per CP rank")
     key_assignments = query_assignments
