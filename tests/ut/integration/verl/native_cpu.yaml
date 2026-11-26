@@ -1,0 +1,41 @@
+# Minimal native CPU configuration; no external assets are constructed.
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: fixture-model
+  torch_dtype: bfloat16
+training:
+  train_iters: 3
+  global_batch_size: 2
+  micro_batch_size: 1
+  backend: gloo
+  init_device: cpu
+fsdp_config:
+  dp_shard_size: 2
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: fixture-data
+  data_config:
+    labels_are_shifted: true
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: compressed
+    reset_position_ids: true
+    runtime_input_adapter:
+      _target_: hyper_parallel.data.batching.runtime_input.PackedAttentionRuntime
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  muon_config:
+    muon_lr: 0.001
+  adamw_config:
+    adamw_lr: 0.0001
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.1
+    lr_warmup_steps: 0

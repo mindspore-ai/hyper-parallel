@@ -15,15 +15,20 @@
 """Stage-1 tests: build options surface, Trainer re-export identity, boundaries."""
 # pylint: disable=wrong-import-position
 
+import runpy
 import subprocess
 import sys
 import unittest
+from unittest.mock import Mock, patch
 from dataclasses import fields
 from pathlib import Path
 
 import torch
 
+import hyper_parallel.models as auto_models
 from hyper_parallel.components.quantization.config import LowPrecisionConfig
+from hyper_parallel.trainer import config as trainer_config
+from hyper_parallel.models import api, build_options
 from hyper_parallel.models.build_options import (
     CompileConfig,
     FSDP2Config,
@@ -35,6 +40,76 @@ from hyper_parallel.trainer.config.parallelism import ActivationCheckpointConfig
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+class TestDeviceDiscovery(unittest.TestCase):
+    """CUDA compatibility shims must not change the native accelerator type."""
+
+    def test_cuda_availability_requires_compiled_backend(self) -> None:
+        """An NPU shim may report CUDA availability on a CPU/NPU Torch build."""
+        cases = ((False, True, False), (True, True, True), (True, False, False), (False, False, False))
+        for compiled, available, expected in cases:
+            with self.subTest(compiled=compiled, available=available), \
+                    patch.object(torch.backends.cuda, "is_built", return_value=compiled), \
+                    patch.object(torch.cuda, "is_available", return_value=available):
+                actual = build_options._cuda_is_available()
+                self.assertEqual(actual, expected, f"CUDA availability={actual}, expected={expected}")
+
+    def test_selects_device_namespace_and_current_id(self) -> None:
+        """Prefer CUDA, then NPU, with CPU as the fallback."""
+        for cuda, npu, expected in ((True, True, "cuda"), (False, True, "npu"), (False, False, "cpu")):
+            with self.subTest(device=expected), patch.multiple(
+                build_options, IS_CUDA_AVAILABLE=cuda, IS_NPU_AVAILABLE=npu,
+            ):
+                self.assertEqual(build_options.get_device_type(), expected)
+        device = Mock(current_device=Mock(return_value=3))
+        with patch.object(build_options, "get_device_type", return_value="cpu"), patch.object(torch, "cpu", device):
+            self.assertEqual(build_options.get_device_id(), 3)
+        with patch.object(build_options, "get_device_type", return_value="missing_device"):
+            self.assertIs(build_options.get_torch_device(), torch.cuda)
+
+    def test_import_without_optional_npu_package(self) -> None:
+        """Permit import when the NPU wheel is unavailable."""
+        with patch.dict(sys.modules, {"torch_npu": None}):
+            namespace = runpy.run_path(build_options.__file__)
+        self.assertFalse(namespace["IS_NPU_AVAILABLE"])
+
+    def test_registered_npu_disables_internal_format(self) -> None:
+        """Initialize NPU config when the optional backend is registered."""
+        npu = Mock(is_available=Mock(return_value=True))
+        with patch.dict(sys.modules, {"torch_npu": Mock()}), patch.object(torch, "npu", npu, create=True):
+            namespace = runpy.run_path(build_options.__file__)
+        self.assertTrue(namespace["IS_NPU_AVAILABLE"])
+        self.assertFalse(npu.config.allow_internal_format)
+
+
+class TestBuildOptionsValidation(unittest.TestCase):
+    """Reject malformed runtime options before building a model."""
+
+    def test_validation_messages(self) -> None:
+        """Identify invalid option fields and preserve valid mixed precision overrides."""
+        cases = (
+            (CompileConfig, {"dynamic_arg_dims": []}, ValueError, "dynamic_arg_dims"),
+            (CompileConfig, {"backend": ""}, ValueError, "backend"),
+            (CompileConfig, {"options": []}, TypeError, "options"),
+            (CompileConfig, {"max_in_flight_gb": -1}, ValueError, "max_in_flight_gb"),
+            (FSDP2Config, {"wrapper_class": ["not valid"]}, ValueError, "wrapper_class"),
+            (FSDP2Config, {"reshard_after_forward": 1}, TypeError, "reshard_after_forward"),
+            (FSDP2MixedPrecisionConfig, {"custom_params": []}, ValueError, "custom_params"),
+            (FSDP2MixedPrecisionConfig, {"custom_params": {"": {}}}, ValueError, "keys"),
+            (FSDP2MixedPrecisionConfig, {"custom_params": {"weight": []}}, ValueError, "values"),
+            (FSDP2MixedPrecisionConfig, {"custom_params": {"weight": {"output_dtype": None}}}, ValueError, "supports"),
+            (FSDP2MixedPrecisionConfig, {"custom_params": {"weight": {"param_dtype": "float64"}}}, ValueError, "dtype"),
+            (ModelBuildOptions, {"device": 0}, TypeError, "device"),
+            (ModelBuildOptions, {"low_precision": []}, TypeError, "low_precision"),
+        )
+        for config, options, error, message in cases:
+            with self.subTest(options=options), self.assertRaisesRegex(error, message):
+                config(**options)
+        with self.assertRaisesRegex(TypeError, "requires a mapping"):
+            ModelBuildOptions.from_dict([])
+        precision = FSDP2MixedPrecisionConfig(custom_params={"weight": {"param_dtype": "float32"}})
+        self.assertEqual(precision.custom_params["weight"]["param_dtype"], "float32")
 
 
 def _field_snapshot(cls):
@@ -210,15 +285,11 @@ class TestTrainerReexportIdentity(unittest.TestCase):
 
     def test_trainer_config_reexport_identity(self):
         """trainer.config CompileConfig/FSDP2Config ARE the build_options classes."""
-        from hyper_parallel.trainer import config as trainer_config  # pylint: disable=import-outside-toplevel
-
         self.assertIs(trainer_config.CompileConfig, CompileConfig)
         self.assertIs(trainer_config.FSDP2Config, FSDP2Config)
 
     def test_package_root_reexport_identity(self):
         """The auto_models package root re-exports the same class objects."""
-        import hyper_parallel.models as auto_models  # pylint: disable=import-outside-toplevel
-
         self.assertIs(auto_models.ModelBuildOptions, ModelBuildOptions)
         self.assertIs(auto_models.CompileConfig, CompileConfig)
         self.assertIs(auto_models.FSDP2Config, FSDP2Config)
@@ -257,8 +328,6 @@ class TestBuildOptionsBoundary(unittest.TestCase):
 
     def test_api_skeleton_surface(self):
         """api.py exposes the stable skeleton and delegates from_pretrained lazily."""
-        from hyper_parallel.models import api  # pylint: disable=import-outside-toplevel
-
         self.assertEqual(
             api.__all__,
             [

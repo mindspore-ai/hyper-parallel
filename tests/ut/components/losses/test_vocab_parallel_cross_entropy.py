@@ -125,3 +125,81 @@ class TestVocabParallelCrossEntropy(unittest.TestCase):
         self.assertIsNotNone(loss.grad_fn)
         loss.backward()
         torch.testing.assert_close(local_logits.grad, logits.grad[:, 3:])
+
+    def test_local_loss_validates_mesh_targets_and_reduction(self) -> None:
+        """Accept the named or explicit TP axis and reject ambiguous input."""
+        logits = torch.randn(2, 3, 4)
+        targets = torch.zeros((2, 3), dtype=torch.long)
+        mesh = _mesh()
+        mesh.ndim = 2
+        mesh.mesh_dim_names = ("dp", "tp")
+        for mesh_dim in (None, 1):
+            with self.subTest(mesh_dim=mesh_dim), patch.object(
+                loss_module, "_differentiable_all_reduce", side_effect=_identity_reduce,
+            ):
+                loss = loss_module.vocab_parallel_cross_entropy_local(
+                    logits, targets, vocab_size=4, mesh=mesh, mesh_dim=mesh_dim,
+                )
+                torch.testing.assert_close(loss.squeeze(), functional.cross_entropy(
+                    logits.flatten(0, 1), targets.flatten(), reduction="sum",
+                ))
+                mesh.get_group.assert_called_with(1)
+
+        with self.assertRaisesRegex(ValueError, "mesh_dim=2"):
+            loss_module.vocab_parallel_cross_entropy_local(logits, targets, vocab_size=4, mesh=mesh, mesh_dim=2)
+        with self.assertRaisesRegex(ValueError, "Probabilistic target"):
+            loss_module.vocab_parallel_cross_entropy_local(logits, targets.float(), vocab_size=4, mesh=mesh)
+        with self.assertRaisesRegex(ValueError, "Invalid reduction"):
+            loss_module.vocab_parallel_cross_entropy_local(logits, targets, vocab_size=4, mesh=mesh, reduction="max")
+        mesh.mesh_dim_names = ("dp", "cp")
+        with self.assertRaisesRegex(ValueError, "name the sharding axis"):
+            loss_module.vocab_parallel_cross_entropy_local(logits, targets, vocab_size=4, mesh=mesh)
+
+    def test_collective_materializes_noncontiguous_input(self) -> None:
+        """The autograd-aware collective receives a contiguous tensor and the requested op."""
+        values = torch.arange(6).reshape(2, 3).T
+        with patch.object(loss_module.dist_func, "all_reduce", side_effect=_identity_reduce) as reduce:
+            result = loss_module._differentiable_all_reduce(values, "max", group=None)
+        torch.testing.assert_close(result, values)
+        self.assertTrue(reduce.call_args.args[0].is_contiguous())
+        self.assertEqual(reduce.call_args.kwargs, {"op": torch.distributed.ReduceOp.MAX, "group": None})
+
+    def test_entropy_validates_mesh_and_chunk_size(self) -> None:
+        """Reject ambiguous vocabulary axes and invalid chunk lengths."""
+        logits = torch.zeros(2, 3)
+        mesh = _mesh()
+        with self.assertRaisesRegex(ValueError, "chunk_size"):
+            loss_module.entropy_from_logits(logits, mesh=mesh, chunk_size=0)
+        mesh.ndim = 2
+        with self.assertRaisesRegex(ValueError, "one-dimensional"):
+            loss_module.entropy_from_logits(logits, mesh=mesh)
+
+    def test_recompute_matches_native_entropy_without_fp32_vocab_caches(self) -> None:
+        """Cross chunk boundaries while retaining only input logits and per-token entropy."""
+        saved = []
+
+        def pack(tensor):
+            saved.append(tensor)
+            return tensor
+
+        for options in ({}, {"chunk_size": 1024}):
+            with self.subTest(options=options):
+                generator = torch.Generator().manual_seed(43)
+                logits = torch.randn(2051, 11, generator=generator, requires_grad=True)
+                reference_logits = logits.detach().clone().requires_grad_()
+                saved.clear()
+
+                with patch.object(loss_module, "_differentiable_all_reduce", side_effect=_identity_reduce), \
+                        patch.object(torch.distributed, "all_reduce"), \
+                        torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+                    actual = loss_module.entropy_from_logits(logits, mesh=_mesh(), **options)
+                    gradient = torch.randn(actual.shape, generator=generator)
+                    actual.backward(gradient)
+                reference_log_probs = reference_logits.log_softmax(-1)
+                reference = -(reference_log_probs.exp() * reference_log_probs).sum(-1)
+                reference.backward(gradient)
+                torch.testing.assert_close(actual, reference)
+                torch.testing.assert_close(logits.grad, reference_logits.grad, atol=1e-6, rtol=1e-5)
+                retained = sum(tensor.numel() for tensor in saved)
+                limit = logits.numel() + logits.shape[0]
+                self.assertLessEqual(retained, limit, f"entropy retained {retained} elements, limit={limit}")
