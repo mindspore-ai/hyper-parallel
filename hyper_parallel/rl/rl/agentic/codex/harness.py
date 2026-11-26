@@ -29,7 +29,7 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Union, Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
 from rl.agentic.codex.gateway import CodexGateway
@@ -50,7 +50,7 @@ from rl.data.contracts import PromptRecord, Trajectory
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_CODEX_VERSION = "0.152.1"
-RewardCallable = Callable[[str, PromptRecord], float | RewardResult]
+RewardCallable = Callable[[str, PromptRecord], Union[float, RewardResult]]
 WorkspaceCallable = Callable[[PromptRecord, Path], None]
 ExecutionCallable = Callable[[list[str], Path, Path, dict[str, str]], tuple[list[str], Path, dict[str, str]]]
 _MODEL_METADATA_FALLBACK = re.compile(
@@ -187,6 +187,8 @@ def _classify_codex_events(
     diagnostics: list[dict[str, Any]] = []
     failed_events: list[dict[str, Any]] = []
     for line in lines:
+        if len(diagnostics) + len(failed_events) >= 256:
+            raise RuntimeError("Codex diagnostic event limit exceeded; see the complete artifact log")
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -217,9 +219,9 @@ def _classify_codex_events(
     return final_answer, diagnostics, failed_events
 
 
-def _has_completed_codex_turn(output: str) -> bool:
+def _has_completed_codex_turn(output: str | Iterable[str]) -> bool:
     """Require the CLI terminal event even when a repository summary is absent."""
-    for line in output.splitlines():
+    for line in output.splitlines() if isinstance(output, str) else output:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -258,9 +260,8 @@ class CodexRuntime(HarnessRuntime):
         capture_spec = getattr(engine, "router_capture_spec", None)
         if capture_spec is not None:
             gateway_options["router_capture_spec"] = asdict(capture_spec)
-        for name in ("max_request_bytes", "max_response_bytes"):
-            if name in config:
-                gateway_options[name] = int(config[name])
+        for name, default in (("max_request_bytes", 8 * 1024 * 1024), ("max_response_bytes", 32 * 1024 * 1024)):
+            gateway_options[name] = int(config.get(name, default))
         if config.get("admin_auth", False):
             gateway_options["admin_token"] = secrets.token_urlsafe(32)
         super().__init__(
@@ -374,7 +375,8 @@ class CodexAgentProgram:
     async def _admin_request_once(self, method: str, path: str, payload: Mapping | None,
                                   timeout: float) -> dict[str, Any]:
         """Await the result of one HTTP operation before retry or cancellation cleanup."""
-        options = {}
+        options = ({"max_response_bytes": int(self.config["max_response_bytes"])}
+                   if "max_response_bytes" in self.config else {})
         arguments = (method, self.admin_url + path, payload, timeout)
         if self.admin_token is not None:
             arguments = (*arguments, self.admin_token)
@@ -809,12 +811,30 @@ async def _stop_process_group(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
+class _CapturedOutput(list[str]):
+    """Keep a small diagnostic tail while replaying the full stream from disk."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self.path = path
+
+    def append(self, text: str) -> None:
+        super().append(text)
+        del self[:-20]
+
+    def __iter__(self):
+        with self.path.open(encoding="utf-8") as stream:
+            for line in stream:
+                yield line.rstrip("\r\n")
+
+
 async def _drain_codex_stream(
     reader: Any, path: Path, lines: list[str], *, normalize_newlines: bool,
 ) -> None:
     """Persist one child stream while retaining its decoded lines for diagnostics."""
     if reader is None:
         return
+    line_index = 0
     with path.open("w", encoding="utf-8") as stream:
         while True:
             line = await reader.readline()
@@ -823,7 +843,8 @@ async def _drain_codex_stream(
             decoded = line.decode("utf-8", errors="replace")
             text = decoded.rstrip("\r\n")
             if normalize_newlines:
-                _performance_event(path.parent, "cli_stdout.received", line_index=len(lines))
+                _performance_event(path.parent, "cli_stdout.received", line_index=line_index)
+            line_index += 1
             lines.append(text)
             stream.write(text + "\n" if normalize_newlines else decoded)
             stream.flush()
@@ -840,8 +861,8 @@ async def _collect_codex_output(
     process: Any, artifact_dir: Path, timeout: float,
 ) -> tuple[list[str], list[str]]:
     """Drain both child pipes and preserve timeout and cancellation cleanup."""
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
+    stdout_lines = _CapturedOutput(artifact_dir / "codex-events.jsonl")
+    stderr_lines = _CapturedOutput(artifact_dir / "codex-stderr.log")
     stdout_task = asyncio.create_task(
         _drain_codex_stream(process.stdout, artifact_dir / "codex-events.jsonl", stdout_lines,
                             normalize_newlines=True)
@@ -883,6 +904,22 @@ def _cli_budget_response(event: Mapping[str, Any]) -> Optional[tuple[int, str]]:
     return None if match is None else (int(match[1]), match[2])
 
 
+def _missing_final_message(stdout_lines: list[str], stderr_tail: str, artifact_hint: str) -> _MissingFinalMessage:
+    """Keep the existing bounded tail and terminal evidence in missing-answer errors."""
+    event_tail = "\n".join(stdout_lines[-10:]).strip()
+    details = []
+    if event_tail:
+        details.append(f"event tail:\n{event_tail}")
+    if stderr_tail:
+        details.append(f"stderr tail:\n{stderr_tail}")
+    suffix = f"; {'; '.join(details)}" if details else ""
+    return _MissingFinalMessage(
+        "Codex JSONL did not contain a final agent message"
+        f"{suffix}; {artifact_hint}",
+        turn_completed=_has_completed_codex_turn(stdout_lines),
+    )
+
+
 def _interpret_codex_output(
     stdout_lines: list[str], stderr_lines: list[str], return_code: int, artifact_dir: Path,
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -905,18 +942,7 @@ def _interpret_codex_output(
             f"{failed_events[-1]}{detail}; {artifact_hint}"
         )
     if not final_answer:
-        event_tail = "\n".join(stdout_lines[-10:]).strip()
-        details = []
-        if event_tail:
-            details.append(f"event tail:\n{event_tail}")
-        if stderr_tail:
-            details.append(f"stderr tail:\n{stderr_tail}")
-        suffix = f"; {'; '.join(details)}" if details else ""
-        raise _MissingFinalMessage(
-            "Codex JSONL did not contain a final agent message"
-            f"{suffix}; {artifact_hint}",
-            turn_completed=_has_completed_codex_turn("\n".join(stdout_lines)),
-        )
+        raise _missing_final_message(stdout_lines, stderr_tail, artifact_hint)
     return final_answer, diagnostic_events
 
 

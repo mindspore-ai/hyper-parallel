@@ -160,6 +160,7 @@ class TestRegistrationRecovery(unittest.IsolatedAsyncioTestCase):
         program = object.__new__(CodexAgentProgram)
         program.admin_url = "http://gateway"
         program.admin_token = None
+        program.config = {}
         calls = []
         body = {"session_id": "s", "policy_version": 3, "max_completions": 2}
 

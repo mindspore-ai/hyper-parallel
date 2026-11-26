@@ -23,6 +23,24 @@ import urllib.error
 import urllib.request
 
 
+DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
+def read_gateway_body(stream: Any, limit: int, length: int | None = None) -> bytes:
+    """Reject oversized bodies before parsing or allocating their full contents."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("Gateway byte limit must be a positive integer")
+    if length is not None and length > limit:
+        raise ValueError("Gateway request exceeds its byte limit")
+    body = stream.read(limit + 1 if length is None else length)
+    if len(body) > limit:
+        raise ValueError("Gateway response exceeded its byte limit")
+    if length is not None and len(body) != length:
+        raise ValueError("Request body ended before Content-Length")
+    return body
+
+
 class GatewayTransportError(RuntimeError):
     """Identify a disconnected management request without treating HTTP rejection as retryable."""
 
@@ -37,6 +55,9 @@ def request_gateway_json(
     max_response_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Exchange one JSON object with an external harness gateway."""
+    max_response_bytes = DEFAULT_MAX_RESPONSE_BYTES if max_response_bytes is None else max_response_bytes
+    if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int) or max_response_bytes <= 0:
+        raise ValueError("Gateway response byte limit must be a positive integer")
     data = None if payload is None else json.dumps(dict(payload)).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if admin_token:
@@ -46,7 +67,7 @@ def request_gateway_json(
                     if admin_token is not None else urllib.request.urlopen)
     try:
         with open_request(request, timeout=timeout) as response:
-            content = response.read() if max_response_bytes is None else response.read(max_response_bytes + 1)
+            content = response.read(max_response_bytes + 1)
     except urllib.error.HTTPError as error:
         detail = error.read(4096).decode("utf-8", errors="replace")
         raise RuntimeError(f"{label} gateway HTTP {error.code}: {detail}") from error
