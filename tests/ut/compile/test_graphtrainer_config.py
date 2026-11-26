@@ -116,6 +116,30 @@ class TestGraphModeIntegration(unittest.TestCase):
         base._build_graph_compiler()
         self.assertIsNone(base.graph_compiler)
 
+    def test_deferred_graph_optimizer_rejects_cold_restore_and_swap(self):
+        """Reject unsupported settings before creating graph optimizer views or attaching swap."""
+        for is_muon, fp32_main in ((True, False), (False, True)):
+            for swap, restore, expected in (
+                (True, False, "optimizer.swap.enabled"),
+                (False, True, "checkpoint.restore_optimizer=false"),
+            ):
+                with self.subTest(muon=is_muon, fp32_main=fp32_main, swap=swap, restore=restore):
+                    chain = Mock(chained_optimizers=[SimpleNamespace(is_muon=is_muon)])
+                    target = Mock()
+                    target.build.return_value.get_optimizer.return_value = chain
+                    base = BaseTrainer.__new__(BaseTrainer)
+                    base.model = torch.nn.Linear(2, 2)
+                    base.config = SimpleNamespace(
+                        compile=CompileConfig(enabled=True, use_joint_graph=True),
+                        optimizer=SimpleNamespace(
+                            target=target, fp32_main_params=fp32_main, swap=SimpleNamespace(enabled=swap),
+                        ),
+                        checkpoint=SimpleNamespace(restore_from="LATEST", restore_optimizer=restore),
+                    )
+                    with self.assertRaisesRegex(ValueError, expected):
+                        base._build_optimizer()
+                    chain.defer_parameter_binding.assert_not_called()
+
     def test_basetrainer_graph_train_fn_uses_postforward(self):
         """The graph wrapper should return postforward's (loss, loss_dict)."""
         base = BaseTrainer.__new__(BaseTrainer)

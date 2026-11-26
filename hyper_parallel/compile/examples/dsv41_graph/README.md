@@ -2,12 +2,13 @@
 
 This example runs native `TextTrainer` / `GraphCompiler` training on eight Ascend
 NPUs with **FSDP4 + TP2/SP + EP2** (expert EDP4), FP32, sequence length 2304,
-micro batch size 1, global batch size 8, and 30 optimizer steps. Dataset packing,
+micro batch size 1, global batch size 8, and 30 Muon optimizer steps. Full
+recomputation, dataset packing,
 DSA Compressor, and Indexer are enabled; CP and PP are disabled.
 
 The recipe was validated with a four-layer, 16-expert, text-only model with reduced
-Engram capacity. The YAML does not crop the model automatically: its architecture
-comes from the supplied model configuration. By default, `load_base_model: false`
+Engram capacity. The AutoModel recipe reads a prepared model configuration. The training-demo recipe
+crops the architecture from the release configuration at startup. By default, `load_base_model: false`
 randomly initializes weights; pretrained checkpoints must be supplied separately.
 
 ## Resources and Launch
@@ -20,6 +21,12 @@ points to this checkout:
 pip install -e .
 python -c 'import hyper_parallel; print(hyper_parallel.__file__)'
 ```
+
+### AutoModel recipe with a prepared model configuration
+
+Use [train_deepseek_v41_graph_fsdp_tp_ep.yaml](train_deepseek_v41_graph_fsdp_tp_ep.yaml)
+with the AutoModel launcher below. The supplied model configuration determines
+the layer count, expert count and compression layout.
 
 Prepare a local model configuration, its matching tokenizer and Engram assets,
 and a **WikiText dataset**. Set their paths using the environment variables or
@@ -49,7 +56,7 @@ MASTER_PORT=29743 \
 bash hyper_parallel/compile/examples/dsv41_graph/run_deepseek_v41_graph.sh
 ```
 
-`CONFIG=/path/to/job.yaml` selects another YAML; `OUTPUT_LOG` changes the default
+`CONFIG=/path/to/job.yaml` selects another AutoModel-style YAML; `OUTPUT_LOG` changes the default
 `output/dsv41_graph/train.log`. Append CLI overrides such as
 `--training.train_iters=10`. For eager mode, append
 `--compile.enabled=false --compile.use_joint_graph=false`.
@@ -74,8 +81,71 @@ python -m torch.distributed.run --nproc_per_node=8 --master_port=29743 \
 ```
 
 Keep `model.torch_dtype` and `model_init_dtype` consistent when changing precision.
-The default FP32 recipe completed a ten-step functional run on the cropped model;
-this does not establish full-model memory requirements or numerical parity.
+
+### Training-demo recipe with a release configuration
+
+Use [train_demo_graph_muon.yaml](train_demo_graph_muon.yaml) with the
+`examples.training_demo.train_text` entry point. Its model builder selects
+four layers and 16 routed experts, retaining the original backbone width.
+The YAML enables the joint graph, full recomputation, Muon, FSDP4, EP2,
+TP2/SP and WikiText packing into 2304-token rows. Layer 2 supplies compressed
+keys and Indexer metadata.
+
+1. Prepare a local copy of the DeepSeek-V4.1-Flash release's `config.json`,
+   `tokenizer.json` and `tokenizer_config.json`. Random initialization only
+   requires these configuration and tokenizer files.
+2. Generate the Engram assets from the **original** release directory. Then
+   prepare a separate training configuration with Engram head dimension 32.
+   Run these commands from the repository root, substituting your release path.
+
+   ```bash
+   RELEASE_DIR=/path/to/DeepSeek-V4.1-Flash
+   ASSETS=output/dsv41_graph/demo_assets
+   mkdir -p "$ASSETS/model"
+   python -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_assets \
+     --model-dir "$RELEASE_DIR" --output "$ASSETS/engram_d8.json" \
+     --bucket-base 64 --parameter-divisor 8 --table-pad-multiple 2
+   python - "$RELEASE_DIR/config.json" "$ASSETS/model/config.json" <<'PY_CONFIG'
+   import json, sys
+   from pathlib import Path
+   config = json.loads(Path(sys.argv[1]).read_text())
+   config["text_config"]["engram_head_dim"] = 32
+   Path(sys.argv[2]).write_text(json.dumps(config, indent=2))
+   PY_CONFIG
+   cp "$RELEASE_DIR"/tokenizer{,_config}.json "$ASSETS/model/"
+   ```
+
+3. Put WikiText training JSONL (one `{"text": "..."}` object per line) at
+   `output/datasets/wikitext-train.jsonl`. For other locations edit
+   `dataset.data_path`, `model.config_path`, `model.engram_assets_path` and
+   `dataset.model_assets.tokenizer.pretrained_model_name_or_path` in the YAML.
+4. Select eight available devices in the training environment and launch:
+
+   ```bash
+   python -m torch.distributed.run --standalone --nproc_per_node=8 \
+     --module examples.training_demo.train_text \
+     hyper_parallel/compile/examples/dsv41_graph/train_demo_graph_muon.yaml
+   ```
+
+## Muon with Graph Training
+
+The default YAML uses Muon for eligible matrix parameters and AdamW for fallback
+parameters. Forward/backward run in the joint graph; optimizer updates remain eager.
+The optimizer binds final TP/EP/FSDP layouts after compilation. FP32 optimizer
+views share model storage; optional FP32 main weights own only the local shard.
+
+Muon and FP32 main weights require compiler layouts to restore optimizer state.
+For a fresh GraphCompiler run that loads only model weights, set
+`checkpoint.restore_optimizer: false`, `checkpoint.restore_train_state: false`,
+and `checkpoint.restore_dataloader_state: false`. Set
+`optimizer.swap.enabled: false` when using Muon or FP32 main weights in this mode.
+
+All participating ranks bind at the first optimizer step in the same order.
+Binding validates local parameters and shapes before Muon builds metadata using
+collectives. A collective failure requires restarting the distributed job.
+The parameter objects, storage and compiler layout must stay fixed after
+binding. Rebuild the trainer if recompilation or a device move replaces them.
+In-process worker recovery is available for eager training.
 
 ## Compressor, Indexer, and Packing
 
