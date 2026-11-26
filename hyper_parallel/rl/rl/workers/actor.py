@@ -21,6 +21,8 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional
 
+from rl.workers.adapters.token_log_probs import chunked_logits_log_probs
+
 from rl.workers.engine.optimizer import optimizer_step
 from rl.algorithm.loss import RLAlgorithm
 from rl.algorithm.distillation import compute_opd_loss
@@ -167,11 +169,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         )
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         next_token_ids = sequences[:, 1:]
-        log_probs = logits[:, :-1, :].float().log_softmax(dim=-1)
-        return log_probs.gather(
-            dim=-1,
-            index=next_token_ids.unsqueeze(-1),
-        ).squeeze(-1)
+        return chunked_logits_log_probs(logits[:, :-1, :], next_token_ids)
 
     def _micro_batch_inputs(
         self, experience: ExperienceBatch, start: int, end: int, *, trim: bool = False,

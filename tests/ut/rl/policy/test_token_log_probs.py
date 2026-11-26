@@ -19,8 +19,9 @@ import unittest
 
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
+from torch.utils._python_dispatch import TorchDispatchMode
 
-from rl.workers.adapters.token_log_probs import chunked_token_log_probs
+from rl.workers.adapters.token_log_probs import chunked_logits_log_probs, chunked_token_log_probs
 
 
 class TestChunkedTokenLogProbs(unittest.TestCase):
@@ -84,3 +85,63 @@ class TestChunkedTokenLogProbs(unittest.TestCase):
             chunked_token_log_probs(hidden, labels, head, position_mask=torch.ones(1, 5))
         with self.assertRaises(ValueError):
             chunked_token_log_probs(hidden, labels, head, chunk_size=True)
+
+    def test_noncontiguous_hidden_does_not_save_full_copies(self) -> None:
+        """Backward saves the original storage and only chunk-sized gathered hidden."""
+        source = torch.randn(2, 21, 8, requires_grad=True)
+        hidden = source[:, :-1]
+        labels = torch.randint(0, 16, (2, 20))
+        head = torch.nn.Linear(8, 16)
+        saved = []
+
+        def pack(tensor):
+            if tensor.ndim >= 2 and tensor.shape[-1] == 8:
+                saved.append((tensor.numel(), tensor.untyped_storage().data_ptr()))
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            result = chunked_token_log_probs(
+                hidden, labels, head, position_mask=torch.ones_like(labels, dtype=torch.bool), chunk_size=3,
+            )
+        allowed = {source.untyped_storage().data_ptr(), head.weight.untyped_storage().data_ptr()}
+        self.assertTrue(all(size <= 3 * 8 or storage in allowed for size, storage in saved))
+        expected = head(hidden).log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        torch.testing.assert_close(result, expected)
+        result.sum().backward()
+        self.assertIsNotNone(source.grad)
+
+    def test_fallback_chunks_preserve_values_and_gradients(self) -> None:
+        """FP32 normalization is bounded while full-logit inputs retain their contract."""
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                logits = torch.randn(2, 18, 32, dtype=dtype, requires_grad=True)
+                labels = torch.randint(0, 32, (2, 17))
+                weights = torch.randn(2, 17)
+                actual = chunked_logits_log_probs(logits[:, :-1], labels, chunk_size=3)
+                expected = logits[:, :-1].float().log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+                torch.testing.assert_close(actual, expected)
+                actual_grad = torch.autograd.grad(actual, logits, weights, retain_graph=True)[0]
+                expected_grad = torch.autograd.grad(expected, logits, weights)[0]
+                torch.testing.assert_close(actual_grad, expected_grad)
+                with torch.no_grad():
+                    torch.testing.assert_close(chunked_logits_log_probs(logits[:, :-1], labels, 3), expected)
+
+    def test_fallback_never_casts_a_full_vocabulary_batch(self) -> None:
+        """FP32 allocations remain chunk-sized even for noncontiguous logits."""
+        conversions = []
+
+        class CaptureCasts(TorchDispatchMode):
+            """Observe actual dtype conversion operations without replacing their math."""
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten._to_copy.default:
+                    conversions.append(args[0].numel())
+                return func(*args, **(kwargs or {}))
+
+        logits = torch.randn(2, 18, 32, dtype=torch.bfloat16, requires_grad=True)
+        labels = torch.randint(0, 32, (2, 17))
+        with CaptureCasts():
+            result = chunked_logits_log_probs(logits[:, :-1], labels, chunk_size=3)
+        self.assertTrue(conversions)
+        self.assertLessEqual(max(conversions), 3 * 32)
+        self.assertEqual(result.shape, labels.shape)
