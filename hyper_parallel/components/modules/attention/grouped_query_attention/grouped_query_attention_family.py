@@ -49,7 +49,7 @@ def validate_gqa_family(*, config: Any, module: nn.Module | None, context: Any, 
 
 
 def _validate_gqa_degrees(config, member):
-    """Check TP/CP factors against whole Q and KV groups."""
+    """Keep whole KV groups for TP; CP may replicate KV to partition query heads."""
     degree = member.arguments.get("ulysses_degree")
     cp = member.axis_sizes["cp"]
     degree = cp if degree is None else degree
@@ -64,8 +64,8 @@ def _validate_gqa_degrees(config, member):
             "TP KV replication is not implemented"
         )
 
-    if cp > 1 and (config.num_attention_heads // tp % degree or config.num_key_value_heads // tp % degree):
-        raise ValueError("GQA Ulysses degree must divide TP-local Q and KV heads")
+    if cp > 1 and config.num_attention_heads // tp % degree:
+        raise ValueError("GQA Ulysses degree must divide TP-local Q heads")
 
 def gqa_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
     """Own all GQA parameters and declare the actual external token layout."""

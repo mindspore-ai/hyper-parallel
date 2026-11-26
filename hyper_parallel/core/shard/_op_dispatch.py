@@ -799,7 +799,7 @@ class OpDispatcher:
     @staticmethod
     def _restore_inplace_dtensor_result(op_name: str, args: tuple, output: Any) -> Any:
         """Return the original DTensor wrapper after a local in-place operation."""
-        if op_name in {"add_", "sub_"} and args and isinstance(args[0], DTensor):
+        if op_name in {"add_", "sub_", "log_"} and args and isinstance(args[0], DTensor):
             return args[0]
         return output
 

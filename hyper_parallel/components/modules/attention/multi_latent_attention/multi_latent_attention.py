@@ -326,8 +326,8 @@ class MultiLatentAttentionModule(nn.Module):
 
     def reset_parameters(self) -> None:
         """Initialize direct-config parameters without overriding a source model's initializer."""
-        # HF initialization already visits converted Linear/Norm children. The replacement
-        # framework also invokes this method after it, so source conversions must not reset them again.
+        # Converted sources retain their model's initialization; config-owned members
+        # provide complete defaults before the enclosing model applies its own policy.
         if not self._config_initialization:
             return
         for projection in (self.linear_qkv, self.q_b_proj, self.kv_b_proj, self.o_proj):

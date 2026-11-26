@@ -28,7 +28,7 @@ from torch import nn
 
 from hyper_parallel.components.modules.module_family import (
     FamilyBoundary, FamilyBuildInfo, _build_family_member, _context_from_mesh, collect_family_modules, resolve_family,
-    validate_family_context,
+    validate_family_context, _inherit_initialization_contract,
 )
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.build_context import collect_module_contexts, context_with_config
@@ -157,6 +157,7 @@ def _adopt_family_state(source: nn.Module, candidate: nn.Module, fqn: str) -> No
                 owner.register_buffer(leaf, value, persistent=persistent)
     for name, original in source.named_modules():
         target = candidate.get_submodule(name)
+        _inherit_initialization_contract(original, target)
         target.training = original.training
         if type(original).get_extra_state is not nn.Module.get_extra_state:
             target.set_extra_state(deepcopy(original.get_extra_state()))

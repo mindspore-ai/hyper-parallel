@@ -263,6 +263,15 @@ def _validate_initialization_contract(module: nn.Module) -> bool:
     return callable(make_transforms) and callable(reset_parameters)
 
 
+def _inherit_initialization_contract(source: nn.Module, target: nn.Module) -> None:
+    """Carry deferred initialization when another member adopts the same family state."""
+    if not getattr(source, "_hp_reset_after_materialization", False):
+        return
+    if not _validate_initialization_contract(target):
+        raise TypeError("family promotion cannot discard deferred parameter initialization")
+    target._hp_reset_after_materialization = True  # pylint: disable=protected-access
+
+
 def _build_family_member(
     request: FamilyRequest,
     member: ResolvedFamily,
@@ -285,6 +294,10 @@ def _build_family_member(
     result._hp_family_build_info = info  # pylint: disable=protected-access
     if config is not None and requires_reset:
         result._hp_reset_after_materialization = True  # pylint: disable=protected-access
+    if module is not None:
+        source_info = get_family_build_info(module)
+        if source_info is not None and source_info.resolved.family.baseline is member.family.baseline:
+            _inherit_initialization_contract(module, result)
     return result
 
 

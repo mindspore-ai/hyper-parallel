@@ -16,7 +16,6 @@
 import unittest
 from unittest.mock import MagicMock, patch
 import copy
-import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -56,7 +55,7 @@ def _get_expand_impl(op, func, output_layout, layouts, extra_args=None):
 
 class TestParallelElementwiseOps(unittest.TestCase):
     """Unit tests for ElementWiseDistributedOp."""
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method.
 
         Clears global caches to ensure test isolation and initializes
@@ -74,7 +73,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         self._mock_utils.get_created_group.return_value = MagicMock()
         self.addCleanup(self._utils_patcher.stop)
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
@@ -201,6 +200,28 @@ class TestParallelElementwiseOps(unittest.TestCase):
                 ElementWiseDistributedOp,
                 msg=f"Expected {op_name} to use element-wise inference, got {registered_op!r}",
             )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_log_inplace_preserves_layout_and_rejects_partial(self, mock_platform):
+        """In-place log supports replicated/sharded tensors, but cannot retain Partial sums."""
+        op = get_distributed_op("log_")
+        self.assertIsInstance(op, ElementWiseDistributedOp)
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        for placements in ((Replicate(), Replicate(), Replicate()),
+                           (Shard(0), Replicate(), Replicate()),
+                           (Replicate(), Replicate(), Shard(-1)),
+                           (Shard(0), Shard(1), Replicate())):
+            with self.subTest(placements=placements):
+                layout = _build_layout(mesh, placements, 3)
+                output = _infer_output_layout(op, (layout,), {"input_shapes": [(4, 8, 16)]})
+                self.assertEqual(output, layout)
+                self.assertIsNot(output, layout)
+        # Unary log uses the original local operator for every supported placement.
+        self.assertIsNone(op.get_expand_impl(None, ((output,), None), [layout, [(4, 8, 16)]]))
+        partial_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        partial_layout.set_partial_by_dev_axis("dp", "sum")
+        with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
+            op.infer_layout([partial_layout, [(4, 8, 16)]])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_input_partial_0(self, mock_platform):

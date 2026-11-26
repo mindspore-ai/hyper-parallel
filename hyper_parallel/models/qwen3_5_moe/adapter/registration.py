@@ -17,7 +17,7 @@
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.qwen3_5.adapter.checkpoint import export_text_checkpoint
 from hyper_parallel.models.qwen3_5.adapter.registration import _load_replacements
-from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
+from hyper_parallel.models.qwen3_5.adapter.materialization import prepare_model_materialization
 from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import get_fsdp_execution_order
 from hyper_parallel.models.registry import register_model_adapter
 
@@ -58,7 +58,7 @@ def _load_encoder_parallel():
 
 
 QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
-    materialization=register_rotary_materialization,
+    materialization=prepare_model_materialization,
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",
     loss=_load_vlm_loss,
@@ -70,7 +70,7 @@ QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
 
 QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     checkpoint_export=export_text_checkpoint,
-    materialization=register_rotary_materialization,
+    materialization=prepare_model_materialization,
     architecture="Qwen3_5MoeForCausalLM",
     model_type="qwen3_5_moe_text",
     loss=_load_loss,

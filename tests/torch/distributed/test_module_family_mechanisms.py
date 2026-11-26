@@ -36,3 +36,20 @@ def test_family_cp_fsdp_dcp_npu() -> None:
     """
     torchrun_case(__file__.replace("test_module_family", "_test_module_family"),
                   "test_family_cp_fsdp_dcp_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_attention_meta_initialization_cp_fsdp_npu() -> None:
+    """Validate all attention family initialization policies after real CP2 and FSDP2 preparation."""
+    torchrun_case(__file__.replace("test_module_family", "_test_module_family"),
+                  "test_attention_meta_initialization_cp_fsdp_npu", num_proc=2)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_qwen35_native_initialization_cp_fsdp_npu() -> None:
+    """Feature: Native Qwen initialization after family replacement and parallel wrapping.
+    Description: Materialize dense/MoE models on actual CP2 and FSDP2 parameter shards.
+    Expectation: All parameters are finite and special values match the native initializer exactly.
+    """
+    torchrun_case(__file__.replace("test_module_family", "_test_module_family"),
+                  "test_qwen35_native_initialization_cp_fsdp_npu", num_proc=2)

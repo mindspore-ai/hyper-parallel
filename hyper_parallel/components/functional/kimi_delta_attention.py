@@ -301,6 +301,8 @@ def _prepare_kda_wy(
     )
 
     gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
+    # Future-token differences may overflow exp; masking afterwards leaves 0 * inf in backward.
+    gate_pair = gate_pair.masked_fill(~strict_causal.unsqueeze(-1), float("-inf"))
     key_pair = torch.einsum(
         "...ik,...jk,...ijk->...ij",
         key,
@@ -339,6 +341,7 @@ def _run_kda_chunks(
         u_i = u[:, :, chunk_idx]
 
         relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
+        relative_gate = relative_gate.masked_fill(~causal.unsqueeze(-1), float("-inf"))
         qk = torch.einsum(
             "bhik,bhjk,bhijk->bhij",
             query_i,
@@ -565,6 +568,8 @@ def torch_kda_state_summary(
         chunk_size, chunk_size, dtype=torch.bool, device=key.device,
     ).tril(diagonal=-1)
     gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
+    # Future-token differences may overflow exp; masking afterwards leaves 0 * inf in backward.
+    gate_pair = gate_pair.masked_fill(~strict_causal.unsqueeze(-1), float("-inf"))
     key_pair = torch.einsum(
         "...ik,...jk,...ijk->...ij", key, key, gate_pair.exp(),
     )

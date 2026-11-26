@@ -52,6 +52,7 @@ gate 来自融合投影，不使用 gated MLA 的独立 gate 投影调度。
 
 ## 支持范围
 
-- 当前要求 Q/K 与 V 的 head width 相等；Q/KV 头数均须能被 `TP×U` 整除。
+- 当前要求 Q/K 与 V 的 head width 相等；Q 头数须能被 `TP×U` 整除，KV 头数须能被 TP 整除。
+  KV 头数不足以均分 U 时复用 GQA 的最小复制，gate 保持本地，不增加 KV 副本。
 - packed、padding mask、位置表和 CP cache 限制沿用 [GQA 支持范围](../grouped_query_attention/README.md#支持范围)。
 - 此模块处理 Qwen3.5 full attention；完整混合模型中的 GDN 和其他层需要各自的配方支持。

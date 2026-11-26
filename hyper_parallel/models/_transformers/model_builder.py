@@ -24,6 +24,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 
 import fnmatch
 import logging
+from types import MethodType
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -343,8 +344,25 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: torch.d
         module._buffers[name] = buffer.to(device=current.device)  # pylint: disable=W0212
 
 
-def _initialize_model_weights(model: nn.Module) -> None:
-    """Initialize materialized state through the model's native contract."""
+def _reset_module_tree(module: nn.Module, visited: set[int], *, only_deferred: bool = False) -> None:
+    """Visit children before their owner, optionally limiting resets to deferred components."""
+    if id(module) in visited:
+        return
+    visited.add(id(module))
+    for child in module.children():
+        _reset_module_tree(child, visited, only_deferred=only_deferred)
+    # Activation wrappers forward reset_parameters to the child already visited.
+    if isinstance(module, ActivationWrapper):
+        return
+    if only_deferred and not getattr(module, "_hp_reset_after_materialization", False):
+        return
+    reset_parameters = getattr(module, "reset_parameters", None)
+    if callable(reset_parameters):
+        reset_parameters()
+
+
+def _clear_initialization_flags(model: nn.Module) -> None:
+    """Enable a fresh model policy while retaining externally initialized parameter guards."""
     for module in model.modules():
         module._is_hf_initialized = False  # pylint: disable=W0212
     external = get_model_external_state(model)
@@ -353,30 +371,22 @@ def _initialize_model_weights(model: nn.Module) -> None:
         if id(tensor) not in external_ids:
             tensor._is_hf_initialized = False  # pylint: disable=W0212
 
+
+@torch.no_grad()
+def _initialize_model_weights(model: nn.Module) -> None:
+    """Apply component defaults before the native model policy, which owns final values."""
+    _clear_initialization_flags(model)
     initialize_weights = getattr(model, "initialize_weights", None)
-    native_initialization = callable(initialize_weights)
+    if not callable(initialize_weights):
+        initialize_weights = getattr(model, "init_weights", None)
     if callable(initialize_weights):
+        _reset_module_tree(model, set(), only_deferred=True)
+        # Defaults must not convince HF that its model-specific initialization already ran.
+        _clear_initialization_flags(model)
         initialize_weights()
     else:
-        init_weights = getattr(model, "init_weights", None)
-        native_initialization = callable(init_weights)
-        if callable(init_weights):
-            init_weights()
-        else:
-            for module in model.modules():
-                reset_parameters = getattr(module, "reset_parameters", None)
-                if callable(reset_parameters):
-                    reset_parameters()
-    if native_initialization:
-        for module in model.modules():
-            if isinstance(module, ActivationWrapper):
-                continue
-            if not getattr(module, "_hp_reset_after_materialization", False):
-                continue
-            reset_parameters = getattr(module, "reset_parameters", None)
-            if callable(reset_parameters):
-                reset_parameters()
-    logger.info("Initialized model state with model-native random initialization")
+        _reset_module_tree(model, set())
+    logger.info("Initialized model state with component defaults followed by the model policy")
 
 
 def _apply_model_method_replacements(model: nn.Module, distributed_setup: Any, low_precision_config: Any) -> None:
@@ -451,6 +461,16 @@ def _apply_parameter_freezing(model: nn.Module, freeze_config: Any) -> None:
         "Froze %d parameter tensors (%.1fM elements) under %d module(s) matching %s",
         frozen_tensors, frozen_numel / 1e6, len(matched), patterns,
     )
+
+
+def _preserve_initialization_identity(model: nn.Module) -> None:
+    """Keep HF's native/custom policy tied to the source class across parallel wrapping."""
+    for module in model.modules():
+        predicate = getattr(module, "is_custom_code", None)
+        if isinstance(predicate, MethodType) and isinstance(predicate.__self__, type):
+            # FSDP creates a class in its own Python module. HF must not interpret
+            # that wrapper as custom model code and skip parent-owned initialization.
+            module.is_custom_code = predicate
 
 
 def _apply_materialization_adapter(model: nn.Module) -> None:
@@ -760,6 +780,7 @@ def apply_model_infrastructure(
         model, distributed_setup, low_precision_config, load_base_model,
     )
     if is_meta_device:
+        _preserve_initialization_identity(model)
         _apply_materialization_adapter(model)
 
     _tie_model_weights_before_parallelism(model)
