@@ -429,7 +429,6 @@ class TestGraphModeIntegration(unittest.TestCase):
 
         self.assertTrue(config.compile.selects_graph_compiler())
 
-
     def test_build_pass_config_projects_parallel_topology(self):
         """Trainer topology and inferred FSDP intent are copied to PassConfig."""
         config = SimpleNamespace(

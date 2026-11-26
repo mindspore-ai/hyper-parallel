@@ -131,6 +131,32 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
                 self.assertEqual(trainer.state.global_step, 8)
                 self.assertTrue(callback._initial_checkpoint_processed)
 
+    def test_graph_reshard_hook_is_registered_once_after_restore(self) -> None:
+        """A restored optimizer registers one post-compile reshard hook.
+
+        Feature: Graph-mode optimizer-state resharding on resume.
+        Description: Start a checkpoint callback whose trainer owns an uncompiled
+            graph compiler and reenter the start hook.
+        Expectation: The optimizer restore stays single-shot while exactly one
+            reshard hook is queued for the lazy compile.
+        """
+        with tempfile.TemporaryDirectory() as restore_from:
+            trainer = self._build_trainer(restore_from, False)
+            hooks = []
+            trainer.graph_compiler = SimpleNamespace(
+                is_compiled=False,
+                add_post_compile_hook=hooks.append,
+            )
+            checkpointer = _FakeCheckpointer()
+            with patch(f"{_CALLBACK_MODULE}.build_checkpointer", return_value=checkpointer), \
+                    patch(f"{_CALLBACK_MODULE}.initialize_optimizer_state", return_value=True), \
+                    patch(f"{_CALLBACK_MODULE}.get_device_rng_state", return_value=None), \
+                    patch(f"{_CALLBACK_MODULE}.is_recovery_reboot", return_value=False):
+                callback = CheckpointerCallback(trainer)
+                callback.on_train_begin(trainer.state)
+                callback.on_train_begin(trainer.state)
+        self.assertEqual(len(hooks), 1)
+
     def test_initial_checkpoint_absence_is_processed_once(self) -> None:
         """Feature: An initial start without a checkpoint is still handled once.
 

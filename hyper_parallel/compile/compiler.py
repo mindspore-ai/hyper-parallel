@@ -46,9 +46,10 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
-from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.models.build_options import FSDP2Config, get_device_type
 from hyper_parallel.models.external_state import get_model_external_state
 
+from . import checkpoint_metadata, optimizer_state
 from .graph_parallel_plan import GraphParallelPlan
 from .pass_config import (
     GradientReduction,
@@ -99,7 +100,7 @@ class GraphCompiler:
             trainer_config: Optional trainer topology used only to infer a
                 default ``PassConfig`` when ``pass_config`` is omitted.
             device: Device to place the model and run the graph on. Defaults
-                to the NPU device when available, otherwise CPU.
+                to the available accelerator (CUDA/NPU), otherwise CPU.
             mesh_context: Optional automodel ``MeshContext`` carrying the
                 pre-built parallel meshes. Model forwards retain their TP/EP
                 groups; the compiler registers the dense shard sub-mesh under
@@ -143,11 +144,11 @@ class GraphCompiler:
         self._optimizer_layout_source = None
         self._optimizer_parameter_layouts = None
         self._layout_signature = None
-        self.device = device or (
-            torch.device("npu")
-            if (hasattr(torch, "npu") and torch.npu.is_available())
-            else torch.device("cpu")
-        )
+        self._source_parameter_layouts = None
+        self._source_layout_signature = None
+        self._post_compile_hooks: List[Callable[[], None]] = []
+        self._compile_started = False
+        self.device = device or torch.device(get_device_type())
 
         self.pass_config.validate()
 
@@ -224,11 +225,8 @@ class GraphCompiler:
                 rank = coordinate[axis]
                 valid_rows = min(local_shape[0], max(shape[0] - rank * local_shape[0], 0))
                 local_shape = (valid_rows, *local_shape[1:])
-            source = self.source_layout_for_parameter(name)
-            if source is not None and source[1] is not None:
-                source_layout = Layout.from_device_mesh(source[1])
-                source_layout.set_placements(tuple(source[0]))
-                source_layout.placement_to_tensor_map(len(shape))
+            source_layout = self.source_global_layout(name, len(shape))
+            if source_layout is not None:
                 shape = source_layout.get_global_shape(shape)
             layout = layouts[parameter]
             if tuple(shape) != tuple(layout.tensor_shape):
@@ -238,6 +236,68 @@ class GraphCompiler:
         self._optimizer_layout_source = layouts
         self._optimizer_parameter_layouts = result
         return result
+
+    @property
+    def source_parameter_layouts(self) -> Optional[dict]:
+        """Pre-FSDP layouts for source-local parameters, available before compile.
+
+        A restored checkpoint is loaded before the lazy compile, when TP/EP
+        parameters are source-local plain tensors rather than sharded storage.
+        Describing that state lets DCP map a global checkpoint onto the correct
+        local slice instead of treating every rank as the first shard.
+        """
+        if self._joint_graph is not None:
+            return None
+        parameters = dict(self.model.named_parameters())
+        signature = tuple((id(param), tuple(param.shape), param.dtype, param.device) for param in parameters.values())
+        if signature != self._source_layout_signature:
+            self._source_parameter_layouts = (
+                checkpoint_metadata.build_source_parameter_layouts(self, parameters)
+            )
+            self._source_layout_signature = signature
+        return self._source_parameter_layouts
+
+    @property
+    def joint_graph(self) -> Optional[Any]:
+        """The compiled joint graph, or ``None`` before lazy compilation."""
+        return self._joint_graph
+
+    @property
+    def mesh_context(self) -> Optional[Any]:
+        """The automodel mesh context attached at construction, if any."""
+        return self._mesh_context
+
+    @property
+    def parameter_shapes(self) -> Dict[str, Tuple[int, ...]]:
+        """Pre-shard parameter shapes captured at compile time (name -> shape)."""
+        return self._parameter_shapes
+
+    def ensure_expert_param_names(self) -> None:
+        """Populate expert FQNs from the model when no plan already provides them.
+
+        Checkpoint metadata can be requested before the lazy compile, so this
+        mirrors the expert discovery ``_init_expert_dp`` performs during mesh
+        setup.
+        """
+        if self._expert_param_names or self._mesh_context is None:
+            return
+        if getattr(self._mesh_context, "ep_size", 1) <= 1:
+            return
+        self._expert_param_names = self._discover_expert_param_names()
+
+    def _discover_expert_param_names(self) -> set[str]:
+        """Return FQNs of parameters owned by modules exposing local experts."""
+        parameters = {
+            id(parameter)
+            for module in self.model.modules()
+            if hasattr(module, "local_expert_count")
+            for parameter in module.parameters(recurse=False)
+        }
+        return {
+            name
+            for name, parameter in self.model.named_parameters(remove_duplicate=False)
+            if id(parameter) in parameters
+        }
 
     def _validate_compile_mode(self) -> None:
         """Reject unsupported ownership and dynamic pipeline combinations."""
@@ -263,6 +323,13 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
+        if self._compile_started:
+            raise RuntimeError(
+                "GraphCompiler.compile() may only be called once: the "
+                "partitioning passes mutate the live model in place, so "
+                "re-compiling (even after a failed attempt) would trace an "
+                "already-partitioned model"
+            )
         self._validate_compile_mode()
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
@@ -314,11 +381,57 @@ class GraphCompiler:
 
         # Passes mutate ``graph_module`` in place and return it, so the
         # transformed graph lives on ``joint_graph`` for ``forward_backward``.
+        # Only the mutating passes make a retry unsafe, so guard from here.
+        self._compile_started = True
         pipeline.run(joint_graph.graph_module, **pass_kwargs)
 
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()
         self._joint_graph = joint_graph
+        hooks, self._post_compile_hooks = self._post_compile_hooks, []
+        for hook in hooks:
+            hook()
+
+    def add_post_compile_hook(self, hook: Callable[[], None]) -> None:
+        """Run ``hook`` once the next lazy compile has sharded the live model.
+
+        Args:
+            hook: No-argument callable invoked after the passes mutate the live
+                model; if compilation already happened it runs immediately.
+        """
+        if self.is_compiled:
+            hook()
+            return
+        self._post_compile_hooks.append(hook)
+
+    def reshard_optimizer_state(self, optimizers: Any) -> None:
+        """Re-shard pre-compile optimizer state onto the live FSDP shards.
+
+        Restored moments are dense at the pre-compile parameter shapes; once the
+        passes shard the model they must follow the same padded chunk geometry
+        or the first optimizer step sees a shape mismatch. See
+        :func:`~hyper_parallel.compile.optimizer_state.reshard_optimizer_state`.
+
+        Args:
+            optimizers: One optimizer or a list of optimizers whose leaf
+                ``state`` tensors should be re-sharded in place.
+        """
+        optimizer_state.reshard_optimizer_state(self, optimizers)
+
+    def attach_shard_metadata(self, *, strict_strided: bool = True) -> None:
+        """Annotate graph-sharded parameters for HF export and DCP consumers.
+
+        Args:
+            strict_strided: Raise on a strided FSDP shard (export cannot describe
+                it). Optimizer resharding passes False so an unrelated strided
+                parameter does not block resharding of parameters that do have
+                optimizer state.
+        """
+        checkpoint_metadata.attach_shard_metadata(self, strict_strided=strict_strided)
+
+    def attach_source_shard_metadata(self) -> None:
+        """Annotate source-local parameters for pre-compile checkpoint load/save."""
+        checkpoint_metadata.attach_source_shard_metadata(self)
 
     def forward_backward(self, **inputs: Any) -> Any:
         """
@@ -392,6 +505,24 @@ class GraphCompiler:
             return ((Replicate(),), mesh["tp"])
         return None
 
+    def source_global_layout(self, name: str, ndim: int) -> Optional[Layout]:
+        """Build the pre-FSDP source layout for one parameter, if sharded.
+
+        Args:
+            name: Parameter FQN in the live model.
+            ndim: Number of tensor dims the source placements map onto.
+
+        Returns:
+            The source layout, or None when the parameter has no source shard.
+        """
+        source = self.source_layout_for_parameter(name)
+        if source is None or source[1] is None:
+            return None
+        layout = Layout.from_device_mesh(source[1])
+        layout.set_placements(tuple(source[0] or ()))
+        layout.placement_to_tensor_map(ndim)
+        return layout
+
     def _build_parameter_layouts(self, parameters: dict) -> Optional[dict]:
         """Describe actual local storage using common FSDP layout construction."""
         context = self._mesh_context
@@ -403,8 +534,9 @@ class GraphCompiler:
             self._init_mesh_from_context(context, self.pass_config.dp_mode, register_groups=False)
         layouts = {}
         for name, parameter in parameters.items():
-            if not parameter.requires_grad:
-                continue
+            # Frozen parameters still need a layout: they carry no gradient, but
+            # checkpoint export/DCP still gather and chop their weights, so they
+            # cannot be skipped here (grad clipping filters them separately).
             mesh = self._parameter_fsdp_mesh(name)
             layouts[parameter] = self._build_parameter_layout(
                 parameter, mesh, self.source_layout_for_parameter(name), sharded=name in sharded,
@@ -491,6 +623,10 @@ class GraphCompiler:
                 self._register_mesh_group(group, shard)
                 registered[ranks] = group
             self._parameter_groups[name] = (registered[ranks], shard.size())
+
+    def _mesh_device_type(self) -> str:
+        """Return the backend of the self-built mesh, honoring ``device``."""
+        return torch.device(self.device).type
 
     def _init_device_mesh(self, mesh_context: Optional[Any] = None):
         """Initialize the DP process group(s) for the configured ``dp_mode``.
@@ -593,17 +729,7 @@ class GraphCompiler:
         mesh = context.fsdp_moe_mesh
         if mesh is None or "edp_shard" not in mesh.mesh_dim_names:
             raise ValueError("Graph EP requires the expert data-parallel shard mesh")
-        parameters = {
-            id(parameter)
-            for module in self.model.modules()
-            if hasattr(module, "local_expert_count")
-            for parameter in module.parameters(recurse=False)
-        }
-        self._expert_param_names = {
-            name
-            for name, parameter in self.model.named_parameters(remove_duplicate=False)
-            if id(parameter) in parameters
-        }
+        self._expert_param_names = self._discover_expert_param_names()
         if not self._expert_param_names:
             raise ValueError("Graph EP requires bound local expert parameters")
         names = tuple(mesh.mesh_dim_names)
@@ -726,13 +852,6 @@ class GraphCompiler:
             self.pass_config.dp_replicate_degree = dp_degree
         else:
             self.pass_config.fsdp_degree = dp_degree
-
-    @staticmethod
-    def _mesh_device_type() -> str:
-        """Return the backend device type for the self-built mesh."""
-        if hasattr(torch, "npu") and torch.npu.is_available():
-            return "npu"
-        return "cpu"
 
     def _init_mesh_from_context(self, mesh_context: Any, dp_mode: str, *, register_groups: bool = True) -> None:
         """Resolve and register the DP group(s) from an automodel ``MeshContext``.

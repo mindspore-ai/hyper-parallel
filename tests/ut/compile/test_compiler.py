@@ -46,6 +46,7 @@ from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed.mesh import MeshContext
+from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.models.build_options import FSDP2Config
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -141,6 +142,148 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
         torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
         for parameter, expected in zip(model.parameters(), expected_grads):
             torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
+
+    def test_second_compile_is_rejected(self) -> None:
+        """Compilation mutates the live model, so a second call must fail fast."""
+        model = _make_model()
+        x, y = _fixed_batch()
+        compiler = GraphCompiler(model, _mse_train_fn, device=torch.device("cpu"))
+
+        compiler.compile(x=x, y=y)
+        with self.assertRaisesRegex(RuntimeError, "may only be called once"):
+            compiler.compile(x=x, y=y)
+
+    def test_preflight_failure_allows_retry(self) -> None:
+        """Pre-trace failures leave the compiler reusable.
+
+        Feature: One-shot graph compilation.
+        Description: Fail a pre-flight check before any pass mutates the model,
+            then retry compile after clearing the failure.
+        Expectation: The retry compiles instead of tripping the one-shot guard.
+        """
+        model = _make_model()
+        x, y = _fixed_batch()
+        compiler = GraphCompiler(model, _mse_train_fn, device=torch.device("cpu"))
+        model._hp_external_state = SimpleNamespace(parameters={"weight": object()})
+
+        with self.assertRaisesRegex(ValueError, "externally managed parameters"):
+            compiler.compile(x=x, y=y)
+        self.assertFalse(compiler._compile_started)
+
+        model._hp_external_state = SimpleNamespace(parameters={})
+        compiler.compile(x=x, y=y)
+        self.assertTrue(compiler.is_compiled)
+
+    def test_self_built_mesh_uses_explicit_device(self) -> None:
+        """Explicit device overrides accelerator autodetection for the mesh.
+
+        Feature: Device selection for self-built meshes.
+        Description: Build a compiler on an explicit CPU device on any host.
+        Expectation: The self-built mesh backend is CPU, not the detected device.
+        """
+        compiler = GraphCompiler(_make_model(), _mse_train_fn, device=torch.device("cpu"))
+
+        self.assertEqual(compiler._mesh_device_type(), "cpu")
+
+    def test_compile_attaches_checkpoint_shard_metadata(self) -> None:
+        """Compiled parameters expose the layout HF export and DCP consume."""
+        model = _make_model()
+        mesh = init_device_mesh(
+            "cpu",
+            (1,),
+            mesh_dim_names=("fsdp_shard",),
+            rank_list=(0,),
+            init_backend=False,
+        )
+        compiler = GraphCompiler(
+            model,
+            _mse_train_fn,
+            PassConfig(fsdp_enabled=False),
+            mesh_context=MeshContext(fsdp_non_moe_mesh=mesh),
+        )
+
+        compiler.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        compiler.attach_shard_metadata()
+
+        self.assertFalse(hasattr(model.weight, "_sharding_spec"))
+        chunk_info = model.weight.chunk_info
+        self.assertEqual(chunk_info.global_shape, (4, 4))
+        self.assertEqual(chunk_info.chunk.offsets, (0, 0))
+        self.assertEqual(chunk_info.chunk.sizes, (4, 4))
+        gathered = CheckpointManager(model, compiler)._gather_full_state_dict(
+            keep_state_dict=True
+        )
+        self.assertEqual(tuple(gathered["weight"].shape), (4, 4))
+
+    def test_frozen_parameters_get_checkpoint_layouts(self) -> None:
+        """Frozen params still need export/DCP metadata even without gradients."""
+
+        class _MixedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.trained = nn.Linear(4, 4, bias=False)
+                self.frozen = nn.Linear(4, 4, bias=False)
+                self.frozen.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                """Add a trainable and a frozen projection to exercise mixed grads."""
+                return self.trained(x) + self.frozen(x)
+
+        model = _MixedModel()
+        mesh = init_device_mesh(
+            "cpu",
+            (1,),
+            mesh_dim_names=("fsdp_shard",),
+            rank_list=(0,),
+            init_backend=False,
+        )
+        compiler = GraphCompiler(
+            model,
+            _mse_train_fn,
+            PassConfig(fsdp_enabled=False),
+            mesh_context=MeshContext(fsdp_non_moe_mesh=mesh),
+        )
+
+        compiler.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        compiler.attach_shard_metadata()
+
+        layouts = compiler.parameter_layouts
+        self.assertIn(model.trained.weight, layouts)
+        self.assertIn(model.frozen.weight, layouts)
+        self.assertEqual(
+            model.frozen.weight.chunk_info.global_shape,
+            tuple(model.frozen.weight.shape),
+        )
+
+    def test_source_layouts_describe_precompile_tp_storage(self) -> None:
+        """Before compile, source-local TP params still expose global metadata."""
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.randn(4, 2))
+        mesh = init_device_mesh(
+            "cpu",
+            (2,),
+            mesh_dim_names=("tp",),
+            rank_list=(0, 1),
+            init_backend=False,
+        )
+        compiler = GraphCompiler(
+            model,
+            _mse_train_fn,
+            PassConfig(fsdp_enabled=False),
+            mesh_context=MeshContext(fsdp_non_moe_mesh=mesh),
+            source_shard_info={"weight": ((Shard(1),), mesh)},
+        )
+
+        self.assertFalse(compiler.is_compiled)
+        compiler.attach_source_shard_metadata()
+
+        chunk_info = model.weight.chunk_info
+        self.assertEqual(chunk_info.global_shape, (4, 4))
+        self.assertEqual(chunk_info.chunk.offsets, (0, 0))
+        self.assertEqual(chunk_info.chunk.sizes, (4, 2))
+        layouts = compiler.source_parameter_layouts or {}
+        self.assertIn(model.weight, layouts)
+        self.assertIs(model.weight._sharding_spec, layouts[model.weight])
 
     def test_parameter_layouts_are_lazy_and_refresh_replaced_parameters(self):
         """Only final physical storage is described; no gradient references are cached."""
