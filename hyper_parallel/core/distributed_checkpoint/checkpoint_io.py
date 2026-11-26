@@ -22,6 +22,42 @@ import torch
 from safetensors.torch import load_file, save_file
 
 
+def unshare_storage(state_dict: dict) -> dict:
+    """
+    Return the same mapping with no two tensors sharing one storage.
+
+    ``safetensors`` refuses to write a mapping whose entries alias each other,
+    so a model with tied weights -- ``lm_head.weight`` pointing at the
+    embedding under ``tie_word_embeddings``, the common case -- fails at save
+    time after training has already succeeded. Entries after the first in an
+    alias group are copied, which keeps every key, every value and the
+    round trip intact at the cost of writing the tied tensor once per name.
+
+    Tensors with no storage (``data_ptr() == 0``: empty, meta) are left alone;
+    they alias each other trivially and copying them would mean nothing.
+
+    Args:
+        state_dict (dict): Tensors to write, keyed by their physical name.
+
+    Returns:
+        dict: The same keys, with aliases replaced by independent copies.
+    """
+    owners = {}
+    unshared = {}
+    for name, value in state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            unshared[name] = value
+            continue
+        pointer = value.untyped_storage().data_ptr()
+        key = (value.device, pointer)
+        if pointer and key in owners:
+            unshared[name] = value.detach().clone().contiguous()
+        else:
+            owners[key] = name
+            unshared[name] = value
+    return unshared
+
+
 def save_checkpoint_file(state_dict: dict, file_path: str, ckpt_format: str = "safetensors") -> None:
     """
     Write a flat tensor dict to one checkpoint file.
@@ -33,7 +69,7 @@ def save_checkpoint_file(state_dict: dict, file_path: str, ckpt_format: str = "s
             a pickle written by :func:`torch.save`. Default ``safetensors``.
     """
     if ckpt_format == "safetensors":
-        save_file(tensors=state_dict, filename=file_path)
+        save_file(tensors=unshare_storage(state_dict), filename=file_path)
     else:
         torch.save(obj=state_dict, f=file_path)
 
