@@ -90,6 +90,16 @@ class LinearStrategy(ABC):
         """Run the complete bias-free Dense forward lifecycle."""
 
         input_matrix = _as_matrix(inputs)
+        if input_matrix.shape[0] == 0:
+            ctx.empty_tokens = True
+            ctx.strategy = self
+            ctx.input_shape = inputs.shape
+            ctx.input_dtype = inputs.dtype
+            ctx.weight_shape = weight.shape
+            ctx.weight_dtype = weight.dtype
+            ctx.device = weight.device
+            return inputs.new_empty(*inputs.shape[:-1], weight.shape[0])
+        ctx.empty_tokens = False
         needs_grad_input = inputs.requires_grad
         needs_grad_weight = weight.requires_grad
         input_quant = self.quantize_input(
@@ -143,9 +153,21 @@ class LinearStrategy(ABC):
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run the complete Dense dgrad/wgrad lifecycle."""
 
-        grad_matrix = _as_matrix(grad_output)
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
+        if getattr(ctx, "empty_tokens", False):
+            grad_input = (
+                grad_output.new_empty(ctx.input_shape, dtype=ctx.input_dtype)
+                if needs_grad_input
+                else None
+            )
+            grad_weight = (
+                torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.device)
+                if needs_grad_weight
+                else None
+            )
+            return grad_input, grad_weight
+        grad_matrix = _as_matrix(grad_output)
         if ctx.quantized_operands_saved:
             _, input_quant, weight_quant = restore_quantized_operands(ctx)
         else:

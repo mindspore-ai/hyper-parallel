@@ -19,10 +19,28 @@ from typing import Any
 
 from torch import nn
 
+from hyper_parallel.components.quantization.functional.hifloat8_linear_func import HiFloat8LinearStrategy
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
 from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import validate_hifloat8_runtime
 from hyper_parallel.components.quantization.ops.npu_mxfp8 import validate_npu_runtime
 from hyper_parallel.models.replacement import module_replacement
+
+
+def _validate_fp8_linear_context(
+    module: nn.Module,
+    module_fqn: str,
+    context: Mapping[str, Any],
+    *,
+    format_label: str,
+) -> None:
+    """Validate exact source type and supported parallel topology for FP8 Linear."""
+    if type(module) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
+        raise TypeError(f"{module_fqn!r} must be exact nn.Linear, got {type(module).__name__}")
+    if context.get("tp"):
+        raise NotImplementedError(f"{module_fqn!r}: {format_label} Linear does not support tensor parallelism")
+    if context.get("pp"):
+        raise NotImplementedError(f"{module_fqn!r}: {format_label} Linear does not support pipeline parallelism")
 
 
 @module_replacement
@@ -39,11 +57,27 @@ def replace_mxfp8_linear(
     Returns:
         The existing low-precision Linear with an MXFP8 strategy.
     """
-    if type(module) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
-        raise TypeError(f"{module_fqn!r} must be exact nn.Linear, got {type(module).__name__}")
+    _validate_fp8_linear_context(module, module_fqn, context, format_label="MXFP8")
     if module.in_features % 32 or module.out_features % 32:
         raise ValueError(f"{module_fqn!r}: MXFP8 Linear requires feature dimensions divisible by 32")
-    if context.get("pp"):
-        raise NotImplementedError(f"{module_fqn!r}: MXFP8 Linear does not support pipeline parallelism")
     validate_npu_runtime()
     return LowPrecisionLinear.from_linear(module, strategy=MXFP8LinearStrategy())
+
+
+@module_replacement
+def replace_hif8_linear(
+    *, module: nn.Module, module_fqn: str, context: Mapping[str, Any],
+) -> LowPrecisionLinear:
+    """Bind the HiFloat8 Dense strategy selected by the Family rule.
+
+    Args:
+        module: Source Linear whose loaded parameters are retained.
+        module_fqn: Module path for diagnostics.
+        context: Replacement context containing parallel topology.
+
+    Returns:
+        The existing low-precision Linear with a HiFloat8 strategy.
+    """
+    _validate_fp8_linear_context(module, module_fqn, context, format_label="HiFloat8")
+    validate_hifloat8_runtime()
+    return LowPrecisionLinear.from_linear(module, strategy=HiFloat8LinearStrategy())

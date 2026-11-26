@@ -50,9 +50,20 @@ class Linear(nn.Linear):
 register_module_family(ModuleFamily(
     name="linear",
     baseline=Linear,
-    variants={"mxfp8": "hyper_parallel.components.modules.low_precision_linear.replace_mxfp8_linear"},
+    variants={
+        "mxfp8": "hyper_parallel.components.modules.low_precision_linear.replace_mxfp8_linear",
+        "hif8": "hyper_parallel.components.modules.low_precision_linear.replace_hif8_linear",
+    },
     selector_specs={"weight_format": SelectorSpec(str, ""), "act_format": SelectorSpec(str, ""),
                     "is_fake_quantize": SelectorSpec(bool, False), "fused": SelectorSpec(bool, False)},
-    variant_rules=(VariantRule(
-        {"weight_format": "mxfp8", "act_format": "mxfp8", "is_fake_quantize": False, "fused": False}, "mxfp8"),),
+    variant_rules=(
+        VariantRule(
+            {"weight_format": "mxfp8", "act_format": "mxfp8", "is_fake_quantize": False, "fused": False},
+            "mxfp8",
+        ),
+        VariantRule(
+            {"weight_format": "hif8", "act_format": "hif8", "is_fake_quantize": False, "fused": False},
+            "hif8",
+        ),
+    ),
 ))

@@ -28,6 +28,7 @@ from hyper_parallel.components.functional.sparse_flash_mla import (
     supports_fused_attention_inputs, sparse_flash_mla,
 )
 from hyper_parallel.components.modules.common.rms_norm import RMSNorm
+from hyper_parallel.components.quantization.tensor.csa2_cache_tensor import CSA2CacheTensor
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from .compressor import CSA2Compressor
 from .document_layout import SharedCompressedPackedSequence
@@ -124,12 +125,13 @@ class SharedCompressedAttentionState:
 
     def require_index_key(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
         """Read the Indexer key associated with a compressed-KV source."""
-        return self._require(
+        value = self._require(
             self.index_key_by_source,
             source_layer,
             "Indexer key",
             consumer_layer,
         )
+        return value.dequantize() if isinstance(value, CSA2CacheTensor) else value
 
     def publish_topk_indices(self, source_layer: int, value: torch.Tensor) -> bool:
         """Publish one Full/Reindex layer's token selection."""
@@ -509,6 +511,12 @@ class CompressedSparseAttention2Module(nn.Module):
             return self.compressor(hidden_states, embeddings["compress"])
         return self.compressor(hidden_states, key_positions, block_plan)
 
+    def _publish_compressed_kv(
+            self, shared_state: SharedCompressedAttentionState, compressed: torch.Tensor,
+    ) -> None:
+        """Publish the local compressed K=V bank into the forward state."""
+        shared_state.publish_compressed_kv(self.layer_idx, compressed)
+
     def prepare_attention_inputs(self, hidden_states: torch.Tensor, embeddings: dict,
                                  shared_state: SharedCompressedAttentionState,
                                  document: CSA2DocumentInputs) -> CSA2AttentionInputs:
@@ -519,7 +527,7 @@ class CompressedSparseAttention2Module(nn.Module):
         qr, query = self._project_query(hidden_states, cos, sin)
         latent, compressed = self.compress_key_value(hidden_states, embeddings, plan, key_positions)
         if compressed is not None:
-            shared_state.publish_compressed_kv(self.layer_idx, compressed)
+            self._publish_compressed_kv(shared_state, compressed)
         indexed = self._run_indexer(hidden_states, qr, latent, embeddings, shared_state, document,
                                     block_plan=plan, key_position_embeddings=key_positions)
         return CSA2AttentionInputs(query, key_value, indexed)
@@ -575,7 +583,11 @@ class CompressedSparseAttention2Module(nn.Module):
             causal_upper=document.causal_upper,
         )
         if self.indexer.owns_key:
-            shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
+            shared_state.publish_index_key(
+                self.layer_idx,
+                indexer_output.index_key_cache if indexer_output.index_key_cache is not None
+                else indexer_output.index_key,
+            )
         shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
         if indexer_output.candidate_blocks is not None:
             shared_state.publish_candidate_blocks(
@@ -677,6 +689,10 @@ class CompressedSparseAttention2Module(nn.Module):
                     f"ratio={self.compress_ratio}, window={self.sliding_window}. "
                     "Check the SMLA training extension and native input contract; no reference fallback was run."
                 )
+        key_value = key_value.dequantize() if isinstance(key_value, CSA2CacheTensor) else key_value
+        compressed_kv = (compressed_kv.dequantize() if isinstance(compressed_kv, CSA2CacheTensor)
+                         else compressed_kv)
+        if self.use_fused_ops:
             output = sparse_flash_mla(
                 query, key_value, compressed_kv, topk_indices, self.sinks, self.scaling,
                 self.compress_ratio, self.sliding_window, query_offset, query_segments, raw_key_offset, main_key_offset,

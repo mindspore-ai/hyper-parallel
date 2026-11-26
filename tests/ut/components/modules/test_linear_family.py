@@ -22,7 +22,8 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules.linear import Linear
-from hyper_parallel.components.modules.low_precision_linear import replace_mxfp8_linear
+from hyper_parallel.components.modules.low_precision_linear import replace_hif8_linear, replace_mxfp8_linear
+from hyper_parallel.components.quantization.functional.hifloat8_linear_func import HiFloat8LinearStrategy
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
 from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
 from hyper_parallel.trainer.config.parallelism import entries_to_module_replacements
@@ -74,8 +75,38 @@ class TestLinearFamily(unittest.TestCase):
             replace_mxfp8_linear(module=type("SubLinear", (nn.Linear,), {})(128, 256), module_fqn="0", context={})
         with self.assertRaisesRegex(ValueError, "divisible by 32"):
             replace_mxfp8_linear(module=nn.Linear(30, 64), module_fqn="0", context={})
+        with self.assertRaisesRegex(NotImplementedError, "tensor parallelism"):
+            replace_mxfp8_linear(module=nn.Linear(128, 256), module_fqn="0", context={"tp": True})
         with self.assertRaisesRegex(NotImplementedError, "pipeline parallelism"):
             replace_mxfp8_linear(module=nn.Linear(128, 256), module_fqn="0", context={"pp": True})
+
+    @patch("hyper_parallel.components.modules.low_precision_linear.validate_hifloat8_runtime")
+    def test_hif8_selected_and_preserves_parameters(self, probe) -> None:
+        """
+        Feature: Scheme-selected Module Family.
+        Description: An explicit HiFloat8 scheme selects HiFloat8LinearStrategy without 32-alignment restriction.
+        Expectation: Selection, validation and 0-token forward/backward match the stated contract.
+        """
+        raw = linear_config(quantized=True).to_dict()
+        raw["training"]["low_precision"]["dtype_schemes"]["dense"] = {
+            "weight_format": "hif8", "act_format": "hif8",
+        }
+        source = nn.Linear(48, 80, bias=False)
+        model = install_family(nn.Sequential(source), resolve_config(raw))
+        self.assertIs(type(model[0]), LowPrecisionLinear)
+        self.assertIs(type(model[0].strategy), HiFloat8LinearStrategy)
+        self.assertIs(model[0].weight, source.weight)
+        probe.assert_called_once()
+        empty_in = torch.empty(2, 0, 48, dtype=torch.bfloat16, requires_grad=True)
+        empty_out = model(empty_in)
+        self.assertEqual(empty_out.shape, (2, 0, 80))
+        empty_out.sum().backward()
+        self.assertEqual(empty_in.grad.shape, (2, 0, 48))
+        torch.testing.assert_close(model[0].weight.grad, torch.zeros_like(model[0].weight), rtol=0, atol=0)
+        with self.assertRaisesRegex(NotImplementedError, "tensor parallelism"):
+            replace_hif8_linear(module=nn.Linear(48, 80), module_fqn="0", context={"tp": True})
+        with self.assertRaisesRegex(NotImplementedError, "pipeline parallelism"):
+            replace_hif8_linear(module=nn.Linear(48, 80), module_fqn="0", context={"pp": True})
 
     def test_dense_w4a8_is_not_silently_treated_as_grouped(self) -> None:
         """
