@@ -266,6 +266,7 @@ class DeepseekV41TopKRouter(nn.Module):
         self.top_k = int(config.num_experts_per_tok)
         self.scoring_func = str(config.scoring_func)
         self.routed_scaling_factor = float(config.routed_scaling_factor)
+        self.initializer_range = float(getattr(config, "initializer_range", 0.02))
         self.aux_loss_coeff = float(getattr(config, "router_aux_loss_coef", 0.0))
         if not math.isfinite(self.aux_loss_coeff) or self.aux_loss_coeff < 0:
             raise ValueError("router_aux_loss_coef must be finite and nonnegative")

@@ -113,7 +113,7 @@ def _uses_indexer_metadata(device: torch.device) -> bool:
 @torch.inference_mode(False)
 def _bsnd_indexer_metadata(device, batch, length, heads, dim, key_length, topk, ratio, residual):
     """Reuse shape-only BSND metadata without caching inference-mode tensors."""
-    residue = torch.full((batch,), residual, device=device, dtype=torch.int32)
+    residue = torch.full((batch,), residual, device=device, dtype=torch.int32) if ratio > 1 else None
     metadata = None
     if _uses_indexer_metadata(device):
         metadata = _load_indexer_metadata_op()(
