@@ -491,6 +491,29 @@ class TestReduceBuckets(unittest.TestCase):
         self.assertIs(param_group.comm_ctx.pre_param_group, param_group)
 
     @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
+    def test_final_bucket_applies_existing_grad_without_parking_view(self, mock_reduce_scatter):
+        """An accumulated device grad consumes the final RS view before root cleanup."""
+        param = _fake_param([1.0, 2.0])
+        param.source_shard_info = None
+        param.apply_grad_on_fp32_main_grad = False
+        param.sharded_param.grad = torch.tensor([10.0, 20.0])
+        param.apply_reduced_grad.side_effect = param.sharded_param.grad.add_
+        group = HSDPParamGroup([param], device=torch.device("cpu"))
+        _set_unsharded_grad(param, torch.ones(4))
+
+        def reduce_scatter(**args: torch.Tensor) -> MagicMock:
+            """Emulate the two-rank SUM into the supplied output tensor."""
+            args["output"].copy_(args["input"].view(2, -1).sum(dim=0))
+            return MagicMock()
+
+        mock_reduce_scatter.side_effect = reduce_scatter
+        group.foreach_reducescatter(dist.ReduceOp.SUM)
+        group.wait_reduce_scatter_and_issue_all_reduce()
+        param.apply_reduced_grad.assert_called_once()
+        torch.testing.assert_close(param.sharded_param.grad, torch.tensor([12.0, 22.0]))
+        self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_requires_all_reduce_accumulates_fresh_reduce_outputs(self, mock_reduce_scatter):
         """Deferred all-reduce should accumulate fresh reduce-scatter outputs."""
         hsdp_param = _fake_param([1.0, 2.0])

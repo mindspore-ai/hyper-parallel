@@ -886,11 +886,22 @@ class HSDPParamGroup:
                 reduce_scatter_bucket.layout.param_numels,
                 reduce_scatter_bucket.param_offsets,
             ):
-                hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = reduce_scatter_output.narrow(
+                grad_view = reduce_scatter_output.narrow(
                     0,
                     param_offset,
                     param_numel,
                 )
+                # Consume final device gradients while this bucket is current.
+                # Source-layout reductions and offload are finalized by the root.
+                if (
+                    hsdp_param.source_shard_info is None
+                    and not hsdp_param.offload_to_cpu
+                    and not hsdp_param.apply_grad_on_fp32_main_grad
+                    and hsdp_param.sharded_param.grad is not None
+                ):
+                    hsdp_param.apply_reduced_grad(grad_view)
+                else:
+                    hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = grad_view
         self.reduce_scatter_buckets = []
         # Step3: luanch async allreduce buckets
         self._issue_all_reduce_buckets(self.all_reduce_buckets, async_op)
