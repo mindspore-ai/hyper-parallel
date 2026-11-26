@@ -26,6 +26,7 @@ from .impl.grouped_matmul import GROUPED_MATMUL
 from .impl.grouped_swiglu import GROUPED_SWIGLU
 from .impl.kda import KDA
 from .impl.mhc_post import MHC_POST
+from .impl.mhc_pre import MHC_PRE, MHC_PRE_APPLY, MHC_SPLIT
 from .impl.moe_router import MOE_ROUTER
 from .impl.moe_token_reorder import MOE_TOKEN_REORDER, MOE_TOKEN_RESTORE
 from .impl.mome import MOME
@@ -38,6 +39,10 @@ from .registry import OpRegistry
 
 def apply_auto_policy(registry: OpRegistry) -> None:
     """Set device-specific priorities independently of implementation registration."""
+    for spec in (MHC_PRE, MHC_SPLIT, MHC_PRE_APPLY):
+        for device in ("cpu", "cuda", "npu"):
+            candidates = ("cann", "native") if spec == MHC_PRE and device == "npu" else ("native",)
+            registry.set_auto_order(spec, device=device, candidates=candidates)
     for spec in (RMS_NORM, RMS_NORM_FP32_AFFINE, SWIGLU, SWIGLU_CLAMPED):
         registry.set_auto_order(spec, device="npu", candidates=("torch_npu",))
         registry.set_auto_order(spec, device="cuda", candidates=("native",))

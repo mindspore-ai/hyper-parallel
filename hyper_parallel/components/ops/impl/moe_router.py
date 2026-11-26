@@ -21,7 +21,7 @@ from typing import Protocol
 import torch
 from torch.nn import functional as F
 
-from .._dependency import require_package
+from .._dependency import require_package, require_symbol
 from ..registry import ImplementationUnavailable, OpRegistry
 from ..spec import OpSpec
 
@@ -96,8 +96,28 @@ def _load_megagate() -> MoeRouterFn:
     return route
 
 
+def _load_tile_kernels() -> MoeRouterFn:
+    kernels = require_package("tile_kernels.moe")
+    require_symbol(kernels, "topk_gate")
+
+    def route(x, weight, bias, vision_bias, image_mask, top_k, scoring_func, scale):
+        """Fuse selection only; retain Torch's learned scoring and gradient path."""
+        logits = F.linear(x.reshape(-1, x.shape[-1]).float(), weight.float())  # pylint: disable=not-callable
+        scores = router_scores(logits, scoring_func)
+        if image_mask is not None and vision_bias is not None:
+            bias = torch.where(image_mask.reshape(-1, 1), vision_bias.unsqueeze(0), bias.unsqueeze(0))
+        indices = kernels.topk_gate((scores + bias).contiguous(), top_k)
+        weights = scores.gather(1, indices)
+        if top_k > 1:
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)
+        return logits, weights * scale, indices
+
+    return route
+
+
 def register_moe_router(registry: OpRegistry) -> None:
     """Register DeepSeek's Torch router and MegaGate route kernel."""
     registry.register_family("moe_router", specs=(MOE_ROUTER,))
     registry.register_impl(MOE_ROUTER, name="native", devices=("cpu", "cuda", "npu"), load=lambda: _torch_router)
     registry.register_impl(MOE_ROUTER, name="megagate", devices=("npu",), load=_load_megagate)
+    registry.register_impl(MOE_ROUTER, name="tile_kernels", devices=("npu",), load=_load_tile_kernels)

@@ -14,9 +14,12 @@
 # ============================================================================
 """Packed and DeepSeek FP32 clamped SwiGLU implementations."""
 
+from __future__ import annotations
+
 from typing import Protocol
 
 import torch
+from torch.autograd.function import once_differentiable
 from torch.nn import functional as F
 
 from ..registry import OpRegistry
@@ -88,11 +91,52 @@ def _load_npu_clamped() -> ClampedSwiGLUFn:
     return swiglu_clamped
 
 
+class _TileKernelsSwiGLU(torch.autograd.Function):
+    """Bind the upstream non-quantized forward and backward to one autograd node."""
+
+    @staticmethod
+    def forward(ctx, x, forward_kernel, backward_kernel):
+        """Retain the packed input and the exact backward selected for this call."""
+        ctx.save_for_backward(x)
+        ctx.backward_kernel = backward_kernel
+        ctx.fmt = "bf16" if x.dtype == torch.bfloat16 else "fp32"
+        return forward_kernel(x, ctx.fmt)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        """Consume the upstream tuple containing the unquantized input gradient."""
+        (x,) = ctx.saved_tensors
+        (grad_input,) = ctx.backward_kernel(x, grad_output.contiguous(), ctx.fmt)
+        return grad_input, None, None
+
+
+def _load_tile_kernels() -> SwiGLUFn:
+    kernels = require_package("tile_kernels.quant")
+    require_symbol(kernels, "swiglu_forward")
+    require_symbol(kernels, "swiglu_backward")
+    forward_kernel, backward_kernel = kernels.swiglu_forward, kernels.swiglu_backward
+
+    def swiglu(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Adapt arbitrary packed axes and leading dimensions to upstream's 2-D ABI."""
+        packed = x.movedim(dim, -1)
+        width = packed.shape[-1]
+        result = _TileKernelsSwiGLU.apply(
+            packed.reshape(-1, width).contiguous(), forward_kernel, backward_kernel,
+        )
+        return result.reshape(*packed.shape[:-1], width // 2).movedim(-1, dim)
+
+    return swiglu
+
+
 def register_swiglu(registry: OpRegistry) -> None:
     """Register packed and clamped SwiGLU under the same selection key."""
     registry.register_family("swiglu", specs=(SWIGLU, SWIGLU_CLAMPED))
     registry.register_impl(SWIGLU, name="native", devices=("cuda", "cpu", "npu"), load=_load_native)
     registry.register_impl(SWIGLU, name="torch_npu", devices=("npu",), load=_load_npu)
+    registry.register_impl(
+        SWIGLU, name="tile_kernels", devices=("npu",), load=_load_tile_kernels,
+    )
     registry.register_impl(
         SWIGLU_CLAMPED, name="native", devices=("cuda", "cpu", "npu"), load=_load_native_clamped,
     )

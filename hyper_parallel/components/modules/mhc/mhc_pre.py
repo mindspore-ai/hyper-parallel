@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from typing import Any
 import torch
 from torch import nn
-from hyper_parallel.components.functional.mhc_pre import mhc_pre
+from hyper_parallel.components.ops import mhc_pre
 from ._utils import (_validate_settings, _num_stream, _required_attribute, _required_config_value,
                          _parameter, _validate_parameter_layout)
 

@@ -21,7 +21,9 @@ import torch
 
 from hyper_parallel.components.ops.catalog import builtin_registry
 from tests.common.op_precision import PrecisionCase
-from tests.common.op_precision_cases import attention_cases, expert_cases, linear_attention_cases, pointwise_cases
+from tests.common.op_precision_cases import (
+    attention_cases, expert_cases, linear_attention_cases, mhc_pre_cases, pointwise_cases, tile_kernels_cases,
+)
 from tests.common.op_precision_dsa import dsa_cases
 
 FAMILY_BUILDERS: dict[str, Callable[..., list[PrecisionCase]]] = {
@@ -29,6 +31,7 @@ FAMILY_BUILDERS: dict[str, Callable[..., list[PrecisionCase]]] = {
     "swiglu": pointwise_cases,
     "rope": pointwise_cases,
     "mhc_post": pointwise_cases,
+    "mhc_pre": mhc_pre_cases,
     "sinkhorn": pointwise_cases,
     "grouped_matmul": expert_cases,
     "grouped_swiglu": expert_cases,
@@ -45,7 +48,7 @@ FAMILY_BUILDERS: dict[str, Callable[..., list[PrecisionCase]]] = {
 }
 
 
-def backend_precision_dtypes(family: str, backend: str) -> tuple[torch.dtype, ...]:
+def backend_precision_dtypes(family: str, backend: str, variant: str = "standard") -> tuple[torch.dtype, ...]:
     """Return the explicit training dtype scope of the hardware precision gate.
 
     DSA and optional linear-attention/expert kernels retain BF16 acceptance
@@ -53,6 +56,14 @@ def backend_precision_dtypes(family: str, backend: str) -> tuple[torch.dtype, ..
     The built-in Torch NPU pointwise, attention and grouped kernels cover all
     three training dtypes. CUDA grouped_mm only accepts BF16.
     """
+    if family == "mhc_pre":
+        return (torch.float32,) if variant == "split_mixes" else (torch.bfloat16,)
+    if backend == "tile_kernels":
+        if family == "mhc_post":
+            return (torch.bfloat16,)
+        if family == "sinkhorn":
+            return (torch.float32,)
+        return (torch.float32, torch.bfloat16)
     if backend == "torch_grouped_mm":
         return (torch.bfloat16,)
     if family in ("rms_norm", "swiglu", "rope", "attention", "grouped_matmul",
@@ -65,8 +76,12 @@ def backend_precision_dtypes(family: str, backend: str) -> tuple[torch.dtype, ..
     return (torch.bfloat16,)
 
 
-def precision_cases(family: str, dtype: torch.dtype, *, hardware: bool = False) -> list[PrecisionCase]:
+def precision_cases(
+    family: str, dtype: torch.dtype, *, hardware: bool = False, backend: str = "native",
+) -> list[PrecisionCase]:
     """Return deterministic cases for one family, with fused-compatible ST dimensions."""
+    if backend == "tile_kernels":
+        return tile_kernels_cases(family, dtype)
     return [case for case in FAMILY_BUILDERS[family](dtype, hardware) if case.family == family]
 
 

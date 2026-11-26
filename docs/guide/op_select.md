@@ -24,7 +24,84 @@ ops:
 
 NPU and GPU training recipes can share the same `ops` settings when they use `auto`. To pin a backend, set the implementation in each device's YAML. For example, use `attention: torch_npu` in the NPU recipe and `attention: sdpa` in the CUDA recipe.
 
-Use `--ops.<family>=<implementation>` to add or override a selection, for example `--ops.deepseek_sparse_attention=native`. Model replacements and recipe migration follow in the integration PR. The Python examples below exercise the standalone public interfaces.
+Use `--ops.<family>=<implementation>` to add or override a selection, for example `--ops.deepseek_sparse_attention=native`. The mHC modules call public Ops; other module and recipe migrations follow in integration PRs.
+
+### TileKernels
+
+Requirements: [TileKernels](https://github.com/deepseek-ai/TileKernels#requirements) currently requires Ascend 950, CANN ≥9.2.0, Python ≥3.12, PyTorch ≥2.13 and TileLang ≥0.1.15 with the Ascend backend enabled.
+
+Install:
+
+```bash
+git clone https://github.com/deepseek-ai/TileKernels.git
+python -m pip install ./TileKernels
+```
+
+SwiGLU forward and backward:
+
+```python
+import torch
+import torch_npu
+from hyper_parallel.components.ops import ops, swiglu
+
+ops.set_backends({"swiglu": "tile_kernels"})
+x = torch.randn(2, 256, device="npu", dtype=torch.bfloat16, requires_grad=True)
+swiglu(x).float().sum().backward()
+print(ops.used_backends())
+```
+
+Interleaved RoPE forward and backward:
+
+```python
+import torch
+import torch_npu
+from hyper_parallel.components.ops import ops, rope_interleaved
+
+ops.set_backends({"rope": "tile_kernels"})
+q = torch.randn(1, 4, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(1, 2, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+angles = torch.randn(1, 16, 32, device="npu")
+cos, sin = (t.to(q.dtype).repeat(1, 1, 2) for t in (angles.cos(), angles.sin()))
+q_out, k_out = rope_interleaved(q, k, cos, sin)
+(q_out.float().sum() + k_out.float().sum()).backward()
+print(ops.used_backends())
+```
+
+Trainer YAML configuration (applies only to modules calling the public Ops interfaces):
+
+```yaml
+ops:
+  swiglu: tile_kernels
+  rope: tile_kernels
+  mhc_pre: tile_kernels
+  mhc_post: tile_kernels
+  sinkhorn: tile_kernels
+  moe_router: tile_kernels
+```
+
+| Interface | Supported scope |
+|---|---|
+| `swiglu` | BF16/FP32; positive packed Gate/Up dimension divisible by 256 |
+| `rope_interleaved` | 4-D BF16/FP32 Q/K; rotary dimensions 64/128; partial rotation and first-order input/frequency gradients |
+| `mhc_pre` | Four BF16 streams, FP32 projection and coefficients, optional gamma; returns block input, post/residual coefficients and original residual |
+| `mhc_split_mixes`, `mhc_pre_apply` | Share the `mhc_pre` configuration key; FP32 coefficient splitting and BF16 stream aggregation using upstream forward/backward |
+| `mhc_post` | BF16 activations and FP32 coefficients; upstream Post forward/backward with flattened output streams |
+| `sinkhorn` | FP32, 4×4 mixing matrices; upstream Sinkhorn forward/backward |
+| `moe_router` | V4.1 `sqrtsoftplus` routing; TileKernels Top-K selection only, retaining Torch projection, scoring and gradients; Top-K ≤32 |
+
+RoPE preserves inputs. Use `unsqueeze_dim=1` for `[B,H,S,D]` or `2` for `[B,S,H,D]`. FP16 Q/K, half RoPE, clamped SwiGLU, quantized outputs and second derivatives are unsupported. TileKernels requires explicit selection and is excluded from automatic selection.
+
+`MHCPre`, `MHCPost` and `PipelinedMhc` use these settings. `PipelinedMhc(hidden)` retains its three coefficient outputs; `PipelinedMhc(hidden, pre_mix)` returns the input aggregated using the supplied coefficients and the next pre/post/residual coefficients.
+
+Run forward/backward precision acceptance on an NPU meeting the requirements above:
+
+```bash
+python -m pip install -e .
+python -m pytest -v --log-cli-level=INFO --junitxml=tile_kernels_precision.xml \
+  tests/torch/ops/_test_backend_precision.py::test_tile_kernels_precision
+```
+
+This covers the interfaces above. Each case checks native against an independent mathematical reference, then real kernels against same-device native outputs and all differentiable input gradients, including input immutability. mHC Pre covers optional gamma, projection, scale/base and aggregation gradients. Missing dependencies or NPU hardware fail this entry instead of skipping. Logs include per-tensor errors.
 
 ## How backend selection works
 
@@ -59,6 +136,8 @@ Each device column lists its `auto` candidates in priority order from left to ri
 | `swiglu` | `standard`, `clamped_fp32` for packed inputs and clamping separate inputs | `torch_npu` | `native` | `native` |
 | `rope` | `half`, `interleaved`, both with partial head-dimension rotation | `torch_npu`, `native` | `native` | `native` |
 | `mhc_post` | `standard` mixes the transformed output and residual streams | `cann`, `omni`, `native` | `native` | `native` |
+| `mhc_pre` | `standard`, complete Pre | `cann`, `native` | `native` | `native` |
+| `mhc_pre` | `split_mixes`, `apply_mix`, coefficient splitting and aggregation | `native` | `native` | `native` |
 | `sinkhorn` | `standard` normalizes the mHC mixing matrix | `omni`, `native` | `native` | `native` |
 | `mome` | `standard` applies masked causal convolution and a residual connection on the DSA output | `omni`, `native` | `native` | `native` |
 | `grouped_matmul` | `standard` performs a single bias-free grouped matrix multiplication with expert-major inputs | `torch_npu` | `torch_grouped_mm`, `native` | `native` |

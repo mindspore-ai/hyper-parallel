@@ -48,15 +48,32 @@ class TestPrecisionChecks(unittest.TestCase):
         for family, variant, backend, device in registered_backends():
             if backend == "native" or device not in ("npu", "cuda"):
                 continue
-            for dtype in backend_precision_dtypes(family, backend):
+            for dtype in backend_precision_dtypes(family, backend, variant):
                 with self.subTest(family=family, variant=variant, backend=backend, dtype=dtype):
-                    cases = [case for case in precision_cases(family, dtype, hardware=True)
+                    cases = [case for case in precision_cases(family, dtype, hardware=True, backend=backend)
                              if case.variant == variant]
                     self.assertTrue(cases, f"Missing cases for {family}/{variant}/{backend}/{device}/{dtype}")
                     names = [case.name for case in cases]
                     self.assertEqual(len(names), len(set(names)), f"Duplicate case names: {names}")
                     first = next(arg for arg in cases[0].args if isinstance(arg, torch.Tensor))
                     self.assertEqual(first.dtype, dtype)
+
+    def test_tile_kernels_fixtures_preserve_existing_case_dimensions(self) -> None:
+        """New backend dimensions must not replace native or existing fused fixtures."""
+        for family, expected_width, tile_width in (("swiglu", 128, 256), ("rope", 32, 64)):
+            with self.subTest(family=family):
+                default = precision_cases(family, torch.bfloat16, hardware=True)
+                existing = precision_cases(family, torch.bfloat16, hardware=True, backend="torch_npu")
+                tile = precision_cases(family, torch.bfloat16, hardware=True, backend="tile_kernels")
+                self.assertEqual([case.name for case in default], [case.name for case in existing])
+                for left, right in zip(default, existing):
+                    for arg, target in zip(left.args, right.args):
+                        if isinstance(arg, torch.Tensor):
+                            torch.testing.assert_close(arg, target, rtol=0, atol=0)
+                argument = 0 if family == "swiglu" else 2
+                self.assertEqual(default[0].args[argument].shape[-1], expected_width)
+                self.assertEqual(tile[0].args[argument].shape[-1], tile_width)
+                self.assertTrue(all(case.name.startswith("tile_kernels_") for case in tile))
 
     def test_pointwise_success_does_not_bypass_relative_l2(self) -> None:
         """A small systematic drift can pass allclose while exceeding the L2 budget."""
