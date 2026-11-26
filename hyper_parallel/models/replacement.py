@@ -28,10 +28,14 @@ from typing import Any, Callable, Iterable, Optional
 
 from torch import nn
 
-from hyper_parallel.components.modules.family import resolve_module_family_target
 from hyper_parallel.components.modules.module_family import (
-    FamilyRequest, _module_aliases, _validate_initialization_contract,
-    build_family, get_family_build_info, get_module_family,
+    FamilyRequest,
+    _module_aliases,
+    _validate_initialization_contract,
+    build_family,
+    get_family_build_info,
+    get_module_family,
+    resolve_module_family_target,
 )
 from hyper_parallel.models.build_context import collect_module_contexts
 

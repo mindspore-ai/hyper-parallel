@@ -19,8 +19,8 @@ from dataclasses import replace
 from importlib import import_module
 from unittest.mock import patch
 
-from hyper_parallel.components.modules import family as registry
-from hyper_parallel.components.modules.family import (
+from hyper_parallel.components.modules import module_family as registry
+from hyper_parallel.components.modules.module_family import (
     ModuleFamily,
     SelectorSpec,
     VariantRule,

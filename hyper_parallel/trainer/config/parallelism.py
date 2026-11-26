@@ -44,7 +44,7 @@ from hyper_parallel.models.replacement import (
     module_replacement,
 )
 
-from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.components.modules.module_family import get_module_family
 from hyper_parallel.trainer.config.replacement import ReplacementTarget
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 

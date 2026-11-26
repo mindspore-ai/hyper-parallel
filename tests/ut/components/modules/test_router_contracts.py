@@ -28,7 +28,7 @@ from hyper_parallel.components.modules.moe.router import (
     Gate, GateModule, MegaGateModule, routing_scores, select_topk_scores,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
-from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.components.modules.module_family import get_module_family
 from tests.common.mark_utils import arg_mark
 
 

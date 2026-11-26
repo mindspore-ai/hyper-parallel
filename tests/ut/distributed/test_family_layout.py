@@ -24,7 +24,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from hyper_parallel.components.modules import family as registry
+from hyper_parallel.components.modules import module_family as registry
 from hyper_parallel.components.modules.module_family import FamilyShardingContext, build_family
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard

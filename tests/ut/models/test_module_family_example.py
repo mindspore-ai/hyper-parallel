@@ -21,7 +21,7 @@ from unittest.mock import patch
 import torch
 
 from examples.torch.module_family import CausalAttention, DecoderConfig, FamilyDecoder, GroupedExperts
-from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.components.modules.module_family import get_module_family
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from tests.common.mark_utils import arg_mark
 

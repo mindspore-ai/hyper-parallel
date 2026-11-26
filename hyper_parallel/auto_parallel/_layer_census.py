@@ -564,7 +564,7 @@ def replacement_specs(plan_overrides: Any) -> Tuple[Any, ...]:
         ValueError: If a replacement names a module or factory that cannot be
             imported, or uses a removed replacement field.
     """
-    from hyper_parallel.components.modules.family import resolve_module_family_target  # pylint: disable=C0415
+    from hyper_parallel.components.modules.module_family import resolve_module_family_target  # pylint: disable=C0415
     from hyper_parallel.models.replacement import ModuleReplacementSpec, module_replacement  # pylint: disable=C0415
 
     specs = []

@@ -31,7 +31,7 @@ from hyper_parallel.components.modules.attention.grouped_query_attention.grouped
 from hyper_parallel.components.modules.attention.multi_latent_attention.multi_latent_attention import (
     MultiLatentAttentionModule,
 )
-from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.components.modules.module_family import get_module_family
 from hyper_parallel.components.modules.common.rms_norm import NativeRMSNormModule, NativeOffsetRMSNormModule
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementSpec

@@ -30,7 +30,12 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 )
 
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
+from hyper_parallel.components.modules.module_family import (
+    ModuleFamily,
+    SelectorSpec,
+    VariantRule,
+    register_module_family,
+)
 from hyper_parallel.components.functional import (
     grouped_matmul,
     moe_token_permute,

@@ -25,7 +25,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from hyper_parallel.components.modules import family as registry
+from hyper_parallel.components.modules import module_family as registry
 from hyper_parallel.components.modules.module_family import (
     FamilyRequest, ResolvedFamily, build_family, collect_family_modules, get_family_build_info, validate_family_context,
 )
