@@ -59,8 +59,24 @@ class SpatialMergeProjectorModule(nn.Module):
                 or self.downsample_ratio < 1):
             raise ValueError("downsample_ratio must be a positive integer")
 
-    def forward(self, hidden_states: Tensor, grid_height: int, grid_width: int) -> Tensor:
-        """Pad one image grid, merge channel-major patches and project image-token rows."""
+    def forward(self, hidden_states: Tensor, grid_height: int | None = None,
+                grid_width: int | None = None, *, input_is_merged: bool = False) -> Tensor:
+        """Project a full image grid or already merged channel-major output rows.
+
+        Args:
+            hidden_states: Image patch rows, or [output_rows, ratio**2 * input_size].
+            grid_height: Full image patch height for ordinary spatial merging.
+            grid_width: Full image patch width for ordinary spatial merging.
+            input_is_merged: Use preassembled independent spatial blocks. This
+                retains the module forward boundary for FSDP and checkpointing.
+        """
+        if input_is_merged:
+            if grid_height is not None or grid_width is not None:
+                raise ValueError("premerged projector inputs do not take image grid dimensions")
+            if hidden_states.ndim != 2 or hidden_states.shape[1] != self.w1.in_features:
+                raise ValueError("premerged projector rows must match w1.in_features")
+            return self.w2(F.gelu(self.w1(hidden_states)))  # pylint: disable=not-callable
+
         if any(isinstance(size, bool) or not isinstance(size, int) or size < 1 for size in (grid_height, grid_width)):
             raise ValueError("grid dimensions must be positive integers")
         channels = self.w1.in_features // self.downsample_ratio**2

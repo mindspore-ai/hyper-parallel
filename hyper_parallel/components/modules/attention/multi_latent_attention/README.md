@@ -67,7 +67,8 @@ latent 可减少 KV 通信量，实际节省取决于 latent 宽度、头数和 
 | [multi_latent_attention.py](multi_latent_attention.py) | MLA 参数构造与转换、投影/RoPE、FA 和共享 forward |
 | [multi_latent_attention_family.py](multi_latent_attention_family.py) | 选择 local/CP 成员，声明布局并校验配置 |
 | [cp_multi_latent_attention.py](cp_multi_latent_attention.py) | CP 拓扑、文档分区、输入调度和输出恢复 |
-| [cp_mla_backward_overlap.py](cp_mla_backward_overlap.py) | 投影与通信的配对反向，以及输出通信重叠 |
+| [cp_mla_backward_overlap.py](cp_mla_backward_overlap.py) | MLA latent 投影与输出投影的通信反向调度 |
+| [ulysses_overlap.py](../../../../distributed/context_parallel/ulysses_overlap.py) | MLA、Gated MLA 和 ViT 共用的 Q/K/V 配对 launch/wait |
 
 ## 执行流程
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MLA backward scheduling with paired input A2A nodes and one output projection node.
+"""MLA-specific latent and output projection backward scheduling.
 
 Paired launch/wait nodes require a complete first-order training backward.
 Partial autograd.grad calls can prune the consumer and are not supported.
@@ -31,8 +31,9 @@ from torch.autograd.function import once_differentiable
 from torch.nn import functional as F
 
 from hyper_parallel.distributed.context_parallel.collectives import (
-    AsyncCPCollective, async_ulysses_seq_to_head_launch,
+    async_ulysses_seq_to_head_launch,
 )
+from hyper_parallel.distributed.context_parallel.ulysses_overlap import UlyssesInputA2AState
 
 
 class CPMLAOutputLinear(nn.Linear):
@@ -173,79 +174,11 @@ def _output_projection_backward(ctx, gradient):
     return grad_attention_output, grad_weight, grad_bias, None
 
 
-@dataclass
-class MLAInputA2AState:
-    """Own one input A2A and its inverse for a single forward invocation.
-
-    Attributes:
-        mesh: Ulysses device mesh.
-        forward_a2a_handle: Q/K/V transfer from token-local to head-local layout.
-        backward_a2a_handle: Gradient transfer from head-local to token-local layout.
-        needs_send_grad: Whether the original input requires its inverse transfer.
-
-    Each handle owns the communication work and its buffers. The paired consumer
-    waits for it exactly once before reading the result, then clears the field.
-    This shared state passes directly between autograd nodes, not through the
-    managed projection's forward arguments and FSDP input conversion.
-    """
-
-    mesh: Any
-    forward_a2a_handle: AsyncCPCollective | None = None
-    backward_a2a_handle: AsyncCPCollective | None = None
-    needs_send_grad: bool = False
-
-
-class _InputA2ALaunch(torch.autograd.Function):
-    """Keep independent native compute between a send and its gradient wait."""
-
-    @staticmethod
-    def forward(ctx: Any, send_tensor: torch.Tensor, compute_input: torch.Tensor,
-                state: MLAInputA2AState) -> torch.Tensor:
-        """Launch token-to-head A2A and attach the intervening compute edge.
-
-        Args:
-            ctx: Autograd context holding this invocation's A2A state.
-            send_tensor: Token-local tensor ready for communication.
-            compute_input: Input of the independent projection branch.
-            state: Forward and backward handles shared with the paired wait.
-
-        Returns:
-            A view of compute_input retaining both gradient dependencies.
-        """
-        ctx.state = state
-        state.needs_send_grad = ctx.needs_input_grad[0]
-        state.forward_a2a_handle = async_ulysses_seq_to_head_launch(send_tensor, 1, 2, state.mesh)
-        # Pass through the value without a copy while the paired nodes bracket
-        # the independent projection's native backward graph.
-        return compute_input.view_as(compute_input)
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx: Any, compute_gradient: torch.Tensor) -> tuple:
-        """Consume the inverse A2A after the independent branch backward.
-
-        Args:
-            ctx: Autograd context containing the paired A2A state.
-            compute_gradient: Gradient returned by the independent branch.
-
-        Returns:
-            Exchanged source gradient, compute gradient and no state gradient.
-        """
-        state = ctx.state
-        send_gradient = None
-        if state.needs_send_grad:
-            if state.backward_a2a_handle is None:
-                raise RuntimeError("MLA input consumer did not submit its inverse A2A")
-            send_gradient = state.backward_a2a_handle.wait()
-            state.backward_a2a_handle = None
-        return send_gradient, compute_gradient, None
-
-
 class _LatentInputA2AWait(torch.autograd.Function):
     """Launch inverse Q before releasing the local KV projection gradients."""
 
     @staticmethod
-    def forward(ctx: Any, key: torch.Tensor, value: torch.Tensor, state: MLAInputA2AState) -> tuple:
+    def forward(ctx: Any, key: torch.Tensor, value: torch.Tensor, state: UlyssesInputA2AState) -> tuple:
         """Attach completed Q and both KV edges to the paired consumer.
 
         Args:
@@ -281,114 +214,6 @@ class _LatentInputA2AWait(torch.autograd.Function):
         if state.needs_send_grad:
             state.backward_a2a_handle = async_ulysses_seq_to_head_launch(grad_query, 2, 1, state.mesh)
         return grad_key, grad_value, None
-
-
-@dataclass
-class MLAExpandedInputA2AState:
-    """Own only the Q/K/V transfers for one expanded forward invocation."""
-
-    query: MLAInputA2AState
-    key: MLAInputA2AState
-    value: MLAInputA2AState
-
-    def wait(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Consume Q/K/V in attention order after all forward work is submitted."""
-        results = []
-        for a2a_state in (self.query, self.key, self.value):
-            results.append(a2a_state.forward_a2a_handle.wait())
-            a2a_state.forward_a2a_handle = None
-        return results[0], results[1], results[2]
-
-    def launch_backward(self, grad_query: torch.Tensor, grad_key: torch.Tensor,
-                        grad_value: torch.Tensor) -> None:
-        """Submit each required inverse before releasing the independent compute.
-
-        Args:
-            grad_query: Head-local query gradient from attention.
-            grad_key: Head-local key gradient from attention.
-            grad_value: Head-local value gradient from attention.
-        """
-        for a2a_state, gradient in ((self.query, grad_query), (self.key, grad_key), (self.value, grad_value)):
-            if a2a_state.needs_send_grad:
-                a2a_state.backward_a2a_handle = async_ulysses_seq_to_head_launch(gradient, 2, 1, a2a_state.mesh)
-
-
-class _ExpandedInputA2AWait(torch.autograd.Function):
-    """Finish ordinary MLA inputs and return only Q's gradient to its projection."""
-
-    @staticmethod
-    def forward(ctx: Any, query: torch.Tensor, state: MLAExpandedInputA2AState) -> tuple:
-        """Submit Q after the shared V/K launches, then consume all three inputs.
-
-        Args:
-            ctx: Autograd context holding the three input transfers.
-            query: Final token-local query, with no following gate computation.
-            state: Per-forward Q/K/V communication state.
-
-        Returns:
-            Completed attention inputs in query, key, value order.
-        """
-        ctx.state = state
-        state.query.needs_send_grad = ctx.needs_input_grad[0]
-        state.query.forward_a2a_handle = async_ulysses_seq_to_head_launch(query, 1, 2, state.query.mesh)
-        return state.wait()
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx: Any, grad_query: torch.Tensor, grad_key: torch.Tensor,
-                 grad_value: torch.Tensor) -> tuple:
-        """Submit dQ/dK/dV and release Q backward after dQ has arrived.
-
-        Args:
-            ctx: Autograd context holding the three paired input transfers.
-            grad_query: Attention gradient for head-local queries.
-            grad_key: Attention gradient for head-local keys.
-            grad_value: Attention gradient for head-local values.
-
-        Returns:
-            Token-local Q gradient and no communication-state gradient.
-        """
-        state = ctx.state
-        state.launch_backward(grad_query, grad_key, grad_value)
-        query_gradient = None
-        if state.query.needs_send_grad:
-            query_gradient = state.query.backward_a2a_handle.wait()
-            state.query.backward_a2a_handle = None
-        return query_gradient, None
-
-
-def launch_input_a2a(send_tensor: torch.Tensor, compute_input: torch.Tensor,
-                     a2a_state: MLAInputA2AState) -> torch.Tensor:
-    """Submit an input A2A while retaining its native collective backward.
-
-    Args:
-        send_tensor: Final token-local Q, K or V ready to send.
-        compute_input: Input of the independent branch to execute next.
-        a2a_state: State receiving this forward communication handle.
-
-    Returns:
-        Unchanged compute_input, without adding a paired autograd dependency.
-    """
-    a2a_state.forward_a2a_handle = async_ulysses_seq_to_head_launch(send_tensor, 1, 2, a2a_state.mesh)
-    return compute_input
-
-
-def finish_expanded_inputs(query: torch.Tensor, state: MLAExpandedInputA2AState,
-                           overlap_backward: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Finish ungated expanded inputs using paired or native collective gradients.
-
-    Args:
-        query: Final token-local query, after V and K have been submitted.
-        state: This invocation's Q/K/V communication state.
-        overlap_backward: Pair input autograd nodes for the pure-Ulysses backward.
-
-    Returns:
-        Completed query, key and value tensors in head-local layout.
-    """
-    if overlap_backward:
-        return _ExpandedInputA2AWait.apply(query, state)
-    state.query.forward_a2a_handle = async_ulysses_seq_to_head_launch(query, 1, 2, state.query.mesh)
-    return state.wait()
 
 
 class _LatentKVLinear(torch.autograd.Function):

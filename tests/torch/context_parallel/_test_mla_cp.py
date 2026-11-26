@@ -587,7 +587,7 @@ def _overlap_snapshot(module, mesh, strategy, packed, gated, overlap, degree):
         value = full_input[:, rank * local:(rank + 1) * local].to(device).clone().requires_grad_()
         output = checkpoint(forward, value, use_reentrant=False) if packed else forward(value)
         nodes = _overlap_graph_nodes(output)
-        consumer = "_GatedExpandedInputA2AWaitBackward" if gated else "_ExpandedInputA2AWaitBackward"
+        consumer = "_GatedExpandedInputA2AWaitBackward" if gated else "_QKVInputA2AWaitBackward"
         if strategy == "latent_kv_head":
             consumer = "_LatentInputA2AWaitBackward"
         output_node = "_GatedOutputProjectionBackward" if gated else "_OutputProjectionBackward"

@@ -23,6 +23,9 @@ from hyper_parallel.distributed.encoder_parallel.planning import DecoderSequence
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
 from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Model
+from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
+    IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START,
+)
 
 
 class TestEncoderMerge(unittest.TestCase):
@@ -41,7 +44,7 @@ class TestEncoderMerge(unittest.TestCase):
         parameter_anchor = torch.zeros((), requires_grad=True)
         captured = []
 
-        def _merge(hidden, local_types, records, global_start):
+        def _merge(hidden, local_types, records, global_start, **_kwargs):
             captured.append((local_types, records, global_start))
             return hidden
 
@@ -88,7 +91,7 @@ class TestEncoderMerge(unittest.TestCase):
         model = SimpleNamespace(
             embed_tokens=lambda _input_ids: torch.ones((1, 32, 8)),
             _collect_image_records=lambda *_args: ["image-record"],
-            _merge_image_embeddings=lambda hidden, types, records, start: (
+            _merge_image_embeddings=lambda hidden, types, records, start, **_kwargs: (
                 captured.append((types, records, start)) or hidden
             ),
         )
@@ -135,3 +138,41 @@ class TestEncoderMerge(unittest.TestCase):
         )
         no_sp = runtime.build_runtime_inputs(batch=batch, context=no_sp_context)
         self.assertEqual(no_sp["image_sequence_start"], 128)
+
+    def test_partial_feature_rows_preserve_merge_and_all_gradients(self):
+        """Feature: image features routed as exact row intervals.
+
+        Description: Compare full records with local subsets across marker-only shards.
+        Expectation: Embeddings, marker gradients and image gradients match exactly.
+        """
+        torch.manual_seed(18)
+        model = SimpleNamespace(image_start=torch.randn(4, requires_grad=True),
+                                image_end=torch.randn(4, requires_grad=True),
+                                image_newline=torch.randn(4, requires_grad=True))
+        features = (torch.randn(4, 4, requires_grad=True), torch.randn(2, 4, requires_grad=True))
+        types = torch.zeros(1, 20, dtype=torch.long)
+        types[0, :8] = torch.tensor([IMAGE_START, IMAGE, IMAGE, IMAGE_NEW_LINE,
+                                    IMAGE, IMAGE, IMAGE_NEW_LINE, IMAGE_END])
+        types[0, 12:17] = torch.tensor([IMAGE_START, IMAGE, IMAGE, IMAGE_NEW_LINE, IMAGE_END])
+        records = [(0, 0, 2, 2, features[0]), (0, 12, 1, 2, features[1])]
+        markers = (model.image_start, model.image_end, model.image_newline)
+        for start in (0, 4, 8, 12, 16):
+            with self.subTest(start=start):
+                hidden = torch.randn(1, 4, 4, requires_grad=True)
+                full = DeepseekV41Model._merge_image_embeddings(  # pylint: disable=protected-access
+                    model, hidden, types[:, start:start + 4], records, start)
+                partial, row_starts = [], []
+                for batch, token, height, width, feature in records:
+                    before = max(0, min(height * (width + 1), start - token - 1))
+                    after = max(0, min(height * (width + 1), start + 4 - token - 1))
+                    first = before // (width + 1) * width + min(before % (width + 1), width)
+                    last = after // (width + 1) * width + min(after % (width + 1), width)
+                    partial.append((batch, token, height, width, feature[first:last]))
+                    row_starts.append(first)
+                actual = DeepseekV41Model._merge_image_embeddings(  # pylint: disable=protected-access
+                    model, hidden, types[:, start:start + 4], partial, start, row_starts)
+                torch.testing.assert_close(actual, full, rtol=0, atol=0)
+                expected_grad = torch.autograd.grad(full.square().sum(), (hidden, *features, *markers))
+                actual_grad = torch.autograd.grad(actual.square().sum(), (hidden, *features, *markers))
+                for result, reference in zip(actual_grad, expected_grad):
+                    torch.testing.assert_close(result, reference, rtol=0, atol=0)

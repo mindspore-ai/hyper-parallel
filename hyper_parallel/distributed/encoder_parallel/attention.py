@@ -34,6 +34,8 @@ class EncoderAttentionContext:
     declared_heads: Mapping[str, int]
     expected: frozenset[str]
     seen: dict[str, int] = field(default_factory=dict)
+    packed_sequence_lengths: tuple[int, ...] | None = None
+    overlap: bool = False
 
     def record(self, module_fqn: str) -> None:
         """Record one replacement invocation.

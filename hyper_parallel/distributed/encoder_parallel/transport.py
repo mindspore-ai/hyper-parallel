@@ -108,7 +108,10 @@ class EncoderParallelBatchTransport:
         for target in range(context.tp_world_size):
             parent_rank = context.cp_rank * context.tp_world_size + target
             bucket, cp_rank = divmod(parent_rank, self.runtime.config.encoder_cp_size)
-            target_segments.append(build_segments(plan.buckets[bucket], cp_rank, self.runtime.config.encoder_cp_size))
+            target_segments.append(build_segments(
+                plan.buckets[bucket], cp_rank, self.runtime.config.encoder_cp_size,
+                packed=self.runtime.config.packed_attention,
+            ))
         patch_elements = local[0].numel()
         max_elements = max((sum(segment.local_padded_length for segment in segments) * patch_elements
                             for segments in target_segments[1:]), default=0)

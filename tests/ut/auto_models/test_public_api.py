@@ -175,7 +175,9 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("loss_parallel", "False"),
                 (
                     "encoder_parallel",
-                    "<factory> EncoderParallelConfig(enabled=False, encoder_cp_size=1)",
+                    "<factory> EncoderParallelConfig(enabled=False, encoder_cp_size=1, "
+                    "packed_attention=False, projector_mode='leader', overlap=False, "
+                    "balance_cost='attention')",
                 ),
             ],
         )

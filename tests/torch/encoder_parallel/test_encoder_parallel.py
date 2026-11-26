@@ -71,3 +71,13 @@ def test_parent_nosp():
     Expectation: Each CP owner receives a full record on every TP rank.
     """
     torchrun_case(str(_HERE / "_test_exchange.py"), "test_parent_nosp", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_packed_input_overlap():
+    """Feature: two-rank packed input overlap.
+
+    Description: Compare combined and split QKV with and without checkpointing.
+    Expectation: Outputs and first-order input/parameter gradients agree.
+    """
+    torchrun_case(str(_HERE / "_test_ulysses.py"), "test_packed_input_overlap", num_proc=2)

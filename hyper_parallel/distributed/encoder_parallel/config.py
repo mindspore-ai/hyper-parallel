@@ -22,14 +22,37 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class EncoderParallelConfig:
-    """Configuration of a derived Encoder-DP/Encoder-CP domain."""
+    """Configuration of a derived Encoder-DP/Encoder-CP domain.
+
+    ``packed_attention`` exchanges the concatenated bucket sequence and calls
+    image-isolated TND attention. ``projector_mode`` selects leader projection
+    after a full gather, or spatially sharded projection with direct input dispatch.
+    Defaults retain per-image attention, leader projection, and patch-square
+    work assignment. ``overlap`` splits Q/K/V projection and overlaps input
+    communication in forward and backward; it requires packed attention.
+    ``balance_cost`` optionally includes the model's linear projection/MLP work.
+    """
 
     enabled: bool = False
     encoder_cp_size: int = 1
+    packed_attention: bool = False
+    projector_mode: str = "leader"
+    overlap: bool = False
+    balance_cost: str = "attention"
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean")
+        if not isinstance(self.packed_attention, bool):
+            raise ValueError("packed_attention must be a boolean")
+        if not isinstance(self.overlap, bool):
+            raise ValueError("overlap must be a boolean")
+        if self.overlap and not self.packed_attention:
+            raise ValueError("encoder_parallel.overlap requires packed_attention=True")
+        if self.projector_mode not in ("leader", "sharded_dispatch"):
+            raise ValueError("projector_mode must be leader or sharded_dispatch")
+        if self.balance_cost not in ("attention", "encoder_flops"):
+            raise ValueError("balance_cost must be attention or encoder_flops")
         if (isinstance(self.encoder_cp_size, bool) or not isinstance(self.encoder_cp_size, int)
                 or self.encoder_cp_size < 1):
             raise ValueError(

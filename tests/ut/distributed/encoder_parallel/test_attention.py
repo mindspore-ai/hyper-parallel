@@ -23,6 +23,7 @@ from hyper_parallel.distributed.encoder_parallel.attention import (
     EncoderAttentionContext,
     activate_encoder_attention,
     current_encoder_attention_context,
+    encoder_attention_checkpoint_contexts,
 )
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderSegment, EncoderWorkItem
 from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41EncoderParallelAttention
@@ -48,6 +49,8 @@ class TestEncoderAttention(unittest.TestCase):
         torch.manual_seed(2)
         original = DeepseekV41VisionAttention(8, 2)
         replacement = DeepseekV41EncoderParallelAttention.from_source(original, module_fqn="vision.attn")
+        self.assertEqual(original.state_dict().keys(), replacement.state_dict().keys())
+        self.assertIs(original.wqkv.weight, replacement.wqkv.weight)
         source = torch.randn(4, 8, requires_grad=True)
         target = source.detach().clone().requires_grad_(True)
         cosine = torch.ones(4, 1, 2)
@@ -105,3 +108,24 @@ class TestEncoderAttention(unittest.TestCase):
             context.record("first")
         with self.assertRaisesRegex(RuntimeError, "vision attention execution mismatch"):
             context.assert_exactly_once()
+
+    def test_checkpoint_retains_its_own_packed_context(self):
+        """Feature: encoder checkpoint metadata ownership.
+
+        Description: Replay one microbatch while another microbatch is active.
+        Expectation: Image lengths come from the saved context.
+        """
+        first = EncoderAttentionContext((), _OneRankMesh(), {}, frozenset(),
+                                        packed_sequence_lengths=(3, 5), overlap=True)
+        second = EncoderAttentionContext((), _OneRankMesh(), {}, frozenset(),
+                                         packed_sequence_lengths=(7,))
+        with activate_encoder_attention(first):
+            _, replay = encoder_attention_checkpoint_contexts()
+        with activate_encoder_attention(second):
+            with replay:
+                active = current_encoder_attention_context()
+                self.assertEqual(active.packed_sequence_lengths, (3, 5))
+                self.assertTrue(active.overlap)
+                self.assertIsNot(active.seen, first.seen)
+            self.assertIs(current_encoder_attention_context(), second)
+        self.assertIsNone(current_encoder_attention_context())

@@ -17,8 +17,11 @@
 import torch
 import torch.distributed as dist
 from torch.nn import functional
+from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel.distributed.encoder_parallel.attention import EncoderAttentionContext, activate_encoder_attention
+from hyper_parallel.distributed.encoder_parallel.attention import (
+    EncoderAttentionContext, activate_encoder_attention, encoder_attention_checkpoint_contexts,
+)
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderSegment, EncoderWorkItem
 from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41EncoderParallelAttention
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionAttention
@@ -82,3 +85,49 @@ def test_odd_patch_ulysses():
     if rank == 0:
         print("Ulysses odd-patch forward/backward passed", flush=True)
     dist.destroy_process_group()
+
+
+def test_packed_input_overlap():
+    """Feature: packed input Ulysses overlap and checkpoint replay.
+
+    Description: Compare outputs and all first-order gradients with combined QKV.
+    Expectation: Both schedules preserve the image mask and checkpoint gradients.
+    """
+    dist.init_process_group("gloo")
+    try:
+        rank = dist.get_rank()
+        torch.manual_seed(35)
+        module = DeepseekV41EncoderParallelAttention.from_source(
+            DeepseekV41VisionAttention(32, 4), module_fqn="vision.attn",
+        )
+        hidden = torch.randn(24, 32)[rank * 12:(rank + 1) * 12].clone()
+        angles = torch.randn(24, 1, 4)[rank * 12:(rank + 1) * 12]
+        cosine, sine = angles.cos(), angles.sin()
+        reference = None
+        for recompute in (False, True):
+            for overlap in (False, True):
+                module.zero_grad(set_to_none=True)
+                local = hidden.detach().requires_grad_()
+                context = EncoderAttentionContext(
+                    (), Mesh(), {name: 4 for name in ("query", "key", "value")},
+                    frozenset({"vision.attn"}), packed_sequence_lengths=(9, 14), overlap=overlap,
+                )
+                with activate_encoder_attention(context):
+                    if recompute:
+                        output = checkpoint(module, local, cosine, sine, use_reentrant=False,
+                                            early_stop=False, context_fn=encoder_attention_checkpoint_contexts)
+                    else:
+                        output = module(local, cosine, sine)
+                context.assert_exactly_once()
+                output.square().sum().backward()
+                actual = {"output": output.detach(), "input_grad": local.grad}
+                actual.update({name: parameter.grad for name, parameter in module.named_parameters()})
+                if reference is None:
+                    reference = {name: value.clone() for name, value in actual.items()}
+                for name, value in actual.items():
+                    torch.testing.assert_close(
+                        value, reference[name], atol=1e-5, rtol=2e-5,
+                        msg=f"{name}: rank={rank}, overlap={overlap}, checkpoint={recompute}",
+                    )
+    finally:
+        dist.destroy_process_group()
