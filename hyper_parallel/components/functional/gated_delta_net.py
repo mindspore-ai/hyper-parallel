@@ -275,6 +275,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     backend: str = "eager",
     cu_seqlens: Optional[torch.Tensor] = None,
+    use_beta_sigmoid_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch GDN to an explicitly selected eager, Triton or Ascend C backend.
 
@@ -290,13 +291,15 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel: Whether this operator normalizes query and key.
         backend: Explicit local operator implementation to dispatch.
         cu_seqlens: Cumulative document boundaries for packed tokens.
+        use_beta_sigmoid_in_kernel: Interpret beta as raw logits and fuse when supported.
     """
     if query.ndim == 3:
         output, final = chunk_gated_delta_rule(
             *(tensor.unsqueeze(0) for tensor in (query, key, value, g, beta)),
             initial_state=initial_state, output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, chunk_size=chunk_size,
-            backend=backend, cu_seqlens=cu_seqlens)
+            backend=backend, cu_seqlens=cu_seqlens,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel)
         return output.squeeze(0), final
     backend = backend.lower()
     if backend not in _GDN_BACKENDS:
@@ -304,6 +307,8 @@ def chunk_gated_delta_rule(
             f"unsupported GDN backend {backend!r}; "
             f"expected one of {sorted(_GDN_BACKENDS)}."
         )
+    if use_beta_sigmoid_in_kernel and backend != "ascendc":
+        beta = beta.sigmoid()
     if backend == "eager":
         return torch_chunk_gated_delta_rule(
             query,
@@ -319,13 +324,14 @@ def chunk_gated_delta_rule(
         )
     if backend == "ascendc":
         if initial_state is not None or output_final_state:
-            raise NotImplementedError("GDN Ascend C currently supports zero-state local or pure Ulysses training only.")
+            raise NotImplementedError(
+                "The local GDN Ascend C entry does not expose recurrent states; state CP uses its staged adapter.")
         if chunk_size != 64:
             raise ValueError("GDN Ascend C requires chunk_size=64.")
-        # Preserve the existing GDN normalization graph outside the native core.
-        if use_qk_l2norm_in_kernel:
-            query, key = _l2norm(query), _l2norm(key)
-        return chunk_gated_delta_rule_ascendc(query, key, value, g, beta, cu_seqlens=cu_seqlens)
+        return chunk_gated_delta_rule_ascendc(
+            query, key, value, g, beta, cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel)
     if not is_triton_gdn_available(
         query, key, value, g, beta, chunk_size=chunk_size,
     ):

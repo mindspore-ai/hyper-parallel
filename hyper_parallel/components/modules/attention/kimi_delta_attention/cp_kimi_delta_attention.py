@@ -12,22 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""KDA layer CP scheduling, gathered state protocols and Triton state autograd."""
+"""KDA layer CP scheduling, state protocols and backend-specific state autograd."""
 from __future__ import annotations
+from functools import lru_cache
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
+from torch.autograd.function import once_differentiable
 
 from hyper_parallel.components.functional.kimi_delta_attention import (
     apply_kda_state_gradient_summary, apply_kda_state_summary,
+)
+from hyper_parallel.components.functional.kimi_delta_attention_ascendc import (
+    load_kda_native_ops, prepare_kda_native, finish_kda_native_forward, restore_kda_native_backward,
+    prepare_kda_native_backward, finish_kda_native_backward,
 )
 from hyper_parallel.components.functional.kimi_delta_attention_triton import (
     get_fla_kda_staged_ops, validate_triton_kda_inputs, validate_kda_state_summary,
     kda_state_gradient_summary_from_prepared, kda_state_summary_forward_from_prepared,
 )
 from hyper_parallel.components.functional.linear_attention_convolution import fused_causal_conv1d, packed_causal_conv1d
+from hyper_parallel.components.modules.attention.linear_attention_utils.cp_state_exchange import (
+    NativeStateAllGather, NativeStateExchange as _NativeStateExchange,
+    native_state_intervals as _native_ag_intervals,
+)
 from hyper_parallel.components.modules.attention.linear_attention_utils.layer_adapter import (
     prepare_linear_attention_input,
 )
@@ -35,10 +45,10 @@ from hyper_parallel.components.modules.attention.linear_attention_utils.cp_convo
     causal_convolutions_with_halo,
 )
 from hyper_parallel.components.modules.attention.linear_attention_utils.parallel_layout import (
-    validate_linear_attention_layout,
+    validate_linear_attention_layout, split_linear_attention_mesh as split_kda_mesh,
 )
 from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import (
-    PackedSequenceInfo, resolve_packed_sequence,
+    PackedSequenceInfo, resolve_packed_sequence, plan_packed_summary_exchange, local_chunk_metadata,
 )
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.distributed.context_parallel.collectives import exchange_sequence_heads
@@ -54,7 +64,8 @@ class CPKimiDeltaAttentionModule(KimiDeltaAttentionModule):
                  module_fqn: str = "", context: Any = None, backend: str = "eager",
                  conv_backend: str | None = None, chunk_size: int = 64, input_layout: str = "BSH",
                  ulysses_degree: int | None = 1, state_cp_method: str = "p2p",
-                 allgather_group_size: int = 1) -> None:
+                 allgather_group_size: int = 1, p2p_head_chunks: int = 1,
+                 reuse_cp_state_on_recompute: bool = False) -> None:
         """Record scheduling choices; do not construct groups or retain an active invocation."""
         del module_fqn, context
         # Preserve the established post-A2A convolution for the degree=None request.
@@ -67,6 +78,10 @@ class CPKimiDeltaAttentionModule(KimiDeltaAttentionModule):
         self.ulysses_degree = ulysses_degree
         self.state_cp_method = state_cp_method
         self.allgather_group_size = allgather_group_size
+        self.p2p_head_chunks = p2p_head_chunks
+        if reuse_cp_state_on_recompute and backend != "ascendc":
+            raise NotImplementedError("Checkpoint entry caching currently requires the Ascend C state backend.")
+        self.reuse_cp_state_on_recompute, self._cp_entry_key = reuse_cp_state_on_recompute, object()
         self.cp_rank, self.cp_size = 0, 1
         self.cp_context = None
         self.state_mesh = None
@@ -126,12 +141,12 @@ class CPKimiDeltaAttentionModule(KimiDeltaAttentionModule):
             return self.run_local_core(operands, info, a_log, dt_bias)
         size, rank = self.state_size, self.state_mesh.get_local_rank()
         if self.backend == "ascendc":
-            # Native CP must not import optional Triton summary kernels.
-            from .cp_state_ascendc import ascendc_state_kda  # pylint: disable=import-outside-toplevel
             # FSDP may expose BF16 compute weights; native gates require FP32, as in the local core.
             return ascendc_state_kda(
                 *operands, a_log=a_log.float(), dt_bias=dt_bias.float(), lower_bound=self.lower_bound,
-                state_cp=self.state_cp, cp_mesh=self.state_mesh, sequence_info=info)
+                state_cp=self.state_cp, cp_mesh=self.state_mesh, sequence_info=info,
+                p2p_head_chunks=self.p2p_head_chunks,
+                reuse_cp_state_on_recompute=self.reuse_cp_state_on_recompute, cache_key=self._cp_entry_key)
         if self.backend != "triton":
             raise NotImplementedError("KDA state CP requires Triton or Ascend C; eager supports local/pure Ulysses")
         ranks = self.state_mesh.rank_list
@@ -194,7 +209,7 @@ class CPKimiDeltaAttentionModule(KimiDeltaAttentionModule):
                 output = fused_causal_conv1d(tensor, weight, bias, backend=self.conv_backend,
                                              dilation=conv.dilation[0])
             else:
-                output = F.conv1d(tensor.transpose(1, 2), weight, bias, stride=conv.stride,
+                output = torch.conv1d(tensor.transpose(1, 2), weight, bias, stride=conv.stride,
                                   padding=conv.padding, dilation=conv.dilation, groups=channels)
                 output = F.silu(output[:, :, :tensor.shape[1]].transpose(1, 2))
             convolved.append(output)
@@ -244,42 +259,18 @@ def _validate_mesh_order(mesh: DeviceMesh) -> None:
         raise ValueError("KDA mesh sequence order must match its communication group order.")
 
 
-def split_kda_mesh(mesh: DeviceMesh, degree: int, names: tuple[str, str]) -> DeviceMesh:
-    """Split a CP axis without losing the root rank map or sibling DP groups.
-
-    Args:
-        mesh: One-dimensional chronological CP mesh.
-        degree: Size of the inner split axis.
-        names: Names of the outer and inner axes.
-
-    Returns:
-        Two-dimensional submesh attached to the original root.
-    """
-    if mesh.ndim != 1 or not isinstance(degree, int) or isinstance(degree, bool):
-        raise ValueError("KDA mesh splitting requires a 1-D mesh and integer degree.")
-    if degree < 1 or mesh.size() % degree:
-        raise ValueError("KDA split degree must be positive and divide the CP size.")
-    _validate_mesh_order(mesh)
-    # Group creation uses WORLD; every rank must derive the same sibling groups.
-    root = mesh._get_root_mesh()  # pylint: disable=protected-access
-    if root.size() != dist.get_world_size():
-        raise ValueError("Hybrid KDA requires a CP submesh retaining its WORLD root mesh.")
-    # Like the existing hybrid CP helper, preserve all sibling groups through the root layout.
-    return mesh._unflatten(0, (mesh.size() // degree, degree), names)  # pylint: disable=protected-access
-
-
 def build_kda_state_cp(mesh: DeviceMesh, protocol: str, allgather_group_size: int) -> object | None:
     """Construct a state-CP executor holding only communication metadata.
 
     Args:
         mesh: One-dimensional mesh ordered along the state sequence.
-        protocol: p2p, allgather, grouped_allgather_p2p, or recursive_doubling.
+        protocol: p2p, allgather, alltoallv, grouped_allgather_p2p, or recursive_doubling.
         allgather_group_size: Consecutive ranks per local gather, only for the grouped protocol.
 
     Returns:
         State executor with an invocation-owned cache, or None for the P2P/local path.
     """
-    if protocol not in ("p2p", "allgather", "grouped_allgather_p2p", "recursive_doubling"):
+    if protocol not in ("p2p", "allgather", "alltoallv", "grouped_allgather_p2p", "recursive_doubling"):
         raise ValueError(f"Unknown KDA state_cp_method: {protocol!r}.")
     if not isinstance(allgather_group_size, int) or isinstance(allgather_group_size, bool) or allgather_group_size < 1:
         raise ValueError("KDA allgather_group_size must be a positive integer.")
@@ -291,9 +282,10 @@ def build_kda_state_cp(mesh: DeviceMesh, protocol: str, allgather_group_size: in
     rank, size = mesh.get_local_rank(), mesh.size()
     if protocol == "recursive_doubling":
         return KDAStateRecursiveDoubling(mesh.get_group(), rank, ranks) if size > 1 else None
-    if protocol == "allgather":
+    if protocol in ("allgather", "alltoallv"):
         _validate_mesh_order(mesh)
-        return KDAStateAllGather(mesh.get_group(), rank, size)
+        executor = KDAStateAllToAllV if protocol == "alltoallv" else KDAStateAllGather
+        return executor(mesh.get_group(), rank, size)
     if size % allgather_group_size:
         raise ValueError("KDA allgather_group_size must divide the state CP size.")
     if allgather_group_size == 1:
@@ -314,27 +306,8 @@ def _gather_maps(state: torch.Tensor, matrix: torch.Tensor, group: Any, size: in
     return output.view(size, *packed.shape)
 
 
-class KDAStateAllGather:
+class KDAStateAllGather(NativeStateAllGather):
     """Gather S/M forward and G/M backward; only local M survives forward."""
-
-    def __init__(self, group: Any, rank: int, size: int) -> None:
-        """Bind precreated communication metadata, without tensor workspaces."""
-        if not isinstance(size, int) or isinstance(size, bool) or size < 1 or not 0 <= rank < size:
-            raise ValueError("AllGather requires a positive size and valid local rank.")
-        self.group, self.rank, self.size = group, rank, size
-
-    def gather_packed(self, packed: torch.Tensor) -> torch.Tensor:
-        """Collect native [1,H,128,256] summaries without a second packing copy.
-
-        The autograd caller owns the returned storage and its reverse protocol;
-        this metadata-only executor retains no per-invocation tensors.
-
-        Args:
-            packed: Packed state and transition tensors for the scan.
-        """
-        output = packed.new_empty((self.size, *packed.shape[1:]))
-        dist.all_gather_into_tensor(output, packed, group=self.group)
-        return output
 
     def forward(self, state: torch.Tensor, matrix: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Return the incoming state and this invocation's original local M.
@@ -372,6 +345,77 @@ class KDAStateAllGather:
         )
         maps = _gather_maps(gradient, matrix, self.group, self.size)
         return merge_affine_summaries(maps[..., :128], maps[..., 128:], self.rank, False)
+
+
+class KDAStateAllToAllV(KDAStateAllGather):
+    """Collect only packed-document dependencies; dense calls retain AllGather."""
+
+    protocol = "alltoallv"
+
+    def bind_sequence(self, info: PackedSequenceInfo, *, state_shape: tuple) -> object:
+        """Bind an immutable sparse plan to this invocation, not the shared executor.
+
+        Args:
+            info: Real document offsets and this state rank's local interval.
+            state_shape: Local state shape, with physical packed batch size one.
+        """
+        if state_shape[0] != 1:
+            raise ValueError("Sparse packed summaries require physical batch size one.")
+        plan = plan_packed_summary_exchange(info, self.rank, self.size)
+        return _SparseAllGatherInvocation(self.group, plan)
+
+
+class _SparseAllGatherInvocation:
+    """Own only a plan; transport buffers remain local to each forward/backward."""
+
+    def __init__(self, group: Any, plan: Any) -> None:
+        self.group, self.plan = group, plan
+
+    def exchange_maps(self, packed: torch.Tensor, forward: bool) -> tuple[torch.Tensor, int]:
+        """Receive compact chronological maps and one unused local-rank slot.
+
+        The sentinel preserves existing merge-kernel rank semantics without a
+        full-group restore copy. Raw collectives are inside the attention's
+        custom autograd, whose reverse summary exchange owns differentiation.
+
+        Args:
+            packed: One rank's [B,H,128,256] S/M or reverse G/M (native G/N).
+            forward: Select forward edges; backward uses the exact transposed edges.
+        """
+        sends, receives = self.plan.send_counts, self.plan.recv_counts
+        if not forward:
+            sends, receives = receives, sends
+        send_count, recv_count = sum(sends), sum(receives)
+        maps = packed.new_empty((recv_count + 1, *packed.shape))
+        rank = recv_count if forward else 0
+        if self.plan.active:
+            outgoing = packed.unsqueeze(0).expand(send_count, *packed.shape).contiguous()
+            incoming = maps[:recv_count] if forward else maps[1:]
+            dist.all_to_all_single(incoming, outgoing, output_split_sizes=list(receives),
+                                   input_split_sizes=list(sends), group=self.group)
+        return maps, rank
+
+    def forward(self, state: torch.Tensor, matrix: torch.Tensor) -> tuple[torch.Tensor, tuple]:
+        """Merge only the head document's earlier fragments and cache local M."""
+        validate_kda_state_summary(state, matrix)
+        # Triton math is optional for native transport-only users.
+        from hyper_parallel.components.functional.kimi_delta_attention_triton import (  # pylint: disable=import-outside-toplevel
+            merge_affine_summaries,
+        )
+        maps, rank = self.exchange_maps(torch.cat((state, matrix), dim=-1), True)
+        initial = merge_affine_summaries(maps[..., :128], maps[..., 128:], rank, True)
+        return initial, (matrix,)
+
+    def backward(self, gradient: torch.Tensor, cache: tuple) -> torch.Tensor:
+        """Send head gradients backward and merge only the tail document's suffix."""
+        matrix, = cache
+        validate_kda_state_summary(gradient, matrix)
+        # Keep the native path free of an optional Triton import.
+        from hyper_parallel.components.functional.kimi_delta_attention_triton import (  # pylint: disable=import-outside-toplevel
+            merge_affine_summaries,
+        )
+        maps, rank = self.exchange_maps(torch.cat((gradient, matrix), dim=-1), False)
+        return merge_affine_summaries(maps[..., :128], maps[..., 128:], rank, False)
 
 
 class KDAStateAllGatherP2P:
@@ -918,3 +962,159 @@ def triton_state_kda(
         state_cp,
         sequence_info,
     )
+
+
+@lru_cache(maxsize=1)
+def _load_state_ops():
+    """Check every native stage before entering the first state collective."""
+    ops = load_kda_native_ops()
+    required = (
+        "pre_process_fwd_kernel_merged", "pre_process_bwd_kernel_merged",
+        "merge_fwd_bwd_kernel",
+    )
+    missing = [name for name in required if not callable(getattr(ops, name, None))]
+    if missing:
+        raise RuntimeError(f"Native KDA state CP requires these fla-npu APIs: {', '.join(missing)}.")
+    return ops
+
+
+def _exchange_native_gradient(ctx, ops, inputs, reception):
+    """Own G/N production, reset injection and the stock dHT dtype boundary."""
+    if ctx.exchange is None:
+        return None, None, None
+    gk, qg, kg, weights, grad, dv_local_head = inputs
+    maps = None
+    if ctx.exchange.needs_summary(False):
+        # Only the stock G/N ABI rounds gk; local dhu/finalize retain FP32.
+        maps = ops.pre_process_bwd_kernel_merged(
+            qg, kg, weights, grad, dv_local_head, ctx.scale, 64,
+            gk=gk.to(qg.dtype), cu_seqlens=ctx.head)
+    terminal, send_handle, outgoing = ctx.exchange.exchange(ops, maps, reception, False, ctx.suffix)
+    if ctx.exchange.info is not None:
+        terminal = ctx.exchange.info.last_state(terminal)
+    # Communication and summary apply retain FP32; only stock dhu requires BF16.
+    terminal = None if terminal is None else terminal.to(qg.dtype)
+    return terminal, send_handle, outgoing
+
+
+class _AscendCKDAState(torch.autograd.Function):
+    """Share native local stages; state protocols optionally inject H and D."""
+
+    @staticmethod
+    def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                gate: torch.Tensor, beta: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
+                scale: float, lower_bound: float, metadata: dict,
+                exchange: _NativeStateExchange | None) -> torch.Tensor:
+        """Share prepare with S/M and local FwdH, then release gathered maps.
+
+        Args:
+            ctx: Per-invocation autograd context.
+            query: Raw token-major queries.
+            key: Raw token-major keys.
+            value: Token-major values.
+            gate: Sequence-major gate logits.
+            beta: Sequence-major beta logits.
+            a_log: FP32 decay parameters.
+            dt_bias: FP32 gate bias.
+            scale: Attention scale.
+            lower_bound: Safe-gate lower bound.
+            metadata: Native packed offsets and chunk indices.
+            exchange: Optional state protocol for this invocation.
+        """
+        ops = _load_state_ops()
+        inputs = (query, key, value, gate, beta, a_log, dt_bias)
+        reception = None if exchange is None else exchange.receive(query, True)
+        prepared = prepare_kda_native(inputs, scale, lower_bound, metadata)
+        initial = send_handle = outgoing = head = suffix = None
+        if exchange is not None:
+            tail, head, prefix, suffix = _native_ag_intervals(
+                exchange.info, query.shape[1], exchange.rank, exchange.size)
+            maps = None
+            if exchange.needs_summary(True):
+                maps = ops.pre_process_fwd_kernel_merged(
+                    prepared.kg, prepared.w, prepared.u, gk=prepared.gk, cu_seqlens=tail)
+            initial, send_handle, outgoing = exchange.exchange(ops, maps, reception, True, prefix)
+            del maps, reception
+            if exchange.info is not None:
+                initial = exchange.info.first_state(initial)
+        output = finish_kda_native_forward(
+            ctx, inputs, prepared, initial, scale, lower_bound, metadata)
+        if send_handle is not None:
+            send_handle.wait()
+        del outgoing
+        ctx.exchange, ctx.head, ctx.suffix = exchange, head, suffix
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
+        """Collect G/N, inject nonzero dHT and finish raw-input gradients.
+
+        Args:
+            ctx: Forward-owned activations and communication metadata.
+            grad_output: Sequence-major output gradient.
+        """
+        ops = _load_state_ops()
+        # Share one unpack across phases, including checkpoint recomputation.
+        saved = ctx.saved_tensors
+        reception = ctx.exchange.receive(saved[12], False)
+        saved = restore_kda_native_backward(ctx, saved)
+        gk, weights, qg, kg = saved[4], saved[7], saved[9], saved[10]
+        grad, d_aqk, dv_local_head, dq_raw = prepare_kda_native_backward(ctx, saved, grad_output)
+        terminal, send_handle, outgoing = _exchange_native_gradient(
+            ctx, ops, (gk, qg, kg, weights, grad, dv_local_head), reception)
+        del reception
+        gradients = finish_kda_native_backward(ctx, saved, grad, d_aqk, dv_local_head, dq_raw, terminal)
+        if send_handle is not None:
+            send_handle.wait()
+        del outgoing
+        return (*gradients, None, None, None, None)
+
+
+def ascendc_state_kda(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
+    dt_bias: torch.Tensor, state_cp: Any, cp_mesh: Any, sequence_info: Any = None,
+    scale: float | None = None, lower_bound: float = -5.0,
+    p2p_head_chunks: int = 1, reuse_cp_state_on_recompute: bool = False, cache_key: object = None,
+) -> torch.Tensor:
+    """Run native KDA with P2P, AllGather, grouped AllGather/P2P, or RD.
+
+    Args:
+        query: Raw BF16 queries [1,T,H,128].
+        key: Matching raw keys.
+        value: BF16 values with the query shape.
+        gate: Raw gate logits with the query shape.
+        beta: Raw beta logits [1,T,H].
+        a_log: Per-head FP32 decay parameters.
+        dt_bias: FP32 gate bias [H,128].
+        state_cp: Existing gather/RD executor, or None for ordinary P2P.
+        cp_mesh: Ordered state mesh after any Ulysses redistribution.
+        sequence_info: Packed interval metadata after any Ulysses redistribution.
+        scale: Attention scale, default 1/sqrt(128).
+        lower_bound: Safe gate lower bound.
+        p2p_head_chunks: Number of state packets for ordinary P2P; keeps Prepare and summaries unsplit.
+        reuse_cp_state_on_recompute: Reuse this forward entry during a HyperParallel checkpoint replay.
+        cache_key: Stable caller identity; direct callers otherwise follow invocation order.
+
+    Returns:
+        Output with the query shape. Uses the unmodified native stage APIs:
+        backward summary gk and local dhu dHT are converted to model dtype.
+        Prepared gates, communicated states and summary apply remain FP32.
+        These ABI conversions introduce rounding relative to FP32-input kernels.
+    """
+    if query.device.type != "npu" or query.dtype != torch.bfloat16:
+        raise ValueError("Native KDA state CP requires BF16 NPU inputs.")
+    if query.ndim != 4 or query.shape[0] != 1 or query.shape[-1] != 128:
+        raise ValueError("Native KDA state CP requires [1,T,H,128] inputs.")
+    if any(tensor.shape != query.shape for tensor in (key, value, gate)) or beta.shape != query.shape[:-1]:
+        raise ValueError("Native KDA state CP requires matching Q/K/V/gate heads and beta [1,T,H].")
+    metadata = local_chunk_metadata(None if sequence_info is None else sequence_info.local_offsets, query.shape[1])
+    scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
+    tokens = tuple(tensor.contiguous() for tensor in (query, key, value))
+    exchange = _NativeStateExchange(cp_mesh, state_cp, sequence_info, query.shape[1], query.shape[2],
+                                    p2p_head_chunks, reuse_cp_state_on_recompute=reuse_cp_state_on_recompute,
+                                    cache_key=cache_key, algorithm="kda")
+    return _AscendCKDAState.apply(
+        *tokens, gate.contiguous(), beta.contiguous(), a_log.reshape(-1).clone(),
+        dt_bias.reshape(-1, query.shape[-1]).clone(), scale, lower_bound, metadata, exchange)

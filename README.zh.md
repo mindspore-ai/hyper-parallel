@@ -105,6 +105,10 @@ torchrun --standalone --nproc_per_node=8 \
 
 字段定义与解析规则见 [训练配置与组件](hyper_parallel/models/README.zh.md)。
 
+KDA/GDN 的 Ascend C 后端使用官方 fla-npu `26.10.0+feature` release。
+安装与运行时要求见 [后端说明](hyper_parallel/components/functional/README.md#linear-attention-backends)，
+并行组合与重计算配置见 [线性注意力 CP 指南](docs/guide/linear_attention_tnd_cp.md)。
+
 ### 使用 HyperParallel Core API
 
 以下示例在数据并行 DeviceMesh 上应用 `fully_shard`，实现模型参数分片：

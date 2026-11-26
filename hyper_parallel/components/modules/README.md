@@ -8,6 +8,7 @@ Python or declaratively replace existing model modules through Trainer YAML.
 | Category | Modules |
 | --- | --- |
 | Attention | `GroupedQueryAttention`, `GatedGroupedQueryAttention`, `MultiLatentAttention`, `GatedMultiLatentAttention`, `DeepseekSparseAttention` |
+| Linear attention | `KimiDeltaAttention`, `GatedDeltaNet` |
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
@@ -45,6 +46,13 @@ Choose an attention family for the model's mathematical variant:
 | [MultiLatentAttention](attention/multi_latent_attention/README.md) | MLA with expanded or latent KV communication and supported forward/backward overlap |
 | [GatedMultiLatentAttention](attention/gated_multi_latent_attention/README.md) | NoPE MLA with an independent output gate and gate-aware CP scheduling |
 | [DeepseekSparseAttention](attention/deepseek_sparse_attention/readme.md) | DeepSeek-V3.2 sparse attention, native construction and KV-AllGather CP |
+
+KDA/GDN use the [linear-attention module families](../../../docs/guide/linear_attention_module_families.md)
+and [TND CP guide](../../../docs/guide/linear_attention_tnd_cp.md). Their Ascend C backend uses
+the unmodified FLA-NPU `26.10.0+feature` release; see the
+[backend installation and capability contract](../functional/README.md#linear-attention-backends).
+GDN supports compact GVA, state P2P/AllGather and their Ulysses hybrids; KDA additionally
+supports sparse TND AllToAllV, grouped AG/P2P and RD. Convolution remains independently selectable.
 
 Each guide includes a YAML fragment, configuration choices, file responsibilities, the execution flow and support limits.
 Families support direct `config=` construction or `module=` conversion from a compatible source.

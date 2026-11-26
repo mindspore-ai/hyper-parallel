@@ -12,7 +12,8 @@ TND 将多个独立文档的 token 连续拼接。文档边界必须同时约束
 | KDA Ulysses + P2P / AllGather / 分组 AllGather + P2P / RD | 支持；保持原有并行配置入口 |
 | GDN 本地层、纯 Ulysses | 支持 eager 参考与 Triton-Ascend；状态 P2P 使用 Triton-Ascend |
 | KDA / GDN 本地算子、纯 Ulysses | 可选 Ascend C；各后端的算子能力与限制见下文及 KDA 指南 |
-| KDA P2P、AllGather、分组 AllGather + P2P 及其 Ulysses 混合 | 另支持 Ascend C；原生摘要和独立反向接口要求见 [KDA 指南](kda_context_parallel.md#ascend-c-状态-p2pallgather-与分组混合) |
+| GDN 状态 P2P、AllGather 及其 Ulysses 混合 | 支持 Ascend C，保留紧凑 GVA 和真实文档 reset |
+| KDA P2P、AllGather、分组 AllGather + P2P 及其 Ulysses 混合 | 另支持 Ascend C；原生摘要和独立反向接口要求见 [KDA 指南](kda_context_parallel.md#ascend-c-state-p2p-allgather-rd-and-hybrids) |
 
 层入口接受 `[T, hidden_size]` 或 `[1, T, hidden_size]`，输出保持输入维数。
 投影后的算子接受 `[T, H, D]` 或 `[1, T, H, D]`。TND 的批维为 1；多个文档由累计长度表示。
@@ -162,7 +163,7 @@ Dense 卷积保留 `[B,S,C]` 的 batch 隔离；packed 由同一公共适配传�
   backward 沿同一计划的反向边消费必要转移缓存。Ulysses 后先重建文档区间，再沿 state 子域规划。
   尾文档不延续到下一状态 rank 时不生产 S；只有入口会影响该出口时才生产 M。头文档延续时仍需 G，
   所以 rank 内部 reset 不等于整张卡都无需通信。没有活跃倍增轮的 rank 跳过 S/M 打包；计划不创建新通信组。
-- Ascend C KDA：前向收集 S/M、反向重新生成 G/N，不跨前反向缓存 M。普通 P2P 跳过真实文档边界，
+- Ascend C KDA/GDN：前向生成 S/M、反向重新生成 G/N，不跨前反向缓存 M。普通 P2P 跳过真实文档边界，
   分组路径用零转移隔离 reset；具体接口精度、布局和生命周期见 KDA 指南。
 - ShortConv：保留既有 halo 交换，按全局文档边界屏蔽越界 tap；该 mask 同时阻断越界的反向梯度。
 - backward：仅在内核调用处将紧凑入口状态、出口梯度展开到局部片段槽位，元数据和本地 M 由各自 autograd
@@ -197,7 +198,8 @@ GDN 前向状态算子同时包含 key-gate 的布局和地址修复：`gk` 在�
 
 ## GDN 的 Ascend C 后端
 
-Qwen3.5 纯 Ulysses 可选择 `backend: ascendc`，同一配置选择本地 attention 与 ShortConv。
+Qwen3.5 本地、纯 Ulysses、状态 P2P / AllGather 及 Ulysses＋状态混合可选择 `backend: ascendc`；
+ShortConv 通过独立的 `conv_backend` 选择。
 TND 的 decoder metadata wrapper 不变，CP1 由普通模块族成员执行。
 依赖与公开算子接口见 [functional 说明](../../hyper_parallel/components/functional/README.md#linear-attention-backends)。
 
@@ -213,13 +215,44 @@ plan_overrides:
         ulysses_degree: null
 ```
 
-当前适配输入为核外归一化的 Q/K、有效 log-decay 与 sigmoid(beta)。它们的 autograd 链保留在调用方；
-原生 GDN 前反向关闭对应的 `in_kernel` 开关，避免重复处理。
-文档 offsets 按调用保存，dense 与 packed 共用公开原生前反向入口，末块无需 64 对齐。
+模块传入紧凑 GVA 的原始 Q/K、有效 log-decay 与 sigmoid(beta)。Q/K 归一化由原生算子及其
+配对反向完成；标量 gate 变换和模块的 beta sigmoid 保留在外层 autograd 中。
+本地/纯 Ulysses 沿用公开完整前反向入口，保存的 Q/K 保持 BNSD，避免布局往返。
+连续 V 复用原存储；非连续 QKV 切片保留已转换的 V，避免保存一个 view 却延长整份 QKV 的生命周期。
+文档 offsets 按调用保存，末块无需 64 对齐。
 
-当前不开放非零初态、最终态输出/梯度、double backward 与 Ascend C 状态 P2P。
-显式选择的后端不做静默回退。融合卷积需要宽度为 2/3/4、通道数能被 16 整除，
-输入、权重和 bias 使用相同的 BF16 或 FP16 dtype；不隐式降低参数精度。
+状态 CP 使用同一个 release 的 Prepare、FwdH、FwdO、Dhu、Finalize 和 S/M、G/N 原语。
+它复用 KDA 的状态传输实现；不重复 Q/K 到 value-head 数，也不在 native 包中打补丁。
+配置增量如下，`ulysses_degree: 1` 表示使用整个 CP 轴做状态并行：
+
+```yaml
+implementation:
+  _target_: hyper_parallel.components.modules.GatedDeltaNet
+  backend: ascendc
+  conv_backend: eager
+  ulysses_degree: 1
+  state_cp_method: allgather  # 或 p2p
+```
+
+普通 P2P 可设置 `p2p_head_chunks`（默认 1）只对状态 apply/收发分包；Prepare、S/M、G/N 仍处理
+全部本地 heads。AG 不接受此分包选项；分包数不超过 TP/Ulysses 后的本地 value heads。
+
+在 CP4 下，将上例 `ulysses_degree` 改为 2 即为 U2＋P2P2 / AG2；CP8 下同样配置为 U2＋状态4。
+Ulysses 组包含相邻的序列 rank，外层状态组包含持有相同 head 分片的 rank；
+例如 CP4 的 U 组为 `[0,1]`、`[2,3]`，状态组为 `[0,2]`、`[1,3]`。
+卷积先在原始 token 分片上处理 halo，再交换 Q/K/V 和 gate/beta；状态计算后逆向 AllToAll 恢复 token 布局。
+交换后的真实文档区间重新推导，不将原 rank 切口当成 reset。GVA 比例不变且不复制 Q/K；
+TP×U 必须分别整除 Q/K 和 V heads。通信组在绑定阶段创建，逐 batch 不重建。
+GDN 当前不开放 RD 或分组 AG；混合 U＋state 当前限于 Ascend C。
+状态 CP 使用 `[1,T,H,128]`、BF16 Q/K/V、有效标量 gate/beta；Hv 必须是 Hq 的正整数倍。
+状态及摘要 apply 保持 FP32，仅原生 Dhu 的 dHT 输入按公开 ABI 转为 BF16。
+
+状态 CP 保存本地 h/v_new 供反向使用，释放无后续消费者的 U。
+不同调用独立持有元数据和发送缓冲区。外层 checkpoint 仍可能重放前向状态通信。
+
+当前不对外提供任意初态/最终态梯度 API，也不支持 double backward。
+显式后端不做静默回退。融合卷积要求宽度 2/3/4、通道数被 16 整除，输入、权重和 bias 同为 BF16
+或 FP16；不隐式降低参数精度。卷积后端与状态协议彼此独立。
 
 TP/SP 的 token 布局和模型元数据约定见 [KDA/GDN 模块族](linear_attention_module_families.md)。
 

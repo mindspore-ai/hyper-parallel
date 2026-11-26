@@ -110,10 +110,10 @@ for name in ("triton", "fla", "fla_npu"):
     sys.modules[name] = None
 
 prefix = "hyper_parallel.components.modules.attention."
-for module in ("kimi_delta_attention.cp_kimi_delta_attention",
-               "kimi_delta_attention.cp_state_ascendc",
-               "gated_delta_net.cp_gated_delta_net"):
-    importlib.import_module(prefix + module)
+for module, entry in (("kimi_delta_attention.cp_kimi_delta_attention", "ascendc_state_kda"),
+                      ("gated_delta_net.cp_gated_delta_net", "ascendc_state_gdn")):
+    loaded = importlib.import_module(prefix + module)
+    assert callable(getattr(loaded, entry))
 
 from hyper_parallel.components.modules import KimiDeltaAttention, KimiRMSNormGated
 from hyper_parallel.components.functional import fused_chunk_kda

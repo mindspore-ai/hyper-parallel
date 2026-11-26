@@ -18,12 +18,56 @@ from __future__ import annotations
 from typing import Any
 
 from torch import nn
+import torch.distributed as dist
 
 from hyper_parallel.components.modules.module_family import get_family_build_info
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.distributed._builder.family_layout import validate_tp_boundary
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.distributed.module_binding import ParallelModuleSpec
+
+
+def split_linear_attention_mesh(mesh: DeviceMesh, degree: int, names: tuple[str, str]) -> DeviceMesh:
+    """Split chronological CP ranks into outer state and inner head-exchange groups.
+
+    Args:
+        mesh: One-dimensional CP mesh retaining its complete root rank map.
+        degree: Number of consecutive sequence ranks in each Ulysses group.
+        names: Names for the outer state axis and inner Ulysses axis.
+    """
+    if mesh.ndim != 1 or not isinstance(degree, int) or isinstance(degree, bool):
+        raise ValueError("Linear-attention mesh splitting requires a 1-D mesh and integer degree.")
+    if degree < 1 or mesh.size() % degree:
+        raise ValueError("The split degree must be positive and divide the CP size.")
+    ranks = tuple(mesh.rank_list)
+    if ranks != tuple(dist.get_process_group_ranks(mesh.get_group())):
+        raise ValueError("The CP mesh rank order must match the communication group order.")
+    # Group creation must derive the same sibling groups on every root rank.
+    root = mesh._get_root_mesh()  # pylint: disable=protected-access
+    if root.size() != dist.get_world_size():
+        raise ValueError("Hybrid linear attention requires a CP submesh retaining its WORLD root mesh.")
+    return mesh._unflatten(0, (mesh.size() // degree, degree), names)  # pylint: disable=protected-access
+
+
+def validate_state_packets(options: Any, cp_size: int, degree: int, backend: str,
+                           local_heads: int | None = None) -> None:
+    """Check explicit state packet ownership before creating communication groups.
+
+    Args:
+        options: Module-family arguments containing the packet count and protocol.
+        cp_size: Total context-parallel degree.
+        degree: Ulysses degree within the CP axis.
+        backend: Selected local attention backend.
+        local_heads: Value heads after TP and Ulysses, when dimensions are known.
+    """
+    packets = options.get("p2p_head_chunks", 1)
+    if isinstance(packets, bool) or not isinstance(packets, int) or packets < 1:
+        raise ValueError("p2p_head_chunks must be a positive integer")
+    if packets > 1 and (backend != "ascendc" or options.get("state_cp_method", "p2p") != "p2p" or cp_size <= degree):
+        raise ValueError("p2p_head_chunks requires Ascend C state P2P")
+    if local_heads is not None and packets > local_heads:
+        raise ValueError("p2p_head_chunks must not exceed the local value-head count")
 
 
 def linear_attention_sharding(*, module: nn.Module, context: Any,

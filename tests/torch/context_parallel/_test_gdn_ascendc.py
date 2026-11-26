@@ -26,6 +26,13 @@ from hyper_parallel.components.functional.gated_delta_net_ascendc import chunk_g
 from hyper_parallel.distributed.context_parallel.collectives import (
     exchange_sequence_heads as _differentiable_all_to_all_shard,
 )
+from hyper_parallel.components.modules.attention.gated_delta_net.cp_gated_delta_net import ascendc_state_gdn
+from hyper_parallel.components.modules.attention.linear_attention_utils.cp_state_exchange import NativeStateAllGather
+from hyper_parallel.components.modules.attention.linear_attention_utils.parallel_layout import (
+    split_linear_attention_mesh,
+)
+from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import PackedSequenceInfo
+from tests.common.op_precision import assert_precision
 from tests.torch.context_parallel._test_linear_tnd import _GDN, _assert_same, _bind_family, _execute, _isolation
 
 
@@ -80,6 +87,58 @@ def _check_layer(mesh, length):
     _isolation(wrapper, local, grad_output, tails, rank, length)
 
 
+def _state_output(inputs, state_mesh, ulysses_mesh, info, executor, packets):
+    """Exercise differentiable head exchange around the native state adapter."""
+    local_inputs, local_info = inputs, info
+    if ulysses_mesh is not None:
+        local_inputs = [_differentiable_all_to_all_shard(tensor, ulysses_mesh, split_dim=2, concat_dim=1)
+                        for tensor in inputs]
+        local_info = None if info is None else info.ulysses(ulysses_mesh.size(), ulysses_mesh.get_local_rank())
+    output = ascendc_state_gdn(*local_inputs, cp_mesh=state_mesh, state_cp=executor, sequence_info=local_info,
+                               p2p_head_chunks=packets)
+    if ulysses_mesh is not None:
+        output = _differentiable_all_to_all_shard(output, ulysses_mesh, split_dim=1, concat_dim=2)
+    return output
+
+
+def _check_state_core(mesh: object, length: int, degree: int = 1) -> None:
+    """Check compact GVA, true resets, packet relay against native CP1."""
+    rank, size = dist.get_rank(), dist.get_world_size()
+    generator = torch.Generator().manual_seed(11251)
+    source = [torch.randn(1, size * length, heads, 128, generator=generator).bfloat16()
+              for heads in (4, 4, 12)]
+    source += [-torch.rand(1, size * length, 12, generator=generator) * .02,
+               torch.randn(1, size * length, 12, generator=generator).sigmoid()]
+    grad_output = torch.randn(source[2].shape, generator=generator).bfloat16().npu() * .1
+    state_mesh, ulysses_mesh = mesh, None
+    if degree > 1:
+        hybrid = split_linear_attention_mesh(mesh, degree, ("gdn_state_test", "gdn_ulysses_test"))
+        state_mesh, ulysses_mesh = hybrid["gdn_state_test"], hybrid["gdn_ulysses_test"]
+    gather = NativeStateAllGather(state_mesh.get_group(), state_mesh.get_local_rank(), state_mesh.size())
+    shard = slice(rank * length, (rank + 1) * length)
+    for offsets in (None, (0, 65, length + 113, 2 * length, 3 * length + 67, size * length)):
+        inputs = [tensor.npu().requires_grad_() for tensor in source]
+        output, _ = chunk_gated_delta_rule_ascendc(*inputs, use_qk_l2norm_in_kernel=True, cu_seqlens=offsets)
+        gradients = torch.autograd.grad(output, inputs, grad_output)
+        expected = [tensor[:, shard].detach().clone() for tensor in (output, *gradients)]
+        del output, gradients, inputs
+        inputs = [tensor[:, shard].npu().requires_grad_() for tensor in source]
+        info = None if offsets is None else PackedSequenceInfo(offsets, rank * length, (rank + 1) * length)
+        reference = None
+        for executor, packets in ((None, 1), (None, 4), (gather, 1)):
+            output = _state_output(inputs, state_mesh, ulysses_mesh, info, executor, packets)
+            gradients = torch.autograd.grad(output, inputs, grad_output[:, shard].contiguous())
+            actual = [tensor.detach() for tensor in (output, *gradients)]
+            if reference is None:
+                reference = [tensor.clone() for tensor in actual]
+            for index, (tensor, full, base) in enumerate(zip(actual, expected, reference)):
+                assert_precision(tensor, full, dtype=torch.bfloat16, backward=index > 0,
+                                 label=f"GDN state CP output/gradient {index}")
+                torch.testing.assert_close(tensor, base, rtol=0, atol=0,
+                                           msg=f"GDN packets differ for output/gradient {index}")
+        del expected, inputs, reference, output, gradients, actual
+
+
 def test_gdn_ascendc_ulysses() -> None:
     """Qualify dense/TND native core and packed full-layer checkpoint ownership."""
     torch.set_num_threads(1)
@@ -95,5 +154,7 @@ def test_gdn_ascendc_ulysses() -> None:
         _check_core(mesh, length, None)
         _check_core(mesh, length, (0, length + 1, 2 * length + 63, size * length - 1, size * length))
         _check_layer(mesh, length)
+        _check_state_core(mesh, length)
+        _check_state_core(mesh, length, degree=2)
     finally:
         dist.destroy_process_group()

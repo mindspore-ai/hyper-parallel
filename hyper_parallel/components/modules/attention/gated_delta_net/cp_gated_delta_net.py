@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""GDN Ulysses and state-P2P scheduling over the complete local algorithm."""
+"""GDN Ulysses and state-CP scheduling over the complete local algorithm."""
 from __future__ import annotations
+import math
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
+from torch.autograd.function import once_differentiable
 
 from hyper_parallel.components.functional.gated_delta_net import (
     chunk_gated_delta_rule, is_triton_gdn_available, apply_gdn_state_summary, apply_gdn_state_gradient_summary,
+)
+from hyper_parallel.components.functional.gated_delta_net_ascendc import (
+    GDNNativePrepared, load_gdn_native_state_ops, prepare_gdn_native, finish_gdn_native_forward,
 )
 from hyper_parallel.components.functional.linear_attention_convolution import fused_causal_conv1d, packed_causal_conv1d
 from hyper_parallel.components.modules.attention.linear_attention_utils.layer_adapter import (
@@ -31,31 +36,50 @@ from hyper_parallel.components.modules.attention.linear_attention_utils.cp_convo
     causal_convolutions_with_halo,
 )
 from hyper_parallel.components.modules.attention.linear_attention_utils.parallel_layout import (
-    validate_linear_attention_layout,
+    validate_linear_attention_layout, split_linear_attention_mesh,
 )
-from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import PackedSequenceInfo
+from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import (
+    PackedSequenceInfo, local_chunk_metadata,
+)
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.distributed.context_parallel.collectives import exchange_sequence_heads
 from hyper_parallel.distributed.module_binding import ParallelModuleSpec
+from hyper_parallel.components.modules.attention.linear_attention_utils.cp_state_exchange import (
+    NativeStateAllGather, NativeStateExchange, native_state_intervals,
+)
 from .gated_delta_net import GatedDeltaNetModule
 
 
+# Convert natural-log decay to the log2 convention of native CP summary kernels.
+LOG2_E = 1.0 / math.log(2.0)
+
+
 class CPGatedDeltaNetModule(GatedDeltaNetModule):
-    """Existing GDN pure-U and state-P2P execution without copying the layer forward."""
+    """GDN Ulysses and state CP execution sharing the complete local layer math."""
 
     def __init__(self, *, config: Any = None, module: torch.nn.Module | None = None,
                  module_fqn: str = "", context: Any = None, backend: str = "eager",
                  conv_backend: str | None = None, chunk_size: int = 64,
-                 input_layout: str = "BSH", ulysses_degree: int | None = 1) -> None:
+                 input_layout: str = "BSH", ulysses_degree: int | None = 1,
+                 state_cp_method: str = "p2p",
+                 p2p_head_chunks: int = 1, reuse_cp_state_on_recompute: bool = False) -> None:
         """Retain the explicitly requested algorithm and deferred CP resources."""
         del module_fqn, context
         self.ulysses_degree = ulysses_degree
+        self.state_cp_method = state_cp_method
+        self.p2p_head_chunks = p2p_head_chunks
+        if reuse_cp_state_on_recompute and backend != "ascendc":
+            raise NotImplementedError("Checkpoint entry caching currently requires the Ascend C state backend.")
+        self.reuse_cp_state_on_recompute, self._cp_entry_key = reuse_cp_state_on_recompute, object()
+        self.state_cp = None
         if conv_backend is None and ulysses_degree == 1:
             conv_backend = "eager"
         super().__init__(config=config, module=module,
                          backend=backend, conv_backend=conv_backend, chunk_size=chunk_size, input_layout=input_layout)
         self.cp_rank, self.cp_size = 0, 1
         self.ulysses_size, self.state_size = 1, 1
+        self.ulysses_mesh = self.state_mesh = None
+        self.ulysses_rank = 0
         self.cp_context = None
         self.convolve_after_exchange = ulysses_degree is None
 
@@ -85,14 +109,32 @@ class CPGatedDeltaNetModule(GatedDeltaNetModule):
         self.cp_context = binding.cp_context
         self.cp_rank, self.cp_size = self.cp_context.rank, self.cp_context.size
         degree = self.cp_size if self.ulysses_degree is None else self.ulysses_degree
-        if degree not in (1, self.cp_size):
-            raise NotImplementedError("GDN supports pure Ulysses or P2P, not a mixed degree")
+        if not isinstance(degree, int) or isinstance(degree, bool) or degree < 1 or self.cp_size % degree:
+            raise ValueError("GDN Ulysses degree must divide CP size")
         self.ulysses_size, self.state_size = degree, self.cp_size // degree
         self.convolve_after_exchange = self.ulysses_degree is None or (1 < self.cp_size == degree)
-        if self.convolve_after_exchange and (self.num_k_heads % degree or self.num_v_heads % degree):
+        if self.num_k_heads % degree or self.num_v_heads % degree:
             raise ValueError("GDN Ulysses degree must divide query and value heads")
-        if not self.convolve_after_exchange and self.cp_size > 1 and self.backend != "triton":
-            raise NotImplementedError("GDN state CP requires Triton; use local/pure Ulysses for other backends")
+        self._bind_state_groups(degree)
+
+    def _bind_state_groups(self, degree: int) -> None:
+        """Create head-shard state groups once, retaining the parent root mapping."""
+        self.state_mesh = self.cp_context.mesh
+        if 1 < degree < self.cp_size:
+            if self.backend != "ascendc":
+                raise NotImplementedError("GDN hybrid Ulysses/state CP currently requires Ascend C")
+            hybrid = split_linear_attention_mesh(self.state_mesh, degree, ("gdn_state", "gdn_ulysses"))
+            self.state_mesh, self.ulysses_mesh = hybrid["gdn_state"], hybrid["gdn_ulysses"]
+            self.ulysses_rank = self.ulysses_mesh.get_local_rank()
+        if not self.convolve_after_exchange and self.cp_size > 1:
+            if self.backend not in ("triton", "ascendc"):
+                raise NotImplementedError("GDN state CP requires Triton or Ascend C")
+            if self.state_cp_method == "allgather":
+                ranks = tuple(self.state_mesh.rank_list)
+                if ranks != tuple(dist.get_process_group_ranks(self.state_mesh.get_group())):
+                    raise ValueError("GDN AllGather requires the mesh order to match the communication group's order")
+                self.state_cp = NativeStateAllGather(
+                    self.state_mesh.get_group(), self.state_mesh.get_local_rank(), self.state_size)
 
     def _exchange_raw_inputs(self, operands: tuple) -> tuple:
         """Exchange packed Q/K/V and gates before pure-Ulysses convolution."""
@@ -119,7 +161,7 @@ class CPGatedDeltaNetModule(GatedDeltaNetModule):
             return packed_causal_conv1d(mixed, conv, info, weight=weight, bias=bias, backend=self.conv_backend)
         if self.conv_backend != "eager":
             return fused_causal_conv1d(mixed, weight, bias, backend=self.conv_backend, dilation=conv.dilation[0])
-        output = F.conv1d(mixed.transpose(1, 2), weight, bias, stride=conv.stride,
+        output = torch.conv1d(mixed.transpose(1, 2), weight, bias, stride=conv.stride,
                           padding=conv.padding, dilation=conv.dilation, groups=mixed.shape[-1])
         return F.silu(output[:, :, :mixed.shape[1]]).transpose(1, 2)
 
@@ -148,10 +190,28 @@ class CPGatedDeltaNetModule(GatedDeltaNetModule):
                                                self.cp_rank, self.cp_size, sequence_info=info,
                                                backend=self.conv_backend)
         inputs = self.prepare_core_inputs(mixed, beta, decay)
+        if self.ulysses_mesh is not None:
+            # Convolution and raw gates retain their original token ownership.
+            # Equal Q/K and V splits preserve each compact GVA group.
+            inputs = tuple(exchange_sequence_heads(tensor, self.ulysses_mesh, split_dim=2, concat_dim=1)
+                           for tensor in inputs)
+            info = None if info is None else info.ulysses(self.ulysses_size, self.ulysses_rank)
+        output = self._run_state_core(inputs, info)
+        return (output if self.ulysses_mesh is None else
+                exchange_sequence_heads(output, self.ulysses_mesh, split_dim=1, concat_dim=2))
+
+    def _run_state_core(self, inputs: tuple, info: PackedSequenceInfo | None) -> torch.Tensor:
+        """Execute local phases on this head shard's chronological state group."""
         if self.backend == "triton":
             if not is_triton_gdn_available(*inputs):
                 raise RuntimeError("GDN P2P Triton requires the fixed NPU BF16 K=V=128 contract")
-            return triton_state_gdn(*inputs, self.cp_context.mesh, self.cp_rank, self.cp_size, sequence_info=info)
+            return triton_state_gdn(*inputs, self.state_mesh, self.state_mesh.get_local_rank(), self.state_size,
+                                   sequence_info=info)
+        if self.backend == "ascendc" and self.state_size > 1:
+            return ascendc_state_gdn(
+                *inputs, cp_mesh=self.state_mesh, state_cp=self.state_cp, sequence_info=info,
+                p2p_head_chunks=self.p2p_head_chunks,
+                reuse_cp_state_on_recompute=self.reuse_cp_state_on_recompute, cache_key=self._cp_entry_key)
         return self.run_local_core(inputs, info)
 
 
@@ -503,3 +563,118 @@ def triton_state_gdn(
         next_rank,
         sequence_info,
     )
+
+
+class _AscendCGDNState(torch.autograd.Function):
+    """Keep local activations and asynchronous send storage owned by one invocation."""
+
+    @staticmethod
+    def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                gate: torch.Tensor, beta: torch.Tensor, metadata: dict,
+                exchange: NativeStateExchange) -> torch.Tensor:
+        """Exchange the entry state, then run and save the local native forward."""
+        ops = load_gdn_native_state_ops()
+        reception = exchange.receive(query, True)
+        prepared = prepare_gdn_native((query, key, value, gate, beta), metadata)
+        tail, head, prefix, suffix = native_state_intervals(
+            exchange.info, query.shape[1], exchange.rank, exchange.size)
+        maps = None
+        if exchange.needs_summary(True):
+            # GDN local phases use natural log. Native summary kernels use log2.
+            maps = ops.pre_process_fwd_kernel_merged(
+                prepared.key, prepared.weights, prepared.updates,
+                g=prepared.gate * LOG2_E, cu_seqlens=tail, chunk_size=64)
+        initial, send_handle, payloads = exchange.exchange(ops, maps, reception, True, prefix)
+        del maps, reception
+        if exchange.info is not None:
+            initial = exchange.info.first_state(initial)
+        output, hidden, values = finish_gdn_native_forward(prepared, initial, metadata)
+        prepared = prepared._replace(updates=None)
+        ctx.save_for_backward(*prepared, hidden, values)
+        ctx.exchange, ctx.native_metadata, ctx.head, ctx.suffix = exchange, metadata, head, suffix
+        if send_handle is not None:
+            send_handle.wait()
+        del payloads
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
+        """Exchange the exit-state gradient before completing local native gradients."""
+        ops = load_gdn_native_state_ops()
+        # Unpack once: non-reentrant checkpoint consumes each saved-tensor handle.
+        saved = ctx.saved_tensors
+        prepared = GDNNativePrepared(*saved[:11])
+        hidden, values = saved[11:]
+        exchange, metadata = ctx.exchange, ctx.native_metadata
+        reception = exchange.receive(prepared.query, False)
+        grad = grad_output.transpose(1, 2).contiguous()
+        scale = prepared.key.shape[-1] ** -0.5
+        dv_local = ops.chunk_bwd_dv_local(
+            prepared.query, prepared.key, grad, prepared.gate, scale, 64,
+            A=prepared.matrix_a, **metadata)
+        maps = None
+        if exchange.needs_summary(False):
+            maps = ops.pre_process_bwd_kernel_merged(
+                prepared.query, prepared.key, prepared.weights, grad, dv_local, scale, 64,
+                g=prepared.gate * LOG2_E, cu_seqlens=ctx.head)
+        terminal, send_handle, payloads = exchange.exchange(ops, maps, reception, False, ctx.suffix)
+        del maps, reception
+        if exchange.info is not None:
+            terminal = exchange.info.last_state(terminal)
+        dh, _, du = ops.chunk_gated_delta_rule_bwd_dhu(
+            prepared.query, prepared.key, prepared.weights, grad, dv_local, scale, 64,
+            g=prepared.gate, dht=None if terminal is None else terminal.to(prepared.query.dtype),
+            use_exp2=False, **metadata)
+        del dv_local, terminal
+        value = (prepared.value_head if prepared.value_token is None else
+                 prepared.value_token.transpose(1, 2).contiguous())
+        dq, dk, dv, dbeta, dgate = ops.chunk_gated_delta_rule_bwd_finalize(
+            prepared.query, prepared.key, value, values, grad, du,
+            prepared.gate, prepared.beta, hidden, dh, prepared.matrix_a,
+            q_rstd=prepared.q_rstd, k_rstd=prepared.k_rstd, scale=scale,
+            use_qk_l2_norm_in_kernel=True, use_exp2=False, **metadata)
+        gradients = tuple(tensor.transpose(1, 2).contiguous() for tensor in (dq, dk, dv, dgate, dbeta))
+        if send_handle is not None:
+            send_handle.wait()
+        del payloads
+        return (*gradients, None, None)
+
+
+def ascendc_state_gdn(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                      gate: torch.Tensor, beta: torch.Tensor, *, cp_mesh: Any,
+                      state_cp: Any = None, sequence_info: Any = None,
+                      p2p_head_chunks: int = 1, reuse_cp_state_on_recompute: bool = False,
+                      cache_key: object = None) -> torch.Tensor:
+    """Execute dense/TND GDN P2P or AllGather with compact native GVA.
+
+    Args:
+        query: Raw BF16 queries [1,T,Hq,128], normalized inside native Prepare.
+        key: Matching compact keys, with Hv a multiple of Hq.
+        value: BF16 values [1,T,Hv,128].
+        gate: Effective log-decay [1,T,Hv], before chunk cumsum.
+        beta: Effective delta coefficients [1,T,Hv].
+        cp_mesh: Existing chronological state CP mesh.
+        state_cp: Gather executor, or None for ordinary P2P.
+        sequence_info: Real packed document metadata for this rank.
+        p2p_head_chunks: State packets; local Prepare and summary kernels stay unsplit.
+        reuse_cp_state_on_recompute: Reuse this forward entry during a HyperParallel checkpoint replay.
+        cache_key: Stable caller identity; direct callers otherwise follow invocation order.
+
+    Returns:
+        Token-major output. State communication and apply use FP32; only the
+        native Dhu boundary converts the terminal gradient to the input dtype.
+    """
+    if query.device.type != "npu" or query.dtype != torch.bfloat16:
+        raise ValueError("Native GDN state CP requires BF16 NPU inputs.")
+    if query.ndim != 4 or query.shape[0] != 1 or query.shape[-1] != 128 or value.shape[-1] != 128:
+        raise ValueError("Native GDN state CP requires [1,T,H,128] inputs.")
+    if (key.shape != query.shape or value.shape[:2] != query.shape[:2]
+            or value.shape[2] % query.shape[2] or gate.shape != value.shape[:-1] or beta.shape != gate.shape):
+        raise ValueError("Native GDN state CP requires matching Q/K and Hv divisible by Hq, with gates [1,T,Hv].")
+    load_gdn_native_state_ops()
+    metadata = local_chunk_metadata(None if sequence_info is None else sequence_info.local_offsets, query.shape[1])
+    exchange = NativeStateExchange(cp_mesh, state_cp, sequence_info, query.shape[1], value.shape[2],
+                                   p2p_head_chunks, reuse_cp_state_on_recompute=reuse_cp_state_on_recompute,
+                                   cache_key=cache_key, algorithm="gdn")
+    return _AscendCGDNState.apply(query, key, value, gate, beta, metadata, exchange)
