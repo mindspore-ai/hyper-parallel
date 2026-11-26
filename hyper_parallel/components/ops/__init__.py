@@ -31,42 +31,64 @@ from .impl.attention import (
 )
 from .impl.causal_conv1d import CAUSAL_CONV1D
 from .impl.dsa_indexer import (
-    DSA_INDEXER, DSA_PACKED_INDEXER, PackedDsaIndexerFn, indexer_native_only, native_dsa_indexer,
+    DSA_INDEXER, DSA_PACKED_INDEXER, DSA_TOPK, SelectTopKFn, PackedDsaIndexerFn,
+    deep_select_stride_requirement, indexer_native_only, native_dsa_indexer,
 )
+from .impl.dsa_indexer import DSA_MQA, DSA_PAGED_MQA, paged_mqa_metadata
 from .impl.dsa_indexer_kl import (
     DSA_DENSE_KL, DSA_INDEXER_KL, DSA_PACKED_KL, DenseDsaKlFn, PackedDsaKlFn, indexer_kl_native_only,
     native_dsa_indexer_kl,
 )
 from .impl.deepseek_sparse_attention import (
-    DSA_ABSORBED, DSA_ABSORBED_SINK, DSA_COMPRESSED_BANKS, PackedDeepseekSparseAttentionFn, attention_native_only,
+    DSA_ABSORBED, DSA_ABSORBED_SINK, DSA_COMPRESSED_BANKS, DSA_SPARSE_PREFILL, DSA_SPARSE_DECODE,
+    PackedDeepseekSparseAttentionFn, attention_native_only, get_mla_metadata, require_sparse_inference,
 )
 from .impl.gdn import GDN
+from .impl.gemm import GEMM, HEAD_EINSUM, Operand, operand_data
+from .impl.grouped_matmul import M_GROUPED_GEMM, K_GROUPED_GEMM
+from .impl.engram import ENGRAM_GATE, ENGRAM_HASH, EngramGateFn, EngramHashFn
 from .impl.grouped_matmul import GROUPED_MATMUL, GroupedMatmulFn
 from .impl.grouped_swiglu import GROUPED_SWIGLU
 from .impl.kda import KDA
+from .impl.mhc_pre import MHC_PRENORM, MhcPrenormFn
 from .impl.mhc_post import MHC_POST, MhcPostFn
-from .impl.moe_router import MOE_ROUTER, router_scores
+from .impl.mhc_pre import MHC_PRE, MHC_PRE_APPLY, MHC_SPLIT, MhcApplyFn, MhcPreFn, MhcSplitFn
+from .impl.moe_router import (
+    MOE_GATE, MOE_GATE_BACKWARD, MOE_ROUTER, ROUTING_NORMALIZE,
+    MoeTopKFn, MoeTopKBackwardFn, NormalizeRoutingFn, router_scores,
+)
+from .impl.quantization import CAST_BACK, PER_BLOCK_CAST, PER_TOKEN_CAST, PerBlockCastFn, QuantTensor
 from .impl.moe_token_reorder import MOE_TOKEN_REORDER, MOE_TOKEN_RESTORE, PermutedTokens
 from .impl.mome import MOME, MomeFn
 from .impl.rms_norm import RMS_NORM, RMS_NORM_FP32_AFFINE, RMSNormFn
-from .impl.rope import ROPE, ROPE_INTERLEAVED, InterleavedRopeFn, RopeFn
+from .impl.rope import ROPE, ROPE_CACHED, ROPE_INTERLEAVED, CachedRopeFn, InterleavedRopeFn, RopeFn
 from .impl.sinkhorn import SINKHORN, SinkhornFn
-from .impl.swiglu import SWIGLU, SWIGLU_CLAMPED, ClampedSwiGLUFn, SwiGLUFn
+from .impl.swiglu import (
+    SWIGLU, SWIGLU_BACKWARD, SWIGLU_CLAMPED, SWIGLU_FORWARD, SWIGLU_QUANTIZED, SWIGLU_QUANTIZED_BACKWARD,
+    ClampedSwiGLUFn, SwiGLUFn, SwiGLUForwardFn, SwiGLUBackwardFn, QuantizedSwiGLUFn,
+)
 from .spec import OpSpec
 
 __all__ = [
-    "DsaQueryLayout", "causal_conv1d", "dsa_indexer", "dsa_indexer_kl", "dsa_indexer_kl_dense",
+    "mqa_logits", "paged_mqa_logits", "paged_mqa_metadata", "mhc_prenorm_projection", "gemm", "head_einsum",
+    "m_grouped_gemm", "k_grouped_gemm", "DsaQueryLayout", "deep_select_topk", "deep_select_stride_requirement",
+    "causal_conv1d", "dsa_indexer", "dsa_indexer_kl", "dsa_indexer_kl_dense",
     "dsa_indexer_kl_packed", "dsa_indexer_packed",
     "deepseek_sparse_attention_absorbed", "deepseek_sparse_attention_compressed_banks",
-    "deepseek_sparse_attention_with_sink",
+    "deepseek_sparse_attention_with_sink", "flash_mla_sparse_prefill", "flash_mla_sparse_decode", "get_mla_metadata",
     "gdn", "grouped_query_attention", "grouped_matmul", "grouped_swiglu", "kda", "mhc_post", "multi_latent_attention",
-    "multi_latent_attention_with_stats",
+    "multi_latent_attention_with_stats", "mhc_pre", "mhc_pre_apply", "mhc_split_mixes",
     "moe_router", "moe_token_reorder", "moe_token_restore", "mome", "ops", "rms_norm", "rms_norm_fp32_affine",
     "router_scores",
-    "rope", "rope_interleaved", "rope_qk",
+    "rope", "rope_cached", "apply_rotary", "rope_interleaved", "rope_qk",
     "sinkhorn", "swiglu", "swiglu_clamped", "vision_attention",
+    "engram_gate", "engram_hash", "moe_topk_gate", "moe_topk_gate_backward", "normalize_routing_weights",
+    "per_token_cast", "per_block_cast", "cast_back", "swiglu_forward", "swiglu_backward",
+    "swiglu_forward_and_per_token_cast", "swiglu_backward_and_per_token_cast",
 ]
 
+mhc_prenorm_projection: MhcPrenormFn = _dispatch(MHC_PRENORM)
+deep_select_topk: SelectTopKFn = _dispatch(DSA_TOPK)
 grouped_matmul: GroupedMatmulFn = _dispatch(GROUPED_MATMUL)
 dsa_indexer_packed: PackedDsaIndexerFn = _dispatch(DSA_PACKED_INDEXER)
 dsa_indexer_kl_dense: DenseDsaKlFn = _dispatch(DSA_DENSE_KL)
@@ -74,15 +96,86 @@ dsa_indexer_kl_packed: PackedDsaKlFn = _dispatch(DSA_PACKED_KL)
 deepseek_sparse_attention_absorbed: PackedDeepseekSparseAttentionFn = _dispatch(DSA_ABSORBED)
 deepseek_sparse_attention_with_sink: PackedDeepseekSparseAttentionFn = _dispatch(DSA_ABSORBED_SINK)
 mhc_post: MhcPostFn = _dispatch(MHC_POST)
+mhc_pre: MhcPreFn = _dispatch(MHC_PRE)
+mhc_pre_apply: MhcApplyFn = _dispatch(MHC_PRE_APPLY)
+mhc_split_mixes: MhcSplitFn = _dispatch(MHC_SPLIT)
+engram_gate: EngramGateFn = _dispatch(ENGRAM_GATE)
+engram_hash: EngramHashFn = _dispatch(ENGRAM_HASH)
+moe_topk_gate: MoeTopKFn = _dispatch(MOE_GATE)
+normalize_routing_weights: NormalizeRoutingFn = _dispatch(ROUTING_NORMALIZE)
+per_block_cast: PerBlockCastFn = _dispatch(PER_BLOCK_CAST)
 multi_latent_attention_with_stats: MultiLatentAttentionStatsFn = _dispatch(MULTI_LATENT_ATTENTION_WITH_STATS)
 mome: MomeFn = _dispatch(MOME)
 rms_norm: RMSNormFn = _dispatch(RMS_NORM)
 rms_norm_fp32_affine: RMSNormFn = _dispatch(RMS_NORM_FP32_AFFINE)
+rope_cached: CachedRopeFn = _dispatch(ROPE_CACHED)
 rope: RopeFn = _dispatch(ROPE)
 rope_interleaved: InterleavedRopeFn = _dispatch(ROPE_INTERLEAVED)
 sinkhorn: SinkhornFn = _dispatch(SINKHORN)
+swiglu_forward: SwiGLUForwardFn = _dispatch(SWIGLU_FORWARD)
+swiglu_backward: SwiGLUBackwardFn = _dispatch(SWIGLU_BACKWARD)
+swiglu_forward_and_per_token_cast: QuantizedSwiGLUFn = _dispatch(SWIGLU_QUANTIZED)
 swiglu: SwiGLUFn = _dispatch(SWIGLU)
 swiglu_clamped: ClampedSwiGLUFn = _dispatch(SWIGLU_CLAMPED)
+
+
+def flash_mla_sparse_prefill(query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor,
+                             softmax_scale: float, **options: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward-only sparse prefill; statistics exclude the optional attention sink."""
+    require_sparse_inference(query, key_value, options.get("attention_sink"))
+    return _select_for_call(DSA_SPARSE_PREFILL, query)(query, key_value, indices, softmax_scale, **options)
+
+
+def flash_mla_sparse_decode(query: torch.Tensor, key_cache: torch.Tensor, indices: torch.Tensor,
+                            scheduler_metadata: Any = None, **options: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward-only sparse paged decode with caller-owned scheduling metadata."""
+    require_sparse_inference(query, key_cache, options.get("attention_sink"), options.get("extra_key_cache"))
+    return _select_for_call(DSA_SPARSE_DECODE, query)(query, key_cache, indices, scheduler_metadata, **options)
+
+
+def apply_rotary(
+    query: torch.Tensor, cos_sin_cache: torch.Tensor, key: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None, *, interleaved: bool = False,
+    conjugate: bool = False, sequence_offset: int = 0,
+) -> None:
+    """Compatibility in-place inference API; use rope_cached for autograd."""
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (query, cos_sin_cache, key)):
+        raise RuntimeError("apply_rotary is an in-place inference API; use rope_cached for autograd")
+    result, key_result = rope_cached(query, cos_sin_cache, key, positions, interleaved=interleaved,
+                                     conjugate=conjugate, sequence_offset=sequence_offset)
+    query.copy_(result)
+    if key is not None:
+        key.copy_(key_result)
+
+
+def swiglu_backward_and_per_token_cast(
+    x: QuantTensor, gradient: torch.Tensor, fmt: str, num_per_channels: int, **options: Any,
+) -> tuple:
+    """Dispatch the explicit FP8 VJP using the encoded tensor's device."""
+    return _select_for_call(SWIGLU_QUANTIZED_BACKWARD, x[0])(x, gradient, fmt, num_per_channels, **options)
+
+
+def per_token_cast(x: torch.Tensor | QuantTensor, fmt: str, num_per_channels: int, **options: Any) -> QuantTensor:
+    """Quantize floating or previously quantized data with per-token scaling."""
+    sample = x[0] if isinstance(x, tuple) else x
+    return _select_for_call(PER_TOKEN_CAST, sample)(x, fmt, num_per_channels, **options)
+
+
+def cast_back(x: QuantTensor, fmt: str, block_size: tuple[int, int], **options: Any) -> torch.Tensor:
+    """Dequantize a data/scale pair; selection follows the data tensor's device."""
+    return _select_for_call(CAST_BACK, x[0])(x, fmt, block_size, **options)
+
+
+def moe_topk_gate_backward(
+    scores: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor,
+    topk_weight_gradient: torch.Tensor, routed_scaling_factor: float, *, scoring_func: str = "sqrtsoftplus",
+    mask: torch.Tensor | None = None, score_sum_gradient: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Preserve the original explicit VJP API, translating its auxiliary-gradient name."""
+    backward: MoeTopKBackwardFn = _select_for_call(MOE_GATE_BACKWARD, scores)
+    return backward(scores, topk_indices, topk_weights, topk_weight_gradient, routed_scaling_factor,
+                    scoring_func=scoring_func, mask=mask, grad_scores_sum=score_sum_gradient, out=out)
 vision_attention: VisionAttentionFn = _dispatch(VISION_ATTENTION)
 
 
@@ -254,7 +347,9 @@ def dsa_indexer(
     if x.ndim != 4 or key.ndim != 3 or min(sparse_count, key.shape[1]) <= 0 or x.shape[1] == 0:
         implementation = native_dsa_indexer
     else:
-        implementation = _select_for_call(DSA_INDEXER, x, native_only=indexer_native_only(x, layout, reduce_sum))
+        reason = indexer_native_only(x, layout, reduce_sum)
+        blocked = () if reason is None else (("cann", reason),)
+        implementation = _select_for_call(DSA_INDEXER, x, blocked_backends=blocked)
     return implementation(
         x, key, merge_weight, layout=layout, sparse_count=sparse_count,
         query_chunk_size=query_chunk_size, reduce_sum=reduce_sum,
@@ -325,3 +420,38 @@ def moe_router(
         native_only = "MegaGate requires nonempty batched tokens and sqrtsoftplus scoring"
     route = _select_for_call(MOE_ROUTER, x, native_only=native_only)
     return route(x, weight, bias, vision_bias, image_mask, top_k, scoring_func, scale)
+
+
+def gemm(a: Operand, b: Operand, **options: Any) -> torch.Tensor:
+    """Multiply nt/nn/tn/tt operands; BF16 is differentiable, quantized pairs are inference-only."""
+    return _select_for_call(GEMM, operand_data(a))(a, b, **options)
+
+
+def head_einsum(a: Operand, b: Operand, expression: str, **options: Any) -> torch.Tensor:
+    """Contract MLA head projections with BF16 VJPs or explicitly quantized FP8 inputs."""
+    return _select_for_call(HEAD_EINSUM, operand_data(a))(a, b, expression, **options)
+
+
+def m_grouped_gemm(a: Operand, b: Operand, ends: torch.Tensor, **options: Any) -> torch.Tensor:
+    """Multiply M-grouped operands whose group starts include alignment padding."""
+    return _select_for_call(M_GROUPED_GEMM, operand_data(a))(a, b, ends, **options)
+
+
+def k_grouped_gemm(a: Operand, b: Operand, ends: torch.Tensor, **options: Any) -> torch.Tensor:
+    """Reduce padded K groups, returning one matrix per expert."""
+    return _select_for_call(K_GROUPED_GEMM, operand_data(a))(a, b, ends, **options)
+
+
+def mqa_logits(q: QuantTensor, kv: QuantTensor, weights: torch.Tensor, starts: torch.Tensor,
+               ends: torch.Tensor, max_length: int) -> torch.Tensor:
+    """Compute quantized head-reduced MQA scores in compressed per-query intervals."""
+    return _select_for_call(DSA_MQA, q[0])(q, kv, weights, starts, ends, max_length)
+
+
+def paged_mqa_logits(q: QuantTensor, cache: torch.Tensor, weights: torch.Tensor, context_lens: torch.Tensor,
+                     block_table: torch.Tensor, schedule_meta: torch.Tensor | None, max_length: int,
+                     request_ids: torch.Tensor, *, use_ascend_kv_layout: bool = False) -> torch.Tensor:
+    """Compute inference scores from quantized pages with caller-owned scheduling metadata."""
+    return _select_for_call(DSA_PAGED_MQA, q[0])(
+        q, cache, weights, context_lens, block_table, schedule_meta, max_length, request_ids,
+        use_ascend_kv_layout=use_ascend_kv_layout)

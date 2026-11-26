@@ -18,6 +18,7 @@ from functools import partial
 from typing import Protocol
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from hyper_parallel.components.functional.mhc_post import mhc_post
 
@@ -64,9 +65,43 @@ def _load_cann() -> MhcPostFn:
     return partial(mhc_post, backend="cann")
 
 
+class _TileKernelsMhcPost(torch.autograd.Function):
+    """Connect upstream's raw post forward and backward kernels."""
+
+    @staticmethod
+    def forward(ctx, x, residual, post, combine, kernels):
+        """Save the exact activation and coefficient tensors consumed by the kernel."""
+        ctx.save_for_backward(x, residual, post, combine)
+        ctx.backward_kernel = kernels.mhc_post_bwd
+        return kernels.mhc_post_fwd(x, residual, post, combine)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, gradient):
+        """Return all four upstream gradients without deriving another backward."""
+        return (*ctx.backward_kernel(*ctx.saved_tensors, gradient.contiguous()), None)
+
+
+def _load_tile_kernels() -> MhcPostFn:
+    kernels = require_package("tile_kernels.mhc")
+    for symbol in ("mhc_post_fwd", "mhc_post_bwd"):
+        require_symbol(kernels, symbol)
+
+    def run(x, residual, h_post, h_res, num_stream):
+        """Restore upstream's explicit stream axis and Hyper's flattened output."""
+        streams = residual.reshape(*x.shape[:2], num_stream, x.shape[-1]).contiguous()
+        output = _TileKernelsMhcPost.apply(
+            x.contiguous(), streams, h_post.unsqueeze(-1).contiguous(), h_res.contiguous(), kernels,
+        )
+        return output.flatten(2)
+
+    return run
+
+
 def register_mhc_post(registry: OpRegistry) -> None:
     """Register Torch residual mixing and the optional CANN and Omni kernels."""
     registry.register_family("mhc_post", specs=(MHC_POST,))
     registry.register_impl(MHC_POST, name="native", devices=("cuda", "cpu", "npu"), load=_load_native)
     registry.register_impl(MHC_POST, name="cann", devices=("npu",), load=_load_cann)
     registry.register_impl(MHC_POST, name="omni", devices=("npu",), load=_load_omni)
+    registry.register_impl(MHC_POST, name="tile_kernels", devices=("npu",), load=_load_tile_kernels)

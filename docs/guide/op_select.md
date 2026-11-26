@@ -24,7 +24,31 @@ ops:
 
 NPU and GPU training recipes can share the same `ops` settings when they use `auto`. To pin a backend, set the implementation in each device's YAML. For example, use `attention: torch_npu` in the NPU recipe and `attention: sdpa` in the CUDA recipe.
 
-Use `--ops.<family>=<implementation>` to add or override a selection, for example `--ops.deepseek_sparse_attention=native`. Model replacements and recipe migration follow in the integration PR. The Python examples below exercise the standalone public interfaces.
+Use `--ops.<family>=<implementation>` to add or override a selection, for example `--ops.deepseek_sparse_attention=native`. Module and recipe migrations follow separately; backend settings affect public Ops calls.
+
+### Ascend backends
+
+Install the required upstream packages: [TileKernels](https://github.com/deepseek-ai/TileKernels#requirements), [DeepSelect](https://github.com/deepseek-ai/DeepSelect), [DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend), [FlashMLA](https://github.com/deepseek-ai/FlashMLA) or [DeepEP-Ascend](https://github.com/deepseek-ai/DeepEP-Ascend).
+For example, install TileKernels with `python -m pip install git+https://github.com/deepseek-ai/TileKernels.git` in a supported Ascend environment.
+
+```yaml
+ops:
+  swiglu: tile_kernels
+  rope: tile_kernels
+  engram: native  # Original eager implementation; select tile_kernels for the fused backend.
+  dsa_indexer: deep_select
+  grouped_matmul: deep_gemm
+  deepseek_sparse_attention: flash_mla
+```
+
+These optional backends require explicit selection. Settings apply only to public Ops calls; existing mHC, Engram and Router module calls are unchanged. TileKernels also supports mHC Pre/Post, Sinkhorn, Router and quantization. DeepGEMM quantized paths and FlashMLA are inference-only. DeepEP transport and MegaMoE buffers are resource interfaces under `hyper_parallel.distributed.expert_parallel`, not Ops selectors.
+
+Run real NPU precision checks with the required packages installed:
+
+```bash
+python -m pytest -v tests/torch/ops/_test_backend_precision.py::test_tile_kernels_precision
+python -m pytest -v tests/torch/ops/_test_backend_precision.py::test_deepseek_ascend_precision
+```
 
 ## How backend selection works
 
@@ -59,11 +83,16 @@ Each device column lists its `auto` candidates in priority order from left to ri
 | `swiglu` | `standard`, `clamped_fp32` for packed inputs and clamping separate inputs | `torch_npu` | `native` | `native` |
 | `rope` | `half`, `interleaved`, both with partial head-dimension rotation | `torch_npu`, `native` | `native` | `native` |
 | `mhc_post` | `standard` mixes the transformed output and residual streams | `cann`, `omni`, `native` | `native` | `native` |
+| `mhc_pre` | `standard`, complete Pre | `cann`, `native` | `native` | `native` |
+| `mhc_pre` | `split_mixes`, `apply_mix`, coefficient splitting and aggregation | `native` | `native` | `native` |
 | `sinkhorn` | `standard` normalizes the mHC mixing matrix | `omni`, `native` | `native` | `native` |
 | `mome` | `standard` applies masked causal convolution and a residual connection on the DSA output | `omni`, `native` | `native` | `native` |
 | `grouped_matmul` | `standard` performs a single bias-free grouped matrix multiplication with expert-major inputs | `torch_npu` | `torch_grouped_mm`, `native` | `native` |
 | `grouped_swiglu` | `standard` runs the gate, up, and down computations for non-quantized experts | `torch_npu`, `native` | `torch_grouped_mm`, `native` | `native` |
 | `moe_router` | `deepseek_v41` performs top-k routing in V4.1 | `megagate`, `native` | `native` | `native` |
+| `moe_router` | `topk_gate`, `topk_gate_backward`, `normalize_weights` | `native` | `native` | `native` |
+| `engram` | `hash`, `gate` | `native` | `native` | `native` |
+| `quantization` | `per_token`, `per_block`, `cast_back` | `native` | `native` | `native` |
 | `moe_token_reorder` | `standard`, `weighted_restore` for expert-major reordering and weighted restoration | `torch_npu`, `native` | `native` | `native` |
 | `attention` | `vision`, `gqa`, `mla`, `mla_with_stats` | `torch_npu`, `native` | `sdpa`, `native` | `sdpa`, `native` |
 | `gdn` | `zero_state` runs local zero-state Gated DeltaNet | `triton_ascend`, `ascendc`, `native` | `native` | `native` |

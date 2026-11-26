@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.mlp import SwiGLUMLP, SwiGLUMLPModule
 
 _EXPORT_TO_MODULE = {
+    "FlashMLASparsePrefill": "attention.flash_mla",
+    "FlashMLASparseDecode": "attention.flash_mla",
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
     "Gate": "moe.router",
     "GateModule": "moe.router",

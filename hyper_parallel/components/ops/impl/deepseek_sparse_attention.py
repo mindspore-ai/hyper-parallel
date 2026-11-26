@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 from torch.nn import functional as F
@@ -303,9 +303,155 @@ def _cann_attention(
     return output
 
 
+class SparsePrefillFn(Protocol):
+    """Forward-only sparse attention with optional sink and valid Top-K lengths."""
+
+    def __call__(self, query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor,
+                 softmax_scale: float, **options: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return output, maximum logits and LSE without a backward graph."""
+
+
+class SparseDecodeFn(Protocol):
+    """Forward-only sparse attention over V4.1 FP8/FP4 paged KV caches."""
+
+    def __call__(self, query: torch.Tensor, key_cache: torch.Tensor, indices: torch.Tensor,
+                 scheduler_metadata: Any = None, **options: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return [B,S,H,D] output and [B,H,S] LSE; caller owns scheduler state."""
+
+
+DSA_SPARSE_PREFILL = OpSpec[SparsePrefillFn](config_key="deepseek_sparse_attention", variant="sparse_prefill")
+DSA_SPARSE_DECODE = OpSpec[SparseDecodeFn](config_key="deepseek_sparse_attention", variant="sparse_decode")
+
+
+def require_sparse_inference(*tensors: torch.Tensor | None) -> None:
+    """Reject training before selecting a forward-only native extension."""
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in tensors):
+        raise RuntimeError("sparse FlashMLA has no backward; use torch.no_grad() for inference")
+
+
+def get_mla_metadata(*args: Any, **options: Any) -> Any:
+    """Construct optional native scheduling metadata; callers retain its lifetime."""
+    kernels = require_package("flash_mla")
+    require_symbol(kernels, "get_mla_metadata")
+    return kernels.get_mla_metadata(*args, **options)
+
+
+def _decode_sparse_cache(cache):
+    if cache.shape[-1] == 512:
+        return cache
+    raw = cache.view(torch.uint8)
+    if raw.shape[-1] == 528:
+        data = raw[..., :512].contiguous().view(torch.float8_e4m3fn).float()
+        scale = torch.pow(2.0, raw[..., 512:].float() - 127)
+        return (data * scale.repeat_interleave(32, -1)).to(torch.bfloat16)
+    if raw.shape[-1] == 288:
+        codes = torch.stack((raw[..., :256] & 15, raw[..., :256] >> 4), -1).flatten(-2)
+        levels = torch.tensor((0, 0.5, 1, 1.5, 2, 3, 4, 6), device=cache.device)
+        data = levels[(codes & 7).long()] * torch.where(codes < 8, 1.0, -1.0)
+        scale = raw[..., 256:].contiguous().view(torch.float8_e4m3fn).float()
+        return (data * scale.repeat_interleave(16, -1)).to(torch.bfloat16)
+    raise ValueError("V4.1 sparse KV cache rows require 528 FP8 bytes or 288 packed FP4 bytes")
+
+
+def _sparse_statistics(query, selected, valid, scale, sink):
+    logits = torch.einsum("thgd,thkd->thgk", query.float(), selected.float()) * scale
+    logits = logits.masked_fill(~valid.unsqueeze(-2), -torch.inf)
+    maximum = logits.amax(-1)
+    lse = torch.logsumexp(logits, -1)
+    denominator = lse if sink is None else torch.logaddexp(lse, sink.reshape(1, *lse.shape[1:]))
+    denominator = torch.where(denominator == -torch.inf, torch.inf, denominator)
+    probabilities = torch.exp(logits - denominator.unsqueeze(-1))
+    output = torch.einsum("thgk,thkd->thgd", probabilities, selected.float())
+    return output, maximum, torch.where(lse == -torch.inf, torch.inf, lse)
+
+
+@torch.no_grad()
+def _native_sparse_prefill(query, key_value, indices, softmax_scale, *, value_head_dim=512,
+                           attention_sink=None, topk_length=None):
+    if value_head_dim != 512:
+        raise ValueError("sparse FlashMLA requires value_head_dim=512")
+    keys = _decode_sparse_cache(key_value)
+    heads = keys.shape[1]
+    positions = indices.long()
+    valid = (positions >= 0) & (positions < keys.shape[0])
+    if topk_length is not None:
+        valid &= torch.arange(indices.shape[-1], device=query.device) < topk_length[:, None, None]
+    selected = keys[positions.clamp(0, keys.shape[0] - 1), torch.arange(heads, device=query.device)[None, :, None]]
+    grouped = query.reshape(query.shape[0], heads, query.shape[1] // heads, query.shape[-1])
+    output, maximum, lse = _sparse_statistics(grouped, selected, valid, softmax_scale, attention_sink)
+    return output.flatten(1, 2).to(query.dtype), maximum.flatten(1, 2), lse.flatten(1, 2)
+
+
+@torch.no_grad()
+def _native_sparse_decode(query, key_cache, indices, scheduler_metadata=None, *, value_head_dim=512,
+                          softmax_scale=None, attention_sink=None, topk_length=None,
+                          extra_key_cache=None, extra_indices=None, extra_topk_length=None,
+                          enable_batch_invariant=False):
+    del scheduler_metadata, enable_batch_invariant
+    if value_head_dim != 512:
+        raise ValueError("sparse FlashMLA requires value_head_dim=512")
+    batch, sequence, heads, width = query.shape
+
+    def gather(cache: Any, ids: Any, lengths: Any) -> Any:
+        """Gather valid cache slots while preserving masked positions."""
+        keys = _decode_sparse_cache(cache).reshape(-1, width)
+        selected = keys.index_select(0, ids.clamp_min(0).long().flatten()).reshape(batch * sequence, 1, -1, width)
+        valid = ids != -1
+        if lengths is not None:
+            valid &= torch.arange(ids.shape[-1], device=query.device) < lengths[:, None, None]
+        return selected, valid.reshape(batch * sequence, 1, -1)
+
+    selected, valid = gather(key_cache, indices, topk_length)
+    if extra_key_cache is not None:
+        extra, extra_valid = gather(extra_key_cache, extra_indices, extra_topk_length)
+        selected, valid = torch.cat((selected, extra), -2), torch.cat((valid, extra_valid), -1)
+    output, _, lse = _sparse_statistics(query.reshape(batch * sequence, 1, heads, width), selected, valid,
+                                       width**-0.5 if softmax_scale is None else softmax_scale, attention_sink)
+    return output.reshape(query.shape).to(query.dtype), lse.reshape(batch, sequence, heads).transpose(1, 2)
+
+
+def _load_flash_prefill() -> SparsePrefillFn:
+    kernels = require_package("flash_mla")
+    require_symbol(kernels, "flash_mla_sparse_fwd")
+
+    def run(query: Any, key_value: Any, indices: Any, softmax_scale: Any, *, value_head_dim: Any=512,
+            attention_sink: Any=None, topk_length: Any=None) -> Any:
+        """Apply the operator contract using the selected implementation."""
+        return kernels.flash_mla_sparse_fwd(query, key_value, indices, softmax_scale,
+                                            d_v=value_head_dim, attn_sink=attention_sink, topk_length=topk_length)
+
+    return run
+
+
+def _load_flash_decode() -> SparseDecodeFn:
+    kernels = require_package("flash_mla")
+    require_symbol(kernels, "flash_mla_with_kvcache")
+    require_symbol(kernels, "get_mla_metadata")
+
+    def run(query: Any, key_cache: Any, indices: Any, scheduler_metadata: Any=None, *, value_head_dim: Any=512,
+            softmax_scale: Any=None, attention_sink: Any=None, topk_length: Any=None, extra_key_cache: Any=None,
+            extra_indices: Any=None, extra_topk_length: Any=None, enable_batch_invariant: Any=False) -> Any:
+        """Apply the operator contract using the selected implementation."""
+        if scheduler_metadata is None or isinstance(scheduler_metadata, dict):
+            state = {} if scheduler_metadata is None else scheduler_metadata
+            if "native" not in state:
+                metadata = kernels.get_mla_metadata()
+                state["native"] = metadata[0] if isinstance(metadata, tuple) else metadata
+            scheduler_metadata = state["native"]
+        return kernels.flash_mla_with_kvcache(
+            query, key_cache, None, None, value_head_dim, scheduler_metadata, softmax_scale=softmax_scale,
+            indices=indices, attn_sink=attention_sink, topk_length=topk_length, extra_k_cache=extra_key_cache,
+            extra_indices_in_kvcache=extra_indices, extra_topk_length=extra_topk_length,
+            enable_batch_invariant=enable_batch_invariant,
+        )
+
+    return run
+
+
 def register_deepseek_sparse_attention(registry: OpRegistry) -> None:
     """Register the compressed-banks attention contract and its implementations."""
-    registry.register_family("deepseek_sparse_attention", specs=(DSA_COMPRESSED_BANKS, DSA_ABSORBED, DSA_ABSORBED_SINK))
+    registry.register_family("deepseek_sparse_attention", specs=(DSA_COMPRESSED_BANKS, DSA_ABSORBED, DSA_ABSORBED_SINK,
+                                                                         DSA_SPARSE_PREFILL, DSA_SPARSE_DECODE))
     registry.register_impl(
         DSA_COMPRESSED_BANKS, name="native", devices=("cpu", "cuda", "npu"),
         load=lambda: native_deepseek_sparse_attention,
@@ -319,3 +465,7 @@ def register_deepseek_sparse_attention(registry: OpRegistry) -> None:
         registry.register_impl(spec, name="native", devices=("cpu", "cuda", "npu"), load=lambda: _native_absorbed)
     registry.register_impl(DSA_ABSORBED, name="cann", devices=("npu",), load=_load_cann_absorbed)
     registry.register_impl(DSA_ABSORBED_SINK, name="omni", devices=("npu",), load=_load_omni_sink)
+    for spec, native, loader in ((DSA_SPARSE_PREFILL, _native_sparse_prefill, _load_flash_prefill),
+                                 (DSA_SPARSE_DECODE, _native_sparse_decode, _load_flash_decode)):
+        registry.register_impl(spec, name="native", devices=("cpu", "cuda", "npu"), load=lambda fn=native: fn)
+        registry.register_impl(spec, name="flash_mla", devices=("npu",), load=loader)

@@ -33,6 +33,11 @@ except ImportError as exc:
 
 from hyper_multicore import MegaMoeExperts
 
+from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
+from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    CompressedSparseAttention2Module,
+)
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
     SharedCompressedPackedSequence,
 )
@@ -45,6 +50,8 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import Deep
 from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Compressor,
+    DeepseekV41Attention,
+    DeepseekV41TopKRouter,
     DeepseekV41Model,
     bind_shared_expert_forward,
 )
@@ -365,3 +372,71 @@ class TestV41SharedExpert(unittest.TestCase):
                 torch.testing.assert_close(states.grad, expected_states.grad, rtol=0, atol=0)
                 for parameter, expected_parameter in zip(module.shared_experts.parameters(), reference.parameters()):
                     torch.testing.assert_close(parameter.grad, expected_parameter.grad, rtol=0, atol=0)
+
+
+class TestV41OwnedStateMaterialization(unittest.TestCase):
+    """Keep #1051's model-owned initialization checks without restoring old replacement classes."""
+
+    @staticmethod
+    def _owner(child: torch.nn.Module) -> DeepseekV41Model:
+        model = object.__new__(DeepseekV41Model)
+        torch.nn.Module.__init__(model)
+        model.config = _config()
+        model.vision = None
+        model.child = child
+        return model
+
+    def test_attention_sink_meta_initialization_and_checkpoint_restore(self) -> None:
+        """Initialize poisoned materialized sinks through the native model lifecycle, then retain resume values."""
+        for attention_type in (DeepseekV41Attention, CompressedSparseAttention2Module):
+            with self.subTest(attention_type=attention_type.__name__):
+                attention = object.__new__(attention_type)
+                torch.nn.Module.__init__(attention)
+                attention.sinks = torch.nn.Parameter(torch.empty(4, device="meta"))
+                model = self._owner(attention)
+                model.to_empty(device="cpu")
+                with torch.no_grad():
+                    attention.sinks.fill_(float("nan"))
+                _initialize_model_weights(model)
+                torch.testing.assert_close(attention.sinks, torch.zeros(4), rtol=0, atol=0)
+                saved = {"child.sinks": torch.linspace(-.5, .5, 4)}
+                parameter = attention.sinks
+                model.load_state_dict(saved, strict=True)
+                rebuild_materialized_state(model, MaterializationContext("checkpoint_load", torch.device("cpu")))
+                self.assertIs(attention.sinks, parameter)
+                torch.testing.assert_close(attention.sinks, saved["child.sinks"], rtol=0, atol=0)
+
+    def test_router_meta_visual_bias_and_counter_resume(self) -> None:
+        """Model routers keep text/image state; only nonpersistent counters rebuild after checkpoint loading."""
+        for vision in (False, True):
+            with self.subTest(vision=vision):
+                settings = SimpleNamespace(hidden_size=128, num_local_experts=16, num_experts_per_tok=6,
+                                           scoring_func="sqrtsoftplus", routed_scaling_factor=1.5,
+                                           v41_vision_enabled=vision, initializer_range=.02)
+                with torch.device("meta"):
+                    router = DeepseekV41TopKRouter(settings)
+                model = self._owner(router)
+                model.to_empty(device="cpu")
+                with torch.no_grad():
+                    for parameter in model.parameters():
+                        parameter.fill_(float("nan"))
+                _initialize_model_weights(model)
+                self.assertTrue(torch.isfinite(router.weight).all())
+                self.assertGreater(router.weight.std().item(), 0)
+                torch.testing.assert_close(router.bias, torch.zeros(16), rtol=0, atol=0)
+                if vision:
+                    torch.testing.assert_close(router.bias_vl, torch.zeros(16), rtol=0, atol=0)
+                router.tokens_per_expert.fill_(71)
+                saved = {name: value.detach().clone() for name, value in model.state_dict().items()}
+                saved["child.bias"].fill_(.25)
+                if vision:
+                    saved["child.bias_vl"].fill_(-.125)
+                self.assertNotIn("child.tokens_per_expert", saved)
+                parameters = dict(model.named_parameters())
+                model.load_state_dict(saved, strict=True)
+                rebuild_materialized_state(model, MaterializationContext("checkpoint_load", torch.device("cpu")))
+                torch.testing.assert_close(router.tokens_per_expert, torch.zeros_like(router.tokens_per_expert),
+                                           rtol=0, atol=0)
+                for name, value in model.named_parameters():
+                    self.assertIs(value, parameters[name])
+                    torch.testing.assert_close(value, saved[name], rtol=0, atol=0)

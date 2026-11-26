@@ -18,26 +18,45 @@ from .impl.attention import (
     GROUPED_QUERY_ATTENTION, MULTI_LATENT_ATTENTION, MULTI_LATENT_ATTENTION_WITH_STATS, VISION_ATTENTION,
 )
 from .impl.causal_conv1d import CAUSAL_CONV1D
-from .impl.dsa_indexer import DSA_INDEXER, DSA_PACKED_INDEXER
+from .impl.dsa_indexer import DSA_INDEXER, DSA_PACKED_INDEXER, DSA_TOPK, DSA_MQA, DSA_PAGED_MQA
 from .impl.dsa_indexer_kl import DSA_DENSE_KL, DSA_INDEXER_KL, DSA_PACKED_KL
-from .impl.deepseek_sparse_attention import DSA_ABSORBED, DSA_ABSORBED_SINK, DSA_COMPRESSED_BANKS
+from .impl.deepseek_sparse_attention import (
+    DSA_ABSORBED, DSA_ABSORBED_SINK, DSA_COMPRESSED_BANKS, DSA_SPARSE_PREFILL, DSA_SPARSE_DECODE,
+)
 from .impl.gdn import GDN
-from .impl.grouped_matmul import GROUPED_MATMUL
+from .impl.gemm import GEMM, HEAD_EINSUM
+from .impl.engram import ENGRAM_GATE, ENGRAM_HASH
+from .impl.grouped_matmul import GROUPED_MATMUL, M_GROUPED_GEMM, K_GROUPED_GEMM
 from .impl.grouped_swiglu import GROUPED_SWIGLU
 from .impl.kda import KDA
 from .impl.mhc_post import MHC_POST
-from .impl.moe_router import MOE_ROUTER
+from .impl.mhc_pre import MHC_PRE, MHC_PRE_APPLY, MHC_SPLIT, MHC_PRENORM
+from .impl.moe_router import MOE_GATE, MOE_GATE_BACKWARD, MOE_ROUTER, ROUTING_NORMALIZE
+from .impl.quantization import CAST_BACK, PER_BLOCK_CAST, PER_TOKEN_CAST
 from .impl.moe_token_reorder import MOE_TOKEN_REORDER, MOE_TOKEN_RESTORE
 from .impl.mome import MOME
 from .impl.rms_norm import RMS_NORM, RMS_NORM_FP32_AFFINE
-from .impl.rope import ROPE, ROPE_INTERLEAVED
+from .impl.rope import ROPE, ROPE_CACHED, ROPE_INTERLEAVED
 from .impl.sinkhorn import SINKHORN
-from .impl.swiglu import SWIGLU, SWIGLU_CLAMPED
+from .impl.swiglu import (
+    SWIGLU, SWIGLU_BACKWARD, SWIGLU_CLAMPED, SWIGLU_FORWARD, SWIGLU_QUANTIZED, SWIGLU_QUANTIZED_BACKWARD,
+)
 from .registry import OpRegistry
 
 
 def apply_auto_policy(registry: OpRegistry) -> None:
     """Set device-specific priorities independently of implementation registration."""
+    for spec in (DSA_MQA, DSA_PAGED_MQA, MHC_PRENORM, GEMM, HEAD_EINSUM, M_GROUPED_GEMM, K_GROUPED_GEMM,
+                 DSA_SPARSE_PREFILL, DSA_SPARSE_DECODE, DSA_TOPK,
+                 SWIGLU_FORWARD, SWIGLU_BACKWARD, SWIGLU_QUANTIZED, SWIGLU_QUANTIZED_BACKWARD,
+                 ROPE_CACHED, ENGRAM_GATE, ENGRAM_HASH, MOE_GATE, MOE_GATE_BACKWARD, ROUTING_NORMALIZE,
+                 CAST_BACK, PER_BLOCK_CAST, PER_TOKEN_CAST):
+        for device in ("cpu", "cuda", "npu"):
+            registry.set_auto_order(spec, device=device, candidates=("native",))
+    for spec in (MHC_PRE, MHC_SPLIT, MHC_PRE_APPLY):
+        for device in ("cpu", "cuda", "npu"):
+            candidates = ("cann", "native") if spec == MHC_PRE and device == "npu" else ("native",)
+            registry.set_auto_order(spec, device=device, candidates=candidates)
     for spec in (RMS_NORM, RMS_NORM_FP32_AFFINE, SWIGLU, SWIGLU_CLAMPED):
         registry.set_auto_order(spec, device="npu", candidates=("torch_npu",))
         registry.set_auto_order(spec, device="cuda", candidates=("native",))

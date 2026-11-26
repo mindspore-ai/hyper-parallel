@@ -16,12 +16,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from dataclasses import replace
 
 import torch
 
 from hyper_parallel.components import ops as operators
 from tests.common.op_precision import PrecisionCase
+from tests.common.op_precision_flash_mla import flash_mla_cases
 from tests.common.op_precision_cases import Inputs
 
 
@@ -208,6 +211,48 @@ def _packed_kl_values(x, index_key, weights, query, key, q_rope, k_rope,
     return loss * (loss_coeff / x.shape[0])
 
 
+def _select_reference(x, count, *, end=None, output_indices_offset=None, indices_type=torch.int32,
+                      sorted_index=True, return_value=True):
+    values = x.new_full((x.shape[0], count), -float("inf"))
+    indices = torch.full((x.shape[0], count), 2147483647, dtype=indices_type, device=x.device)
+    with torch.no_grad():
+        for row in range(x.shape[0]):
+            limit = x.shape[1] if end is None else int(end[row])
+            chosen = sorted(range(limit), key=lambda i: float(x[row, i]), reverse=True)[:count]
+            if sorted_index:
+                chosen.sort()
+            offset = 0 if output_indices_offset is None else int(output_indices_offset[row])
+            for slot, index in enumerate(chosen):
+                indices[row, slot] = index + offset
+                values[row, slot] = x[row, index]
+    return values if return_value else None, indices
+
+
+def _select_case_outputs(values, indices):
+    if values is None:
+        return indices
+    invalid = values.isneginf()
+    return values.masked_fill(invalid, 0), invalid, indices
+
+
+def _select_case(x, count, **options):
+    return _select_case_outputs(*operators.deep_select_topk(x, count, **options))
+
+
+def _select_case_reference(x, count, **options):
+    return _select_case_outputs(*_select_reference(x, count, **options))
+
+
+def select_cases(dtype: Any) -> Any:
+    """Select cases."""
+    values = torch.arange(34).reshape(2, 17).flip(-1).to(dtype)
+    return [PrecisionCase("dsa_indexer", "topk", f"bounded_values_{returned}", _select_case,
+                          _select_case_reference, (values, 4),
+                          {"end": torch.tensor([2, 17], dtype=torch.int32), "sorted_index": True,
+                           "output_indices_offset": torch.tensor([7, 11], dtype=torch.int32),
+                           "return_value": returned}, dtype) for returned in (True, False)]
+
+
 def dsa_cases(dtype: torch.dtype, hardware: bool = False) -> list[PrecisionCase]:
     """Cover every DSA variant with padding, packed resets and trainable students/teachers."""
     inputs = Inputs(dtype)
@@ -342,4 +387,4 @@ def _packed_dsa_cases(
         cases.append(replace(case, name="moderate_student", args=(
             moderate_student, *case.args[1:],
         )))
-    return cases
+    return cases + select_cases(dtype) + flash_mla_cases(dtype, hardware)

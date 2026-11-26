@@ -24,7 +24,31 @@ ops:
 
 使用 `auto` 时，NPU 和 GPU 的训练配方可复用同一组 `ops` 配置。需要固定后端时，分别在各自的 YAML 中填写对应实现名。例如 NPU 配方可写 `attention: torch_npu`，CUDA 配方可写 `attention: sdpa`。
 
-也可以使用 `--ops.<算子族>=<实现>` 新增或覆盖一个算子族的配置，例如 `--ops.deepseek_sparse_attention=native`。现有模型的模块替换及配方迁移随后续接入 PR 提供；本阶段可以通过下文的 Python 示例验证选型。
+也可以使用 `--ops.<算子族>=<实现>` 新增或覆盖一个算子族的配置，例如 `--ops.deepseek_sparse_attention=native`。模块和配方迁移单独进行，后端配置仅作用于公共 Ops 调用。
+
+### Ascend 后端
+
+按上游要求安装所需依赖：[TileKernels](https://github.com/deepseek-ai/TileKernels#requirements)、[DeepSelect](https://github.com/deepseek-ai/DeepSelect)、[DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend)、[FlashMLA](https://github.com/deepseek-ai/FlashMLA) 或 [DeepEP-Ascend](https://github.com/deepseek-ai/DeepEP-Ascend)。
+例如，在满足要求的 Ascend 环境中执行 `python -m pip install git+https://github.com/deepseek-ai/TileKernels.git` 安装 TileKernels。
+
+```yaml
+ops:
+  swiglu: tile_kernels
+  rope: tile_kernels
+  engram: native  # 保留原有 eager 实现；选择 tile_kernels 使用融合后端。
+  dsa_indexer: deep_select
+  grouped_matmul: deep_gemm
+  deepseek_sparse_attention: flash_mla
+```
+
+这些可选后端须显式选择，配置仅作用于公共 Ops 调用，现有 mHC、Engram 和 Router 模块调用保持不变。TileKernels 还支持 mHC Pre/Post、Sinkhorn、Router 和量化；DeepGEMM 量化路径与 FlashMLA 仅支持推理。DeepEP 通信与 MegaMoE buffer 属于 `hyper_parallel.distributed.expert_parallel` 的资源接口，不作为 Ops 选项。
+
+安装相应依赖后，在目标 NPU 上执行精度验收：
+
+```bash
+python -m pytest -v tests/torch/ops/_test_backend_precision.py::test_tile_kernels_precision
+python -m pytest -v tests/torch/ops/_test_backend_precision.py::test_deepseek_ascend_precision
+```
 
 ## 选型如何生效
 
@@ -59,11 +83,16 @@ swiglu    standard     native
 | `swiglu` | `standard`、`clamped_fp32`，拼接输入和独立输入裁剪 | `torch_npu` | `native` | `native` |
 | `rope` | `half`、`interleaved`，均支持部分 head 维度旋转 | `torch_npu`, `native` | `native` | `native` |
 | `mhc_post` | `standard`，变换输出与残差流混合 | `cann`, `omni`, `native` | `native` | `native` |
+| `mhc_pre` | `standard`，完整 Pre | `cann`, `native` | `native` | `native` |
+| `mhc_pre` | `split_mixes`、`apply_mix`，系数拆分及聚合 | `native` | `native` | `native` |
 | `sinkhorn` | `standard`，mHC 混合矩阵归一化 | `omni`, `native` | `native` | `native` |
 | `mome` | `standard`，DSA 输出侧的带掩码因果卷积与残差 | `omni`, `native` | `native` | `native` |
 | `grouped_matmul` | `standard`，按专家排列的单次无 bias 分组矩阵乘 | `torch_npu` | `torch_grouped_mm`, `native` | `native` |
 | `grouped_swiglu` | `standard`，非量化专家的 Gate、Up 和 Down 计算 | `torch_npu`, `native` | `torch_grouped_mm`, `native` | `native` |
 | `moe_router` | `deepseek_v41`，V4.1 TopK 路由 | `megagate`, `native` | `native` | `native` |
+| `moe_router` | `topk_gate`、`topk_gate_backward`、`normalize_weights` | `native` | `native` | `native` |
+| `engram` | `hash`、`gate` | `native` | `native` | `native` |
+| `quantization` | `per_token`、`per_block`、`cast_back` | `native` | `native` | `native` |
 | `moe_token_reorder` | `standard`、`weighted_restore`，专家顺序重排和加权还原 | `torch_npu`, `native` | `native` | `native` |
 | `attention` | `vision`、`gqa`、`mla`、`mla_with_stats` | `torch_npu`, `native` | `sdpa`, `native` | `sdpa`, `native` |
 | `gdn` | `zero_state`，Gated DeltaNet 局部零状态计算 | `triton_ascend`, `ascendc`, `native` | `native` | `native` |

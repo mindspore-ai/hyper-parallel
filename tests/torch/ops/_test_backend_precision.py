@@ -19,6 +19,8 @@ see per-backend availability. Missing operator symbols in an installed package,
 kernel runtime errors and numerical failures remain failures.
 """
 
+from __future__ import annotations
+
 import importlib
 import importlib.util
 import os
@@ -29,13 +31,17 @@ import torch
 from hyper_parallel.components.ops.catalog import builtin_registry
 from hyper_parallel.components.ops._dependency import require_package
 from hyper_parallel.components.ops.registry import ImplementationUnavailable
-from tests.common.op_precision import PrecisionCase, check_case
+from tests.common.op_precision import PrecisionCase, _flatten, check_case
 from tests.common.op_precision_suite import (
     FAMILY_BUILDERS, backend_precision_dtypes, precision_cases, registered_backends,
 )
 
 _BACKENDS = [entry for entry in registered_backends() if entry[2] != "native" and entry[3] in ("cuda", "npu")]
 _OPTIONAL_PACKAGES = {
+    "tile_kernels": ("tile_kernels",),
+    "deep_select": ("deep_select",),
+    "deep_gemm": ("deep_gemm",),
+    "flash_mla": ("flash_mla",),
     "omni": ("omni_training_custom_ops",),
     "megagate": ("hyper_multicore",),
     "triton_ascend": ("triton.backends.ascend", "fla"),
@@ -90,13 +96,16 @@ def _require_implementation(family, variant, backend, device_type, sample):
         raise
 
 
-def _precision_matrix():
+def _precision_matrix(backend_filter: str | None = None):
     # Keep each dtype and boundary independent: one skip/failure must not hide
     # another kernel invocation. DSA kernels currently accept BF16 fixtures.
     """Enumerate independent backend, dtype and boundary precision cases."""
     for family, variant, backend, device_type in _BACKENDS:
-        for dtype in backend_precision_dtypes(family, backend):
-            cases = [case for case in precision_cases(family, dtype, hardware=True) if case.variant == variant]
+        if backend_filter is not None and backend != backend_filter:
+            continue
+        for dtype in backend_precision_dtypes(family, backend, variant):
+            cases = [case for case in precision_cases(family, dtype, hardware=True, backend=backend)
+                     if case.variant == variant]
             if not cases:
                 raise AssertionError(f"No real-backend fixture for {family}.{variant}/{backend}/{dtype}")
             for case in cases:
@@ -108,9 +117,41 @@ def _precision_matrix():
 def test_backend_precision(case: PrecisionCase, backend: str, device_type: str) -> None:
     """Require actual selection and compare every output and argument/parameter VJP."""
     device = _device(device_type)
-    first_tensor = next(arg for arg in case.args if isinstance(arg, torch.Tensor))
+    first_tensor = next(arg for arg in _flatten(case.args) if isinstance(arg, torch.Tensor))
     _require_implementation(case.family, case.variant, backend, device_type, first_tensor.to(device))
     check_case(case, backend=backend, device=device)
+
+
+@pytest.mark.parametrize("case,backend,device_type", list(_precision_matrix("tile_kernels")))
+def test_tile_kernels_precision(case: PrecisionCase, backend: str, device_type: str) -> None:
+    """Require real TileKernels forward/backward; missing prerequisites are failures."""
+    importlib.import_module("torch_npu")
+    api = getattr(torch, device_type)
+    if not api.is_available():
+        pytest.fail("TileKernels acceptance requires an available NPU")
+    index = int(os.environ.get("LOCAL_RANK", "0"))
+    api.set_device(index)
+    device = f"{device_type}:{index}"
+    check_case(case, device=device)
+    check_case(case, backend=backend, device=device)
+    api.synchronize()
+
+
+@pytest.mark.parametrize("case,backend,device_type", [
+    case for backend in ("deep_gemm", "deep_select", "flash_mla") for case in _precision_matrix(backend)
+])
+def test_deepseek_ascend_precision(case: PrecisionCase, backend: str, device_type: str) -> None:
+    """Strict acceptance: require real kernels and compare native/oracle before backend parity."""
+    importlib.import_module("torch_npu")
+    api = getattr(torch, device_type)
+    if not api.is_available():
+        pytest.fail("DeepSeek Ascend acceptance requires an available NPU")
+    index = int(os.environ.get("LOCAL_RANK", "0"))
+    api.set_device(index)
+    device = f"{device_type}:{index}"
+    check_case(case, device=device)
+    check_case(case, backend=backend, device=device)
+    api.synchronize()
 
 
 def _native_matrix():

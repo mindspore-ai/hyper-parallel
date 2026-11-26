@@ -22,6 +22,13 @@ Public surface: the built-in ``@local_compute`` EP archetype factories
 components/distributed/ep_compute.py + ep_utils.py in stage 4e.
 """
 
+from hyper_parallel.distributed.expert_parallel.deep_gemm import (
+    MegaMoEBuffer, transform_mega_moe_weights, transform_gemm_scales, transform_k_grouped_gemm_scales,
+)
+
+from hyper_parallel.distributed.expert_parallel.deep_ep import (
+    DeepEPBuffer, create_ep_buffer, deep_ep_combine, deep_ep_destroy, deep_ep_dispatch, deep_ep_wait,
+)
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
@@ -46,6 +53,8 @@ from hyper_parallel.distributed.expert_parallel.recipes import (
 )
 
 __all__ = [
+    "MegaMoEBuffer", "transform_mega_moe_weights", "transform_gemm_scales", "transform_k_grouped_gemm_scales",
+    "DeepEPBuffer", "create_ep_buffer", "deep_ep_combine", "deep_ep_destroy", "deep_ep_dispatch", "deep_ep_wait",
     "EP_ARCHETYPES",
     "EP_ARCHETYPE_SUGGESTIONS",
     "MOE_ROUTER_ADAPTERS",
