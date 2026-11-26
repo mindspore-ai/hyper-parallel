@@ -18,7 +18,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+from itertools import groupby
 import math
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -443,11 +445,26 @@ class MuonSwapAdapter(StateSwapAdapter):
 
     # ------------------------------------------------------------------ execution
     def iter_update_units(self, step_context: Dict[str, Any]) -> List[MuonSwapUnit]:
-        """Return the units built by :meth:`prepare_step`."""
+        """Return the units built by :meth:`prepare_step`.
+
+        Args:
+            step_context: Context returned by :meth:`prepare_step`.
+
+        Returns:
+            Ordered Muon update units for this step.
+        """
         return step_context["units"]
 
     def partition_costs(self, units: Sequence[MuonSwapUnit], step_context: Any) -> Sequence[int]:
-        """Return logical momentum bytes without consulting local slots or gradients."""
+        """Return logical momentum bytes without consulting local slots or gradients.
+
+        Args:
+            units: Ordered Muon update units.
+            step_context: Unused step context supplied by the shared runtime.
+
+        Returns:
+            Rank-independent logical byte cost for every unit.
+        """
         del step_context
         return [unit.logical_nbytes for unit in units]
 
@@ -456,10 +473,152 @@ class MuonSwapAdapter(StateSwapAdapter):
 
         The runtime has already waited for this batch's H2D before calling in,
         so every slot the batch reads is device-resident here.
+
+        Args:
+            batch: Resident update units assigned to this swap partition.
+            step_context: Context holding the step broadcaster.
         """
         broadcaster = step_context["broadcaster"]
+        if self.optimizer.overlap_shard_comm:
+            self._run_overlap_batch(batch, broadcaster)
+            return
         for unit in batch:
             self._run_unit(unit, broadcaster)
+
+    def _run_overlap_batch(
+            self,
+            batch: List[MuonSwapUnit],
+            broadcaster: AsyncReplicateBroadcaster,
+    ) -> None:
+        """Run overlap-eligible units through Muon's native shard pipeline.
+
+        Swap batches remain the residency boundary: only momentum slots already
+        prefetched for ``batch`` may participate in a run. Muon reconnects its
+        final apply event to the current compute stream before returning, so the
+        swap runtime can safely use its existing current-stream event for D2H.
+        """
+        pipeline_local_keys = {
+            (unit.group_index, key[0])
+            for unit in batch
+            for key in (self._shard_pipeline_key(unit),)
+            if key is not None
+        }
+        if not pipeline_local_keys:
+            self._run_units(batch, broadcaster)
+            return
+
+        remaining, local_batches = self._extract_local_overlap_batches(
+            batch, pipeline_local_keys,
+        )
+        runs = self._build_overlap_runs(remaining)
+        shard_runs, quotas = self._plan_local_overlap(runs, local_batches)
+        self._execute_overlap_runs(runs, shard_runs, local_batches, quotas, broadcaster)
+        self._drain_local_batches(local_batches)
+
+    def _extract_local_overlap_batches(
+            self,
+            batch: List[MuonSwapUnit],
+            pipeline_local_keys: set[Tuple[int, torch.device]],
+    ) -> Tuple[List[MuonSwapUnit], Dict[Any, Any]]:
+        """Move independent resident units into Muon's local work queues."""
+        local_batches = {}
+        local_unit_ids = set()
+        for unit in batch:
+            local_key = self._local_overlap_key(unit, pipeline_local_keys)
+            if local_key is None:
+                continue
+            local_batches.setdefault(local_key, deque()).append(unit.params)
+            local_unit_ids.add(id(unit))
+        return [unit for unit in batch if id(unit) not in local_unit_ids], local_batches
+
+    def _build_overlap_runs(self, units: List[MuonSwapUnit]) -> List[Tuple[Any, List[MuonSwapUnit]]]:
+        """Group consecutive units by Muon's native shard pipeline key."""
+        return [
+            (key, list(units))
+            for key, units in groupby(units, key=self._shard_pipeline_key)
+        ]
+
+    def _plan_local_overlap(
+            self,
+            runs: List[Tuple[Any, List[MuonSwapUnit]]],
+            local_batches: Dict[Any, Any],
+    ) -> Tuple[Dict[int, Any], Dict[Any, Any]]:
+        """Use Muon's window planner when this swap batch has local work."""
+        if not local_batches:
+            return {}, {}
+        assignment_runs = [
+            (
+                key,
+                [(unit.group_index, unit.hsdp_assign) for unit in units]
+                if key is not None else [],
+            )
+            for key, units in runs
+        ]
+        return self.optimizer._plan_local_overlap_windows(assignment_runs, local_batches)
+
+    def _execute_overlap_runs(
+            self,
+            runs: List[Tuple[Any, List[MuonSwapUnit]]],
+            shard_runs: Dict[int, Any],
+            local_batches: Dict[Any, Any],
+            quotas: Dict[Any, Any],
+            broadcaster: AsyncReplicateBroadcaster,
+    ) -> None:
+        """Execute serial runs and native Muon shard pipeline runs in order."""
+        for run_index, (key, units) in enumerate(runs):
+            if key is None:
+                self._run_units(units, broadcaster)
+                continue
+            assignments = [(unit.group_index, unit.hsdp_assign) for unit in units]
+            planned_batches = shard_runs.get(run_index)
+            if planned_batches is None:
+                planned_batches = list(self.optimizer._iter_shard_batches(assignments))
+            shard_batches = iter(planned_batches)
+            self.optimizer._process_shard_pipeline(
+                shard_batches, key[0], broadcaster, local_batches, quotas,
+            )
+
+    def _drain_local_batches(self, local_batches: Dict[Any, Any]) -> None:
+        """Run local work left after the shard communication windows."""
+        for (group_index, _), queue in local_batches.items():
+            while queue:
+                self.optimizer._run_local_batch(group_index, queue)
+
+    def _run_units(
+            self,
+            units: Iterable[MuonSwapUnit],
+            broadcaster: AsyncReplicateBroadcaster,
+    ) -> None:
+        """Run units through the serial swap path in schedule order."""
+        for unit in units:
+            self._run_unit(unit, broadcaster)
+
+    def _shard_pipeline_key(self, unit: MuonSwapUnit) -> Any:
+        """Return Muon's overlap key for one sharded swap unit."""
+        if unit.kind != _HSDP or unit.hsdp_assign is None:
+            return None
+        return self.optimizer._shard_pipeline_key((unit.group_index, unit.hsdp_assign))
+
+    def _local_overlap_key(
+            self,
+            unit: MuonSwapUnit,
+            pipeline_local_keys: set[Tuple[int, torch.device]],
+    ) -> Optional[Tuple[int, torch.device]]:
+        """Return the matching shard run for independent local work."""
+        if not unit.params:
+            return None
+        if unit.kind == _HSDP:
+            assignment = unit.hsdp_assign
+            if assignment is None or assignment.is_shard or assignment.is_replicated:
+                return None
+        elif unit.kind != _NO_COMM:
+            return None
+
+        devices = {self._runtime_local_tensor(param).device for param in unit.params}
+        if len(devices) != 1:
+            return None
+        local_key = unit.group_index, next(iter(devices))
+        return local_key if local_key in pipeline_local_keys else None
 
     def _run_unit(self, unit: MuonSwapUnit, broadcaster: AsyncReplicateBroadcaster) -> None:
         """Run one atomic update unit with the matching Muon method."""
@@ -502,7 +661,11 @@ class MuonSwapAdapter(StateSwapAdapter):
         self.optimizer._process_unshard_params(group, ns_inputs)
 
     def finish_step(self, step_context: Any) -> None:
-        """Wait for every parameter broadcast issued during this step."""
+        """Wait for every parameter broadcast issued during this step.
+
+        Args:
+            step_context: Context holding the step broadcaster.
+        """
         step_context["broadcaster"].wait_all()
 
 

@@ -78,7 +78,14 @@ class _MuonNet(torch.nn.Module):
         self.weight1 = torch.nn.Parameter(torch.randn(_OUTPUT_DIM, _HIDDEN_DIM) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the forward network."""
+        """Run the forward network.
+
+        Args:
+            x: Input activation matrix.
+
+        Returns:
+            Network output matrix.
+        """
         return self.weight1 @ torch.relu(self.weight0 @ x)
 
 
@@ -518,7 +525,17 @@ def _step_collective_trace(optimizer):
     def broadcast(
             tensor: torch.Tensor, src: int, group: Optional[dist.ProcessGroup] = None, async_op: bool = False,
     ) -> Optional[dist.Work]:
-        """Record the real broadcast and preserve its asynchronous work handle."""
+        """Record the real broadcast and preserve its asynchronous work handle.
+
+        Args:
+            tensor: Broadcast payload.
+            src: Global source rank.
+            group: Process group used by the broadcast.
+            async_op: Whether to return an asynchronous work handle.
+
+        Returns:
+            Work handle for an asynchronous broadcast, otherwise ``None``.
+        """
         trace.append(("broadcast", tuple(dist.get_process_group_ranks(group)), src,
                       tuple(tensor.shape), str(tensor.dtype), async_op))
         return real_broadcast(tensor, src=src, group=group, async_op=async_op)
@@ -527,7 +544,17 @@ def _step_collective_trace(optimizer):
             output: torch.Tensor, tensor: torch.Tensor,
             group: Optional[dist.ProcessGroup] = None, async_op: bool = False,
     ) -> Optional[dist.Work]:
-        """Record the real input gather without changing its completion semantics."""
+        """Record the real input gather without changing its completion semantics.
+
+        Args:
+            output: Gather destination tensor.
+            tensor: Rank-local gather input.
+            group: Process group used by the gather.
+            async_op: Whether to return an asynchronous work handle.
+
+        Returns:
+            Work handle for an asynchronous gather, otherwise ``None``.
+        """
         trace.append(("all_gather", tuple(dist.get_process_group_ranks(group)),
                       tuple(output.shape), tuple(tensor.shape), str(tensor.dtype), async_op))
         return real_gather(output, tensor, group=group, async_op=async_op)
@@ -601,6 +628,118 @@ def _run_hsdp_logical_schedule(shard_size, packed_swap=False):
                     swapped.load_state_dict(swapped_state)
         del bare, swapped, bare_params, swapped_params
         _release_device_memory()
+
+
+def _overlap_params(mesh, replica_count=None, group_count=3):
+    """Build independent local work and sharded matrices for several groups."""
+    params = []
+    groups = []
+    for group_index in range(group_count):
+        initial = torch.arange(32, device="npu", dtype=torch.float32).view(8, 4) * 0.01 + group_index
+        placements = [Shard(group_index % 2)]
+        if replica_count is not None:
+            placements = [Replicate(), *placements]
+        group_params = [
+            torch.nn.Parameter(distribute_tensor(initial, mesh, placements)),
+            torch.nn.Parameter(distribute_tensor(initial + 0.5, mesh, placements)),
+            torch.nn.Parameter(initial[:4].clone()),
+        ]
+        params.extend(group_params)
+        groups.append({"params": group_params})
+    return params, groups
+
+
+def _assign_overlap_grads(params, step):
+    """Assign identical logical gradients to serial and overlapping optimizers."""
+    for param_index, param in enumerate(params):
+        value = step + 1 + param_index * 0.01
+        grad = torch.full(tuple(param.shape), value, device="npu", dtype=param.dtype)
+        if isinstance(param, DTensor):
+            grad = distribute_tensor(grad, param.device_mesh, param.placements)
+        param.grad = grad
+
+
+def _run_swap_muon_overlap(packed_swap, replica_count=None):
+    """Compare swapped overlap execution with a serial Muon trajectory."""
+    init_dist()
+    if replica_count is None:
+        mesh = init_device_mesh("npu", (2,), mesh_dim_names=("shard",))
+    else:
+        mesh = init_device_mesh("npu", (replica_count, 2), mesh_dim_names=("replicate", "shard"))
+    reference_params, reference_groups = _overlap_params(mesh, replica_count)
+    swapped_params, swapped_groups = _overlap_params(mesh, replica_count)
+    reference = Muon(
+        reference_groups, lr=0.013, momentum=0.93,
+        overlap_shard_comm=False, hsdp_replica_count=replica_count,
+    )
+    swapped = swap_optimizer(
+        Muon(
+            swapped_groups, lr=0.013, momentum=0.93,
+            overlap_shard_comm=True, hsdp_replica_count=replica_count,
+        ),
+        SwapOptimizerConfig(swap_times=1, min_numel=1, packed_swap=packed_swap),
+    )
+    stages = set()
+
+    for step in range(3):
+        _assign_overlap_grads(reference_params, step)
+        _assign_overlap_grads(swapped_params, step)
+        with SkipDTensorDispatch():
+            reference.step()
+        with mock.patch.object(torch.profiler, "record_function", wraps=torch.profiler.record_function) as scopes, \
+                SkipDTensorDispatch():
+            swapped.step()
+        stages.update(invocation.args[0] for invocation in scopes.call_args_list)
+
+        for expected, actual in zip(reference_params, swapped_params):
+            torch.testing.assert_close(
+                to_local_if_dtensor(actual), to_local_if_dtensor(expected), rtol=1e-5, atol=1e-6,
+            )
+            if expected not in reference.state:
+                assert actual not in swapped.state, "Non-owner rank retained swapped momentum state"
+                continue
+            expected_momentum = to_local_if_dtensor(reference.state[expected]["momentum_buffer"])
+            actual_momentum = swapped.adapter._slots[(id(actual), "momentum_buffer")].cpu_tensor
+            torch.testing.assert_close(
+                actual_momentum.cpu(), expected_momentum.cpu(), rtol=0, atol=0,
+            )
+
+        for slot in swapped.adapter.all_slots():
+            if not slot.swappable:
+                continue
+            assert slot.state == "host", f"Expected host slot, got {slot.state}"
+            if slot.packed:
+                assert slot.tensor is slot.cpu_tensor, "Packed overlap state retained a staging view"
+            else:
+                storage_size = to_local_if_dtensor(slot.tensor).untyped_storage().size()
+                assert storage_size == 0, f"Expected released state storage, got {storage_size} bytes"
+
+    expected_stages = {"muon.pipeline.gather", "muon.pipeline.local_ns", "muon.pipeline.apply"}
+    assert expected_stages.issubset(stages), (
+        f"Expected overlap stages {expected_stages}, got {stages}"
+    )
+    del reference, swapped, reference_params, swapped_params
+    _release_device_memory()
+
+
+def test_swap_muon_overlap_2p() -> None:
+    """Verify per-tensor state swap preserves Muon's communication overlap."""
+    _run_swap_muon_overlap(packed_swap=False)
+
+
+def test_swap_muon_packed_overlap_2p() -> None:
+    """Verify packed state swap preserves Muon's communication overlap."""
+    _run_swap_muon_overlap(packed_swap=True)
+
+
+def test_swap_muon_hsdp_overlap_4p() -> None:
+    """Verify per-tensor swap overlap on a replicate-by-shard HSDP mesh."""
+    _run_swap_muon_overlap(packed_swap=False, replica_count=2)
+
+
+def test_swap_muon_hsdp_packed_overlap_4p() -> None:
+    """Verify packed swap overlap on a replicate-by-shard HSDP mesh."""
+    _run_swap_muon_overlap(packed_swap=True, replica_count=2)
 
 
 def test_swap_muon_hsdp_logical_schedule_4p() -> None:

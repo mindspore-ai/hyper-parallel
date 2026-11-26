@@ -867,6 +867,78 @@ class TestMuonLogicalSchedule(unittest.TestCase):
             wrapped.adapter.step_batch(context["units"], context)
         torch.testing.assert_close(seen[0], torch.full_like(param, 7))
 
+    def test_overlap_routes_consecutive_shards_through_muon_pipeline(self):
+        """Route eligible resident shard units through Muon's communication pipeline.
+
+        Feature: Muon shard communication overlap under swap.
+        Description: Build two resident sharded assignments with one pipeline key.
+        Expectation: The native pipeline consumes both batches and the serial adapter path is unused.
+        """
+        params = [torch.nn.Parameter(torch.ones(4, 4)) for _ in range(2)]
+        optimizer = _muon(params, overlap_shard_comm=True)
+        assignments = [_make_assignment([param], True) for param in params]
+        _install_schedule(optimizer, assignments=assignments)
+        for param in params:
+            param.grad = torch.ones_like(param)
+        wrapped = swap_muon(optimizer, _swap_config(swap_times=1))
+        context = wrapped.adapter.prepare_step()
+        pipeline_key = (torch.device("cpu"), (mock.sentinel.shard_group,), ())
+        shard_batches = [mock.sentinel.first_batch, mock.sentinel.second_batch]
+        consumed = []
+
+        def _run_pipeline(batches, *_args):
+            """Consume the planned batches like the real Muon pipeline."""
+            consumed.extend(batches)
+
+        with mock.patch.object(optimizer, "_shard_pipeline_key", return_value=pipeline_key), \
+                mock.patch.object(optimizer, "_iter_shard_batches", return_value=iter(shard_batches)), \
+                mock.patch.object(optimizer, "_process_shard_pipeline", side_effect=_run_pipeline) as pipeline, \
+                mock.patch.object(wrapped.adapter, "_run_unit") as serial:
+            wrapped.adapter.step_batch(context["units"], context)
+
+        pipeline.assert_called_once()
+        serial.assert_not_called()
+        self.assertEqual(consumed, shard_batches)
+
+    def test_overlap_queues_resident_local_units_into_shard_windows(self):
+        """Supply resident no-comm work to Muon's gather/broadcast windows.
+
+        Feature: Local Muon work overlap under swap.
+        Description: Place one no-comm unit beside two eligible shard assignments.
+        Expectation: The native pipeline receives the local queue and the serial adapter path is unused.
+        """
+        local = torch.nn.Parameter(torch.ones(4, 4))
+        sharded = [torch.nn.Parameter(torch.ones(4, 4)) for _ in range(2)]
+        optimizer = _muon([local, *sharded], overlap_shard_comm=True)
+        assignments = [_make_assignment([param], True) for param in sharded]
+        _install_schedule(optimizer, assignments=assignments, no_comm=[local])
+        for param in [local, *sharded]:
+            param.grad = torch.ones_like(param)
+        wrapped = swap_muon(optimizer, _swap_config(swap_times=1))
+        context = wrapped.adapter.prepare_step()
+        pipeline_key = (torch.device("cpu"), (mock.sentinel.shard_group,), ())
+        observed_local_batches = []
+
+        def _iter_shard_batches(entries):
+            """Return one logical shard batch per assignment for window planning."""
+            return iter(SimpleNamespace(group_idx=group_index) for group_index, _ in entries)
+
+        def _run_pipeline(_batches, _device, _broadcaster, local_batches, _quotas):
+            """Record and consume local work as the native pipeline would."""
+            queue = local_batches[(0, torch.device("cpu"))]
+            observed_local_batches.extend(list(queue))
+            queue.clear()
+
+        with mock.patch.object(optimizer, "_shard_pipeline_key", return_value=pipeline_key), \
+                mock.patch.object(optimizer, "_iter_shard_batches", side_effect=_iter_shard_batches), \
+                mock.patch.object(optimizer, "_process_shard_pipeline", side_effect=_run_pipeline) as pipeline, \
+                mock.patch.object(wrapped.adapter, "_run_unit") as serial:
+            wrapped.adapter.step_batch(context["units"], context)
+
+        pipeline.assert_called_once()
+        serial.assert_not_called()
+        self.assertEqual(observed_local_batches, [[local]])
+
     def test_unshard_steps_and_checkpoint_resume_match_bare_muon(self):
         """Planning changes retain numerical behavior across multiple steps and reload."""
         for swap_times in (1, 2, 16):
