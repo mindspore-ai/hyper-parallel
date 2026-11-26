@@ -57,7 +57,8 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: triton
         conv_backend: eager
-        ulysses_degree: 1
+        ulysses_cp_size: 1
+        ring_cp_size: 2
   - match: "*.self_attn"
     replace:
       kind: module
@@ -65,7 +66,8 @@ plan_overrides:
       exact_type: true
       implementation:
         _target_: hyper_parallel.components.modules.GatedGroupedQueryAttention
-        ulysses_degree: 1
+        ulysses_cp_size: 1
+        kv_cp_size: 2
 
 mixed_precision:
   enabled: false

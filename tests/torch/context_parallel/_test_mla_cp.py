@@ -215,7 +215,8 @@ def _sync_tp_cp_gradients(parallel, reference, tp_mesh, cp_mesh, tp, tp_rank, dt
     return relative
 
 
-def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=False, ulysses_degree=None,
+def _build_composition(mesh, tp, cp, ulysses_cp_strategy, metadata, device, dtype, cp_comm_overlap=False,
+                       ulysses_cp_size=None,
                        kv_exchange="all_gather", callbacks=None):
     """Apply the production plan and assert the physical TP layout before training."""
     tp_rank = mesh["tp"].get_local_rank() if tp > 1 else 0
@@ -228,7 +229,8 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=
     parallel = deepcopy(reference)
     parallel.self_attn = MultiLatentAttention(
         module=parallel.self_attn, context={"tp_size": tp, "cp_size": cp},
-        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
+        ulysses_cp_strategy=ulysses_cp_strategy, cp_comm_overlap=cp_comm_overlap,
+        ulysses_cp_size=(ulysses_cp_size or cp), kv_exchange=kv_exchange,
     )
     plan = ShardingPlanner().plan(parallel, mesh, tp_size=tp, cp_size=cp, sequence_parallel=False)
     output_projection = parallel.self_attn.o_proj
@@ -239,7 +241,7 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=
     if callbacks is not None:
         for name, callback in callbacks.items():
             setattr(parallel.self_attn, name, callback)
-    assert parallel.self_attn.cp_plan.compute_heads == dimensions.heads // (tp * (ulysses_degree or cp))
+    assert parallel.self_attn.cp_plan.compute_heads == dimensions.heads // (tp * (ulysses_cp_size or cp))
     attention = parallel.self_attn
     if tp > 1:
         # TP uses the original framework wrapper; its inner callable is the CP
@@ -261,9 +263,9 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=
     return reference, parallel, dimensions
 
 
-def _gradient_composition(mesh, tp: int, cp: int, strategy: str, metadata: dict,
-                       device: torch.device, dtype: torch.dtype, overlap: bool = False,
-                       ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
+def _gradient_composition(mesh, tp: int, cp: int, ulysses_cp_strategy: str, metadata: dict,
+                       device: torch.device, dtype: torch.dtype, cp_comm_overlap: bool = False,
+                       ulysses_cp_size: int | None = None, kv_exchange: str = "all_gather",
                        callbacks: dict | None = None) -> None:
     """Compare recomputed TP/CP outputs and accumulated gradients to the unsharded reference."""
     tp_mesh = mesh["tp"] if tp > 1 else None
@@ -271,7 +273,8 @@ def _gradient_composition(mesh, tp: int, cp: int, strategy: str, metadata: dict,
     tp_rank = tp_mesh.get_local_rank() if tp_mesh is not None else 0
     cp_rank = cp_mesh.get_local_rank() if cp_mesh is not None else 0
     reference, parallel, dimensions = _build_composition(
-        mesh, tp, cp, strategy, metadata, device, dtype, overlap, ulysses_degree, kv_exchange, callbacks,
+        mesh, tp, cp, ulysses_cp_strategy, metadata, device, dtype, cp_comm_overlap,
+        ulysses_cp_size, kv_exchange, callbacks,
     )
     lengths = metadata.get("actual_seq_len")
     sequence = lengths[-1] if lengths else 64
@@ -316,10 +319,11 @@ def _gradient_composition(mesh, tp: int, cp: int, strategy: str, metadata: dict,
         _compare(logical_input_grad, hidden.grad[:, begin:end], dtype, "TP CP logical dX")
     relative = _sync_tp_cp_gradients(parallel, reference, tp_mesh, cp_mesh, tp, tp_rank, dtype)
     if dist.get_rank() == 0:
-        print(json.dumps({"tp": tp, "cp": cp, "mesh_axes": mesh.mesh_dim_names, "strategy": strategy,
+        print(json.dumps({"tp": tp, "cp": cp, "mesh_axes": mesh.mesh_dim_names,
+                          "strategy": ulysses_cp_strategy,
                           "dtype": str(dtype), "packed": metadata.get("actual_seq_len"),
-                          "causal": metadata.get("is_causal", True), "overlap": overlap,
-                          "ulysses_degree": ulysses_degree or cp, "kv_exchange": kv_exchange,
+                          "causal": metadata.get("is_causal", True), "overlap": cp_comm_overlap,
+                          "ulysses_cp_size": ulysses_cp_size or cp, "kv_exchange": kv_exchange,
                           "gradient_relative_l2": relative.item(), "backward_passes": 2}), flush=True)
 
 
@@ -460,7 +464,7 @@ def _model_fsdp_case(mesh: MeshContext, strategy: str, device: torch.device, *, 
     for layer in parallel.model.layers:
         layer.self_attn = MultiLatentAttention(
             module=layer.self_attn, context={"tp_size": mesh.tp_size, "cp_size": mesh.cp_size},
-            strategy=strategy, overlap=True,
+            ulysses_cp_strategy=strategy, cp_comm_overlap=True, ulysses_cp_size=mesh.cp_size,
         )
     planner = ShardingPlanner()
     plan = planner.plan(parallel, mesh.device_mesh, tp_size=mesh.tp_size, cp_size=mesh.cp_size,
@@ -555,7 +559,7 @@ def _overlap_snapshot(module, mesh, strategy, packed, gated, overlap, degree):
     """Keep two forward states alive before backward, then inspect local accumulated gradients."""
     module = (KimiMultiLatentAttention if gated else MultiLatentAttention)(
         module=module, mesh=MeshContext(device_mesh=mesh, cp_size=mesh.size()),
-        strategy=strategy, overlap=overlap, ulysses_degree=degree,
+        ulysses_cp_strategy=strategy, cp_comm_overlap=overlap, ulysses_cp_size=degree,
     )
     rank, world = mesh.get_local_rank(), mesh.size()
     batch, local = (1 if packed else 2), 64

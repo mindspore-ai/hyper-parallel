@@ -139,12 +139,12 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
 
     def __init__(self, *, module: torch.nn.Module | None = None, config: Any = None,
                  module_fqn: str = "", context: Any = None,
-                 fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None) -> None:
+                 fuse_qkv: bool = True, cp_comm_overlap: bool = False, ulysses_cp_size: int = 1) -> None:
         """Keep CP scheduling options on the parallel member, outside local GQA math."""
         del module_fqn, context
         super().__init__(config=config, module=module, fuse_qkv=fuse_qkv)
-        self.overlap = overlap
-        self.ulysses_degree = ulysses_degree
+        self.cp_comm_overlap = cp_comm_overlap
+        self.ulysses_cp_size = ulysses_cp_size
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
         """Request borrowed CP resources in addition to the shared TP boundary."""
@@ -164,29 +164,29 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
             raise ValueError("GQA CP requires a bound CPContext")
         self.cp_context = binding.cp_context
         degree = self.cp_context.size
-        self.ulysses_degree = degree if self.ulysses_degree is None else self.ulysses_degree
-        if self.ulysses_degree < 1 or degree % self.ulysses_degree:
-            raise ValueError("GQA Ulysses degree must divide CP degree")
-        if self.num_heads % self.ulysses_degree or self.num_key_value_heads % self.ulysses_degree:
-            raise ValueError("GQA Ulysses degree must divide TP-local Q and KV heads; use KV AG or a smaller U")
-        self.ulysses_context, self.query_context = self.cp_context.split(self.ulysses_degree)
-        self.all_gather_degree = degree // self.ulysses_degree
+        if (not isinstance(self.ulysses_cp_size, int) or isinstance(self.ulysses_cp_size, bool)
+                or self.ulysses_cp_size < 1 or degree % self.ulysses_cp_size):
+            raise ValueError("GQA ulysses_cp_size must divide CP degree")
+        if self.num_heads % self.ulysses_cp_size or self.num_key_value_heads % self.ulysses_cp_size:
+            raise ValueError("GQA ulysses_cp_size must divide TP-local Q and KV heads; use KV AG or a smaller U")
+        self.ulysses_context, self.query_context = self.cp_context.split(self.ulysses_cp_size)
+        self.all_gather_degree = degree // self.ulysses_cp_size
 
     def _transfer_input(self, tensor: torch.Tensor, *, is_query: bool) -> tuple[torch.Tensor, Any]:
         """Keep Q local for KV AG; otherwise exchange this ready operand along U."""
-        if self.ulysses_degree > 1:
-            if self.overlap:
+        if self.ulysses_cp_size > 1:
+            if self.cp_comm_overlap:
                 return tensor, self.ulysses_context.launch_sequence_to_head(tensor)
             return self.ulysses_context.sequence_to_head(tensor), None
-        if self.overlap and self.all_gather_degree > 1 and not is_query:
+        if self.cp_comm_overlap and self.all_gather_degree > 1 and not is_query:
             return tensor, self.query_context.launch_gather_sequence(tensor).collective
         return tensor, None
 
     def _finish_input_transfers(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                                 query_pending: Any, key_pending: Any, value_pending: Any) -> tuple:
         """Preserve hybrid K/V early submission before waiting for Q."""
-        if self.overlap:
-            if self.ulysses_degree > 1:
+        if self.cp_comm_overlap:
+            if self.ulysses_cp_size > 1:
                 if self.all_gather_degree > 1:
                     key_gather = self.query_context.launch_gather_sequence(key_pending.wait())
                     value_gather = self.query_context.launch_gather_sequence(value_pending.wait())
@@ -349,6 +349,6 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
             # Prefix KV selection makes Q/K lengths unequal, so zero the original
             # padded query rows explicitly; this is not communication/head padding.
             output = output.masked_fill(~output_state.valid_queries[:, :, None, None], 0)
-        if self.ulysses_degree > 1:
+        if self.ulysses_cp_size > 1:
             output = self.ulysses_context.head_to_sequence(output)
         return output, output_state.projection_state

@@ -75,9 +75,8 @@ plan_overrides:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.GroupedQueryAttention
-        # U=1 selects KV AllGather when cp_size>1; U=cp_size selects pure Ulysses.
-        # Other divisors select Ulysses + KV AllGather. overlap defaults to false.
-        ulysses_degree: 1
+        ulysses_cp_size: 1
+        kv_cp_size: 2
   - match: "model.layers.*.mlp.experts"
     replace:
       kind: module

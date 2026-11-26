@@ -284,7 +284,7 @@ class TestMLAContextParallel(unittest.TestCase):
             module(inputs)
         query_partition = make_mla()
         mesh = unittest.mock.Mock(ndim=1, size=lambda: 8, get_local_rank=lambda: 0)
-        query_partition = make_cp_mla(query_partition, mesh, "latent_kv_head", ulysses_degree=1)
+        query_partition = make_cp_mla(query_partition, mesh, "latent_kv_head", ulysses_cp_size=1)
         with patch("hyper_parallel.components.modules.attention.multi_latent_attention."
                               "cp_multi_latent_attention.mla_all_gather") as collective:
             for options in ({"is_causal": False}, {"attention_mask": torch.ones(96, 96, dtype=torch.bool)}):
@@ -300,23 +300,23 @@ class TestMLAContextParallel(unittest.TestCase):
         """
         dims = MLADimensions(4, 5, 6, 3, 2, 4)
         with self.assertRaisesRegex(ValueError, "divisible"):
-            MLACPPlan(dims, 3)
+            MLACPPlan(dims, 3, ulysses_cp_size=3)
         with self.assertRaisesRegex(ValueError, "divisible"):
-            MLACPPlan(dims, 2, tp_degree=4)
-        self.assertEqual(MLACPPlan(dims, 2, tp_degree=2).compute_heads, 1)
-        self.assertEqual(MLACPPlan(dims, 8, ulysses_degree=1).compute_heads, 4)
-        self.assertEqual(MLACPPlan(dims, 8, ulysses_degree=2).all_gather_degree, 4)
+            MLACPPlan(dims, 2, tp_degree=4, ulysses_cp_size=2)
+        self.assertEqual(MLACPPlan(dims, 2, tp_degree=2, ulysses_cp_size=2).compute_heads, 1)
+        self.assertEqual(MLACPPlan(dims, 8, ulysses_cp_size=1).compute_heads, 4)
+        self.assertEqual(MLACPPlan(dims, 8, ulysses_cp_size=2).all_gather_degree, 4)
         for degree in (0, 3, 16, True, 1.5):
-            with self.assertRaisesRegex(ValueError, "ulysses_degree"):
-                MLACPPlan(dims, 8, ulysses_degree=degree)
+            with self.assertRaisesRegex(ValueError, "ulysses_cp_size"):
+                MLACPPlan(dims, 8, ulysses_cp_size=degree)
         with self.assertRaisesRegex(ValueError, "TP1"):
-            MLACPPlan(dims, 4, tp_degree=2, ulysses_degree=1)
-        with self.assertRaisesRegex(ValueError, "overlap must be bool"):
-            MLACPPlan(dims, 2, overlap="true")
+            MLACPPlan(dims, 4, tp_degree=2, ulysses_cp_size=1)
+        with self.assertRaisesRegex(ValueError, "cp_comm_overlap must be bool"):
+            MLACPPlan(dims, 2, cp_comm_overlap="true")
         with self.assertRaisesRegex(ValueError, "kv_exchange"):
-            MLACPPlan(dims, 4, ulysses_degree=1, kv_exchange="invalid")
+            MLACPPlan(dims, 4, ulysses_cp_size=1, kv_exchange="invalid")
         with self.assertRaisesRegex(ValueError, "query-partitioned"):
-            MLACPPlan(dims, 4, kv_exchange="all_to_all_v")
+            MLACPPlan(dims, 4, ulysses_cp_size=4, kv_exchange="all_to_all_v")
         module = make_mla()
         self.assertFalse(hasattr(module, "cp_runtime"))
         mesh = TestCPMesh(singleton=True)
@@ -443,15 +443,17 @@ class TestMLAModel(unittest.TestCase):
                 direct = factory(config=source.config)
                 source.q_b_proj.weight.requires_grad_(False)
                 source.q_a_layernorm.weight = source.kv_a_layernorm.weight
-                rebuilt = factory(module=source, overlap=True, strategy="latent_kv_head")
+                rebuilt = factory(module=source, cp_comm_overlap=True,
+                                  ulysses_cp_strategy="latent_kv_head")
                 self.assertNotIn("cp_plan", vars(rebuilt))
                 self.assertNotIn("context", inspect.signature(type(rebuilt)).parameters)
                 self.assertNotIn("module_fqn", inspect.signature(type(rebuilt)).parameters)
                 self.assertNotIn("use_mome", vars(rebuilt))
                 for attribute in ("tp_degree", "tensor_parallel", "bind_parallel", "parallel_module_spec"):
                     self.assertFalse(hasattr(rebuilt, attribute), attribute)
-                self.assertNotIn("overlap", vars(rebuilt))
-                self.assertEqual(get_family_build_info(rebuilt).request.kwargs["strategy"], "latent_kv_head")
+                self.assertNotIn("cp_comm_overlap", vars(rebuilt))
+                self.assertEqual(get_family_build_info(rebuilt).request.kwargs[
+                    "ulysses_cp_strategy"], "latent_kv_head")
                 self.assertEqual(get_family_build_info(rebuilt).resolved.variant, "local")
                 self.assertIsInstance(rebuilt, MultiLatentAttentionModule)
                 self.assertFalse(rebuilt.training)
@@ -499,7 +501,9 @@ class TestMLAModel(unittest.TestCase):
                 self.assertFalse(hasattr(module, "cp_runtime"))
                 cp_mesh = MeshContext(device_mesh=LogicalDeviceMesh(("cp", "tp"), (2, 1)), cp_size=2)
                 with torch.device("meta"):
-                    parallel = factory(config=config, mesh=cp_mesh, strategy="latent_kv_head", overlap=True)
+                    parallel = factory(config=config, mesh=cp_mesh, ulysses_cp_size=2,
+                                        ulysses_cp_strategy="latent_kv_head", kv_cp_size=1,
+                                        cp_comm_overlap=True)
                 self.assertEqual(get_family_build_info(parallel).resolved.variant, "cp")
                 self.assertEqual(parallel.cp_plan.cp_degree, 2)
                 self.assertIsNone(parallel.cp_context)
@@ -507,7 +511,7 @@ class TestMLAModel(unittest.TestCase):
                 self.assertNotIn("forward", vars(parallel.kv_b_proj))
                 self.assertNotIn("forward", vars(parallel.o_proj))
                 with torch.device("meta"):
-                    deferred = factory(config=config)
+                    deferred = factory(config=config, ulysses_cp_size=2, kv_cp_size=1)
                 identities = {name: id(parameter) for name, parameter in deferred.named_parameters()}
                 deferred, _ = prepare_model_components(
                     deferred, build_module_context(DistributedSetup(mesh_context=cp_mesh)),
@@ -554,7 +558,7 @@ class TestMLAModel(unittest.TestCase):
         self.assertEqual(len(setup.module_replacement_requests), 1)
         request = setup.module_replacement_requests[0]
         self.assertIs(request.target, MultiLatentAttention)
-        self.assertEqual(request.kwargs["strategy"], "expanded_ulysses")
+        self.assertEqual(request.kwargs["ulysses_cp_strategy"], "expanded_ulysses")
         self.assertFalse({"module", "module_fqn", "context", "mesh"} & set(request.kwargs))
         self.assertFalse(setup.method_replacements)
 
@@ -567,7 +571,8 @@ class TestMLAModel(unittest.TestCase):
         config = make_deepseek_model().config
         mesh = LogicalDeviceMesh(("cp", "tp"), (2, 2))
         with torch.device("meta"):
-            module = MultiLatentAttention(config=config, context={"cp_size": 2, "tp_size": 2})
+            module = MultiLatentAttention(config=config, context={"cp_size": 2, "tp_size": 2},
+                                          ulysses_cp_size=2, kv_cp_size=1)
         tokens = {"cp": Shard(1), "tp": Replicate()}
         override = ModuleShardingSpec(
             in_src={"hidden_states": tokens}, out_dst={"output": tokens},
@@ -607,8 +612,8 @@ class TestMLAModel(unittest.TestCase):
         config = make_deepseek_model().config
         for factory in (MultiLatentAttention, GatedMultiLatentAttention):
             for cp in (1, 2):
-                for options in ({"overlap": 1}, {"strategy": "typo"}, {"ulysses_degree": True},
-                                {"ulysses_degree": 0}, {"kv_exchange": "typo"}):
+                for options in ({"cp_comm_overlap": 1}, {"ulysses_cp_strategy": "typo"}, {"ulysses_cp_size": True},
+                                {"ulysses_cp_size": 0}, {"kv_exchange": "typo"}):
                     with self.subTest(factory=factory.__name__, cp=cp, options=options):
                         with self.assertRaises((ValueError, TypeError)):
                             factory(config=config, context={"cp_size": cp}, **options)

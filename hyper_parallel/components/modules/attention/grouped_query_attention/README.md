@@ -22,25 +22,27 @@ plan_overrides:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.GroupedQueryAttention
-        ulysses_degree: 2
-        overlap: true
+        ulysses_cp_size: 2
+        kv_cp_size: 2
+        cp_comm_overlap: true
 ```
 
 `cp_size: 1` 选择 local 成员；大于 1 时选择 CP 成员。DP/FSDP 等拓扑仍需与总设备数匹配。
 完整示例见 [Qwen3-MoE packed 配方](../../../../models/qwen3_moe/recipes/train.yaml) 和
 [dense 离线配方](../../../../../examples/training_demo/qwen3_moe/train_parallel_full_offline.yaml)。
 
-令 `P=cp_size`、`U=ulysses_degree`，KV AllGather 子组大小为 `A=P/U`：
+令 `P=cp_size`、`U=ulysses_cp_size`、`A=kv_cp_size`。GQA 要求 `P=U×A`：
 
-| ulysses_degree（P>1） | 并行方式 | CP4 示例 |
+| U / A | 并行方式 | CP4 示例 |
 | --- | --- | --- |
-| 省略、null 或 P | 纯 Ulysses | U4 |
-| 1 | Q 保持本地，KV AllGather | AG4 |
-| 其他整除 P 的正整数 U | Ulysses + KV AllGather | U2×AG2 |
+| U4 / A1 | 纯 Ulysses | U4 |
+| U1 / A4 | Q 保持本地，KV AllGather | AG4 |
+| U2 / A2 | Ulysses + KV AllGather | U2×AG2 |
 
-`overlap` 默认 false；true 提前提交通信，与独立计算重叠，不改变投影参数表示。
+`cp_comm_overlap` 默认 false；true 提前提交通信，与独立计算重叠，不改变投影参数表示。
 普通 YAML 无需设置 `fuse_qkv`，默认融合 QKV。
-现有 Qwen3-MoE 配方显式设置 U=1，因此只增大 cp_size 会选择 KV AG。
+GQA 当前只支持 `ulysses_cp_strategy: alltoall`、`kv_cp_strategy: allgather`，不支持 Ring 域或 zigzag 负载均衡。
+现有 Qwen3-MoE 配方显式设置 U=1，因此应将 KV 域设为总 CP 度。
 
 ## 混合 CP 与通算掩盖
 
@@ -48,7 +50,7 @@ Ulysses 在 U 张卡之间用 AllToAll 将序列分片转换为头分片；KV Al
 Q 仍按 query 区间分工。例如 U2×AG2 中，每个 rank 负责一半头、一半 query 序列，并取得对应头的完整 KV。
 这样可以扩展 CP 规模，而无需把 KV 复制到 Q 的头数；头数整除约束作用于 TP×U，不是 TP×CP。
 
-`overlap: true` 让已完成投影、Norm/RoPE 的输入立即通信，直到 FA 消费前才等待：
+`cp_comm_overlap: true` 让已完成投影、Norm/RoPE 的输入立即通信，直到 FA 消费前才等待：
 
 - Ulysses 的 Q/K/V 分别就绪后提交；后续输入的准备工作可覆盖已提交的通信。
   默认融合 QKV 已一次完成三路投影，可利用的主要窗口是剩余 Norm/RoPE 等处理；独立投影还可利用后续投影计算。
@@ -71,7 +73,7 @@ GQA 的反向使用已有可微通信接口；这里主要优化输入前向调�
 ```
 
 输入准备使用共享的投影、Norm 和 RoPE 数学方法。CP 成员负责通信和调度，local 成员不产生 CP 通信。
-开启 overlap 后，准备阶段便可提交已就绪的数据；流程中的阶段不表示所有计算和通信串行执行。
+开启 `cp_comm_overlap` 后，准备阶段便可提交已就绪的数据；流程中的阶段不表示所有计算和通信串行执行。
 TP/SP 由框架原有的布局重分布处理。
 
 ## 支持范围
@@ -80,4 +82,4 @@ TP/SP 由框架原有的布局重分布处理。
 - packed 需要模型/数据入口传入全局文档累计边界和正确的位置表，不能同时使用显式 mask。
   TND 长度描述文档隔离；RoPE 仍使用模型提供的 cos/sin，在 FA 前执行。
 - 非 packed 支持全局 `[B,Sglobal]` padding mask（True/1 为有效 token），以及 Q/K 可见性 mask。
-- CP 是训练路径，拒绝非空 KV cache。overlap 不保证每项前反向通信都能完全隐藏。
+- CP 是训练路径，拒绝非空 KV cache。`cp_comm_overlap` 不保证每项前反向通信都能完全隐藏。

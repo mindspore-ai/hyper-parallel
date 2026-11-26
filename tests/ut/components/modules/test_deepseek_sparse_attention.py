@@ -32,7 +32,7 @@ from hyper_parallel.components.modules.attention.deepseek_sparse_attention.cp_de
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention.deepseek_sparse_attention import (
     SparseAttentionSequenceMetadata,
 )
-from hyper_parallel.components.modules.module_family import FamilyRequest, build_family
+from hyper_parallel.components.modules.module_family import FamilyRequest, build_family, get_family_build_info
 from hyper_parallel.distributed.module_binding import ParallelBinding
 from hyper_parallel.models.module_build import prepare_model_components
 from tests.common.mark_utils import arg_mark
@@ -115,16 +115,20 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         Expectation: Both paths retain the documented KV transport and overlap defaults.
         """
         expected = {
-            "kv_cp_size": 1, "kv_cp_strategy": "allgather", "cp_comm_overlap": False,
+            "ulysses_cp_size": 1, "ulysses_cp_strategy": "alltoall",
+            "kv_cp_size": 1, "kv_cp_strategy": "allgather", "kv_cp_load_balance": False,
+            "ring_cp_size": 1, "ring_cp_strategy": "p2p", "ring_cp_load_balance": False,
+            "cp_comm_overlap": False,
         }
         for deferred in (False, True):
             with self.subTest(deferred=deferred):
                 if deferred:
-                    module = build_family(FamilyRequest(DeepseekSparseAttention, {}), config=_config())
+                    module = build_family(FamilyRequest(DeepseekSparseAttention, expected), config=_config())
                 else:
                     module = DeepseekSparseAttention(config=_config())
                 self.assertIs(type(module), DeepseekSparseAttentionModule)
-                self.assertEqual({name: getattr(module, name) for name in expected}, expected)
+                request = get_family_build_info(module).request.kwargs
+                self.assertEqual({name: request[name] for name in expected}, expected)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_promotion_preserves_parameters_and_eval_mode(self) -> None:
@@ -195,12 +199,13 @@ class TestDeepseekSparseAttention(unittest.TestCase):
                 DeepseekSparseAttention(config=_config(), kv_cp_size=value)
         with self.assertRaises(ValueError):
             DeepseekSparseAttention(config=_config(), kv_cp_strategy="p2p")
-        for name, value in (("ulysses_cp_size", 2), ("kv_cp_load_balance", False)):
-            with self.subTest(removed_argument=name):
-                with self.assertRaises(TypeError):
-                    DeepseekSparseAttention(config=_config(), **{name: value})
-                with self.assertRaises(TypeError):
-                    FamilyRequest(DeepseekSparseAttention, {name: value})
+        module = DeepseekSparseAttention(config=_config(), ulysses_cp_size=1, kv_cp_load_balance=False)
+        self.assertIs(type(module), DeepseekSparseAttentionModule)
+        FamilyRequest(DeepseekSparseAttention, {"ulysses_cp_size": 1, "kv_cp_load_balance": False})
+        with self.assertRaises(NotImplementedError):
+            DeepseekSparseAttention(
+                config=_config(), context={"cp_size": 2}, ulysses_cp_size=2,
+            )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cp_binding_rejects_an_incompatible_runtime_degree(self) -> None:

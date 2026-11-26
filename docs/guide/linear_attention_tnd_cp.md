@@ -56,7 +56,7 @@ output = layer(local_hidden, cu_seq_lens=(0, 6145, 12288, 16383, 16384))
 
 ## 配置
 
-KDA 沿用 [KDA 上下文并行](kda_context_parallel.md) 的模块族、`state_cp_method`、`ulysses_degree` 和
+KDA 沿用 [KDA 上下文并行](kda_context_parallel.md) 的模块族、`state_cp_method`、`ulysses_cp_size` 和
 `allgather_group_size`。TND 不增加一套 CP 方法，也不在每个 batch 创建通信组。
 例如 CP8 的 U2 + 组内 AG2 + 组间 P2P：
 
@@ -70,7 +70,7 @@ plan_overrides:
         backend: triton
         conv_backend: eager
         state_cp_method: grouped_allgather_p2p
-        ulysses_degree: 2
+        ulysses_cp_size: 2
         allgather_group_size: 2
 ```
 
@@ -107,7 +107,7 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: triton
         conv_backend: eager
-        ulysses_degree: 1
+        ulysses_cp_size: 1
   - match: "model.layers.0.forward"
     params: {}  # decoder 无直接参数；声明仅转发元数据的边界
     replace:
@@ -116,7 +116,7 @@ plan_overrides:
         _target_: hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.qwen3_5_linear_attention_decoder_wrapper
 ```
 
-纯 Ulysses 将 mixer 的 `ulysses_degree` 设为 `null`，卷积通过 `conv_backend` 显式选择。
+纯 Ulysses 将 mixer 的 `ulysses_cp_size` 设为总 CP 大小，卷积通过 `conv_backend` 显式选择。
 CP1 自动选择普通 GDN 成员，无需 packed-local wrapper。decoder wrapper 只能匹配线性 decoder；
 不能无区别覆盖 full-attention 层。flat `[T,H]` 的模块布局需要 `input_layout: TH`。
 更多构造和迁移说明见 [模块族说明](linear_attention_module_families.md)。
@@ -133,11 +133,11 @@ from hyper_parallel.components.modules import KimiDeltaAttention, GatedDeltaNet
 
 kda_layer = KimiDeltaAttention(
     module=original_kda_layer, mesh=mesh_context, backend="triton",
-    conv_backend="triton", ulysses_degree=None,
+    conv_backend="triton", ulysses_cp_size=mesh_context.cp_size,
 )
 gdn_layer = GatedDeltaNet(
     module=original_gdn_layer, mesh=mesh_context, backend="triton",
-    conv_backend="triton", ulysses_degree=None,
+    conv_backend="triton", ulysses_cp_size=mesh_context.cp_size,
 )
 ```
 
@@ -210,7 +210,7 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: ascendc
         conv_backend: ascendc
-        ulysses_degree: null
+        ulysses_cp_size: 8
 ```
 
 当前适配输入为核外归一化的 Q/K、有效 log-decay 与 sigmoid(beta)。它们的 autograd 链保留在调用方；

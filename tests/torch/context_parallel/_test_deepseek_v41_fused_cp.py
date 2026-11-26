@@ -167,7 +167,9 @@ def test_native_geometry_cp8_gloo():
         candidate = _chain()
         candidate.load_state_dict(reference.state_dict(), strict=True)
         candidate = torch.nn.ModuleList([
-            CompressedSparseAttention2(module=module, context={"cp_size": size}) for module in candidate
+            CompressedSparseAttention2(
+                module=module, context={"cp_size": size}, ulysses_cp_size=1, kv_cp_size=size,
+            ) for module in candidate
         ])
         binding = ParallelBinding(MeshBinding(SimpleNamespace(tp_size=1)), CPContext(_CPMesh()))
         for module in candidate:

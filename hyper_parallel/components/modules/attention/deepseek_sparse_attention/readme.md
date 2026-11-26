@@ -25,17 +25,18 @@ plan_overrides:
         cp_comm_overlap: true
 ```
 
-CP 的三个配置参数写在 `replace.implementation` 下：
+CP 配置写在 `replace.implementation` 下。DSA 当前只使用 KV 域：
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `kv_cp_size` | `1` | 上下文并行大小，与 `accelerator.cp_size` 保持一致；1 表示不开启 CP。 |
+| `kv_cp_size` | `1` | KV 域大小；须与 `accelerator.cp_size` 一致。 |
 | `kv_cp_strategy` | `allgather` | KV 通信策略，当前仅支持 `allgather`。 |
 | `cp_comm_overlap` | `false` | 是否启用异步 KV 收集。 |
 
 TP 度和总 CP 度仍写在 `accelerator` 中，改 `accelerator.cp_size` 时须同步改 `kv_cp_size`。
 `*.self_attn` 匹配完整的注意力模块，框架自动选择本地或上下文并行实现；
-通用规则见 [Attention YAML 配置通用规则](../readme.md#yaml-配置通用规则)。
+其他公共 CP 字段和 family 限制见 [CP 参数迁移记录](../cp_parameter_migration.md)；
+通用 YAML 规则见 [Attention YAML 配置通用规则](../readme.md#yaml-配置通用规则)。
 
 ## 参数切分：sparse_attention_sharding
 

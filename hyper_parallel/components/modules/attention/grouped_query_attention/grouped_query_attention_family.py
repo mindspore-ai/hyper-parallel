@@ -23,6 +23,9 @@ from torch import nn
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, register_module_family,
 )
+from hyper_parallel.components.modules.attention.cp_config import (
+    resolve_attention_cp_config, validate_supported_cp_options,
+)
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.distributed._builder.family_layout import validate_tp_boundary
@@ -43,18 +46,18 @@ def validate_gqa_family(*, config: Any, module: nn.Module | None, context: Any, 
     if not isinstance(member.arguments.get("fuse_qkv", True), bool):
         raise TypeError("GQA fuse_qkv must be boolean")
     # Declarative replacement requests omit defaults, unlike a direct Python factory call.
-    if not isinstance(member.arguments.get("overlap", False), bool):
-        raise TypeError("GQA overlap must be boolean")
-    _validate_gqa_degrees(config, member)
+    cp_config = resolve_attention_cp_config(member)
+    validate_supported_cp_options(
+        cp_config, "GQA", allow_ulysses=True, allow_kv=True, allow_overlap=True,
+    )
+    _validate_gqa_degrees(config, member, cp_config["ulysses_cp_size"])
 
 
-def _validate_gqa_degrees(config, member):
+def _validate_gqa_degrees(config, member, degree):
     """Check TP/CP factors against whole Q and KV groups."""
-    degree = member.arguments.get("ulysses_degree")
     cp = member.axis_sizes["cp"]
-    degree = cp if degree is None else degree
     if (not isinstance(degree, int) or isinstance(degree, bool)) or degree < 1 or (cp > 1 and cp % degree):
-        raise ValueError("GQA Ulysses degree must be a positive integer dividing CP degree")
+        raise ValueError("GQA ulysses_cp_size must be a positive integer dividing cp_size")
     tp = member.axis_sizes["tp"]
     if config.num_attention_heads % tp:
         raise ValueError("GQA query heads must be divisible by TP degree")
@@ -65,7 +68,7 @@ def _validate_gqa_degrees(config, member):
         )
 
     if cp > 1 and (config.num_attention_heads // tp % degree or config.num_key_value_heads // tp % degree):
-        raise ValueError("GQA Ulysses degree must divide TP-local Q and KV heads")
+        raise ValueError("GQA ulysses_cp_size must divide TP-local Q and KV heads")
 
 def gqa_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
     """Own all GQA parameters and declare the actual external token layout."""
@@ -118,18 +121,45 @@ def gqa_local_parallel_spec(*, module: nn.Module, member: Any) -> ParallelModule
 
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
-    fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None,
+    fuse_qkv: bool = True,
+    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
+    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
+    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
+    cp_comm_overlap: bool = False,
 ) -> nn.Module:
     """Build standalone math; the family retains CP options and owns parallel layouts."""
-    del module_fqn, context, overlap, ulysses_degree
+    del (module_fqn, context, ulysses_cp_size, ulysses_cp_strategy, kv_cp_size,
+         kv_cp_strategy, kv_cp_load_balance, ring_cp_size, ring_cp_strategy, ring_cp_load_balance,
+         cp_comm_overlap)
     return GroupedQueryAttentionModule(config=config, module=module, fuse_qkv=fuse_qkv)
+
+
+def _build_cp(
+    *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
+    fuse_qkv: bool = True, ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
+    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
+    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
+    cp_comm_overlap: bool = False,
+) -> nn.Module:
+    """Adapt the public domain configuration to the existing GQA CP executor."""
+    del module_fqn
+    # The import stays lazy because this CP executor imports the family layout validator.
+    from .cp_grouped_query_attention import CPGroupedQueryAttentionModule  # pylint: disable=C0415
+
+    return CPGroupedQueryAttentionModule(
+        config=config, module=module, context=context, fuse_qkv=fuse_qkv,
+        cp_comm_overlap=cp_comm_overlap, ulysses_cp_size=ulysses_cp_size,
+    )
 
 
 @module_replacement
 def GroupedQueryAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, fuse_qkv: bool = True,
-    overlap: bool = False, ulysses_degree: int | None = None,
+    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
+    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
+    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
+    cp_comm_overlap: bool = False,
 ) -> nn.Module:
     """Build one GQA family with fixed projections and independent CP scheduling.
 
@@ -140,15 +170,26 @@ def GroupedQueryAttention(  # pylint: disable=invalid-name
         context: Logical parallel configuration, independent of concrete process groups.
         mesh: Existing job mesh, borrowed by the shared execution binder.
         fuse_qkv: Use grouped linear_qkv (True) or independent Q/K/V Parameters (False); fixed at construction.
-        overlap: Submit ready Q/K/V transfers before independent projection stages.
-        ulysses_degree: Head-parallel CP factor; 1 selects KV AG, None selects pure Ulysses.
+        ulysses_cp_size: Number of ranks in the Ulysses domain.
+        ulysses_cp_strategy: GQA currently supports ``alltoall``.
+        kv_cp_size: Number of ranks in the KV AllGather domain.
+        kv_cp_strategy: GQA currently supports ``allgather``.
+        kv_cp_load_balance: Optional KV-domain zigzag balance; currently unsupported.
+        ring_cp_size: Number of ranks in the Ring domain; currently must be one.
+        ring_cp_strategy: Ring transport selector, reserved for future GQA support.
+        ring_cp_load_balance: Optional Ring-domain zigzag balance; currently unsupported.
+        cp_comm_overlap: Submit ready Q/K/V transfers before independent projection stages.
 
     Returns:
         The local or CP member with fixed parameter names and family provenance.
     """
     return build_family(GroupedQueryAttention, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, fuse_qkv=fuse_qkv,
-                        overlap=overlap, ulysses_degree=ulysses_degree)
+                        ulysses_cp_size=ulysses_cp_size, ulysses_cp_strategy=ulysses_cp_strategy,
+                        kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy,
+                        kv_cp_load_balance=kv_cp_load_balance, ring_cp_size=ring_cp_size,
+                        ring_cp_strategy=ring_cp_strategy, ring_cp_load_balance=ring_cp_load_balance,
+                        cp_comm_overlap=cp_comm_overlap)
 
 
 register_module_family(ModuleFamily(
@@ -157,10 +198,8 @@ register_module_family(ModuleFamily(
         "hyper_parallel.components.modules.attention.grouped_query_attention."
         "grouped_query_attention_family._build_local"
     ),
-    "cp": (
-        "hyper_parallel.components.modules.attention.grouped_query_attention."
-        "cp_grouped_query_attention.CPGroupedQueryAttentionModule"
-    )},
+    "cp": "hyper_parallel.components.modules.attention.grouped_query_attention."
+          "grouped_query_attention_family._build_cp"},
     default_variant="local", parallel_axis="cp",
     variant_rules=(VariantRule({"parallel": True}, "cp"),),
     sharding=gqa_sharding, validate=validate_gqa_family, parallel_spec=gqa_local_parallel_spec,

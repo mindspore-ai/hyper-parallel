@@ -45,7 +45,7 @@ class _AttentionModel(nn.Module):
         return self.self_attn(hidden_states, **kwargs)[0]
 
 
-def _build(factory, source, *, cp=1, tp=1, degree=None, overlap=False, fuse_qkv=True):
+def _build(factory, source, *, cp=1, tp=1, degree=None, cp_comm_overlap=False, fuse_qkv=True):
     """Construct the family and apply its declared source-weight conversion."""
     arguments = {} if factory is GatedGroupedQueryAttention else {"fuse_qkv": fuse_qkv}
     attention = factory(module=source, **arguments)
@@ -61,9 +61,11 @@ def _build(factory, source, *, cp=1, tp=1, degree=None, overlap=False, fuse_qkv=
         config = deepcopy(source.config)
         config.qk_norm = True
         config.dtype = next(source.parameters()).dtype
+        cp_degree = degree or cp
         with torch.device(next(source.parameters()).device):
             native = factory(config=config, context={"cp_size": cp, "tp_size": tp},
-                             ulysses_degree=degree, overlap=overlap, **arguments)
+                             ulysses_cp_size=cp_degree, kv_cp_size=cp // cp_degree,
+                             cp_comm_overlap=cp_comm_overlap, **arguments)
         state = attention.state_dict()
         if factory is GatedGroupedQueryAttention:
             # This test source is Qwen3.5: its Norm stores gamma - 1, whereas native
@@ -119,7 +121,7 @@ def _case(mesh, factory, degree, packed, device, *, tp=1, sp=False, padding=Fals
         source = attention_type(config, 0).to(device=device, dtype=torch.bfloat16)
         reference = _build(factory, deepcopy(source), fuse_qkv=fuse_qkv)
         parallel = _build(factory, deepcopy(source), cp=cp, tp=tp, degree=degree,
-                          overlap=overlap, fuse_qkv=fuse_qkv)
+                          cp_comm_overlap=overlap, fuse_qkv=fuse_qkv)
         plan = ShardingPlanner().plan(parallel, mesh, tp_size=tp, cp_size=cp, sequence_parallel=sp)
         parallel, _ = apply_sharding_plan(parallel, plan, mesh)
         options = {"actual_seq_len": (7, 19, 41, 70, 97, 128)} if packed else {}

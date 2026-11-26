@@ -50,15 +50,15 @@ class CPGatedMultiLatentAttentionModule(CPMultiLatentAttentionModule, GatedMulti
         """Install the existing gated output derivative inside its managed Linear."""
         if self.cp_plan.tp_degree != 1:
             raise ValueError("Gated MLA CP currently supports TP1 only")
-        if self.cp_plan.overlap and self.cp_plan.ulysses_degree > 1:
+        if self.cp_plan.cp_comm_overlap and self.cp_plan.ulysses_cp_size > 1:
             self.o_proj = CPGatedMLAOutputLinear(self.o_proj)
 
     def _prepare_input_gate(self, hidden_states: torch.Tensor) -> GatedMLAInputState | None:
         """Reserve a gate in the expanded pure-Ulysses input window, when enabled."""
         plan = self.cp_plan
-        if not plan.overlap or plan.ulysses_degree <= 1:
+        if not plan.cp_comm_overlap or plan.ulysses_cp_size <= 1:
             return None
-        if plan.strategy != "expanded_ulysses" or plan.all_gather_degree != 1:
+        if plan.ulysses_cp_strategy != "expanded_ulysses" or plan.all_gather_degree != 1:
             return None
         # Frozen inputs keep native gate backward; the paired consumer otherwise
         # releases it after the input gradient collectives have been submitted.
@@ -109,7 +109,7 @@ class CPGatedMultiLatentAttentionModule(CPMultiLatentAttentionModule, GatedMulti
         """
         input_gate = output_state
         output_a2a_handle = None
-        if input_gate is None and self.cp_plan.overlap and self.cp_plan.ulysses_degree > 1:
+        if input_gate is None and self.cp_plan.cp_comm_overlap and self.cp_plan.ulysses_cp_size > 1:
             # The gate remains a native child-module call, with its original
             # FSDP hooks/autograd, while O communication is in flight.
             output_a2a_handle = async_ulysses_seq_to_head_launch(output, 2, 1, self.ulysses_mesh)

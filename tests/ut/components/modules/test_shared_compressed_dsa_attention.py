@@ -387,7 +387,8 @@ class TestSharedCompressedCPPlans(unittest.TestCase):
     def test_balance_options(self):
         """Greedy defaults to 2048; irrelevant or invalid options are rejected."""
         self.assertEqual(CompressedSparseAttention2(module=
-            _source(), context={"cp_size": 2}, indexer_load_balance="greedy").indexer_balance_block_size, 2048)
+            _source(), context={"cp_size": 2}, kv_cp_size=2,
+            indexer_load_balance="greedy").indexer_balance_block_size, 2048)
         cases = (
             ({"indexer_balance_block_size": 2048}, "requires indexer_load_balance"),
             ({"indexer_load_balance": "zigzag", "indexer_balance_block_size": 2048}, "requires indexer"),
@@ -452,7 +453,7 @@ class TestCSA2Family(unittest.TestCase):
                     source.eval()
                     source.indexer.q_b_proj.train()
                     selected = CompressedSparseAttention2(
-                        module=source, context={"cp_size": size}, use_fused_ops=fused,
+                        module=source, context={"cp_size": size}, kv_cp_size=size, use_fused_ops=fused,
                     )
                     expected = ("cp_" if size > 1 else "") + ("fused" if fused else "reference")
                     self.assertEqual(get_family_build_info(selected).resolved.variant, expected)
@@ -478,7 +479,7 @@ class TestCSA2Family(unittest.TestCase):
 
     def test_binding_keeps_class_forward_and_rejects_duplicate_owner(self):
         """Binding must not monkeypatch forward or permit a second communication owner."""
-        module = CompressedSparseAttention2(module=_source(), context={"cp_size": 2})
+        module = CompressedSparseAttention2(module=_source(), context={"cp_size": 2}, kv_cp_size=2)
         binding = ParallelBinding(MeshBinding(SimpleNamespace(tp_size=1)),
                                   cp_context=SimpleNamespace(size=2, rank=1))
         before = module.forward.__func__
@@ -497,6 +498,6 @@ class TestCSA2Family(unittest.TestCase):
             CompressedSparseAttention2(module=source, use_fused_ops="true")
         with self.assertRaisesRegex(NotImplementedError, "TP=1"):
             CompressedSparseAttention2(module=source, context={"tp_size": 2}, use_fused_ops=True)
-        cp = CompressedSparseAttention2(module=source, context={"cp_size": 2})
+        cp = CompressedSparseAttention2(module=source, context={"cp_size": 2}, kv_cp_size=2)
         with self.assertRaisesRegex(RuntimeError, "must be bound"):
             cp.query_partition(2, torch.arange(2).unsqueeze(0))

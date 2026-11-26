@@ -22,12 +22,13 @@ plan_overrides:
       exact_type: true
       implementation:
         _target_: hyper_parallel.components.modules.GatedGroupedQueryAttention
-        ulysses_degree: 1
-        overlap: true
+        ulysses_cp_size: 1
+        kv_cp_size: 4
+        cp_comm_overlap: true
 ```
 
-`ulysses_degree` 和 `overlap` 沿用 [GQA 配置](../grouped_query_attention/README.md#yaml-配置)：
-省略 U 为纯 Ulysses，U=1 为 KV AG，其余整除值为混合；overlap 默认 false。
+CP 因子和可用选项沿用 [GQA 配置](../grouped_query_attention/README.md#yaml-配置)，
+完整的家族支持边界见[CP 参数迁移记录](../cp_parameter_migration.md)。
 CP1 选择 local 成员。gate 始终存在，不需要额外开关。
 Qwen3.5 MoE 应使用其对应的 source_type；完整示例见
 [稠密模型配方](../../../../models/qwen3_8/recipes/train_online_p2p_kv_allgather.yaml) 和
@@ -47,7 +48,7 @@ Qwen3.5 MoE 应使用其对应的 source_type；完整示例见
 QKV/gate 投影、QK Norm/RoPE → 输入交换 → FA → 恢复本地 O → 乘 sigmoid(gate) → 输出投影
 ```
 
-gate 保持本地 token 顺序，在 O 恢复后逐通道相乘。CP 的 overlap 沿用 GQA 输入调度；
+gate 保持本地 token 顺序，在 O 恢复后逐通道相乘。CP 的 `cp_comm_overlap` 沿用 GQA 输入调度；
 gate 来自融合投影，不使用 gated MLA 的独立 gate 投影调度。
 
 ## 支持范围

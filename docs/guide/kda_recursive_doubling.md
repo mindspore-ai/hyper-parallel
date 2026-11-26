@@ -21,12 +21,12 @@ plan_overrides:
         backend: triton
         conv_backend: eager
         state_cp_method: recursive_doubling
-        ulysses_degree: 2
+        ulysses_cp_size: 2
 ```
 
 match 是实际 KDA 模块完整路径，不加 `.forward`；混合其他注意力类型时需要收窄范围。
 配置迁移和参数所有权见 [模块族说明](linear_attention_module_families.md)。
-ulysses_degree=1 表示纯 RD，大于1表示 Ulysses×RD；它必须整除总 CP 大小以及 query/value head 数。
+ulysses_cp_size=1 表示纯 RD，大于1表示 Ulysses×RD；它必须整除总 CP 大小以及 query/value head 数。
 RD 不使用 allgather_group_size，该参数保持默认1。局部融合计算固定64-token chunk。
 
 例如总 CP=8、Ulysses=2，自然 rank 顺序下 U 组为 [0,1]、[2,3]、[4,5]、[6,7]，

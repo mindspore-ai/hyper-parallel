@@ -53,18 +53,17 @@ class CPKimiDeltaAttentionModule(KimiDeltaAttentionModule):
     def __init__(self, *, config: Any = None, module: torch.nn.Module | None = None,
                  module_fqn: str = "", context: Any = None, backend: str = "eager",
                  conv_backend: str | None = None, chunk_size: int = 64, input_layout: str = "BSH",
-                 ulysses_degree: int | None = 1, state_cp_method: str = "p2p",
+                 ulysses_cp_size: int = 1, state_cp_method: str = "p2p",
                  allgather_group_size: int = 1) -> None:
         """Record scheduling choices; do not construct groups or retain an active invocation."""
-        del module_fqn, context
-        # Preserve the established post-A2A convolution for the degree=None request.
-        # Topology is tracked separately as CP = ulysses_size * state_size.
-        self.convolve_after_exchange = ulysses_degree is None
+        del module_fqn
+        cp_size = (context or {}).get("cp_size", 1)
+        self.convolve_after_exchange = cp_size <= 1 or cp_size == ulysses_cp_size
         if conv_backend is None and not self.convolve_after_exchange:
             conv_backend = "ascendc" if backend == "ascendc" else "eager"
         super().__init__(config=config, module=module,
                          backend=backend, conv_backend=conv_backend, chunk_size=chunk_size, input_layout=input_layout)
-        self.ulysses_degree = ulysses_degree
+        self.ulysses_cp_size = ulysses_cp_size
         self.state_cp_method = state_cp_method
         self.allgather_group_size = allgather_group_size
         self.cp_rank, self.cp_size = 0, 1
@@ -100,11 +99,11 @@ class CPKimiDeltaAttentionModule(KimiDeltaAttentionModule):
             raise ValueError("KDA CP requires CPContext")
         self.cp_context = binding.cp_context
         self.cp_rank, self.cp_size = self.cp_context.rank, self.cp_context.size
-        degree = self.cp_size if self.convolve_after_exchange else self.ulysses_degree
+        degree = self.ulysses_cp_size
         if (not isinstance(degree, int) or isinstance(degree, bool)) or degree < 1 or self.cp_size % degree:
-            raise ValueError("KDA Ulysses degree must divide CP size")
+            raise ValueError("KDA ulysses_cp_size must divide cp_size")
         if self.num_heads % degree or self.num_v_heads % degree:
-            raise ValueError("KDA Ulysses degree must divide query and value heads")
+            raise ValueError("KDA ulysses_cp_size must divide query and value heads")
         self.ulysses_size, self.state_size = degree, self.cp_size // degree
         if self.state_size == 1:
             # Pure U has no state exchange. Preserve the requested convolution position.

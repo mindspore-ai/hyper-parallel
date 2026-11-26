@@ -55,7 +55,7 @@ def _setup():
 def _wrap(base, mesh, protocol, ulysses):
     """Install the explicit state CP method on a fresh copy of the same layer."""
     model = KimiDeltaAttention(module=copy.deepcopy(base).npu(), context={"cp_size": mesh.size()},
-                               backend="triton", state_cp_method=protocol, ulysses_degree=ulysses)
+                               backend="triton", state_cp_method=protocol, ulysses_cp_size=ulysses)
     model.bind_parallel(SimpleNamespace(cp_context=CPContext(mesh)))
     return model
 

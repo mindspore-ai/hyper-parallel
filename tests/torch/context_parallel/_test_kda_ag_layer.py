@@ -167,7 +167,7 @@ def test_kda_ag_layer() -> None:
     controls = {}
     for protocol, ulysses, width in cases:
         model = KimiDeltaAttention(module=copy.deepcopy(base).npu(), context={"cp_size": size},
-                                   state_cp_method=protocol, ulysses_degree=ulysses,
+                                   state_cp_method=protocol, ulysses_cp_size=ulysses,
                                    allgather_group_size=width, backend="triton")
         model.bind_parallel(SimpleNamespace(cp_context=CPContext(root)))
         gather = protocol != "p2p" and size // ulysses > 1
