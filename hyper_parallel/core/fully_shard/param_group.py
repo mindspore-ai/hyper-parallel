@@ -144,8 +144,9 @@ class AllGatherBucket:
             return False
         flat_storage_ptr = self.flat_param_buffer.untyped_storage().data_ptr()
         offset = 0
-        for param, numel in zip(self.hsdp_params, self.metadata.inp_split_sizes):
+        for index, param in enumerate(self.hsdp_params):
             shard = param._sharded_param_data
+            numel = self.metadata.inp_split_sizes[index] if self.metadata is not None else shard.numel()
             if (shard.untyped_storage().data_ptr() != flat_storage_ptr
                     or shard.storage_offset() != offset or shard.numel() != numel
                     or shard.dtype != self.flat_param_buffer.dtype or not shard.is_contiguous()):

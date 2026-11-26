@@ -164,7 +164,7 @@ class HSDPParamV2:
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
         self._gather_group_ref = None
-        self.mp_policy = mp_policy
+        self._configured_param_dtype = None
         self._src_parameter_id = id(param)
         self.device = device
         self.orig_dtype = None
@@ -674,10 +674,10 @@ class HSDPParamV2:
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
         """Initialize dtype attributes, applying source-parameter overrides before policy defaults."""
         previous_dtype = self.param_dtype or self.orig_dtype
-        self.mp_policy = mp_policy
         custom_dtypes = (mp_policy.custom_params or {}).get(self._src_parameter_id, {})
         param_dtype = custom_dtypes.get("param_dtype", mp_policy.param_dtype)
         reduce_dtype = custom_dtypes.get("reduce_dtype", mp_policy.reduce_dtype)
+        self._configured_param_dtype = param_dtype
         self.orig_dtype = self.sharded_param.dtype
         if reduce_dtype == param_dtype:
             reduce_dtype = None
@@ -1032,7 +1032,9 @@ class HSDPParamV2:
         if not same_local_tensor or pinned_local_tensor:
             self._refresh_sharded_local_tensor(local_tensor, shard_dim)
             if self._gather_group_ref is not None:
-                self.init_dtype_attrs(self.mp_policy)
+                self.orig_dtype = local_tensor.dtype
+                self.param_dtype = (self._configured_param_dtype
+                                    if self._configured_param_dtype != self.orig_dtype else None)
                 self._mark_gather_layout_dirty()
         self._sharding_spec.set_tensor_meta(
             self._sharding_spec.tensor_shape,
