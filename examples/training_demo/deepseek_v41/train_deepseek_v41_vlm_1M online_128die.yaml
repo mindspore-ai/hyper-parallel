@@ -81,35 +81,6 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # The registered architecture runs without replacements. When Encoder
-  # Parallel is enabled, its runtime requires the ViT attention wrapper.
-  - match: "model.vision.blocks.*.attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
-  - match: "model.layers.*.engram"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.components.modules.engram.engram_family.Engram
-        engram_storage_backend: host
-  - match: "model.layers.*.self_attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: >-
-          hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
-        # Fused CSA2 requires candidate pools to remain disabled and TP=1.
-        use_fused_ops: true
-  # Image boundary embeddings stay replicated over TP; FSDP owns their sharding.
-  - match: "model"
-    params:
-      image_start: {tp: replicate}
-      image_end: {tp: replicate}
-      image_newline: {tp: replicate}
-  # Fully declared globs create the mHC/Engram boundaries from the final
-  # model tree, independent of model depth and Engram layer IDs.
   - match: "model.layers.*.*_hc"
     region_dispatch: false
     params:
@@ -142,20 +113,34 @@ plan_overrides:
       pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
-  - match: "model.layers.*.engram"
-    params:
-      q_weight: {tp: replicate}
-      k_weight: {tp: replicate}
-      embed.weight: {ep: "shard(0)"}
-      wkv.weight: {tp: replicate}
-  - match: "model.layers.*.engram.forward"
+  # The registered architecture runs without replacements. When Encoder
+  # Parallel is enabled, its runtime requires the ViT attention wrapper.
+  - match: "model.vision.blocks.*.attn"
     replace:
-      kind: method
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+  - match: "model.layers.*.engram"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.Engram
+        engram_storage_backend: host
+  - match: "model.layers.*.self_attn"
+    replace:
+      kind: module
       implementation:
         _target_: >-
-          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  # Native alternative: remove the MegaMoe expert replacement below and select
-  # deepseek_v41_ep_compute_fn with use_grouped_gemm: true.
+          hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
+        # Fused CSA2 requires candidate pools to remain disabled and TP=1.
+        use_fused_ops: true
+  # Image boundary embeddings stay replicated over TP; FSDP owns their sharding.
+  - match: "model"
+    params:
+      image_start: {tp: replicate}
+      image_end: {tp: replicate}
+      image_newline: {tp: replicate}
+  # Engram and mHC own their layouts; this method override remains MoE-specific.
   - match: "model.layers.*.mlp.forward"
     replace:
       kind: method
@@ -169,7 +154,7 @@ plan_overrides:
       implementation:
         _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
         dispatch_mode: push  # Set to pull for GET dispatch.
-  # HyperMegaMhc reuses the original fn/base/scale parameters.
+  # Retain the legacy shifted adapter and explicit layouts for parallel mHC.
   - match:
       - "model.layers.*.attn_hc"
       - "model.layers.*.ffn_hc"

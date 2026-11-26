@@ -1,0 +1,483 @@
+# Recipe fields used by test_deepseek_v41_recipes.py.
+# Keep these snapshots equal to the corresponding source YAML fields.
+examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml:
+  accelerator:
+    tp_size: 1
+    cp_size: 4
+    ep_size: 8
+    pp_size: 1
+    sequence_parallel: true
+    loss_parallel: false
+  plan_overrides:
+  - match: model.layers.*.*_hc
+    region_dispatch: false
+    params:
+      fn:
+        tp: replicate
+      base:
+        tp: replicate
+      scale:
+        tp: replicate
+    in_src:
+      hidden_streams:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    in_dst:
+      hidden_streams:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    out_src:
+      pre:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    out_dst:
+      pre:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+  - match: model.layers.*.*_hc
+    when: sequence_parallel
+    in_src:
+      hidden_streams:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    in_dst:
+      hidden_streams:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    out_src:
+      pre:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    out_dst:
+      pre:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+  - match: model.layers.*.engram
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.Engram
+        engram_storage_backend: host
+  - match: model.layers.*.self_attn
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
+        use_fused_ops: true
+  - match: model.layers.*.mlp.forward
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
+  - match: model.layers.*.mlp.experts
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+        dispatch_mode: push
+  - match:
+    - model.layers.*.attn_hc
+    - model.layers.*.ffn_hc
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
+  - match: model.layers.*.mlp.gate
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
+examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml:
+  accelerator:
+    tp_size: 1
+    cp_size: 4
+    ep_size: 8
+    pp_size: 1
+    sequence_parallel: true
+    loss_parallel: false
+    encoder_parallel:
+      enabled: true
+      encoder_cp_size: 4
+  plan_overrides:
+  - match: model.layers.*.*_hc
+    region_dispatch: false
+    params:
+      fn:
+        tp: replicate
+      base:
+        tp: replicate
+      scale:
+        tp: replicate
+    in_src:
+      hidden_streams:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    in_dst:
+      hidden_streams:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    out_src:
+      pre:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    out_dst:
+      pre:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+  - match: model.layers.*.*_hc
+    when: sequence_parallel
+    in_src:
+      hidden_streams:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    in_dst:
+      hidden_streams:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    out_src:
+      pre:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    out_dst:
+      pre:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+  - match: model.vision.blocks.*.attn
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+  - match: model.layers.*.engram
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.Engram
+        engram_storage_backend: host
+  - match: model.layers.*.self_attn
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
+        use_fused_ops: true
+  - match: model
+    params:
+      image_start:
+        tp: replicate
+      image_end:
+        tp: replicate
+      image_newline:
+        tp: replicate
+  - match: model.layers.*.mlp.forward
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
+  - match: model.layers.*.mlp.experts
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+        dispatch_mode: push
+  - match:
+    - model.layers.*.attn_hc
+    - model.layers.*.ffn_hc
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
+  - match: model.layers.*.mlp.gate
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
+examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_1M online_128die.yaml:
+  accelerator:
+    tp_size: 1
+    cp_size: 128
+    ep_size: 128
+    pp_size: 1
+    sequence_parallel: true
+    loss_parallel: false
+    encoder_parallel:
+      enabled: true
+      encoder_cp_size: 4
+  plan_overrides:
+  - match: model.layers.*.*_hc
+    region_dispatch: false
+    params:
+      fn:
+        tp: replicate
+      base:
+        tp: replicate
+      scale:
+        tp: replicate
+    in_src:
+      hidden_streams:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    in_dst:
+      hidden_streams:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    out_src:
+      pre:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+    out_dst:
+      pre:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: replicate
+        cp: shard(1)
+        ep: replicate
+  - match: model.layers.*.*_hc
+    when: sequence_parallel
+    in_src:
+      hidden_streams:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    in_dst:
+      hidden_streams:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    out_src:
+      pre:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+    out_dst:
+      pre:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      post:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+      residual:
+        tp: shard(1)
+        cp: shard(1)
+        ep: replicate
+  - match: model.vision.blocks.*.attn
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+  - match: model.layers.*.engram
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.Engram
+        engram_storage_backend: host
+  - match: model.layers.*.self_attn
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
+        use_fused_ops: true
+  - match: model
+    params:
+      image_start:
+        tp: replicate
+      image_end:
+        tp: replicate
+      image_newline:
+        tp: replicate
+  - match: model.layers.*.mlp.forward
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
+  - match: model.layers.*.mlp.experts
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+        dispatch_mode: push
+  - match:
+    - model.layers.*.attn_hc
+    - model.layers.*.ffn_hc
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
+  - match: model.layers.*.mlp.gate
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
+hyper_parallel/models/deepseek_v41/tools/nd_train_deepseek_v41_timing.yaml:
+  accelerator:
+    tp_size: 1
+    cp_size: 1
+    ep_size: 16
+    pp_size: 1
+    sequence_parallel: false
+    loss_parallel: false
+  plan_overrides:
+  - match:
+    - model.layers.*.attn_hc
+    - model.layers.*.ffn_hc
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.PipelinedMhc
+  - match: model.layers.*.engram
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.Engram
+  - match: model.layers.*.self_attn
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.CompressedSparseAttention2
+  - match: '*.mlp.forward'
+    when: ep
+    region_dispatch: false
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+        use_grouped_gemm: false
+.agent/skills/sapp-parallel-strategy/templates/deepseek_v41.yaml:
+  accelerator:
+    tp_size: 1
+    cp_size: 1
+    ep_size: 16
+    pp_size: 1
+    sequence_parallel: false
+    loss_parallel: false
+  plan_overrides:
+  - match:
+    - model.layers.*.attn_hc
+    - model.layers.*.ffn_hc
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.PipelinedMhc
+  - match: model.layers.*.engram
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.Engram
+  - match: model.layers.*.self_attn
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.CompressedSparseAttention2
+  - match: '*.mlp.forward'
+    when: ep
+    region_dispatch: false
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+        use_grouped_gemm: false

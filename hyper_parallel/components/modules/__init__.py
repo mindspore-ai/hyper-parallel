@@ -45,12 +45,19 @@ if TYPE_CHECKING:
     )
     from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts_family import GroupedExperts
     from hyper_parallel.components.modules.linear import Linear
-    from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
+    from hyper_parallel.components.modules.engram import Engram
+    from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule, PipelinedMhc
     from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.moe.shared_expert import SharedExpert
+    from hyper_parallel.components.modules.common.causal_lm_head import CausalLMHead, CausalLMHeadModule
+    from hyper_parallel.components.modules.common.situ_mlp import SiTUMLP, SiTUMLPModule
     from hyper_parallel.components.modules.mlp import SwiGLUMLP, SwiGLUMLPModule
 
 _EXPORT_TO_MODULE = {
+    "CausalLMHead": "common.causal_lm_head",
+    "CausalLMHeadModule": "common.causal_lm_head",
+    "SiTUMLP": "common.situ_mlp",
+    "SiTUMLPModule": "common.situ_mlp",
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
     "Gate": "moe.router",
     "GateModule": "moe.router",

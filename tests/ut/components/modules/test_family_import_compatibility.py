@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Canonical family imports and compatibility aliases register exactly once."""
+"""Canonical module family imports register exactly once."""
 import importlib
 import inspect
 import unittest
@@ -26,7 +26,7 @@ from tests.common.mark_utils import arg_mark
 
 
 class TestFamilyImportCompatibility(unittest.TestCase):
-    """Keep old import identities without duplicate implementation or registration."""
+    """Keep canonical package and implementation exports consistent."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_default_member_names_are_local(self) -> None:
@@ -36,6 +36,9 @@ class TestFamilyImportCompatibility(unittest.TestCase):
         """
         entries = (
             ("common.rms_norm", ("RMSNorm", "OffsetRMSNorm")),
+            ("common.causal_lm_head", ("CausalLMHead",)),
+            ("common.situ_mlp", ("SiTUMLP",)),
+            ("mlp", ("SwiGLUMLP",)),
             ("mlp.mlp_family", ("SwiGLUMLP",)),
             ("moe.shared_expert", ("SharedExpert",)),
             ("common.rotary_embedding", ("RotaryEmbedding",)),
@@ -62,6 +65,8 @@ class TestFamilyImportCompatibility(unittest.TestCase):
         public = importlib.import_module("hyper_parallel.components.modules")
         for name, cls, factory in (
             ("common.rms_norm", "RMSNormModule", "RMSNorm"),
+            ("common.causal_lm_head", "CausalLMHeadModule", "CausalLMHead"),
+            ("common.situ_mlp", "SiTUMLPModule", "SiTUMLP"),
             ("mlp", "SwiGLUMLPModule", "SwiGLUMLP"),
             ("moe.shared_expert", "SharedExpertModule", "SharedExpert"),
             ("moe.router", "GateModule", "Gate"),

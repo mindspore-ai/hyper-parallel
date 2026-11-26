@@ -50,9 +50,11 @@ register_module_family(ModuleFamily(
     variants={
         "local": "hyper_parallel.components.modules.mlp.swiglu_mlp.SwiGLUMLPModule",
         "w1_w2": "hyper_parallel.components.modules.mlp.swiglu_mlp.W1W2SwiGLUMLPModule",
+        "separate": "hyper_parallel.components.modules.mlp.swiglu_mlp.SeparateSwiGLUMLPModule",
     },
     selector_specs={"state_layout": SelectorSpec(str, "linear_fc")},
-    variant_rules=(VariantRule({"state_layout": "w1_w2", "parallel": False}, "w1_w2"),),
+    variant_rules=(VariantRule({"state_layout": "w1_w2", "parallel": False}, "w1_w2"),
+                   VariantRule({"state_layout": "separate", "parallel": False}, "separate")),
     default_variant="local",
 ))
 

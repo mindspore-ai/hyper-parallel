@@ -761,8 +761,8 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 
 | 模型语义 | 正式 reference 模块 | recipe 可选 candidate | 选择方式 |
 |---|---|---|---|
-| pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `PipelinedMhcModule` | `replace.kind: module` + `implementation` |
-| Engram | `DeepseekV41Engram` | `EngramModule` | `replace.kind: module` + `implementation` |
+| pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `hyper_parallel.components.modules.PipelinedMhc` | `replace.kind: module` + `implementation` |
+| Engram | `DeepseekV41Engram` | `hyper_parallel.components.modules.Engram` | `replace.kind: module` + `implementation` |
 | CSA2 Attention | `DeepseekV41Attention` | `CompressedSparseAttention2` | `replace.kind: module` + `implementation` |
 
 `CompressedSparseAttention2` 模块族拥有完整 attention 算法、参数布局及 CP/TP 阶段。

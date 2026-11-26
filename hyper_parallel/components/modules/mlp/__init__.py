@@ -15,12 +15,15 @@
 """Public Dense MLP contracts and concrete member exports."""
 
 from .mlp_family import SwiGLUMLP
-from .swiglu_mlp import SwiGLUMLPModule, W1W2SwiGLUMLPModule, local_swiglu, swiglu_activation
+from .swiglu_mlp import (
+    SeparateSwiGLUMLPModule, SwiGLUMLPModule, W1W2SwiGLUMLPModule, local_swiglu, swiglu_activation,
+)
 
 __all__ = [
     "SwiGLUMLP",
     "SwiGLUMLPModule",
     "W1W2SwiGLUMLPModule",
+    "SeparateSwiGLUMLPModule",
     "local_swiglu",
     "swiglu_activation",
 ]

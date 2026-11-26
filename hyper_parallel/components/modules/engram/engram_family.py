@@ -14,12 +14,17 @@
 # ============================================================================
 """Device-table Engram replacement entry point and family registration."""
 from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
+
 from torch import nn
+
 from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
-from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
+from hyper_parallel.models.replacement import module_replacement
+
+from .engram import engram_sharding
 
 
 @module_replacement
@@ -38,6 +43,6 @@ register_module_family(ModuleFamily(
     variants={"local": "hyper_parallel.components.modules.engram.engram.EngramModule",
               "host": "hyper_parallel.components.modules.engram.host_engram.HostEngramModule"},
     selector_specs={"engram_storage_backend": SelectorSpec(str, "device")},
-    default_variant="local",
+    default_variant="local", sharding=engram_sharding,
     variant_rules=(VariantRule({"engram_storage_backend": "host", "parallel": False}, "host"),),
 ))

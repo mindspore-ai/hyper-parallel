@@ -23,6 +23,7 @@ from torch import nn
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
 from hyper_parallel.models.replacement import module_replacement
+from ._utils import _validate_pipelined, pipelined_mhc_sharding
 
 
 @module_replacement
@@ -61,16 +62,23 @@ register_module_family(ModuleFamily(
 def PipelinedMhc(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Mapping[str, Any] | None = None, mesh: Any = None,
+    shifted: bool = False, use_fused_ops: bool = False, token_tile: int = 32,
 ) -> nn.Module:
     """Construct a tracked PipelinedMhc member without changing its execution contract."""
     return build_family(PipelinedMhc, config=config, module=module, module_fqn=module_fqn,
-                        context=context, mesh=mesh)
+                        context=context, mesh=mesh, shifted=shifted, use_fused_ops=use_fused_ops, token_tile=token_tile)
 
 
 register_module_family(ModuleFamily(
     name="pipelined_mhc", baseline=PipelinedMhc,
-    variants={"local": "hyper_parallel.components.modules.mhc.pipelined_mhc.PipelinedMhcModule"},
-    default_variant="local",
+    variants={"local": "hyper_parallel.components.modules.mhc.pipelined_mhc.PipelinedMhcModule",
+              "shifted": "hyper_parallel.components.modules.mhc.pipelined_mhc.ShiftedPipelinedMhcModule",
+              "shifted_npu": "hyper_parallel.components.modules.mhc.pipelined_mhc.NativeShiftedPipelinedMhcModule"},
+    default_variant="local", selector_specs={"shifted": SelectorSpec(bool, False),
+                                             "use_fused_ops": SelectorSpec(bool, False)},
+    variant_rules=(VariantRule({"shifted": True, "use_fused_ops": False, "parallel": False}, "shifted"),
+                   VariantRule({"shifted": True, "use_fused_ops": True, "parallel": False}, "shifted_npu")),
+    validate=_validate_pipelined, sharding=pipelined_mhc_sharding,
 ))
 
 
