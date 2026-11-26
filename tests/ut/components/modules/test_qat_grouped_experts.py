@@ -29,7 +29,7 @@ from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXF
 from hyper_parallel.components.quantization.functional.w4a8_gmm_func import W4A8GroupedLinear
 from hyper_parallel.components.quantization.functional.fake_w4a8_gmm_func import FakeW4A8GroupedLinear
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.modules.linear import LowPrecisionLinear
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_config
 from hyper_parallel.trainer.config.parallelism import entries_to_module_replacements
 from tests.common.grouped_experts_family import TinyMoE
@@ -235,7 +235,7 @@ class TestQATGroupedExperts(unittest.TestCase):
         model = install_family(TinyMoE(), config)
         self.assertIs(type(model.mlp.experts.grouped_linear), MXFP8GroupedLinear)
 
-    @patch("hyper_parallel.components.modules.low_precision_linear.validate_npu_runtime")
+    @patch("hyper_parallel.components.quantization.functional.linear_strategy_factory.validate_npu_runtime")
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_mixed_dense_and_expert_schemes(self, probe) -> None:

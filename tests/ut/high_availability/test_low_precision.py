@@ -25,7 +25,7 @@ from hyper_parallel.components.quantization.functional.hifloat8_linear_func impo
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
 from hyper_parallel.components.quantization.functional.w4a8_gmm_func import W4A8GroupedLinear
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.modules.linear import LowPrecisionLinear
 from hyper_parallel.components.quantization.quantizers.hifloat8 import HiFloat8Quantizer
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 from hyper_parallel.components.quantization.tensor.mxfp8_tensor import MXFP8Tensor

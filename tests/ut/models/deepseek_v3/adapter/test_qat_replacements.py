@@ -36,7 +36,7 @@ from hyper_parallel.components.quantization.functional.mxfp8_linear_func import 
     MXFP8LinearStrategy,
 )
 from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.modules.linear import LowPrecisionLinear
 from hyper_parallel.components.quantization.tensor import QuantizedTensorStorage
 from hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement import (
     replace_grouped_experts,
@@ -296,7 +296,7 @@ class TestLinearReplacement(unittest.TestCase):
         strategy = _ContractStrategy()
         policy = object()
         path = (
-            "hyper_parallel.components.quantization.modules.replacement."
+            "hyper_parallel.components.modules.linear.linear_family."
             "build_linear_strategy"
         )
         with mock.patch(path, return_value=strategy) as build:
@@ -339,7 +339,7 @@ class TestLinearReplacement(unittest.TestCase):
         """Policy errors identify the FQN selected by the replacement plan."""
         source = nn.Linear(8, 4)
         path = (
-            "hyper_parallel.components.quantization.modules.replacement."
+            "hyper_parallel.components.modules.linear.linear_family."
             "build_linear_strategy"
         )
         with mock.patch(path, side_effect=ValueError("bad policy")):
