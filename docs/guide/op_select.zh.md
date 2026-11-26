@@ -26,6 +26,41 @@ ops:
 
 也可以使用 `--ops.<算子族>=<实现>` 新增或覆盖一个算子族的配置，例如 `--ops.deepseek_sparse_attention=native`。现有模型的模块替换及配方迁移随后续接入 PR 提供；本阶段可以通过下文的 Python 示例验证选型。
 
+### TileKernels interleaved RoPE
+
+[TileKernels](https://github.com/deepseek-ai/TileKernels#requirements) 当前要求 Ascend 950、CANN ≥9.2.0、Python ≥3.12、PyTorch ≥2.13，以及启用 Ascend 后端的 TileLang ≥0.1.15。
+
+安装并调用：
+
+```bash
+git clone https://github.com/deepseek-ai/TileKernels.git
+python -m pip install ./TileKernels
+```
+
+```python
+import torch
+import torch_npu
+from hyper_parallel.components.ops import ops, rope_interleaved
+
+ops.set_backends({"rope": "tile_kernels"})
+q = torch.randn(1, 4, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(1, 2, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+angles = torch.randn(1, 16, 32, device="npu")
+cos, sin = (t.to(q.dtype).repeat(1, 1, 2) for t in (angles.cos(), angles.sin()))
+q_out, k_out = rope_interleaved(q, k, cos, sin)
+(q_out.float().sum() + k_out.float().sum()).backward()
+print(ops.used_backends())
+```
+
+Trainer YAML 配置（仅对调用公共 `rope_interleaved` 的模块生效）：
+
+```yaml
+ops:
+  rope: tile_kernels
+```
+
+支持 BF16/FP32 四维 Q/K、64/128 旋转维度、局部旋转及一阶输入/频率梯度；不修改原输入。`unsqueeze_dim=1` 对应 `[B,H,S,D]`，`2` 对应 `[B,S,H,D]`。当前不注册 `half` 变体，不支持 FP16 Q/K 或二阶梯度；自动选型不变。
+
 ## 选型如何生效
 
 1. **配置加载。** Trainer 校验算子族名、重复键和值类型。显式实现名必须在该族的注册目录中存在。

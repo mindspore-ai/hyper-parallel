@@ -285,7 +285,6 @@ def _delta_rule(x, key, value, gate, beta, *, chunk_size=64, normalize_qk=True, 
 
 def pointwise_cases(dtype: torch.dtype, hardware: bool = False) -> list[PrecisionCase]:
     """Cover normalization, activations, both RoPE layouts and mHC mixing."""
-    del hardware
     inputs = Inputs(dtype)
     cases = []
     for variant, operation in (("standard", operators.rms_norm), ("fp32_affine", operators.rms_norm_fp32_affine)):
@@ -304,14 +303,16 @@ def pointwise_cases(dtype: torch.dtype, hardware: bool = False) -> list[Precisio
         cases.append(PrecisionCase("swiglu", "clamped_fp32", f"limit_{limit}", operators.swiglu_clamped, _clamped,
                                    (inputs.tensor(2, 5, 64, scale=3.0), inputs.tensor(2, 5, 64, scale=3.0), limit),
                                    precision_dtype=dtype))
-    angles = inputs.tensor(1, 5, 16, grad=False, scale=1.0).repeat(1, 1, 2)
+    partial_width = 64 if hardware else 32
+    head_width = 128 if hardware else 64
+    angles = inputs.tensor(1, 5, partial_width // 2, grad=False, scale=1.0).repeat(1, 1, 2)
     cos, sin = angles.cos(), angles.sin()
-    query, key = inputs.tensor(2, 4, 5, 64), inputs.tensor(2, 2, 5, 64)
+    query, key = inputs.tensor(2, 4, 5, head_width), inputs.tensor(2, 2, 5, head_width)
     cases.append(PrecisionCase("rope", "half", "partial_tail", operators.rope, _rope,
                                (query, cos[:, None], sin[:, None]), precision_dtype=dtype))
     cases.append(PrecisionCase("rope", "interleaved", "partial_tail", operators.rope_interleaved, _interleaved,
                                (query, key, cos, sin), precision_dtype=dtype))
-    for name, frequencies in (("full_rotation", 64), ("identity", 0)):
+    for name, frequencies in (("full_rotation", head_width), ("identity", 0)):
         angles = inputs.tensor(1, 5, frequencies // 2, grad=False, scale=1.0).repeat(1, 1, 2)
         cases.append(PrecisionCase("rope", "half", name, operators.rope, _rope,
                                    (query, angles.cos()[:, None], angles.sin()[:, None]), precision_dtype=dtype))
@@ -320,6 +321,11 @@ def pointwise_cases(dtype: torch.dtype, hardware: bool = False) -> list[Precisio
     cases.append(PrecisionCase("rope", "interleaved", "sequence_first_partial", operators.rope_interleaved,
                                _interleaved, (query.transpose(1, 2), key.transpose(1, 2), cos, sin),
                                {"unsqueeze_dim": 2}, dtype))
+    cases.append(PrecisionCase(
+        "rope", "interleaved", "frequency_gradients", operators.rope_interleaved, _interleaved,
+        (query, key, inputs.tensor(1, 5, partial_width, dtype=torch.float32),
+         inputs.tensor(1, 5, partial_width, dtype=torch.float32)), precision_dtype=dtype,
+    ))
     cases.append(PrecisionCase("mhc_post", "standard", "fp32_coefficients", operators.mhc_post, _mhc,
                                (inputs.tensor(2, 5, 128), inputs.tensor(2, 5, 512),
                                 inputs.tensor(2, 5, 4, dtype=torch.float32),

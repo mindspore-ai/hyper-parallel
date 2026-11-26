@@ -53,6 +53,8 @@ def backend_precision_dtypes(family: str, backend: str) -> tuple[torch.dtype, ..
     The built-in Torch NPU pointwise, attention and grouped kernels cover all
     three training dtypes. CUDA grouped_mm only accepts BF16.
     """
+    if backend == "tile_kernels":
+        return (torch.float32, torch.bfloat16)
     if backend == "torch_grouped_mm":
         return (torch.bfloat16,)
     if family in ("rms_norm", "swiglu", "rope", "attention", "grouped_matmul",

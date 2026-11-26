@@ -36,6 +36,7 @@ from tests.common.op_precision_suite import (
 
 _BACKENDS = [entry for entry in registered_backends() if entry[2] != "native" and entry[3] in ("cuda", "npu")]
 _OPTIONAL_PACKAGES = {
+    "tile_kernels": ("tile_kernels",),
     "omni": ("omni_training_custom_ops",),
     "megagate": ("hyper_multicore",),
     "triton_ascend": ("triton.backends.ascend", "fla"),

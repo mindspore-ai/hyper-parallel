@@ -49,7 +49,7 @@ from .impl.moe_router import MOE_ROUTER, router_scores
 from .impl.moe_token_reorder import MOE_TOKEN_REORDER, MOE_TOKEN_RESTORE, PermutedTokens
 from .impl.mome import MOME, MomeFn
 from .impl.rms_norm import RMS_NORM, RMS_NORM_FP32_AFFINE, RMSNormFn
-from .impl.rope import ROPE, ROPE_INTERLEAVED, InterleavedRopeFn, RopeFn
+from .impl.rope import ROPE, ROPE_INTERLEAVED, RopeFn, tile_kernels_rejection as _tile_rope_rejection
 from .impl.sinkhorn import SINKHORN, SinkhornFn
 from .impl.swiglu import SWIGLU, SWIGLU_CLAMPED, ClampedSwiGLUFn, SwiGLUFn
 from .spec import OpSpec
@@ -79,7 +79,6 @@ mome: MomeFn = _dispatch(MOME)
 rms_norm: RMSNormFn = _dispatch(RMS_NORM)
 rms_norm_fp32_affine: RMSNormFn = _dispatch(RMS_NORM_FP32_AFFINE)
 rope: RopeFn = _dispatch(ROPE)
-rope_interleaved: InterleavedRopeFn = _dispatch(ROPE_INTERLEAVED)
 sinkhorn: SinkhornFn = _dispatch(SINKHORN)
 swiglu: SwiGLUFn = _dispatch(SWIGLU)
 swiglu_clamped: ClampedSwiGLUFn = _dispatch(SWIGLU_CLAMPED)
@@ -154,6 +153,16 @@ def multi_latent_attention(
 ) -> tuple[torch.Tensor, None]:
     """Attend over projected MLA states, allowing the value dimension to differ from Q and K."""
     return _dense_attention(MULTI_LATENT_ATTENTION, module, query, key, value, attention_mask, dropout, scaling, kwargs)
+
+
+def rope_interleaved(
+    x: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate adjacent Q/K pairs and return their split-half representation."""
+    reason = _tile_rope_rejection(x, key, cos, sin, unsqueeze_dim)
+    blocked = (("tile_kernels", reason),) if reason is not None else ()
+    operation = _select_for_call(ROPE_INTERLEAVED, x, blocked_backends=blocked)
+    return operation(x, key, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 def rope_qk(

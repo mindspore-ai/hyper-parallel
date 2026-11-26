@@ -26,6 +26,41 @@ NPU and GPU training recipes can share the same `ops` settings when they use `au
 
 Use `--ops.<family>=<implementation>` to add or override a selection, for example `--ops.deepseek_sparse_attention=native`. Model replacements and recipe migration follow in the integration PR. The Python examples below exercise the standalone public interfaces.
 
+### TileKernels interleaved RoPE
+
+[TileKernels](https://github.com/deepseek-ai/TileKernels#requirements) currently requires Ascend 950, CANN ≥9.2.0, Python ≥3.12, PyTorch ≥2.13 and TileLang ≥0.1.15 with the Ascend backend enabled.
+
+Install and call:
+
+```bash
+git clone https://github.com/deepseek-ai/TileKernels.git
+python -m pip install ./TileKernels
+```
+
+```python
+import torch
+import torch_npu
+from hyper_parallel.components.ops import ops, rope_interleaved
+
+ops.set_backends({"rope": "tile_kernels"})
+q = torch.randn(1, 4, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(1, 2, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+angles = torch.randn(1, 16, 32, device="npu")
+cos, sin = (t.to(q.dtype).repeat(1, 1, 2) for t in (angles.cos(), angles.sin()))
+q_out, k_out = rope_interleaved(q, k, cos, sin)
+(q_out.float().sum() + k_out.float().sum()).backward()
+print(ops.used_backends())
+```
+
+Trainer YAML configuration (applies only to modules calling public `rope_interleaved`):
+
+```yaml
+ops:
+  rope: tile_kernels
+```
+
+Supports 4-D BF16/FP32 Q/K, rotary dimensions 64/128, partial rotation and first-order input/frequency gradients without mutating inputs. Use `unsqueeze_dim=1` for `[B,H,S,D]` or `2` for `[B,S,H,D]`. The `half` variant, FP16 Q/K and second derivatives are unsupported. Automatic selection priorities are unchanged.
+
 ## How backend selection works
 
 1. **Configuration load.** The Trainer validates family names, duplicate keys, and value types. An explicit implementation name must be registered for the family.

@@ -14,10 +14,13 @@
 # ============================================================================
 """Half and interleaved rotary position embedding contracts."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from typing import Protocol
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from .._dependency import require_package, require_symbol
 from ..registry import OpRegistry
@@ -129,6 +132,105 @@ def _load_npu_interleaved() -> InterleavedRopeFn:
     return run
 
 
+def tile_kernels_rejection(
+    x: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int,
+) -> str | None:
+    """Keep call-specific layout and frequency restrictions out of cached selections."""
+    if cos.ndim not in (2, 3) or cos.shape != sin.shape:
+        return "TileKernels interleaved RoPE requires matching 2-D or 3-D cos/sin tables"
+    if cos.shape[-1] == 0:
+        return None
+    if cos.shape[-1] not in (64, 128):
+        return "TileKernels interleaved RoPE requires a rotary dimension of 64 or 128"
+    if unsqueeze_dim not in (1, 2) or x.ndim != 4 or key.ndim != 4:
+        return "TileKernels interleaved RoPE requires 4-D Q/K and unsqueeze_dim 1 or 2"
+    sequence_axis = 2 if unsqueeze_dim == 1 else 1
+    batch, sequence = x.shape[0], x.shape[sequence_axis]
+    if (key.shape[0] != batch or key.shape[sequence_axis] != sequence
+            or cos.shape[-2] not in (1, sequence) or (cos.ndim == 3 and cos.shape[0] not in (1, batch))):
+        return "TileKernels interleaved RoPE requires matching Q/K batches and sequences with broadcastable tables"
+    if key.device != x.device or key.dtype not in (torch.bfloat16, torch.float32):
+        return "TileKernels interleaved RoPE requires BF16/FP32 K on the Q device"
+    if any(t.device != x.device or t.dtype not in (torch.float16, torch.bfloat16, torch.float32) for t in (cos, sin)):
+        return "TileKernels interleaved RoPE requires floating-point cos/sin on the Q device"
+    return None
+
+
+def _tile_kernels_dtype(x: torch.Tensor) -> str | None:
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        return "TileKernels interleaved RoPE supports only BF16 and FP32 Q"
+    return None
+
+
+class _TileKernelsInterleavedRope(torch.autograd.Function):
+    """Make the upstream in-place rotation out-of-place and differentiable."""
+
+    @staticmethod
+    def forward(ctx, x, cache, kernel):
+        """Keep original operands for the transpose rotation and frequency gradients."""
+        ctx.save_for_backward(x, cache)
+        ctx.kernel = kernel
+        result = x.clone()
+        kernel(result, cache, interleaved=True)
+        return result
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        """Transpose the rotation; reduce frequency gradients across attention heads."""
+        x, cache = ctx.saved_tensors
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.contiguous().clone()
+            ctx.kernel(grad_input, cache, interleaved=True, conjugate=True)
+        grad_cache = None
+        if ctx.needs_input_grad[1]:
+            even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
+            grad_even, grad_odd = grad_output.float()[..., 0::2], grad_output.float()[..., 1::2]
+            grad_cos = (grad_even * even + grad_odd * odd).sum(dim=1)
+            grad_sin = (grad_odd * even - grad_even * odd).sum(dim=1)
+            grad_cache = torch.cat((grad_cos, grad_sin), dim=-1)
+        return grad_input, grad_cache, None
+
+
+def _load_tile_kernels_interleaved() -> InterleavedRopeFn:
+    extension = require_package("tile_kernels.transform")
+    require_symbol(extension, "apply_rotary")
+    kernel = extension.apply_rotary
+
+    def run(
+        x: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, unsqueeze_dim: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use shared per-token frequencies and restore Hyper's split-half output layout."""
+        rotary_dim = cos.shape[-1]
+        if not rotary_dim:
+            return x, key
+        if rotary_dim > min(x.shape[-1], key.shape[-1]):
+            raise ValueError("RoPE frequencies cannot exceed the Q/K head dimension")
+        if cos.ndim == 2:
+            cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+        batch, sequence = x.shape[0], x.shape[2 if unsqueeze_dim == 1 else 1]
+        cos, sin = (t[..., :rotary_dim // 2].expand(batch, sequence, -1) for t in (cos, sin))
+        cache = torch.cat((cos.float(), sin.float()), dim=-1).reshape(batch * sequence, rotary_dim).contiguous()
+
+        def rotate(tensor: torch.Tensor) -> torch.Tensor:
+            dtype = torch.promote_types(torch.promote_types(tensor.dtype, cos.dtype), sin.dtype)
+            prefix = tensor[..., :rotary_dim].to(dtype)
+            tokens = prefix.transpose(1, 2) if unsqueeze_dim == 1 else prefix
+            heads = tokens.shape[2]
+            packed = tokens.reshape(batch * sequence, heads, rotary_dim).contiguous()
+            rotated = _TileKernelsInterleavedRope.apply(packed, cache, kernel)
+            rotated = rotated.reshape(batch, sequence, heads, rotary_dim)
+            if unsqueeze_dim == 1:
+                rotated = rotated.transpose(1, 2)
+            rotated = rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
+            return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
+
+        return rotate(x), rotate(key)
+
+    return run
+
+
 def register_rope(registry: OpRegistry) -> None:
     """Register half, interleaved and partial rotation on compatible devices."""
     registry.register_family("rope", specs=(ROPE, ROPE_INTERLEAVED))
@@ -138,3 +240,7 @@ def register_rope(registry: OpRegistry) -> None:
     )
     registry.register_impl(ROPE, name="torch_npu", devices=("npu",), load=_load_npu)
     registry.register_impl(ROPE_INTERLEAVED, name="torch_npu", devices=("npu",), load=_load_npu_interleaved)
+    registry.register_impl(
+        ROPE_INTERLEAVED, name="tile_kernels", devices=("npu",), load=_load_tile_kernels_interleaved,
+        check_compatibility=_tile_kernels_dtype,
+    )
