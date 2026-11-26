@@ -163,6 +163,8 @@ class HSDPParamV2:
         """
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
+        self._gather_group_ref = None
+        self.mp_policy = mp_policy
         self._src_parameter_id = id(param)
         self.device = device
         self.orig_dtype = None
@@ -663,8 +665,16 @@ class HSDPParamV2:
         self.param_dtype = None
         self.reduce_dtype = None
 
+    def _mark_gather_layout_dirty(self):
+        if self._gather_group_ref is not None:
+            group = self._gather_group_ref()
+            if group is not None:
+                group.gather_layout_dirty = True
+
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
         """Initialize dtype attributes, applying source-parameter overrides before policy defaults."""
+        previous_dtype = self.param_dtype or self.orig_dtype
+        self.mp_policy = mp_policy
         custom_dtypes = (mp_policy.custom_params or {}).get(self._src_parameter_id, {})
         param_dtype = custom_dtypes.get("param_dtype", mp_policy.param_dtype)
         reduce_dtype = custom_dtypes.get("reduce_dtype", mp_policy.reduce_dtype)
@@ -675,6 +685,8 @@ class HSDPParamV2:
             param_dtype = None
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
+        if (param_dtype or self.orig_dtype) != previous_dtype:
+            self._mark_gather_layout_dirty()
         self.apply_grad_on_fp32_main_grad = mp_policy.apply_grad_on_fp32_main_grad
 
     def init_unsharded_param_buffers(
@@ -926,6 +938,8 @@ class HSDPParamV2:
             # Empty shards may have a zero data pointer and must still be rebuilt.
             sharded_data_ptr > 0
             and sharded_data_ptr == local_tensor.untyped_storage().data_ptr()
+            and self._sharded_param_data.storage_offset() == local_tensor.storage_offset()
+            and self._sharded_param_data.dtype == local_tensor.dtype
         )
 
     def _validate_reset_local_tensor(
@@ -1017,6 +1031,9 @@ class HSDPParamV2:
             raise AssertionError(f"Expected DTensor, got {type(self.sharded_param)}")
         if not same_local_tensor or pinned_local_tensor:
             self._refresh_sharded_local_tensor(local_tensor, shard_dim)
+            if self._gather_group_ref is not None:
+                self.init_dtype_attrs(self.mp_policy)
+                self._mark_gather_layout_dirty()
         self._sharding_spec.set_tensor_meta(
             self._sharding_spec.tensor_shape,
             self._sharding_spec.tensor_stride,

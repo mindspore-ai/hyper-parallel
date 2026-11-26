@@ -43,6 +43,7 @@ all-reduce with layer N-1 reduce-scatter.
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import List, Optional
+from weakref import ref
 
 import torch
 import torch.distributed as dist
@@ -142,10 +143,15 @@ class AllGatherBucket:
         if self.flat_param_buffer is None:
             return False
         flat_storage_ptr = self.flat_param_buffer.untyped_storage().data_ptr()
-        return all(
-            hsdp_param._sharded_param_data.untyped_storage().data_ptr() == flat_storage_ptr
-            for hsdp_param in self.hsdp_params
-        )
+        offset = 0
+        for param, numel in zip(self.hsdp_params, self.metadata.inp_split_sizes):
+            shard = param._sharded_param_data
+            if (shard.untyped_storage().data_ptr() != flat_storage_ptr
+                    or shard.storage_offset() != offset or shard.numel() != numel
+                    or shard.dtype != self.flat_param_buffer.dtype or not shard.is_contiguous()):
+                return False
+            offset += numel
+        return offset == self.flat_param_buffer.numel()
 
     @torch.no_grad()
     def copy_out(self) -> None:
@@ -478,12 +484,43 @@ class HSDPParamGroup:
         self.hsdp_params = hsdp_params
         self.comm_ctx = comm_ctx or ParamGroupCommCtx()
         self.enable_zero_copy = enable_zero_copy
+        self.gather_layout_dirty = True
+        for param in hsdp_params:
+            param._gather_group_ref = ref(self)
         self.gradient_scaling_factor = None
         self.requires_all_reduce = True
         self.all_gather_buckets: list[AllGatherBucket] = []
         self.reduce_scatter_buckets: list[ReduceScatterBucket] = []
         self.all_reduce_buckets: list[AllReduceBucket] = []
         self.reduce_partial_outputs: dict[tuple, torch.Tensor] = {}
+
+    def refresh_all_gather_layout(self) -> None:
+        """Expire the gather plan after reset or mixed-precision reconfiguration."""
+        if not self.gather_layout_dirty:
+            return
+        if not self.all_gather_buckets or self._gather_layout == self._current_gather_layout():
+            self.gather_layout_dirty = False
+            return
+        if any(bucket.all_gather_result is not None for bucket in self.all_gather_buckets):
+            raise RuntimeError("Finish the pending all-gather before changing parameter layout.")
+        for param in self.hsdp_params:
+            buffers = param.unsharded_param_buffers
+            if buffers and (buffers[0].dtype != (param.param_dtype or param.orig_dtype)
+                            or buffers[0].numel() != param._sharded_param_data.numel() * param.shard_world_size):
+                # The stable unsharded Parameter is a view of this output storage.
+                # Recreate both together on the next unshard after the reset.
+                if hasattr(param, "_unsharded_param"):
+                    del param._unsharded_param
+                buffers.clear()
+        self.all_gather_buckets.clear()
+        self.gather_layout_dirty = False
+
+    def _current_gather_layout(self):
+        return tuple(
+            (id(p), id(p.mesh_info.shard_process_group), p.param_dtype or p.orig_dtype,
+             p.padded_sharded_param_size, p.hsdp_placement.dim, p.shard_world_size)
+            for p in self.hsdp_params if p.shard_world_size > 1
+        )
 
     def _init_all_gather_buckets(self) -> None:
         """Build ordered all-gather buckets from each parameter's communication facts."""
@@ -504,6 +541,7 @@ class HSDPParamGroup:
                 bucket_groups[bucket_key] = shard_group
             params_by_bucket[bucket_key].append(hsdp_param)
 
+        self._gather_layout = self._current_gather_layout()
         self.all_gather_buckets = []
         for bucket_key, hsdp_params in params_by_bucket.items():
             shard_group = bucket_groups[bucket_key]
@@ -531,6 +569,7 @@ class HSDPParamGroup:
 
     def unshard(self, async_op: bool = False) -> None:
         """Launch fused all-gathers for every communication bucket."""
+        self.refresh_all_gather_layout()
         if self.all_gather_buckets and any(
             bucket.all_gather_result is not None for bucket in self.all_gather_buckets
         ):
@@ -541,6 +580,7 @@ class HSDPParamGroup:
     @torch.no_grad()
     def foreach_all_gather(self, async_op: bool = False) -> None:
         """Initialize ordered buckets and launch their all-gathers."""
+        self.refresh_all_gather_layout()
         if not self.all_gather_buckets:
             self._init_all_gather_buckets()
         for hsdp_param in self.hsdp_params:
@@ -550,8 +590,10 @@ class HSDPParamGroup:
         for all_gather_bucket in self.all_gather_buckets:
             if all_gather_bucket.all_gather_result is not None:
                 continue
-            if self.enable_zero_copy and not all_gather_bucket.is_flat_buffer_valid():
+            use_flat = self.enable_zero_copy and all_gather_bucket.is_flat_buffer_valid()
+            if self.enable_zero_copy and not use_flat:
                 all_gather_bucket.init_flat_param_buffer(self.device)
+                use_flat = all_gather_bucket.is_flat_buffer_valid()
 
             metadata = all_gather_bucket.metadata
             all_gather_output = torch.empty(
@@ -559,7 +601,7 @@ class HSDPParamGroup:
                 dtype=all_gather_bucket.dtype,
                 device=self.device,
             )
-            if self.enable_zero_copy and all_gather_bucket.is_flat_buffer_valid():
+            if use_flat:
                 if all_gather_bucket.flat_param_buffer.dtype == all_gather_bucket.dtype:
                     all_gather_input = all_gather_bucket.flat_param_buffer
                 else:
