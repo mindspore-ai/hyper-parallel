@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from typing import Any
 import torch
 from torch import nn
-from hyper_parallel.components.functional.mhc_post import mhc_post
+from hyper_parallel.components.ops import mhc_post
 from ._utils import _num_stream, _validate_settings
 
 

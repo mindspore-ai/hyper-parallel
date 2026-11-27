@@ -45,6 +45,7 @@ from .impl.grouped_matmul import GROUPED_MATMUL, GroupedMatmulFn
 from .impl.grouped_swiglu import GROUPED_SWIGLU
 from .impl.kda import KDA
 from .impl.mhc_post import MHC_POST, MhcPostFn
+from .impl.mhc_pre import MHC_PRE, MHC_PRE_APPLY, MHC_SPLIT, MhcApplyFn, MhcPreFn, MhcSplitFn
 from .impl.moe_router import MOE_ROUTER, router_scores
 from .impl.moe_token_reorder import MOE_TOKEN_REORDER, MOE_TOKEN_RESTORE, PermutedTokens
 from .impl.mome import MOME, MomeFn
@@ -60,7 +61,7 @@ __all__ = [
     "deepseek_sparse_attention_absorbed", "deepseek_sparse_attention_compressed_banks",
     "deepseek_sparse_attention_with_sink",
     "gdn", "grouped_query_attention", "grouped_matmul", "grouped_swiglu", "kda", "mhc_post", "multi_latent_attention",
-    "multi_latent_attention_with_stats",
+    "multi_latent_attention_with_stats", "mhc_pre", "mhc_pre_apply", "mhc_split_mixes",
     "moe_router", "moe_token_reorder", "moe_token_restore", "mome", "ops", "rms_norm", "rms_norm_fp32_affine",
     "router_scores",
     "rope", "rope_interleaved", "rope_qk",
@@ -74,6 +75,9 @@ dsa_indexer_kl_packed: PackedDsaKlFn = _dispatch(DSA_PACKED_KL)
 deepseek_sparse_attention_absorbed: PackedDeepseekSparseAttentionFn = _dispatch(DSA_ABSORBED)
 deepseek_sparse_attention_with_sink: PackedDeepseekSparseAttentionFn = _dispatch(DSA_ABSORBED_SINK)
 mhc_post: MhcPostFn = _dispatch(MHC_POST)
+mhc_pre: MhcPreFn = _dispatch(MHC_PRE)
+mhc_pre_apply: MhcApplyFn = _dispatch(MHC_PRE_APPLY)
+mhc_split_mixes: MhcSplitFn = _dispatch(MHC_SPLIT)
 multi_latent_attention_with_stats: MultiLatentAttentionStatsFn = _dispatch(MULTI_LATENT_ATTENTION_WITH_STATS)
 mome: MomeFn = _dispatch(MOME)
 rms_norm: RMSNormFn = _dispatch(RMS_NORM)

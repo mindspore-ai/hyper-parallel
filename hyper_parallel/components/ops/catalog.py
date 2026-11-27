@@ -25,6 +25,7 @@ from .impl.grouped_matmul import register_grouped_matmul
 from .impl.grouped_swiglu import register_grouped_swiglu
 from .impl.kda import register_kda
 from .impl.mhc_post import register_mhc_post
+from .impl.mhc_pre import register_mhc_pre
 from .impl.moe_router import register_moe_router
 from .impl.moe_token_reorder import register_moe_token_reorder
 from .impl.mome import register_mome
@@ -39,6 +40,7 @@ register_rms_norm(builtin_registry)
 register_rope(builtin_registry)
 register_swiglu(builtin_registry)
 register_mhc_post(builtin_registry)
+register_mhc_pre(builtin_registry)
 register_grouped_matmul(builtin_registry)
 register_grouped_swiglu(builtin_registry)
 register_attention(builtin_registry)

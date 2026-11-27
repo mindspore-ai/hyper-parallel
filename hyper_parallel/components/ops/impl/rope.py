@@ -14,10 +14,13 @@
 # ============================================================================
 """Half and interleaved rotary position embedding contracts."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from typing import Protocol
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from .._dependency import require_package, require_symbol
 from ..registry import OpRegistry
@@ -129,6 +132,74 @@ def _load_npu_interleaved() -> InterleavedRopeFn:
     return run
 
 
+class _TileKernelsInterleavedRope(torch.autograd.Function):
+    """Make the upstream in-place rotation out-of-place and differentiable."""
+
+    @staticmethod
+    def forward(ctx, x, cache, kernel):
+        """Keep original operands for the transpose rotation and frequency gradients."""
+        ctx.save_for_backward(x, cache)
+        ctx.kernel = kernel
+        result = x.clone()
+        kernel(result, cache, interleaved=True)
+        return result
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        """Transpose the rotation; reduce frequency gradients across attention heads."""
+        x, cache = ctx.saved_tensors
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.contiguous().clone()
+            ctx.kernel(grad_input, cache, interleaved=True, conjugate=True)
+        grad_cache = None
+        if ctx.needs_input_grad[1]:
+            even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
+            grad_even, grad_odd = grad_output.float()[..., 0::2], grad_output.float()[..., 1::2]
+            grad_cos = (grad_even * even + grad_odd * odd).sum(dim=1)
+            grad_sin = (grad_odd * even - grad_even * odd).sum(dim=1)
+            grad_cache = torch.cat((grad_cos, grad_sin), dim=-1)
+        return grad_input, grad_cache, None
+
+
+def _load_tile_kernels_interleaved() -> InterleavedRopeFn:
+    extension = require_package("tile_kernels.transform")
+    require_symbol(extension, "apply_rotary")
+    kernel = extension.apply_rotary
+
+    def run(
+        x: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, unsqueeze_dim: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use shared per-token frequencies and restore Hyper's split-half output layout."""
+        rotary_dim = cos.shape[-1]
+        if not rotary_dim:
+            return x, key
+        if (unsqueeze_dim not in (1, 2) or x.ndim != 4 or key.ndim != 4
+                or cos.ndim not in (2, 3) or cos.ndim != sin.ndim or rotary_dim != sin.shape[-1]):
+            raise ValueError("RoPE adapter requires 4-D Q/K, matching-width 2-D/3-D tables and unsqueeze_dim 1 or 2")
+        batch, sequence = x.transpose(unsqueeze_dim, 2).shape[:2]
+        if key.transpose(unsqueeze_dim, 2).shape[:2] != (batch, sequence):
+            raise ValueError("Q/K batch and sequence dimensions must match")
+        if any(t.device != x.device for t in (key, cos, sin)):
+            raise ValueError("Q/K and cos/sin must be on the same device")
+        frequency_dtype = torch.promote_types(cos.dtype, sin.dtype)
+        cache = torch.cat((cos[..., :rotary_dim // 2].float(), sin[..., :rotary_dim // 2].float()), dim=-1)
+        cache = cache.expand(batch, sequence, rotary_dim).reshape(batch * sequence, rotary_dim).contiguous()
+
+        def rotate(tensor: torch.Tensor) -> torch.Tensor:
+            prefix = tensor.transpose(unsqueeze_dim, 2)[..., :rotary_dim]
+            prefix = prefix.to(torch.promote_types(tensor.dtype, frequency_dtype))
+            rotated = _TileKernelsInterleavedRope.apply(prefix.flatten(0, 1).contiguous(), cache, kernel)
+            rotated = rotated.reshape(prefix.shape).transpose(unsqueeze_dim, 2)
+            rotated = rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
+            return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
+
+        return rotate(x), rotate(key)
+
+    return run
+
+
 def register_rope(registry: OpRegistry) -> None:
     """Register half, interleaved and partial rotation on compatible devices."""
     registry.register_family("rope", specs=(ROPE, ROPE_INTERLEAVED))
@@ -138,3 +209,6 @@ def register_rope(registry: OpRegistry) -> None:
     )
     registry.register_impl(ROPE, name="torch_npu", devices=("npu",), load=_load_npu)
     registry.register_impl(ROPE_INTERLEAVED, name="torch_npu", devices=("npu",), load=_load_npu_interleaved)
+    registry.register_impl(
+        ROPE_INTERLEAVED, name="tile_kernels", devices=("npu",), load=_load_tile_kernels_interleaved,
+    )

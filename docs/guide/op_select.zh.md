@@ -24,7 +24,84 @@ ops:
 
 使用 `auto` 时，NPU 和 GPU 的训练配方可复用同一组 `ops` 配置。需要固定后端时，分别在各自的 YAML 中填写对应实现名。例如 NPU 配方可写 `attention: torch_npu`，CUDA 配方可写 `attention: sdpa`。
 
-也可以使用 `--ops.<算子族>=<实现>` 新增或覆盖一个算子族的配置，例如 `--ops.deepseek_sparse_attention=native`。现有模型的模块替换及配方迁移随后续接入 PR 提供；本阶段可以通过下文的 Python 示例验证选型。
+也可以使用 `--ops.<算子族>=<实现>` 新增或覆盖一个算子族的配置，例如 `--ops.deepseek_sparse_attention=native`。mHC 模块已调用公共 Ops；其他模块和配方迁移随后续接入 PR 提供。
+
+### TileKernels
+
+环境要求：[TileKernels](https://github.com/deepseek-ai/TileKernels#requirements) 当前要求 Ascend 950、CANN ≥9.2.0、Python ≥3.12、PyTorch ≥2.13，以及启用 Ascend 后端的 TileLang ≥0.1.15。
+
+安装：
+
+```bash
+git clone https://github.com/deepseek-ai/TileKernels.git
+python -m pip install ./TileKernels
+```
+
+SwiGLU 前向与反向：
+
+```python
+import torch
+import torch_npu
+from hyper_parallel.components.ops import ops, swiglu
+
+ops.set_backends({"swiglu": "tile_kernels"})
+x = torch.randn(2, 256, device="npu", dtype=torch.bfloat16, requires_grad=True)
+swiglu(x).float().sum().backward()
+print(ops.used_backends())
+```
+
+Interleaved RoPE 前向与反向：
+
+```python
+import torch
+import torch_npu
+from hyper_parallel.components.ops import ops, rope_interleaved
+
+ops.set_backends({"rope": "tile_kernels"})
+q = torch.randn(1, 4, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(1, 2, 16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+angles = torch.randn(1, 16, 32, device="npu")
+cos, sin = (t.to(q.dtype).repeat(1, 1, 2) for t in (angles.cos(), angles.sin()))
+q_out, k_out = rope_interleaved(q, k, cos, sin)
+(q_out.float().sum() + k_out.float().sum()).backward()
+print(ops.used_backends())
+```
+
+Trainer YAML 配置（仅对调用公共 Ops 接口的模块生效）：
+
+```yaml
+ops:
+  swiglu: tile_kernels
+  rope: tile_kernels
+  mhc_pre: tile_kernels
+  mhc_post: tile_kernels
+  sinkhorn: tile_kernels
+  moe_router: tile_kernels
+```
+
+| 接口 | 支持范围 |
+|---|---|
+| `swiglu` | BF16/FP32；packed Gate/Up 维度须为正的 256 倍数 |
+| `rope_interleaved` | 四维 BF16/FP32 Q/K；64/128 旋转维度；支持局部旋转及一阶输入/频率梯度 |
+| `mhc_pre` | 四路 BF16 激活、FP32 投影与系数，支持可选 gamma；返回 block 输入、post/residual 系数及原残差 |
+| `mhc_split_mixes`、`mhc_pre_apply` | 同属 `mhc_pre` 配置键；FP32 系数拆分、BF16 stream 聚合；复用上游前反向 |
+| `mhc_post` | BF16 激活、FP32 系数；调用上游 Post 前反向，返回展平的 stream 维度 |
+| `sinkhorn` | FP32、4×4 混合矩阵；调用上游 Sinkhorn 前反向 |
+| `moe_router` | V4.1 `sqrtsoftplus` 路由；仅 Top-K 选取使用 TileKernels，投影、打分及梯度保持 Torch 实现；Top-K ≤32 |
+
+RoPE 不修改原输入；`unsqueeze_dim=1` 对应 `[B,H,S,D]`，`2` 对应 `[B,S,H,D]`。当前不支持 FP16 Q/K、half RoPE、截断 SwiGLU、量化输出或二阶梯度。TileKernels 仅供显式选择，不参与默认自动选型。
+
+`MHCPre`、`MHCPost` 和 `PipelinedMhc` 使用上述配置。`PipelinedMhc(hidden)` 保持三组系数输出；传入 `PipelinedMhc(hidden, pre_mix)` 时返回用给定系数聚合的输入，以及下一阶段的 pre/post/residual 系数。
+
+在满足上述要求的 NPU 环境中运行前反向精度验收：
+
+```bash
+python -m pip install -e .
+python -m pytest -v --log-cli-level=INFO --junitxml=tile_kernels_precision.xml \
+  tests/torch/ops/_test_backend_precision.py::test_tile_kernels_precision
+```
+
+覆盖上表各接口，先验证 native 与独立数学参考，再比较真实内核与同设备 native 的输出和全部可导输入梯度，检查输入未被修改。mHC Pre 覆盖可选 gamma、投影、scale/base 与聚合梯度。此入口缺依赖或 NPU 时直接失败，不计为跳过；日志记录逐项误差。
 
 ## 选型如何生效
 
@@ -59,6 +136,8 @@ swiglu    standard     native
 | `swiglu` | `standard`、`clamped_fp32`，拼接输入和独立输入裁剪 | `torch_npu` | `native` | `native` |
 | `rope` | `half`、`interleaved`，均支持部分 head 维度旋转 | `torch_npu`, `native` | `native` | `native` |
 | `mhc_post` | `standard`，变换输出与残差流混合 | `cann`, `omni`, `native` | `native` | `native` |
+| `mhc_pre` | `standard`，完整 Pre | `cann`, `native` | `native` | `native` |
+| `mhc_pre` | `split_mixes`、`apply_mix`，系数拆分及聚合 | `native` | `native` | `native` |
 | `sinkhorn` | `standard`，mHC 混合矩阵归一化 | `omni`, `native` | `native` | `native` |
 | `mome` | `standard`，DSA 输出侧的带掩码因果卷积与残差 | `omni`, `native` | `native` | `native` |
 | `grouped_matmul` | `standard`，按专家排列的单次无 bias 分组矩阵乘 | `torch_npu` | `torch_grouped_mm`, `native` | `native` |

@@ -19,8 +19,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.nn import functional as F
-from hyper_parallel.components.functional.mhc_post import mhc_post
-from hyper_parallel.components.functional.sinkhorn import sinkhorn, sinkhorn_knopps
+from hyper_parallel.components.ops import mhc_post, mhc_pre_apply, mhc_split_mixes, sinkhorn
 from ._utils import _validate_settings
 
 
@@ -96,28 +95,17 @@ class PipelinedMhcModule(nn.Module):
     def forward(
         self,
         hidden_streams: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Produce the coefficients consumed by the following sublayer."""
+        pre_mix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Produce next coefficients, optionally collapsing streams with the supplied pre mix."""
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = F.linear(  # pylint: disable=not-callable
             flattened, self.fn.float()
         )
-        num_stream = self.hc_mult
-        pre, post, residual = mix.split(
-            [num_stream, num_stream, num_stream * num_stream], dim=-1
-        )
-        pre_bias, post_bias, residual_bias = self.base.split(
-            [num_stream, num_stream, num_stream * num_stream]
-        )
-        pre_scale, post_scale, residual_scale = self.scale.unbind(0)
-        pre = torch.sigmoid(pre * pre_scale + pre_bias) + self.hc_eps
-        post = 2 * torch.sigmoid(post * post_scale + post_bias)
-        residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
-        residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
-        if hidden_streams.device.type == "npu" and hasattr(torch.ops.custom, "npu_sinkhorn"):
-            residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
-        else:
-            residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        pre, post, residual = mhc_split_mixes(mix, self.scale, self.base, self.hc_mult, epsilon=self.hc_eps)
+        residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        if pre_mix is not None:
+            return mhc_pre_apply(hidden_streams, pre_mix), pre, post, residual
         return pre, post, residual
 
 

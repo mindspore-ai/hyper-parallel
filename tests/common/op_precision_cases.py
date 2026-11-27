@@ -106,6 +106,57 @@ def _sinkhorn(x, sinkhorn_iters=20, eps=1e-6):
     return value
 
 
+def _mhc_split(mixes, scale, base, num_stream, *, post_multiplier=2.0, epsilon=1e-6):
+    weights = torch.cat((scale[0].expand(num_stream), scale[1].expand(num_stream),
+                         scale[2].expand(num_stream * num_stream)))
+    values = mixes * weights + base
+    return (values[..., :num_stream].sigmoid() + epsilon,
+            values[..., num_stream:2 * num_stream].sigmoid() * post_multiplier,
+            values[..., 2 * num_stream:].reshape(*mixes.shape[:-1], num_stream, num_stream))
+
+
+def _mhc_apply(hidden, pre):
+    return sum(hidden[..., i, :].float() * pre[..., i, None]
+               for i in range(hidden.shape[-2])).to(hidden.dtype)
+
+
+def _mhc_pre(x, phi, alpha, beta, num_stream, sinkhorn_iters=20, norm_eps=1e-6, hc_eps=1e-6, gamma=None):
+    """Independent complete Pre reference with explicit RMS and projection expressions."""
+    normalized = x.float() / (x.float().square().sum(-1, keepdim=True) / x.shape[-1] + norm_eps).sqrt()
+    if gamma is not None:
+        normalized = normalized * gamma.float()
+    mixes = normalized @ phi.float().T
+    pre, post, residual = _mhc_split(mixes, alpha, beta, num_stream, epsilon=hc_eps)
+    hidden = x.reshape(*x.shape[:-1], num_stream, -1)
+    return _mhc_apply(hidden, pre), post, _sinkhorn(residual, sinkhorn_iters, hc_eps), x
+
+
+def mhc_pre_cases(dtype: torch.dtype, hardware: bool = False) -> list[PrecisionCase]:
+    """Cover complete Pre, independent coefficient outputs and stream aggregation."""
+    inputs = Inputs(dtype)
+    hidden = 128 if hardware else 16
+    cases = []
+    for use_gamma in (False, True):
+        cases.append(PrecisionCase(
+            "mhc_pre", "standard", f"gamma_{use_gamma}", operators.mhc_pre, _mhc_pre,
+            (inputs.tensor(2, 5, 4 * hidden), inputs.tensor(24, 4 * hidden, dtype=torch.float32),
+             inputs.tensor(3, dtype=torch.float32), inputs.tensor(24, dtype=torch.float32), 4),
+            {"sinkhorn_iters": 20 if hardware else 3,
+             "gamma": inputs.tensor(4 * hidden, dtype=torch.float32) if use_gamma else None},
+            dtype,
+        ))
+    cases.append(PrecisionCase(
+        "mhc_pre", "split_mixes", "separate_coefficients", operators.mhc_split_mixes, _mhc_split,
+        (inputs.tensor(2, 5, 24, dtype=torch.float32), inputs.tensor(3, dtype=torch.float32),
+         inputs.tensor(24, dtype=torch.float32), 4), {"post_multiplier": 3.0, "epsilon": 1e-4}, torch.float32,
+    ))
+    cases.append(PrecisionCase(
+        "mhc_pre", "apply_mix", "supplied_pre_mix", operators.mhc_pre_apply, _mhc_apply,
+        (inputs.tensor(2, 5, 4, hidden), inputs.tensor(2, 5, 4, dtype=torch.float32)), precision_dtype=dtype,
+    ))
+    return cases
+
+
 def _convolution(x, weight, bias, info=None, *, dilation=1, mask=None):
     """Evaluate causal convolution token by token with packed document resets."""
     offsets = (0, x.shape[1]) if info is None else info.local_offsets
@@ -326,6 +377,78 @@ def pointwise_cases(dtype: torch.dtype, hardware: bool = False) -> list[Precisio
                                 inputs.tensor(2, 5, 4, 4, dtype=torch.float32), 4), precision_dtype=dtype))
     cases.append(PrecisionCase("sinkhorn", "standard", "twenty_iterations", operators.sinkhorn, _sinkhorn,
                                (inputs.tensor(2, 5, 4, 4, dtype=torch.float32),), precision_dtype=torch.float32))
+    return cases
+
+
+def tile_kernels_cases(family: str, dtype: torch.dtype) -> list[PrecisionCase]:
+    """Keep TileKernels-specific dimensions separate from existing backend fixtures."""
+    inputs = Inputs(dtype)
+    if family == "mhc_pre":
+        return mhc_pre_cases(dtype, hardware=True)
+    if family == "mhc_post":
+        return [PrecisionCase(
+            family, "standard", f"tile_kernels_hidden_{hidden}", operators.mhc_post, _mhc,
+            (inputs.tensor(2, 5, hidden), inputs.tensor(2, 5, 4 * hidden),
+             inputs.tensor(2, 5, 4, dtype=torch.float32), inputs.tensor(2, 5, 4, 4, dtype=torch.float32), 4),
+            precision_dtype=dtype,
+        ) for hidden in (128, 1280)]
+    if family == "sinkhorn":
+        return [PrecisionCase(
+            family, "standard", f"tile_kernels_iterations_{iterations}", operators.sinkhorn, _sinkhorn,
+            (inputs.tensor(2, 5, 4, 4),), {"sinkhorn_iters": iterations, "eps": eps}, dtype,
+        ) for iterations, eps in ((1, 1e-6), (3, 1e-4), (20, 1e-6))]
+    if family == "moe_router":
+        return tile_kernels_router_cases(dtype)
+    if family == "swiglu":
+        return [
+            PrecisionCase(family, "standard", "tile_kernels_last_dim", operators.swiglu, _swiglu,
+                          (inputs.tensor(2, 5, 256, scale=2.0),), precision_dtype=dtype),
+            PrecisionCase(family, "standard", "tile_kernels_nonlast_dim", operators.swiglu, _swiglu,
+                          (inputs.tensor(2, 256, 5),), {"dim": 1}, dtype),
+            PrecisionCase(family, "standard", "tile_kernels_saturated_gate", operators.swiglu, _swiglu,
+                          (inputs.tensor(2, 5, 256, scale=12.0),), precision_dtype=dtype),
+        ]
+    if family != "rope":
+        raise ValueError(f"No TileKernels precision fixtures for {family!r}")
+    query, key = inputs.tensor(2, 4, 5, 128), inputs.tensor(2, 2, 5, 128)
+    cases = []
+    for name, width in (("partial_tail", 64), ("full_rotation", 128), ("identity", 0)):
+        angles = inputs.tensor(1, 5, width // 2, grad=False, scale=1.0).repeat(1, 1, 2)
+        cases.append(PrecisionCase(family, "interleaved", f"tile_kernels_{name}", operators.rope_interleaved,
+                                   _interleaved, (query, key, angles.cos(), angles.sin()), precision_dtype=dtype))
+    cos = inputs.tensor(1, 5, 64, dtype=torch.float32)
+    sin = inputs.tensor(1, 5, 64, dtype=torch.float32)
+    for name, args, kwargs in (
+        ("frequency_gradients", (query, key, cos, sin), {}),
+        ("sequence_first_partial", (query.transpose(1, 2), key.transpose(1, 2), cos, sin), {"unsqueeze_dim": 2}),
+        ("unbatched_tables", (query, key, cos.squeeze(0), sin.squeeze(0)), {}),
+        ("broadcast_sequence", (query, key, cos[:, :1], sin[:, :1]), {}),
+    ):
+        cases.append(PrecisionCase(family, "interleaved", f"tile_kernels_{name}", operators.rope_interleaved,
+                                   _interleaved, args, kwargs, dtype))
+    for width in (64, 128):
+        cases.append(PrecisionCase(
+            family, "interleaved", f"tile_kernels_batched_frequency_gradients_{width}", operators.rope_interleaved,
+            _interleaved, (query, key, inputs.tensor(2, 5, width), inputs.tensor(2, 5, width)),
+            precision_dtype=dtype,
+        ))
+    return cases
+
+
+def tile_kernels_router_cases(dtype: torch.dtype) -> list[PrecisionCase]:
+    """Cover learned projection gradients, modality corrections and Top-1 normalization."""
+    inputs = Inputs(dtype)
+    cases = []
+    for top_k, modality in ((1, "text"), (8, "text"), (8, "mixed"), (8, "image")):
+        mask = None if modality == "text" else torch.tensor([[False, True, False, True, True]])
+        if modality == "image":
+            mask = torch.ones(1, 5, dtype=torch.bool)
+        cases.append(PrecisionCase(
+            "moe_router", "deepseek_v41", f"tile_kernels_top{top_k}_{modality}", _canonical_router, _router,
+            (inputs.tensor(1, 5, 128, scale=0.05), inputs.tensor(128, 128, scale=0.05),
+             torch.linspace(-8, 8, 128), torch.linspace(8, -8, 128) if mask is not None else None,
+             mask, top_k, "sqrtsoftplus", 1.7), precision_dtype=dtype,
+        ))
     return cases
 
 
