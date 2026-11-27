@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
     from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.moe.shared_expert import SharedExpert
-    from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
+    from hyper_parallel.components.modules.mlp import SwiGLUMLP, SwiGLUMLPModule
 
 _EXPORT_TO_MODULE = {
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
@@ -66,8 +66,8 @@ _EXPORT_TO_MODULE = {
     "MHCPre": "mhc",
     "MHCPost": "mhc",
     "PipelinedMhc": "mhc",
-    "SwiGLUMLPModule": "swiglu_mlp_family",
-    "SwiGLUMLP": "swiglu_mlp_family",
+    "SwiGLUMLPModule": "mlp",
+    "SwiGLUMLP": "mlp",
     "SharedExpertModule": "moe.shared_expert",
     "SharedExpert": "moe.shared_expert",
     "RMSNormModule": "common.rms_norm",
