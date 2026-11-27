@@ -24,6 +24,7 @@ from contextlib import ExitStack
 from typing import Any
 
 import numpy as np
+from numpy.random import RandomState
 
 from hyper_parallel.data.constants import ONLINE_SOURCE_PATH_KEY, ONLINE_SPLIT_COUNT, ONLINE_SPLIT_NAMES
 from hyper_parallel.data.dataset_logging import get_dataset_logger
@@ -45,6 +46,7 @@ def build_online_mapping_source(
     sample_filter: Callable[[Mapping[str, Any]], bool] | None = None,
     train_valid_test_num_samples: Sequence[int] | None = None,
     sampler_type: str = "single",
+    clamp_split_sizes: bool = False,
 ) -> Any:
     """Build a finite integer-indexed Online source.
 
@@ -55,12 +57,20 @@ def build_online_mapping_source(
         sampler_type: Cyclic leaves shuffle and repetition across epochs to the sampler.
         sample_filter: Optional raw-sample predicate applied before indexing.
         train_valid_test_num_samples: Optional target sample count for each
-            train, validation, and test split.
+            train, validation, and test split. Training treats these as epoch
+            targets, which may repeat source samples.
+        clamp_split_sizes: Treat each requested size as an upper bound and cap it
+            at the split's natural source length. Blend without replacement,
+            skipping exhausted sources, even when no sizes are supplied.
+            Off by default (training epoch semantics).
 
     Returns:
         One Mapping Dataset or a train-valid-test tuple.
     """
-    dataset_builder = _OnlineMappingSourceBuilder(data_path, data_config, train_valid_test_num_samples, sampler_type)
+    dataset_builder = _OnlineMappingSourceBuilder(
+        data_path, data_config, train_valid_test_num_samples, sampler_type,
+        clamp_split_sizes=clamp_split_sizes,
+    )
     mapping_source = dataset_builder.build_source(sample_filter=sample_filter)
     return mapping_source
 
@@ -287,6 +297,8 @@ class _OnlineBlendedMappingDataset:
         size: int,
         random_seed: int,
         shuffle: bool = True,
+        *,
+        replacement: bool = True,
     ) -> None:
         """Build the source schedule and source-local shuffle indices."""
         if not source_datasets or len(source_datasets) != len(weights):
@@ -305,12 +317,15 @@ class _OnlineBlendedMappingDataset:
 
         self.source_datasets = tuple(source_datasets)
         self.weights = self._normalize_weights(weights)
-        self.size = size
-        self.source_index, self.source_sample_index = self._build_blend_indices()
+        self.size = size if replacement else min(size, sum(source_lengths))
+        self.source_index, self.source_sample_index = self._build_blend_indices(
+            None if replacement else source_lengths,
+        )
         self.source_shuffle_indices = self._build_source_shuffle_indices(
             source_lengths,
             random_seed,
             shuffle,
+            replacement,
         )
 
     def __len__(self) -> int:
@@ -337,8 +352,8 @@ class _OnlineBlendedMappingDataset:
             normalized_weights.append(float(weight) / weight_sum)
         return tuple(normalized_weights)
 
-    def _build_blend_indices(self) -> tuple[np.ndarray, np.ndarray]:
-        """Build Megatron's deterministic largest-deficit source schedule."""
+    def _build_blend_indices(self, source_limits: Sequence[int] | None) -> tuple[np.ndarray, np.ndarray]:
+        """Build the weighted schedule, excluding exhausted sources in finite mode."""
         source_index = np.empty(self.size, dtype=np.int16)
         source_logical_index = np.empty(self.size, dtype=np.int64)
         source_sample_counts = [0] * len(self.source_datasets)
@@ -346,8 +361,10 @@ class _OnlineBlendedMappingDataset:
         for global_sample_index in range(self.size):
             scheduled_samples = max(global_sample_index, 1)
             selected_source = 0
-            largest_deficit = self.weights[0] * scheduled_samples - source_sample_counts[0]
-            for source_id in range(1, len(self.source_datasets)):
+            largest_deficit = float("-inf")
+            for source_id in range(len(self.source_datasets)):
+                if source_limits is not None and source_sample_counts[source_id] >= source_limits[source_id]:
+                    continue
                 source_deficit = (
                     self.weights[source_id] * scheduled_samples
                     - source_sample_counts[source_id]
@@ -367,16 +384,19 @@ class _OnlineBlendedMappingDataset:
         source_lengths: Sequence[int],
         random_seed: int,
         shuffle: bool,
+        replacement: bool,
     ) -> tuple[np.ndarray, ...]:
         """Map source-local counters to repeated deterministic sample permutations."""
         source_sample_counts = np.bincount(
             self.source_index,
             minlength=len(self.source_datasets),
         )
-        source_random = np.random.RandomState(random_seed)
+        source_random = RandomState(random_seed)
         source_shuffle_indices = []
         for source_length, requested_samples in zip(source_lengths, source_sample_counts):
-            repeated_epochs = int(np.ceil(int(requested_samples) / source_length))
+            # Finite runs shuffle every source once, including unscheduled ones,
+            # so changing the cap cannot change the RNG state for later sources.
+            repeated_epochs = int(np.ceil(int(requested_samples) / source_length)) if replacement else 1
             source_sample_index = np.tile(
                 np.arange(source_length, dtype=np.int64),
                 repeated_epochs,
@@ -396,12 +416,15 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         data_config: Mapping[str, Any],
         train_valid_test_num_samples: Sequence[int] | None,
         sampler_type: str = "single",
+        *,
+        clamp_split_sizes: bool = False,
     ) -> None:
         """Store source configuration and optional training sample targets."""
         super().__init__(data_path, data_config)
         if sampler_type not in ("single", "cyclic"):
             raise ValueError(f"Unsupported Mapping sampler_type: {sampler_type!r}")
         self.sampler_type = sampler_type
+        self.clamp_split_sizes = bool(clamp_split_sizes)
         self.train_valid_test_num_samples = self._validate_split_sizes(train_valid_test_num_samples)
 
     def build_source(
@@ -417,7 +440,7 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
             source_results.append(source_result)
 
         # Cyclic sampling owns epoch shuffle and repetition, including explicit single sources.
-        if self.sampler_type == "cyclic" and len(source_results) == 1:
+        if self.sampler_type == "cyclic" and len(source_results) == 1 and not self.clamp_split_sizes:
             source = source_results[0]
             if isinstance(source, tuple):
                 return tuple(split if split is not None and len(split) else None for split in source)
@@ -436,7 +459,10 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
             mapping_dataset = self._build_blended_split(source_results, weights, target_size)
             return mapping_dataset
 
-        # source of train, valid, test => each source blend
+        return self._blend_source_splits(source_results, weights)
+
+    def _blend_source_splits(self, source_results: Sequence[Any], weights: Sequence[float]) -> tuple[Any, Any, Any]:
+        """Blend each split separately, keeping unsplit sources in the training slot."""
         blended_splits = []
         for split_index in range(ONLINE_SPLIT_COUNT):
             split_datasets = []
@@ -550,12 +576,14 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
 
     def _get_target_size(self, split_index: int, source_datasets: Sequence[Any]) -> int:
         """Return the configured sample target or one natural blended epoch."""
-        if self.sampler_type != "cyclic" and self.train_valid_test_num_samples is not None:
-            return self.train_valid_test_num_samples[split_index]
-
         natural_size = 0
         for source_dataset in source_datasets:
             natural_size += len(source_dataset)
+        if self.train_valid_test_num_samples is not None and (self.sampler_type != "cyclic" or self.clamp_split_sizes):
+            target_size = self.train_valid_test_num_samples[split_index]
+            # An evaluation range is an upper bound; repeating source samples to
+            # reach it would silently count one sample twice.
+            return min(target_size, natural_size) if self.clamp_split_sizes else target_size
         return natural_size
 
     def _build_blended_split(
@@ -582,6 +610,7 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
             target_size,
             self._random_seed,
             shuffle=self.sampler_type != "cyclic",
+            replacement=not self.clamp_split_sizes,
         )
         return blended_dataset
 

@@ -402,9 +402,13 @@ class BaseTrainer(Stateful, ABC):
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
         )
+        optimizer_config = self.config.optimizer
         _validate_optimize_dtype(
             self.model,
-            fp32_main_params=self.config.optimizer.fp32_main_params,
+            fp32_main_params=(
+                bool(optimizer_config.fp32_main_params)
+                if optimizer_config is not None else False
+            ),
         )
         self.model_config = self.model.config
         if self.global_rank == 0:
@@ -846,7 +850,9 @@ class BaseTrainer(Stateful, ABC):
         """
         # The default empty-shard guard must use the same aligned supervision
         # count as loss weighting, including already-shifted packed targets.
-        if isinstance(self.loss_fn, ModelOutputLoss):
+        # The loss module declares whether it consumes that count, so the call
+        # contract does not depend on an exact loss type.
+        if getattr(self.loss_fn, "accepts_valid_token_count", False):
             local_loss = self.loss_fn(
                 model_output=outputs, labels=labels,
                 valid_token_count=current_token_counts.get("foundation_tokens"),
