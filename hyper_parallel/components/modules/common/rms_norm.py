@@ -48,7 +48,8 @@ def _hf_scale_kind(source: Any) -> str | None:
     if source_type.__name__ in ("Qwen3_5RMSNorm", "Qwen3_5MoeRMSNorm"):
         return "offset"
     if source_type.__name__ in ("Qwen3RMSNorm", "Qwen3MoeRMSNorm", "Qwen2MoeRMSNorm",
-                                "Qwen3VLMoeTextRMSNorm", "DeepseekV3RMSNorm", "DeepseekV32RMSNorm",
+                                "Qwen3VLMoeTextRMSNorm", "DeepseekV2RMSNorm", "DeepseekV3RMSNorm", "DeepseekV32RMSNorm",
+                                "KimiLinearRMSNorm",
                                 "DeepseekV4RMSNorm"):
         return "direct"
     return None
@@ -57,12 +58,18 @@ def _hf_scale_kind(source: Any) -> str | None:
 class _RMSNormPolicy(torch.nn.Module):
     """Declare rounding order and optional FP32 scale ownership at construction."""
 
+    @property
+
+    def variance_epsilon(self) -> float:
+        """Expose the source normalization epsilon to fused residual computations."""
+        return self.eps
+
     def _set_policy(self, source: Any, cast_order: str | None, fp32_weight: bool | None) -> None:
         """Resolve source rounding order and FP32 scale ownership."""
         if cast_order is None:
             cast_order = getattr(source, "rms_norm_cast_order", None)
         if cast_order is None:
-            # HF direct-scale text norms cast normalized activations before multiplication.
+            # Native models can declare FP32 multiplication explicitly; adopted HF scales retain source rounding.
             cast_order = "before_weight" if _hf_scale_kind(source) == "direct" else "after_weight"
         if cast_order not in ("before_weight", "after_weight"):
             raise ValueError("cast_order must be before_weight or after_weight")
@@ -83,6 +90,7 @@ class _RMSNormPolicy(torch.nn.Module):
             protected.add(id(self.weight.grad))
 
         def preserve_scale(tensor: torch.Tensor) -> torch.Tensor:
+            """Retain the declared scale and gradient precision during module conversion."""
             converted = fn(tensor)
             if id(tensor) not in protected or converted.dtype == torch.float32:
                 return converted
@@ -203,19 +211,23 @@ class OffsetRMSNormModule(_RMSNormPolicy):
             self.weight = torch.nn.Parameter(torch.zeros(
                 config.hidden_size, dtype=torch.float32 if self.fp32_weight else None))
         else:
-            weight = getattr(module, "weight", None)
-            if not isinstance(weight, torch.nn.Parameter) or weight.ndim != 1:
-                raise TypeError("offset source must expose a one-dimensional Parameter weight")
-            self.eps = module.eps
-            _validate_rms_settings(weight.numel(), self.eps)
-            if self.fp32_weight and weight.dtype != torch.float32:
-                raise ValueError("fp32_weight source must already own an FP32 offset")
-            if source_representation == "scale":
-                if isinstance(module, OffsetRMSNormModule) or _hf_scale_kind(module) == "offset":
-                    raise ValueError("offset source must not be declared as a direct scale")
-                weight = torch.nn.Parameter(weight.detach() - 1.0, requires_grad=weight.requires_grad)
-            self.weight = weight
-            self.train(module.training)
+            self._adopt_source(module)
+
+    def _adopt_source(self, module: torch.nn.Module) -> None:
+        """Validate offset ownership and convert only an explicitly declared direct scale."""
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.nn.Parameter) or weight.ndim != 1:
+            raise TypeError("offset source must expose a one-dimensional Parameter weight")
+        self.eps = module.eps
+        _validate_rms_settings(weight.numel(), self.eps)
+        if self.fp32_weight and weight.dtype != torch.float32:
+            raise ValueError("fp32_weight source must already own an FP32 offset")
+        if self.source_representation == "scale":
+            if isinstance(module, OffsetRMSNormModule) or _hf_scale_kind(module) == "offset":
+                raise ValueError("offset source must not be declared as a direct scale")
+            weight = torch.nn.Parameter(weight.detach() - 1.0, requires_grad=weight.requires_grad)
+        self.weight = weight
+        self.train(module.training)
 
     def reset_parameters(self) -> None:
         """Initialize the stored offset, not the effective scale."""

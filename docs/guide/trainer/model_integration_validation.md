@@ -760,8 +760,8 @@ DeepSeek-V4.1 core model modules and optimized paths correspond one to one, but 
 
 | Model semantics | Production reference module | Optional recipe candidate | Selection |
 |---|---|---|---|
-| pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `PipelinedMhcModule` | `replace.kind: module` + `implementation` |
-| Engram | `DeepseekV41Engram` | `EngramModule` | `replace.kind: module` + `implementation` |
+| pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `hyper_parallel.components.modules.PipelinedMhc` | `replace.kind: module` + `implementation` |
+| Engram | `DeepseekV41Engram` | `hyper_parallel.components.modules.Engram` | `replace.kind: module` + `implementation` |
 | CSA2 Attention | `DeepseekV41Attention` | `CompressedSparseAttention2` | `replace.kind: module` + `implementation` |
 
 The `CompressedSparseAttention2` family owns the complete attention algorithm, parameter layouts

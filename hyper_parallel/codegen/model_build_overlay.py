@@ -263,6 +263,7 @@ def _codegen_build_model(
     on_observed: Optional[Callable[[Any], None]] = None,
 ):
     """Create the classmethod used only while the CLI constructs a meta model."""
+
     def _build_model(
         cls,
         pretrained_model_name_or_path,

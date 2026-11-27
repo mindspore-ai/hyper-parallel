@@ -52,7 +52,7 @@ def _all_gather_sequence(value: torch.Tensor, group: Any, group_size: int) -> to
 
 
 def aligned_hash_ids(
-    self,
+    self: Any,
     hidden_states: torch.Tensor,
     input_ids: torch.Tensor,
     segment_starts: torch.Tensor | None,
@@ -101,6 +101,7 @@ class HostRowsFn(torch.autograd.Function):
     """Fetch CPU rows and accumulate their backward values as sparse chunks."""
 
     @staticmethod
+
     def forward(ctx: Any, weight: torch.Tensor, local_ids: torch.Tensor, table: Any) -> torch.Tensor:
         """Gather touched CPU rows and retain their local IDs for backward.
 
@@ -115,6 +116,7 @@ class HostRowsFn(torch.autograd.Function):
         return weight.index_select(0, local_ids)
 
     @staticmethod
+
     def backward(ctx: Any, grad_rows: torch.Tensor) -> tuple[None, None, None]:
         """Append touched row gradients without constructing a dense weight grad.
 
@@ -293,6 +295,7 @@ class ParallelEngram:
     _fuse: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
     @staticmethod
+
     def _sparse_lookup(
         hash_ids: torch.Tensor,
         embedding: nn.Embedding,

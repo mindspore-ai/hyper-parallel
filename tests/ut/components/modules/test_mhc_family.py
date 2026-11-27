@@ -25,6 +25,9 @@ from hyper_parallel.components.modules import (
 )
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementSpec
+from hyper_parallel.components.modules.module_family import FamilyShardingContext
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.distributed._builder.family_layout import collect_owned_layouts, validate_owned_layouts
 
 
 class TestMHCFamily(unittest.TestCase):
@@ -124,3 +127,36 @@ class TestMHCFamily(unittest.TestCase):
             PipelinedMhcConfig(4, 16, hc_eps=float("nan"))
         with self.assertRaises(ValueError):
             MHCPost(config=MHCPostConfig(4), module=MHCPost(config=MHCPostConfig(4)))
+
+    def test_owned_layout_covers_normalization_and_cp_sp_tokens(self) -> None:
+        """Default ownership includes child scales and follows CP/SP without splitting coefficient matrices."""
+        for sequence_parallel in (False, True):
+            with self.subTest(sequence_parallel=sequence_parallel):
+                member = PipelinedMhc(config=PipelinedMhcConfig(4, 16))
+                model = torch.nn.Sequential(member)
+                context = FamilyShardingContext(
+                    ("tp", "cp", "ep"), {"tp": 2, "cp": 2, "ep": 1}, {}, sequence_parallel,
+                )
+                owned = collect_owned_layouts(model, context)
+                spec = owned.specs["0"]
+                self.assertEqual(set(spec.params), set(dict(member.named_parameters())))
+                self.assertIn("input_norm.weight", spec.params)
+                for placements in spec.params.values():
+                    self.assertTrue(all(placement == Replicate() for placement in placements.values()))
+                self.assertEqual(spec.in_dst["hidden_streams"]["cp"], Shard(1))
+                self.assertEqual(spec.in_dst["hidden_streams"]["tp"],
+                                 Shard(1) if sequence_parallel else Replicate())
+                self.assertEqual(spec.out_names, ("pre", "post", "residual"))
+                plan = SimpleNamespace(modules=owned.specs)
+                validate_owned_layouts(model, plan, owned, context)
+                spec.region_dispatch = False
+                with self.assertRaisesRegex(ValueError, "legacy compute injection"):
+                    validate_owned_layouts(model, plan, owned, context)
+
+    def test_fused_shifted_member_retains_explicit_parallel_limit(self) -> None:
+        """Unqualified fused advance boundaries fail before any device kernel is imported."""
+        config = SimpleNamespace(num_stream=4, hidden_size=16, sinkhorn_iters=20,
+                                 hc_eps=1e-6, norm_eps=1e-6, use_gamma=False)
+        for context in ({"tp_size": 2}, {"cp_size": 4}):
+            with self.subTest(context=context), self.assertRaisesRegex(NotImplementedError, "TP=CP=1"):
+                PipelinedMhc(config=config, context=context, shifted=True, use_fused_ops=True)

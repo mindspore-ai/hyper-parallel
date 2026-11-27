@@ -28,6 +28,8 @@ import pytest
 import torch
 from torch import nn
 
+from examples.torch.module_family.config import PipelinedMhcConfig, RMSNormConfig, SwiGLUMLPConfig
+
 from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
 from hyper_parallel.codegen.inline.framework_spec import observed_constructor_spec, replacement_spec_for
 from hyper_parallel.codegen.inline.component_source import collapse_unmodified_components
@@ -41,6 +43,10 @@ from hyper_parallel.codegen.model_build_overlay import (
     _observe_replacements,
 )
 from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.components.modules import (
+    Engram, EngramModule, NativeRMSNormModule, PipelinedMhc, PipelinedMhcModule,
+    RMSNorm, SwiGLUMLP, SwiGLUMLPModule,
+)
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.models.module_build import build_module_context
 from hyper_parallel.models import replacement as replacement_api
@@ -56,6 +62,8 @@ from hyper_parallel.trainer.config import (
     Target,
     entries_to_module_replacements,
 )
+
+from tests.common.engram_family import small_config
 
 
 class _SourceBlock(nn.Module):
@@ -519,3 +527,42 @@ class TestNativeStageSource(unittest.TestCase):
         with patch.object(self.cp_type.__bases__[0], "forward", Parent.forward):
             module, _ = self._render(self.cp_type)
             self.assertIs(module.CPGroupedQueryAttentionModule.forward, Parent.forward)
+
+
+class TestPublicFamilySnapshot(unittest.TestCase):
+    """Recorded module factories rebuild through their current canonical paths."""
+
+    def test_owned_module_factories_round_trip_without_target_aliases(self) -> None:
+        """Preserve family selection and parameter ownership in emitted construction records."""
+        for factory, source_type, config in (
+            (RMSNorm, NativeRMSNormModule, RMSNormConfig(4)),
+            (SwiGLUMLP, SwiGLUMLPModule, SwiGLUMLPConfig(4, 8)),
+            (PipelinedMhc, PipelinedMhcModule, PipelinedMhcConfig(2, 4)),
+            (Engram, EngramModule, small_config()),
+        ):
+            with self.subTest(factory=factory.__name__):
+                source = source_type(config=config)
+                model = nn.Module()
+                model.layer = source
+                spec = ModuleReplacementSpec(match=("layer",), factory=factory, module_type=type(source))
+                plan = compile_module_replacements(model, (spec,))
+                with _observe_replacement_installations(plan.specs) as applications:
+                    apply_module_replacements(model, plan, context={"tp_size": 1, "cp_size": 1, "ep_size": 1})
+                session = CodegenBuildSession()
+                session.record_source({"model_type": "owned_module_test"})
+                session.record_replacements(
+                    declarations=replacement_api.describe_replacement_declarations(plan.specs),
+                    applications=applications,
+                )
+                session.mark_not_required("replacement_only_test")
+                records = replacement_records_from_snapshot(session.finish())
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                module_name, _, name = record["factory"].rpartition(".")
+                resolved = getattr(import_module(module_name), name)
+                self.assertIs(resolved, factory)
+                rebuilt = resolved(module=source, **record["target_config"])
+                self.assertIs(type(rebuilt), type(model.layer))
+                self.assertEqual(set(dict(rebuilt.named_parameters())), set(dict(source.named_parameters())))
+                for name, parameter in rebuilt.named_parameters():
+                    self.assertIs(parameter, dict(source.named_parameters())[name])

@@ -62,117 +62,17 @@ plan_overrides:
   replace:
     kind: module
     implementation:
-      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+      _target_: hyper_parallel.components.modules.PipelinedMhc
 - match: model.layers.*.engram
   replace:
     kind: module
     implementation:
-      _target_: hyper_parallel.components.modules.engram.EngramModule
+      _target_: hyper_parallel.components.modules.Engram
 - match: model.layers.*.self_attn
   replace:
     kind: module
     implementation:
       _target_: hyper_parallel.components.modules.CompressedSparseAttention2
-- match: model.layers.*.*_hc
-  region_dispatch: false
-  params:
-    fn:
-      tp: replicate
-    base:
-      tp: replicate
-    scale:
-      tp: replicate
-  in_src:
-    hidden_streams:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-  in_dst:
-    hidden_streams:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-  out_src:
-    pre:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-  out_dst:
-    pre:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: replicate
-      cp: shard(1)
-      ep: replicate
-- match: model.layers.*.*_hc
-  when: sequence_parallel
-  in_src:
-    hidden_streams:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-  in_dst:
-    hidden_streams:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-  out_src:
-    pre:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-  out_dst:
-    pre:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    post:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-    residual:
-      tp: shard(1)
-      cp: shard(1)
-      ep: replicate
-- match: model.layers.*.engram
-  params:
-    q_weight:
-      tp: replicate
-    k_weight:
-      tp: replicate
-    embed.weight:
-      ep: shard(0)
-    wkv.weight:
-      tp: replicate
-- match: model.layers.*.engram.forward
-  when: ep
-  region_dispatch: false
-  replace:
-    kind: method
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
 - match: '*.mlp.forward'
   when: ep
   region_dispatch: false

@@ -21,9 +21,7 @@ from hyper_parallel.models.registry import register_custom_model
 from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
     register_deepseek_v41_checkpoint_mapping,
 )
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import (
-    build_deepseek_v41_external_state,
-)
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import build_deepseek_v41_external_state
 from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
     configure_deepseek_v41_activation_checkpointing,
 )
@@ -36,7 +34,7 @@ from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
 
 
 def _load_expert_parallel():
-    """Return the model's MoE and Engram EP factories lazily."""
+    """Return the model's MoE EP factories lazily."""
     from hyper_parallel.models.deepseek_v41.adapter.distributed import (  # pylint: disable=C0415
         moe_engram_expert_parallel,
     )

@@ -32,7 +32,7 @@ from hyper_parallel.components.quantization.quantizers.hifloat8 import HiFloat8Q
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 from hyper_parallel.components.quantization.quantizers.w4a8 import W4A8Quantizer
 from hyper_parallel.components.quantization.tensor.quantized_tensor import QuantizedTensor
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
+from hyper_parallel.components.modules.engram.host_state import HostEngramState
 
 
 _ROLE_QUANTIZERS = ("input_quantizer", "weight_quantizer", "grad_output_quantizer")
@@ -75,7 +75,7 @@ def validate_recovery_model(model: torch.nn.Module) -> None:
         model: Materialized model with its parallel strategies applied.
     """
     external = getattr(model, "_hp_external_state", None)
-    if external is not None and not isinstance(external, DeepseekV41HostState):
+    if external is not None and not isinstance(external, HostEngramState):
         raise ValueError("model-owned external state requires its own recovery provider")
     validate_low_precision_state(model)
 

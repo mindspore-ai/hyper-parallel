@@ -155,7 +155,7 @@ def test_training_args_only_parse_config(
 
 
 def test_deepseek_v41_engram_params_target_planner_boundary() -> None:
-    """Engram parameters bind to the module while compute binds to forward."""
+    """Parameter layout overrides bind to the Engram module boundary."""
     params_entry = {
         "match": "model.layers.*.engram",
         "params": {
@@ -165,26 +165,11 @@ def test_deepseek_v41_engram_params_target_planner_boundary() -> None:
             "wkv.weight": {"tp": "replicate"},
         },
     }
-    method_entry = {
-        "match": "model.layers.*.engram.forward",
-        "when": "ep",
-        "replace": {
-            "kind": "method",
-            "implementation": {
-                "_target_": (
-                    "hyper_parallel.models.deepseek_v41.adapter.distributed."
-                    "moe_engram_expert_parallel.deepseek_v41_engram_compute_fn"
-                ),
-            },
-        },
-    }
-
     resolved = resolve_component(params_entry, annotation=PlanOverride, path="$.plan_overrides[0]")
     overrides = entries_to_plan_overrides([resolved], ep_size=8)
 
     assert set(overrides) == {"model.layers.*.engram"}
     assert overrides["model.layers.*.engram"].params is not None
-    assert method_entry["match"] == "model.layers.*.engram.forward"
 
 
 def test_atomic_bundle_publishes_only_emitted_files(tmp_path: Path) -> None:
