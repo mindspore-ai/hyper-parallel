@@ -38,8 +38,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from hyper_parallel.components.functional.npu_grouped_swiglu import (
-    npu_grouped_swiglu,
+from hyper_parallel.components.ops import (
+    grouped_matmul, grouped_swiglu, moe_token_permute, moe_token_unpermute, swiglu,
 )
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
@@ -156,16 +156,14 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
             sorted_output = grouped_forward(sorted_states, local_expert_counts)
         else:
             gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
-            if up_weight is not None:
-                raise ValueError(
-                    "EP grouped GEMM currently requires packed gate_up_proj weights"
+            if up_weight is None:
+                boundaries = local_expert_counts.cumsum(0)
+                packed = grouped_matmul(sorted_states, gate_weight.transpose(1, 2), boundaries)
+                sorted_output = grouped_matmul(swiglu(packed), down_weight.transpose(1, 2), boundaries)
+            else:
+                sorted_output = grouped_swiglu(
+                    sorted_states, gate_weight, down_weight, up_weight, local_expert_counts,
                 )
-            sorted_output = npu_grouped_swiglu(
-                sorted_states,
-                gate_weight,
-                down_weight,
-                local_expert_counts,
-            )
         output = torch.empty_like(sorted_output)
         output[token_order] = sorted_output
         return output
@@ -358,18 +356,8 @@ def _prepare_ep_dispatch(
     )
     unpermute_indices = None
     if use_fused_moe_token_permute_and_unpermute:
-        # Keep optional NPU dependencies out of the generic dispatch path.
-        from hyper_parallel.components.functional.moe_token_permute import (  # pylint: disable=C0415
-            moe_token_permute,
-        )
-
-        dispatched_states, unpermute_indices = moe_token_permute(
-            flattened_states, topk_indices.to(torch.int32),
-        )
-        dispatch_order = torch.empty_like(unpermute_indices, dtype=torch.int64)
-        dispatch_order.scatter_(
-            0, unpermute_indices.to(torch.int64),
-            torch.arange(unpermute_indices.numel(), device=unpermute_indices.device),
+        dispatched_states, dispatch_order, unpermute_indices = moe_token_permute(
+            flattened_states, topk_indices,
         )
     else:
         # Global IDs are contiguous across destination ranks.
@@ -423,11 +411,6 @@ def _aggregate_ep_outputs(
 ) -> torch.Tensor:
     """Undo expert-major routing and aggregate weighted top-k outputs."""
     if unpermute_indices is not None:
-        # Keep optional NPU dependencies out of the generic aggregation path.
-        from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=C0415
-            moe_token_unpermute,
-        )
-
         return moe_token_unpermute(combined_outputs, unpermute_indices, routing_weights).view(*output_shape)
     weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
     output = torch.zeros(

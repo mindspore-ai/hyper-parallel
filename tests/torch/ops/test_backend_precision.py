@@ -22,14 +22,21 @@ from tests.common.mark_utils import arg_mark
 _WORKER = str(Path(__file__).with_name("_test_backend_precision.py"))
 
 
-@arg_mark(plat_marks=["platform_ascend910b", "platform_gpu"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
 def test_backend_precision() -> None:
-    """Compare actual registered accelerator kernels with same-device native, including VJPs."""
+    """Gate registered NPU kernels against same-device native, including VJPs."""
     torchrun_case(file_name=_WORKER, case_name="test_backend_precision", num_proc=1)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_gpu"], level_mark="level1",
+          card_mark="onecard", essential_mark="essential")
+def test_backend_precision_cuda() -> None:
+    """Compare registered CUDA kernels with same-device native in the extended suite."""
+    torchrun_case(file_name=_WORKER, case_name="test_backend_precision", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
 def test_native_precision() -> None:
     """Validate same-device native baselines against independent formulas on Ascend."""

@@ -225,16 +225,9 @@ class TestGQAFamilyContracts(unittest.TestCase):
         from hyper_parallel.components.modules.attention.grouped_query_attention.grouped_query_attention import (
             rotate_half,
         )
-        # CPU contract tests replace the NPU boundary while preserving the production fused selection.
-        norm_module = importlib.import_module("hyper_parallel.components.modules.common.rms_norm")
-
-        def norm_kernel(inputs, weight, eps, cast_order):
-            del cast_order
-            return torch.nn.functional.rms_norm(inputs, (inputs.shape[-1],), weight, eps)
-
         def attention(module, query, key, value, mask, **kwargs):
             del module
-            result = torch.nn.functional.scaled_dot_product_attention(
+            result = torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=not-callable
                 query, key, value, attn_mask=mask, scale=kwargs["scaling"], enable_gqa=True)
             return result.transpose(1, 2), None
 
@@ -287,11 +280,10 @@ class TestGQAFamilyContracts(unittest.TestCase):
                     result, _ = attention(None, query.transpose(1, 2), key.transpose(1, 2),
                                           value.transpose(1, 2), mask, scaling=0.7)
                     expected = source.o_proj((result * gate.sigmoid() if gated else result).flatten(-2))
-                    with unittest.mock.patch.object(norm_module, "_npu_rms_norm", norm_kernel):
-                        actual = candidate(local, positions, mask)[0]
-                        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
-                        gradient = torch.randn_like(expected)
-                        actual.backward(gradient)
+                    actual = candidate(local, positions, mask)[0]
+                    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+                    gradient = torch.randn_like(expected)
+                    actual.backward(gradient)
                     expected.backward(gradient)
                     torch.testing.assert_close(local.grad, inputs.grad, atol=3e-6, rtol=3e-5)
                     gradients = {name: parameter.grad for name, parameter in source.named_parameters()}
@@ -581,9 +573,11 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
         from transformers import Qwen3Config, Qwen3Model, Qwen3MoeConfig, Qwen3MoeModel
         from hyper_parallel.models._transformers.packed_attention import register_npu_packed_attention
         for config_type, model_type in ((Qwen3Config, Qwen3Model), (Qwen3MoeConfig, Qwen3MoeModel)):
-            config = config_type(hidden_size=32, intermediate_size=64, num_hidden_layers=1,
-                                 num_attention_heads=4, num_key_value_heads=2, head_dim=8, vocab_size=16,
-                                 moe_intermediate_size=32, num_experts=4, num_experts_per_tok=2)
+            config = config_type.from_dict({
+                "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1,
+                "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "vocab_size": 16,
+                "moe_intermediate_size": 32, "num_experts": 4, "num_experts_per_tok": 2,
+            })
             config._attn_implementation = register_npu_packed_attention()  # pylint: disable=protected-access
             model = model_type(config)
             query = torch.zeros(1, 8, 4, 8)

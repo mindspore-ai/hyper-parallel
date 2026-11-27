@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import torch
 
 from hyper_parallel.components import ops as operators
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
 from tests.common.op_precision import check_case
 from tests.common.op_precision_suite import precision_cases
 
@@ -82,12 +83,12 @@ class TestAttentionMasks(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
                 operators.multi_latent_attention(SimpleNamespace(), query, query, query, None, **kwargs)
 
-    def test_rope_qk_broadcasts_shared_positions_and_preserves_gradients(self) -> None:
+    def test_functional_rope_broadcasts_shared_positions_and_preserves_gradients(self) -> None:
         """A shared position table expands over the batch without mixing query/key gradients."""
         query = torch.ones(2, 1, 3, 4, requires_grad=True)
         key = torch.full_like(query, 2., requires_grad=True)
         cosine, sine = torch.ones(3, 4), torch.zeros(3, 4)
-        rotated_query, rotated_key = operators.rope_qk(query, key, cosine, sine)
+        rotated_query, rotated_key = apply_rotary_pos_emb(query, key, cosine, sine)
         torch.testing.assert_close(rotated_query, query)
         torch.testing.assert_close(rotated_key, key)
         (rotated_query.sum() + 2 * rotated_key.sum()).backward()

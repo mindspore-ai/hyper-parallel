@@ -12,29 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU coverage for the MHC CANN post interface."""
+"""CPU coverage for configuration-driven MHC post dispatch."""
 
 import sys
 import unittest
-import warnings
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from hyper_parallel.components.functional.mhc_post import mhc_post
+from hyper_parallel.components.ops import ops as op_selector
 
 B, S, N, C = 2, 3, 4, 128
 
 
 def _fake_npu_device():
     """Pretend every tensor lives on an NPU, as hardware-free UTs cannot own one."""
-    return patch.object(torch.Tensor, "device", property(lambda _tensor: SimpleNamespace(type="npu")))
+    return patch.object(torch.Tensor, "device", property(lambda _tensor: torch.device("npu:0")))
 
 
 class TestMhcPost(unittest.TestCase):
     """Check the fused CANN operator receives the expected stream contract."""
+
+    def setUp(self):
+        """Isolate backend resolution and usage between adapter mocks."""
+        previous = op_selector.get_backends()
+        self.addCleanup(op_selector.set_backends, previous)
+        op_selector.set_backends({})
 
     def test_cann_post_passes_stream_contract(self):
         """
@@ -57,7 +63,7 @@ class TestMhcPost(unittest.TestCase):
                 _fake_npu_device():
             result = mhc_post(block_output, residual, h_post, h_res, N)
 
-        args = ops.mhc_post.call_args.args
+        args = getattr(ops, "mhc_post").call_args.args
         self.assertEqual(args[0].shape, (B, S, N, C))
         self.assertIs(args[1], h_res)
         self.assertIs(args[2], block_output)
@@ -81,32 +87,29 @@ class TestMhcPost(unittest.TestCase):
         )
         torch.testing.assert_close(result, expected.flatten(2))
 
-    def test_fp32_npu_uses_formula_and_warns(self):
-        """
-        Feature: FP32 NPU MHC post.
-        Description: Invoke the CANN and Omni selections with FP32 NPU inputs.
-        Expectation: Emit a runtime warning, evaluate the tensor formula, and bypass fused dispatch.
-        """
+    def test_fp32_fused_backend_rejects_without_switching(self) -> None:
+        """Configured fused backends reject FP32 instead of changing the selected implementation."""
         inputs = (
-            torch.randn(B, S, C, dtype=torch.float32),
-            torch.randn(B, S, N * C, dtype=torch.float32),
-            torch.randn(B, S, N, dtype=torch.float32),
-            torch.randn(B, S, N, N, dtype=torch.float32),
+            torch.randn(B, S, C), torch.randn(B, S, N * C),
+            torch.randn(B, S, N), torch.randn(B, S, N, N),
         )
-        expected = mhc_post(*inputs, N)
-
+        extension = ModuleType("cann_ops_transformer.ops")
+        extension.mhc_post = Mock()
+        package = ModuleType("cann_ops_transformer")
+        package.ops = extension
+        custom = Mock()
+        modules = {"cann_ops_transformer": package, "cann_ops_transformer.ops": extension,
+                   "omni_training_custom_ops": ModuleType("omni_training_custom_ops")}
         for backend in ("cann", "omni"):
             with self.subTest(backend=backend):
-                with patch("hyper_parallel.components.functional.mhc_post._MhcPost.apply") as fused, \
-                        _fake_npu_device(), warnings.catch_warnings(record=True) as emitted:
-                    warnings.simplefilter("always", RuntimeWarning)
-                    actual = mhc_post(*inputs, N, backend=backend)
-
-                fused.assert_not_called()
-                self.assertEqual(len(emitted), 1)
-                self.assertIs(emitted[0].category, RuntimeWarning)
-                self.assertIn("FP32 NPU inputs", str(emitted[0].message))
-                torch.testing.assert_close(actual, expected)
+                op_selector.set_backends({"mhc_post": backend})
+                with patch.dict(sys.modules, modules), patch.object(torch.ops, "custom", custom), _fake_npu_device():
+                    with self.assertRaisesRegex(ValueError, "FP32.*native"):
+                        mhc_post(*inputs, N)
+                self.assertIn(("mhc_post", "standard", backend), op_selector.used_backends())
+                self.assertNotIn(("mhc_post", "standard", "native"), op_selector.used_backends())
+        extension.mhc_post.assert_not_called()
+        custom.npu_ai_infra_manifold_constrained_hyper_connection_post.assert_not_called()
 
     def test_fake_joint_graph_replays_forward_and_backward(self):
         """
@@ -132,29 +135,27 @@ class TestMhcPost(unittest.TestCase):
         for value, reference in zip(actual, expected):
             torch.testing.assert_close(value, reference)
 
-    def test_omni_backend_is_deprecated(self):
+    def test_configured_omni_backend(self):
         """
-        Feature: Legacy omni MHC post backend.
-        Description: Invoke mhc_post with backend='omni' on NPU.
-        Expectation: Log a deprecation warning and run the legacy post operator
-            through torch.ops.custom.
+        Feature: Configured Omni MHC post backend.
+        Description: Select Omni through the process-wide configuration on NPU.
+        Expectation: Run the configured post operator through torch.ops.custom.
         """
         block_output = torch.randn(B, S, C, dtype=torch.bfloat16)
         residual = torch.randn(B, S, N * C, dtype=torch.bfloat16)
         h_post = torch.randn(B, S, N)
         h_res = torch.randn(B, S, N, N)
         mixed = torch.randn(B, S, N, C)
+        op_selector.set_backends({"mhc_post": "omni"})
         omni = ModuleType("omni_training_custom_ops")
         custom = Mock()
         custom.npu_ai_infra_manifold_constrained_hyper_connection_post = Mock(return_value=mixed)
         with patch.dict(sys.modules, {"omni_training_custom_ops": omni}), \
                 patch.object(torch.ops, "custom", custom, create=True), \
-                _fake_npu_device(), \
-                patch("hyper_parallel.components.functional.mhc_post.logger") as fake_logger:
-            result = mhc_post(block_output, residual, h_post, h_res, N, backend="omni")
+                _fake_npu_device():
+            result = mhc_post(block_output, residual, h_post, h_res, N)
 
-        fake_logger.warning.assert_called_once()
-        self.assertIn("deprecated", fake_logger.warning.call_args.args[0])
+        self.assertIn(("mhc_post", "standard", "omni"), op_selector.used_backends())
         self.assertEqual(result.shape, (B, S, N * C))
         args = custom.npu_ai_infra_manifold_constrained_hyper_connection_post.call_args.args
         self.assertEqual(args[0].shape, (B, S, N, C))
@@ -162,14 +163,36 @@ class TestMhcPost(unittest.TestCase):
         self.assertIs(args[2], block_output)
         self.assertIs(args[3], h_post)
 
-    def test_rejects_unknown_backend(self):
+    def test_rejects_unknown_configured_backend(self):
         """
         Feature: MHC post backend validation.
-        Description: Invoke mhc_post with an unsupported backend name.
+        Description: Configure mhc_post with an unsupported backend name.
         Expectation: Raise ValueError listing the supported backends.
         """
-        with self.assertRaisesRegex(ValueError, "backend must be 'cann' or 'omni'"):
-            mhc_post(
-                torch.randn(B, S, C), torch.randn(B, S, N * C), torch.randn(B, S, N),
-                torch.randn(B, S, N, N), N, backend="eager",
-            )
+        with self.assertRaisesRegex(ValueError, "Invalid ops.mhc_post"):
+            op_selector.set_backends({"mhc_post": "eager"})
+
+    def test_auto_uses_native_when_fused_dependencies_are_unavailable(self) -> None:
+        """Unconfigured functional calls use the registry auto policy, including native fallback."""
+        x = torch.ones(1, 2, 3)
+        residual = torch.ones(1, 2, 6)
+        post = torch.ones(1, 2, 2)
+        matrix = torch.ones(1, 2, 2, 2)
+        with _fake_npu_device(), patch.dict(sys.modules, {
+            "cann_ops_transformer": None, "omni_training_custom_ops": None,
+        }):
+            actual = mhc_post(x, residual, post, matrix, 2)
+        torch.testing.assert_close(actual, torch.full_like(residual, 3))
+        self.assertIn(("mhc_post", "standard", "native"), op_selector.used_backends())
+
+    def test_configured_native_controls_functional_dispatch(self) -> None:
+        """Functional calls on NPU use the configured native backend without loading CANN."""
+        x = torch.ones(1, 2, 3)
+        residual = torch.ones(1, 2, 6)
+        post = torch.ones(1, 2, 2)
+        matrix = torch.ones(1, 2, 2, 2)
+        op_selector.set_backends({"mhc_post": "native"})
+        with _fake_npu_device(), patch.dict(sys.modules, {"cann_ops_transformer": None}):
+            actual = mhc_post(x, residual, post, matrix, 2)
+        torch.testing.assert_close(actual, torch.full_like(residual, 3))
+        self.assertIn(("mhc_post", "standard", "native"), op_selector.used_backends())

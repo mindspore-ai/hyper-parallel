@@ -38,9 +38,7 @@ from hyper_parallel.models.replacement import (
 )
 from hyper_parallel.trainer.config.parallelism import entries_to_module_replacements
 from hyper_parallel.trainer.config.resolver import resolve_config
-from tests.common.grouped_experts_family import (
-    cpu_grouped_matmul, cpu_swiglu, cpu_token_permute, cpu_token_unpermute,
-)
+from hyper_parallel.components.ops import moe_token_permute, swiglu
 from tests.common.mark_utils import arg_mark
 
 
@@ -188,16 +186,10 @@ class TestRoutedGroupedExperts(unittest.TestCase):
 
                 with patch(
                     "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.moe_token_permute",
-                    side_effect=cpu_token_permute,
+                    wraps=moe_token_permute,
                 ) as permute, patch(
-                    "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.moe_token_unpermute",
-                    side_effect=cpu_token_unpermute,
-                ), patch(
-                    "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.grouped_matmul",
-                    side_effect=cpu_grouped_matmul,
-                ), patch(
-                    "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.npu_swiglu",
-                    side_effect=cpu_swiglu,
+                    "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.swiglu",
+                    wraps=swiglu,
                 ) as activation:
                     actual = candidate(hidden, expert_ids, probabilities)
                 activation.assert_called_once()

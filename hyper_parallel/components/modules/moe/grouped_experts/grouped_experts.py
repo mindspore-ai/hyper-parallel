@@ -28,11 +28,8 @@ from torch.nn import functional as F
 from transformers.activations import SiLUActivation
 
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
-from hyper_parallel.components.functional import grouped_matmul
-from hyper_parallel.components.functional import swiglu as npu_swiglu
-from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
-from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
-from hyper_parallel.components.modules.mlp import swiglu_activation
+from hyper_parallel.components.functional.swiglu import swiglu_activation
+from hyper_parallel.components.ops import grouped_matmul, moe_token_permute, moe_token_unpermute, swiglu
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
@@ -191,7 +188,7 @@ def _packed_dimensions(module, module_fqn, parameters, configs):
 
 
 class GroupedExpertsModule(nn.Module):
-    """Internal family member using the existing NPU grouped-GEMM autograd kernel.
+    """Internal family member using selectable grouped-GEMM and activation operators.
 
     Local transport is identity. EP members reuse this math over owner-local slots;
     router, shared experts, auxiliary loss and model masks remain outside this module.
@@ -327,7 +324,7 @@ class GroupedExpertsModule(nn.Module):
     def permute(
         self, hidden_states: Tensor, topk_ids: Tensor, topk_weights: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor]:
-        """Use fused NPU token permutation and align slot metadata with its inverse map.
+        """Group tokens by expert and align slot metadata through the shared inverse map.
 
         Args:
             hidden_states: Validated source tokens [T,H].
@@ -336,20 +333,12 @@ class GroupedExpertsModule(nn.Module):
 
         Returns:
             Expert-major hidden [S,H], IDs [S], counts [E], optional weights [S],
-            and NPU inverse indices [S], where S=T*K.
+            and slot positions [S], where S=T*K.
         """
         ids = topk_ids.reshape(-1).to(torch.int64)
         # Fixed-size counting also rejects invalid IDs without host scalar reads.
         counts = ids.new_zeros(self.config.num_experts).scatter_add_(0, ids, torch.ones_like(ids))
-        if ids.numel():
-            hidden, unpermute_indices = moe_token_permute(
-                hidden_states.contiguous(), topk_ids.to(torch.int32).contiguous(),
-            )
-        else:
-            hidden, unpermute_indices = hidden_states, ids.to(torch.int32)
-        # The kernel maps original route slots to permuted rows; metadata needs the inverse.
-        order = torch.empty_like(unpermute_indices, dtype=torch.int64)
-        order.scatter_(0, unpermute_indices.to(torch.int64), torch.arange(ids.numel(), device=ids.device))
+        hidden, order, unpermute_indices = moe_token_permute(hidden_states.contiguous(), topk_ids.contiguous())
         ids = ids[order]
         weights = topk_weights.reshape(-1)[order] if self.config.routing_weight_mode == "before_fc2" else None
         return hidden, ids, counts, weights, unpermute_indices
@@ -409,7 +398,7 @@ class GroupedExpertsModule(nn.Module):
                 or self.config.activation_dtype != "input"):
             activated = self.apply_activation(*fc1.chunk(2, dim=-1), hidden.dtype)
         else:
-            activated = npu_swiglu(fc1)  # pylint: disable=not-callable
+            activated = swiglu(fc1)
         if self.config.routing_weight_mode == "before_fc2":
             if routing_weights is None:
                 raise ValueError("before_fc2 requires differentiable slot routing weights")
@@ -437,7 +426,7 @@ class GroupedExpertsModule(nn.Module):
     def unpermute(
         self, values: Tensor, unpermute_indices: Tensor, topk_weights: Tensor, output_shape: tuple[int, ...],
     ) -> Tensor:
-        """Use fused NPU unpermutation/top-k sum, applying output probabilities once.
+        """Restore tokens and sum top-k slots, applying output probabilities once.
 
         Args:
             values: Outputs restored to source slot order by combine.
@@ -452,9 +441,9 @@ class GroupedExpertsModule(nn.Module):
             raise ValueError("combine must return one hidden-size output per source slot")
         if not values.shape[0]:
             if self.config.routing_weight_mode == "output":
-                values = values * topk_weights.reshape(-1, 1)
+                values = values * topk_weights.to(values.dtype).reshape(-1, 1)
             return values.reshape(output_shape)
-        # None implies top-k=1 in the kernel; ones retain top-k summation without reweighting FC2 output.
+        # Ones retain top-k summation without reweighting an already weighted FC2 output.
         probs = topk_weights if self.config.routing_weight_mode == "output" else torch.ones_like(topk_weights)
         output = moe_token_unpermute(
             values.contiguous(), unpermute_indices, probs.contiguous(),

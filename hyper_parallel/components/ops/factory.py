@@ -23,7 +23,7 @@ from typing import Any, cast
 
 import torch
 
-from .catalog import builtin_registry
+from .registry import builtin_registry
 from .spec import Fn, OpSpec
 
 
@@ -33,26 +33,22 @@ class _BackendState:
     def __init__(self, selections: Mapping[str, str]) -> None:
         self.selections = MappingProxyType(dict(selections))
         self.resolved: dict[
-            tuple[OpSpec[Any], torch.device, torch.dtype, str, bool, tuple[str, ...]], tuple[str, Any]
+            tuple[str, str, str, torch.device], tuple[str, Any]
         ] = {}
         self.used: dict[tuple[str, str, str], None] = {}
         self.lock = RLock()
 
-    def select(
-        self, spec: OpSpec[Fn], x: torch.Tensor, native_only: str | None,
-        blocked_backends: tuple[tuple[str, str], ...], default_backend: str,
-    ) -> Fn:
-        """Resolve against the actual input device, dtype and compatibility conditions."""
-        selection = self.selections.get(spec.config_key, default_backend)
-        key = (spec, x.device, x.dtype, selection, native_only is not None,
-               tuple(name for name, _ in blocked_backends))
+    def select(self, spec: OpSpec[Fn], device: torch.device) -> Fn:
+        """Resolve only from the contract, configuration and explicit execution device."""
+        selection = self.selections.get(spec.config_key, "auto")
+        key = (spec.config_key, spec.variant, selection, device)
         selected = self.resolved.get(key)
         if torch.compiler.is_compiling():
             # Dynamo captures the callable. Publishing it in the cache would
             # introduce a Python callable side effect during graph tracing.
             if selected is None:
                 selected = builtin_registry.resolve(
-                    spec, selection, x, native_only=native_only, blocked_backends=blocked_backends,
+                    spec, selection, device,
                 )
             self.used[(spec.config_key, spec.variant, selected[0])] = None
         elif selected is None:
@@ -60,7 +56,7 @@ class _BackendState:
                 selected = self.resolved.get(key)
                 if selected is None:
                     selected = self.resolved[key] = builtin_registry.resolve(
-                        spec, selection, x, native_only=native_only, blocked_backends=blocked_backends,
+                        spec, selection, device,
                     )
                 self.used[(spec.config_key, spec.variant, selected[0])] = None
         return cast(Fn, selected[1])
@@ -77,8 +73,8 @@ class _OpSelector:
 
         Args:
             selections: Complete mapping from operator family names to backend
-                names. Omitted families use their default, normally auto.
-                An empty mapping restores the defaults.
+                names. Omitted families use auto.
+                An empty mapping restores auto for all families.
 
         Raises:
             ValueError: A family, backend name or mapping value is invalid.
@@ -104,17 +100,7 @@ class _OpSelector:
 ops = _OpSelector()
 
 
-def _select_for_call(
-    spec: OpSpec[Fn], x: torch.Tensor, *, native_only: str | None = None,
-    blocked_backends: tuple[tuple[str, str], ...] = (), default_backend: str = "auto",
-) -> Fn:
+def _select_for_call(spec: OpSpec[Fn], *, device: torch.device) -> Fn:
+    """Select an implementation without inspecting tensors or their argument positions."""
     state = ops._state  # pylint: disable=protected-access
-    return state.select(spec, x, native_only, blocked_backends, default_backend)
-
-
-def _dispatch(spec: OpSpec[Fn]) -> Fn:
-    def call(x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        """Dispatch this public call using the current process configuration."""
-        return _select_for_call(spec, x)(x, *args, **kwargs)
-
-    return cast(Fn, call)
+    return state.select(spec, device)

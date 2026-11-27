@@ -21,13 +21,13 @@ from math import isfinite
 from typing import Any
 
 import torch
-from torch._subclasses.fake_tensor import is_fake
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 
 from hyper_parallel.components.checkpoint.conversion_ops import AddScalar
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
+from hyper_parallel.components.ops import rms_norm, rms_norm_fp32_affine
 
 
 def _validate_rms_settings(hidden_size: int, eps: float) -> None:
@@ -101,7 +101,7 @@ class _RMSNormPolicy(torch.nn.Module):
 
 
 class RMSNormModule(_RMSNormPolicy):
-    """NPU-fused direct-scale RMSNorm with source-compatible precision and state."""
+    """Direct-scale RMSNorm with selectable operators and source-compatible state."""
 
     def __init__(
         self,
@@ -165,7 +165,7 @@ class RMSNormModule(_RMSNormPolicy):
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=torch.float32 if self.fp32_weight else None))
 
     def _normalize(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return _npu_rms_norm(x, scale, self.eps, self.rms_norm_cast_order)
+        return _selected_rms_norm(x, scale, self.eps, self.rms_norm_cast_order)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the concrete member with the declared precision contract."""
@@ -186,7 +186,7 @@ class RMSNormModule(_RMSNormPolicy):
 
 
 class OffsetRMSNormModule(_RMSNormPolicy):
-    """NPU-fused unit-offset RMSNorm preserving offset checkpoint state."""
+    """Selectable unit-offset RMSNorm preserving offset checkpoint state."""
 
     def __init__(self, *, config: Any = None, module: torch.nn.Module | None = None,
                  module_fqn: str = "", context: Any = None,
@@ -241,49 +241,28 @@ class OffsetRMSNormModule(_RMSNormPolicy):
         return []
 
     def _normalize(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return _npu_rms_norm(x, scale, self.eps, self.rms_norm_cast_order)
+        return _selected_rms_norm(x, scale, self.eps, self.rms_norm_cast_order)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Add the offset in FP32 before applying the declared rounding order."""
         return self._normalize(x, 1.0 + self.weight.float())
 
 
-def _npu_rms_norm(x: torch.Tensor, scale: torch.Tensor, eps: float, cast_order: str) -> torch.Tensor:
-    """Execute fused NPU normalization with the declared source rounding boundary."""
-    # Census traces installed fused modules with CPU FakeTensors and operator stand-ins.
-    if x.device.type != "npu" and not is_fake(x):
-        raise ValueError("NPU RMSNorm requires NPU tensors; select use_fused_ops=False for Torch execution")
-    # Native members must not load the optional NPU package.
-    from hyper_parallel.components.functional.rms_norm import rms_norm  # pylint: disable=import-outside-toplevel
-
+def _selected_rms_norm(x: torch.Tensor, scale: torch.Tensor, eps: float, cast_order: str) -> torch.Tensor:
+    """Resolve the operator at each call while retaining the source rounding boundary."""
     if cast_order == "before_weight":
         # The NPU kernel accumulates internally; retain the input dtype for saved activations.
         normalized = rms_norm(x, torch.ones_like(scale, dtype=x.dtype), eps)
         return scale * normalized
-    return rms_norm(x.float(), scale.float(), eps).to(x.dtype)
-
-
-def _native_rms_norm(x: torch.Tensor, scale: torch.Tensor, eps: float, cast_order: str) -> torch.Tensor:
-    """Preserve FP32 accumulation and the source rounding boundary using Torch operations."""
-    values = x.float()
-    normalized = values * torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + eps)
-    if cast_order == "before_weight":
-        return scale * normalized.to(x.dtype)
-    return (normalized * scale.float()).to(x.dtype)
+    return rms_norm_fp32_affine(x, scale, eps)
 
 
 class NativeRMSNormModule(RMSNormModule):
-    """Ordinary Torch direct-scale member sharing the fused member's parameter contract."""
-
-    def _normalize(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return _native_rms_norm(x, scale, self.eps, self.rms_norm_cast_order)
+    """Legacy local member sharing the selectable direct-scale parameter contract."""
 
 
 class NativeOffsetRMSNormModule(OffsetRMSNormModule):
-    """Ordinary Torch unit-offset member retaining offset parameters without conversion."""
-
-    def _normalize(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return _native_rms_norm(x, scale, self.eps, self.rms_norm_cast_order)
+    """Legacy local member retaining selectable unit-offset execution and state."""
 
 
 @module_replacement
@@ -294,8 +273,8 @@ def RMSNorm(  # pylint: disable=invalid-name
 ) -> torch.nn.Module:
     """Build a tracked RMSNormModule family member from config or a direct-scale source.
 
-    ``use_fused_ops=False`` selects the ordinary Torch member by default;
-    ``use_fused_ops=True`` explicitly selects the NPU-fused member without fallback.
+    ``use_fused_ops`` retains legacy member selection. Both members resolve
+    the numerical backend through the process-wide ``ops`` configuration.
     Existing RMSNormModule class construction remains available for type compatibility.
     Offset source conversion continues through OffsetRMSNormModule.
     """

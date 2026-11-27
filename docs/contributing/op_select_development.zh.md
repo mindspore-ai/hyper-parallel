@@ -6,7 +6,7 @@
 
 已有契约下新增后端时，复用公共接口和参考实现；仅补测试时，围绕现有实现扩展用例。验收范围由本次改动及声明的支持能力决定。
 
-本次分步合入：第一阶段提供基础选型流程、Ops 实现及算子测试；第二阶段接入现有 functional、高性能模块、并行 wrapper 和整网配置，并补齐对应的集成测试。本文的模块与网络验收要求用于第二阶段，不代表当前基础 PR 已完成这些调用点迁移。
+接入可以分步交付选型流程、算子实现、functional/module 调用点及整网配置，但必须逐项声明实际完成范围。当前基础与专家主路径已做部分调用迁移；这不代表同族全部兼容入口、相邻模块或完整网络已经实现硬件解耦，详见第 4.3 节。
 
 用户配置、支持矩阵和注册 API 见[算子后端选型与接入](../guide/op_select.zh.md)。本文规定开发交付物及其验证方式。Agent 执行入口为仓库 skill [op-select-dev](../../.agent/skills/op-select-dev/SKILL.md)。
 
@@ -56,27 +56,55 @@ native 使用基础 PyTorch 运算表达契约，并通过独立公式或独立�
 
 | 位置 | 职责 |
 | --- | --- |
-| [impl/](../../hyper_parallel/components/ops/impl/) | Protocol、OpSpec、实现和该族的注册函数 |
-| [registry.py](../../hyper_parallel/components/ops/registry.py) | `register_family`、`register_impl` 和解析接口 |
+| [impl/](../../hyper_parallel/components/ops/impl/) | Protocol、OpSpec、显式公共函数、参数适配、实现及注册函数 |
+| [registry.py](../../hyper_parallel/components/ops/registry.py) | 共享注册表实例、`register_family`、`register_impl` 和解析接口 |
+| [factory.py](../../hyper_parallel/components/ops/factory.py) | 进程级配置、统一实现选择、缓存及实际后端记录 |
 | [catalog.py](../../hyper_parallel/components/ops/catalog.py) | 组装并封存内置算子目录 |
 | [auto_policy.py](../../hyper_parallel/components/ops/auto_policy.py) | 每个 variant、设备的 `auto` 候选顺序 |
-| [包入口](../../hyper_parallel/components/ops/__init__.py) | 对外导出算子函数并处理调用级约束 |
+| [包入口](../../hyper_parallel/components/ops/__init__.py) | 显式导入公共函数并维护静态 `__all__`；调用级约束归属族文件 |
+
+共享注册表位于 registry，依赖方向为 `catalog → impl → factory → registry`；factory 不导入 catalog，避免族文件调用选择器时形成循环。Protocol 约束后端类型，公共函数维护调用者签名，两者分别保留；当前没有强制静态类型检查门禁，运行时 callable 检查不能代替签名、shape 和数值验收。
 
 `register_impl` 的 `load` 是无参加载器，可返回函数、可调用对象或 `nn.Module`，实现内部可以使用 `torch.autograd.Function` 定义自定义反向。构造参数由加载器绑定；训练参数由模型模块持有，并在调用时传入，避免隐藏在全局缓存的实现对象中。
 
-兼容性处理遵循以下分工：
+选型与输入验证遵循以下分工：
 
-1. `check_compatibility(x)` 根据主输入设备、dtype 等判定能力，返回 `None` 表示可用，字符串表示拒绝原因。
-2. 形状、布局和多个输入之间的约束在公共入口检查，将不兼容候选传入解析逻辑，使结果与解析缓存保持一致。
-3. 可选包和算子按需加载；依赖缺失使用 `ImplementationUnavailable` 表达。普通包导入无需安装所有硬件扩展。
-4. `auto` 只在既定候选中选择；是否允许 native 回退取决于该 variant 的设备策略。显式后端不可用或不兼容时应报错。
-5. 实际内核执行异常直接暴露，不能捕获所有异常后静默改用 native。
+1. 公共函数显式传入执行设备：`_select_for_call(spec, device=x.device)`；不按第一个参数推断。
+2. 缓存 key 只有 `(family, variant, selection, device)`，不使用 dtype、shape 或输入约束排除候选。
+3. 公共入口检查通用契约，所选实现逐次检查后端限制；缓存命中不绕过输入验证。
+4. `auto` 按设备注册顺序加载候选，依赖缺失可以继续。输入不支持和内核运行错误直接报出，不自动改用 native。
+5. 注册表不接受 `check_compatibility`；选择器不接受 `native_only` 或 `blocked_backends`。
 
 注册片段见[注册新算子族或后端](../guide/op_select.zh.md#注册新算子族或后端)。调整 `auto` 优先级时，同时记录所依据的正确性、能力范围和性能证据。
 
+公共接口在 `components/ops/impl/<配置键>.py` 中显式定义，由 `components/ops/__init__.py` 显式导入并列入 `__all__`。Protocol 保留为后端契约，公共函数维护完整的签名、算法说明及 Google 风格参数文档，并调用统一选择器完成适配和后端调用。
+
+新增或删除公共接口时，同步维护族文件、包导入和 `__all__`，运行 `tests/ut/components/ops/test_factory.py` 的静态导出检查及相关算子测试。源码直接提供 IDE 补全、跳转和文档；构建继续打包 `py.typed`，无需生成声明文件或安装提交钩子。详见[注册与公共 API](../guide/op_select.zh.md#注册新算子族或后端)。
+
 ## 4. 在模块中使用公共接口
 
-模块直接从 `components.ops` 导入算子，在 `forward` 中调用。以标准 SwiGLU 为例：
+module 可以从 functional 和 ops 导入，functional 可以从 ops 导入。职责按以下方式划分：
+
+| 层 | 职责 | 调用方式 |
+| --- | --- | --- |
+| module | 参数、状态、checkpoint 转换和模块流程 | 组合功能复用 functional；原子算子可直接调用 ops |
+| functional | 无状态算法组合、布局适配、精度策略和旧接口适配 | 通过 ops 公共接口执行算子，不导入 module |
+| ops | Protocol、公共算子契约、后端选择及具体实现 | 不反向依赖 functional 的组合逻辑 |
+
+### 4.1 最终目标：ops 完成本地算子的硬件解耦
+
+切换已声明支持的执行设备或后端时，functional/module 中的算子调用和算法组合应保持不变。ops 负责识别设备、读取后端配置、加载可选扩展、转换内核专有格式及参数、调用内核和检查后端能力。上层只表达算法契约，不根据 CPU/CUDA/NPU 或后端名称选择实现。
+
+具体边界如下：
+
+- functional/module 可以用原生 Torch 表达硬件无关的组合、布局、精度策略及状态处理，也可用 `x.device` 跟随输入分配张量；这些操作无需全部注册为算子。
+- functional/module 不通过 `device.type`、硬件可用性、`backend` 或 fused 开关切换已接入算子的实现，不直接调用厂商内核，也不导入 `ops.impl` 中的实现或加载器。历史兼容入口同样应满足这一要求。
+- 因数学语义产生的状态、mask、dtype 或 shape 分支可以保留，但不能借此绕过后端配置；内核专有的对齐、编码和限制在 ops 中处理。所选实现不支持输入时显式报错，不由上层改用另一实现。
+- 模块继续管理训练参数、checkpoint、辅助损失和调度。DTensor 布局与通信基础设施按各自模块规则治理；其中的本地算子不能以硬件判断代替 ops 选型。第三方源模块识别与参数迁移应单独记录，不与算子执行混为一项验收结论。
+
+### 4.2 复用组合并维护兼容入口
+
+不要为了统一 import 路径，在不同模块重复实现组合逻辑。以标准 SwiGLU 原子调用为例：
 
 ```python
 import torch
@@ -89,11 +117,41 @@ class Activation(torch.nn.Module):
         return swiglu(x)
 ```
 
-外部模块无需感知 `components/ops/impl/` 内部路径、调用 `ops.create` 或在初始化时绑定后端函数。后端通过已有 YAML 配置或 `ops.set_backends` 在每个 worker 中设置，不需要包裹 Trainer 的训练流程。
+需要 clamp 或激活精度策略时，模块复用 `functional.swiglu.local_swiglu` 或 `swiglu_activation`；BSND 布局的单分支 RoPE 复用 `functional.rotary_embedding.apply_rotary_pos_emb_bsnd`。该适配调用 `ops.rope_interleaved_single`，不通过重复传入同一 Tensor 计算两份旋转结果。Q/K 的半布局组合由 `functional.apply_rotary_pos_emb` 管理，原 `ops.rope_qk` 调用应迁移到该入口。
+
+已有 functional 名称可以作为兼容入口保留，但应转调 ops 并显式维护历史契约。例如，functional token permutation 返回两个结果，逆映射保持 int32；ops 返回三个结果，逆映射使用 int64。functional unpermutation 的 `probs=None` 按 top-k=1 适配。不要同时保留直连旧内核和经过 OpSelect 的两套实现。
+
+外部模块无需感知 `components/ops/impl/` 内部路径、调用 `ops.create` 或在初始化时绑定后端函数。后端仅通过已有 YAML 配置或 `ops.set_backends` 在每个 worker 中设置；公共接口不接收 `backend`，选择器不接收 `default_backend`，省略的族统一使用 `auto`。不需要包裹 Trainer 的训练流程。
 
 `ops.set_backends` 完整替换当前进程配置，并清理解析缓存和使用统计。测试必须保存并恢复原配置；一次前向和反向应在同一配置下完成，结束后再切换到另一组对照实现。
 
 整改已有模块时，保留原权重所有权、参数命名、checkpoint 语义和计算顺序。确认首步实际执行覆盖了目标分支，并通过 `ops.used_backends()` 检查命中的 `(op, variant, backend)`。
+
+### 4.3 当前基础与专家接入的硬件边界审视
+
+2026-11-28，基于 `7534aada` 的静态调用链审视。结论是**已迁移的主路径大多满足目标，完整接入范围尚未全部完成硬件解耦**。本表不以算子注册或已有精度测试通过代替调用链审视，也不代表此次重新执行了硬件测试。
+
+| 路径 | 当前结论 | 证据与剩余工作 |
+| --- | --- | --- |
+| RMSNorm / OffsetRMSNorm | 已接入计算路径满足 | [模块](../../hyper_parallel/components/modules/common/rms_norm.py)仅处理 scale、舍入顺序并调用公共 ops。旧 `use_fused_ops` / `npu` 成员名仍用于兼容构造，两成员实际使用同一进程选型，不决定执行后端 |
+| SwiGLUMLP 及显式精度策略 | 已接入路径满足 | [functional 策略](../../hyper_parallel/components/functional/swiglu.py)组合公共 SwiGLU；[MLP](../../hyper_parallel/components/modules/mlp/swiglu_mlp.py)管理投影与参数，普通/FP32 clamp 的选择表达数学契约 |
+| 旧 GroupedExperts / SharedExpert 的激活适配 | 仍有配置绕过 | [旧专家](../../hyper_parallel/components/modules/grouped_experts.py)和[共享专家](../../hyper_parallel/components/modules/moe/shared_expert.py)的源模块适配仍检查 `use_fused_swiglu`；关闭时可直接执行 `act_fn(gate) * up`。已识别的标准 SiLU 应统一经过公共 SwiGLU；自定义激活另行维护数学契约 |
+| Grouped Matmul 标准无 bias 路径 | 已接入路径满足，兼容分支未完成 | [functional 兼容入口](../../hyper_parallel/components/functional/grouped_matmul.py)在标准条件下调用公共 ops；bias、group_type/group_list_type、gemm_fusion 或缺省 group_list 等其他分支仍导入并调用 `ops.impl` 的 NPU 实现。需为保留能力定义公共契约、后端适配及测试，不能只移动 import |
+| Grouped SwiGLU | 公共契约内满足 | [族实现](../../hyper_parallel/components/ops/impl/grouped_swiglu.py)封装 native/CUDA/NPU 差异，上层不为该接口选择设备实现；量化专家成员不在本次非量化契约内 |
+| Token permute / unpermute 的公共 ops、functional 和新专家模块 | 已接入路径满足 | [functional 重排](../../hyper_parallel/components/functional/moe_token_permute.py)、[恢复](../../hyper_parallel/components/functional/moe_token_unpermute.py)仅适配历史返回值、索引 dtype 和可选概率；[新专家](../../hyper_parallel/components/modules/moe/grouped_experts/grouped_experts.py)调用公共 ops |
+| MoonEP / HF-native EP 的本地重排 | 尚未完全满足 | [MoonEP](../../hyper_parallel/distributed/expert_parallel/moonep_context.py)和[HF-native EP](../../hyper_parallel/distributed/expert_parallel/experts.py)仍按 `device.type == "npu"` 决定是否调用公共重排接口。需保留路由、ragged 语义和通信顺序，移除硬件决定的本地实现选择 |
+| MegaGate 路由计算 | 已接入执行路径满足，源适配仍有外部依赖 | [路由模块](../../hyper_parallel/components/modules/moe/router.py)通过公共 `moe_router` 执行；`_validate_source` 仍识别并导入 HyperMulticore 源类，属于源适配依赖，不是前向内核选择；不能据此称整个模块无厂商依赖 |
+| mHC Post / 普通 PipelinedMhc / Sinkhorn | 已接入主路径满足 | [Post](../../hyper_parallel/components/modules/mhc/mhc_post.py)和[普通 pipelined 路径](../../hyper_parallel/components/modules/mhc/pipelined_mhc.py)调用公共 ops。`functional.sinkhorn_knopps` 仍直接调用 native 实现，不读取配置；虽不限定硬件，也不能作为普通配置选型路径 |
+| aggregate_hidden / functional MOME | 已接入路径满足 | [聚合入口](../../hyper_parallel/components/functional/aggregate_hidden.py)转调公共 ops；[MOME](../../hyper_parallel/components/functional/mome.py)仅组合 padding、布局、bias、mask 和残差，Omni autograd 在 ops 内 |
+| GQA / MLA 使用的 BSND RoPE 及 Q/K 公共组合 | 已接入路径满足，旧入口未完成 | [共享位置适配](../../hyper_parallel/components/functional/rotary_embedding.py)调用公共 half / interleaved_single；同文件的 `apply_rotary_pos_emb_single` 仍判断设备和 fused 开关，`apply_rotary_pos_emb_single_freqs` 仍直接加载 torch_npu。迁移时需保留 SBND、相邻对/半带输出及频率广播语义 |
+
+以下是相邻的既有硬件路径，本次迁移不能被解释为它们也已完成：
+
+- GQA/MLA 的完整 attention 仍使用 `functional.npu_fusion_attention_forward`，该函数直接调用 torch_npu；[ops attention](../../hyper_parallel/components/ops/impl/attention.py)也仍复用该硬件实现。后续应由 ops 承担内核实现，functional 保留通用 mask、packed 元数据及返回值适配。
+- `NativeShiftedPipelinedMhcModule.advance` 仍检查 NPU 并直接调用 HyperMulticore；mHC Pre、MegaMhc 等既有融合路径也不属于本次普通 Post/Sinkhorn 接入的完成范围。
+- GDN、KDA、DSA 等现有序列算子的部分 ops 实现仍依赖 functional 中的硬件实现。公共导出改为显式函数，不代表这些算子的完整调用链已完成分层迁移。
+
+后续优先处理本次范围内的配置绕过和兼容分支，再按各自契约迁移相邻路径。每项整改都需同时验证调用链、独立算法参考、配置命中、输出及梯度；未声明支持的组合应明确报错。将算法功能、硬件后端和源模块兼容性分开验收，避免用成员名、普通 Torch 操作或单设备结果推断硬件解耦已经完成。
 
 ## 5. 精度测试采用两层基线
 

@@ -15,11 +15,12 @@
 """Root mean square normalization function."""
 
 import torch
-import torch_npu
+
+from hyper_parallel.components.ops import rms_norm as selected_rms_norm
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    """Apply NPU-accelerated RMS normalization.
+    """Apply RMS normalization through the configured OpSelect backend.
 
     Args:
         x: Input tensor.
@@ -29,4 +30,4 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.
     Returns:
         The normalized tensor.
     """
-    return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0]
+    return selected_rms_norm(x, weight, eps)

@@ -18,20 +18,82 @@ from typing import Protocol
 
 import torch
 
+from ..factory import _select_for_call
 from ..registry import OpRegistry
 from ..spec import OpSpec
 from .._dependency import require_package, require_symbol
 
 
 class RMSNormFn(Protocol):
-    """Normalize the last dimension and apply the caller-owned scale."""
+    """Normalize the last dimension by its root mean square and apply affine scale.
+
+    Compute x * rsqrt(mean(x**2) + eps) * weight. The native standard variant
+    accumulates FP16/BF16 inputs in FP32. The fp32_affine variant explicitly
+    casts states and weights to FP32 for the full calculation. Both variants
+    return the input dtype and differentiate states and affine weights.
+    """
 
     def __call__(self, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-        """Return the normalized and scaled tensor."""
+        """Return the normalized and scaled tensor.
+
+        Args:
+            x: Floating states [..., hidden].
+            weight: Caller-owned affine scale [hidden], broadcast over token axes.
+            eps: Stability term added to the last-dimension mean square.
+
+        Returns:
+            Normalized and scaled states with the input shape and dtype.
+        """
 
 
-RMS_NORM = OpSpec[RMSNormFn](config_key="rms_norm")
-RMS_NORM_FP32_AFFINE = OpSpec[RMSNormFn](config_key="rms_norm", variant="fp32_affine")
+RMS_NORM = OpSpec[RMSNormFn](config_key='rms_norm')
+RMS_NORM_FP32_AFFINE = OpSpec[RMSNormFn](config_key='rms_norm', variant='fp32_affine')
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-05) -> torch.Tensor:
+    """Return the normalized and scaled tensor.
+
+    Args:
+        x: Floating states [..., hidden].
+        weight: Caller-owned affine scale [hidden], broadcast over token axes.
+        eps: Stability term added to the last-dimension mean square.
+
+    Returns:
+        Normalized and scaled states with the input shape and dtype.
+
+    Notes:
+        Normalize the last dimension by its root mean square and apply affine scale.
+
+        Compute x * rsqrt(mean(x**2) + eps) * weight. The native standard variant
+        accumulates FP16/BF16 inputs in FP32. The fp32_affine variant explicitly
+        casts states and weights to FP32 for the full calculation. Both variants
+        return the input dtype and differentiate states and affine weights.
+    """
+    operation = _select_for_call(RMS_NORM, device=x.device)
+    return operation(x, weight, eps)
+
+
+def rms_norm_fp32_affine(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-05) -> torch.Tensor:
+    """Return the normalized and scaled tensor.
+
+    Args:
+        x: Floating states [..., hidden].
+        weight: Caller-owned affine scale [hidden], broadcast over token axes.
+        eps: Stability term added to the last-dimension mean square.
+
+    Returns:
+        Normalized and scaled states with the input shape and dtype.
+
+    Notes:
+        Normalize the last dimension by its root mean square and apply affine scale.
+
+        Compute x * rsqrt(mean(x**2) + eps) * weight. The native standard variant
+        accumulates FP16/BF16 inputs in FP32. The fp32_affine variant explicitly
+        casts states and weights to FP32 for the full calculation. Both variants
+        return the input dtype and differentiate states and affine weights.
+    """
+    operation = _select_for_call(RMS_NORM_FP32_AFFINE, device=x.device)
+    return operation(x, weight, eps)
 
 
 def _native(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -54,10 +116,15 @@ def _load_native_fp32_affine() -> RMSNormFn:
 
 
 def _load_npu() -> RMSNormFn:
-    require_symbol(require_package("torch_npu"), "npu_rms_norm")
-    # The existing implementation imports the optional NPU package.
-    from hyper_parallel.components.functional.rms_norm import rms_norm  # pylint: disable=import-outside-toplevel
-    return rms_norm
+    extension = require_package("torch_npu")
+    require_symbol(extension, "npu_rms_norm")
+    kernel = extension.npu_rms_norm
+
+    def run(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+        """Return only the normalized output of the NPU kernel."""
+        return kernel(x, weight, epsilon=eps)[0]
+
+    return run
 
 
 def _load_npu_fp32_affine() -> RMSNormFn:

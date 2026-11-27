@@ -20,8 +20,7 @@ from math import isfinite
 import torch
 from torch import nn
 from torch.nn import functional as F
-from hyper_parallel.components.functional.mhc_post import mhc_post
-from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
+from hyper_parallel.components.ops import mhc_post, sinkhorn
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from ._utils import _validate_settings
 
@@ -113,16 +112,16 @@ class PipelinedMhcModule(nn.Module):
                               self.hc_sinkhorn_iters, self.hc_eps)
         self.train(module.training)
 
-
+    @torch.no_grad()
     def reset_parameters(self) -> None:
         """Initialize direct-build coefficient parameters after materialization."""
+        # Adopted parameter-free norms may not expose an initialization hook.
         reset_norm = getattr(self.input_norm, "reset_parameters", None)
         if callable(reset_norm):
             reset_norm()
         nn.init.normal_(self.fn, std=self.init_method_std)
         nn.init.zeros_(self.base)
-        with torch.no_grad():
-            self.scale.fill_(self.init_scale)
+        self.scale.fill_(self.init_scale)
 
     def make_transforms(self) -> list:
         """Declare that this member keeps parameter names and layouts unchanged.
@@ -137,7 +136,14 @@ class PipelinedMhcModule(nn.Module):
         self,
         hidden_streams: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Produce the coefficients consumed by the following sublayer."""
+        """Produce the coefficients consumed by the following sublayer.
+
+        Args:
+            hidden_streams: Residual streams with trailing stream and hidden dimensions.
+
+        Returns:
+            Pre-mixing, post-mixing, and residual-mixing coefficients.
+        """
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = F.linear(  # pylint: disable=not-callable
             flattened, self.fn.float()
@@ -154,7 +160,7 @@ class PipelinedMhcModule(nn.Module):
         post = 2 * torch.sigmoid(post * post_scale + post_bias)
         residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
         residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
-        residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
         return pre, post, residual
 
 

@@ -22,21 +22,81 @@ import torch
 from torch.nn import functional as F
 
 from .._dependency import require_package
+from ..factory import _select_for_call
 from ..registry import ImplementationUnavailable, OpRegistry
 from ..spec import OpSpec
 
 
 class MoeRouterFn(Protocol):
-    """Return logits, normalized routing weights and selected expert indices."""
+    """Project tokens and select experts using modality-corrected routing scores.
+
+    Projection and scoring use FP32 in the native reference. Bias corrections
+    affect expert selection but not the gathered route weights. For top_k > 1,
+    normalize selected scores to sum to one before multiplying by scale. A
+    single route retains its unnormalized score. Expert IDs need not be sorted.
+    """
 
     def __call__(
         self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, vision_bias: torch.Tensor | None,
         image_mask: torch.Tensor | None, top_k: int, scoring_func: str, scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project tokens and perform expert selection with modality corrections."""
+        """Project tokens and perform expert selection with modality corrections.
+
+        Args:
+            x: Token states with final dimension hidden; leading token axes are flattened.
+            weight: Router projection [experts, hidden].
+            bias: Default expert-selection correction [experts].
+            vision_bias: Optional image-token expert-selection correction [experts].
+            image_mask: Optional Boolean token mask selecting vision_bias when both are supplied.
+            top_k: Number of selected experts per token.
+            scoring_func: One of sqrtsoftplus, softmax or sigmoid.
+            scale: Multiplier for the selected, optionally normalized route weights.
+
+        Returns:
+            A tuple of logits [tokens, experts], route weights [tokens, top_k] and expert IDs [tokens,
+            top_k].
+        """
 
 
-MOE_ROUTER = OpSpec[MoeRouterFn](config_key="moe_router", variant="deepseek_v41")
+def moe_router(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    vision_bias: torch.Tensor | None,
+    image_mask: torch.Tensor | None,
+    top_k: int,
+    scoring_func: str,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute logits, routing weights and expert IDs for DeepSeek's top-k router.
+
+    Args:
+        x: Token states with final dimension hidden; leading token axes are flattened.
+        weight: Router projection [experts, hidden].
+        bias: Default expert-selection correction [experts].
+        vision_bias: Optional image-token expert-selection correction [experts].
+        image_mask: Optional Boolean token mask selecting vision_bias when both are supplied.
+        top_k: Number of selected experts per token.
+        scoring_func: One of sqrtsoftplus, softmax or sigmoid.
+        scale: Multiplier for the selected, optionally normalized route weights.
+
+    Returns:
+        A tuple of logits [tokens, experts], route weights [tokens, top_k] and expert IDs [tokens,
+        top_k].
+
+    Notes:
+        Project tokens and select experts using modality-corrected routing scores.
+
+        Projection and scoring use FP32 in the native reference. Bias corrections
+        affect expert selection but not the gathered route weights. For top_k > 1,
+        normalize selected scores to sum to one before multiplying by scale. A
+        single route retains its unnormalized score. Expert IDs need not be sorted.
+    """
+    route = _select_for_call(MOE_ROUTER, device=x.device)
+    return route(x, weight, bias, vision_bias, image_mask, top_k, scoring_func, scale)
+
+
+MOE_ROUTER = OpSpec[MoeRouterFn](config_key='moe_router', variant='deepseek_v41')
 
 
 def router_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
@@ -86,6 +146,8 @@ def _load_megagate() -> MoeRouterFn:
         image_mask: torch.Tensor | None, top_k: int, scoring_func: str, scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply MegaGate using the shared learned routing contract."""
+        if scoring_func != "sqrtsoftplus" or x.ndim != 3 or x.numel() == 0:
+            raise ValueError("MegaGate requires nonempty batched tokens and sqrtsoftplus scoring")
         del scoring_func
         return mega_gate(
             x, weight, bias, _plan_for_device(x.device), vision_bias=vision_bias,

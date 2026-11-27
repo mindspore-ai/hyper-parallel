@@ -16,13 +16,14 @@
 
 from contextlib import ExitStack
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 import unittest
 from unittest.mock import Mock, patch
 
 import torch
 
 from hyper_parallel.components.modules.mhc import pipelined_mhc_post
+from hyper_parallel.components.ops import ops
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
@@ -52,6 +53,10 @@ def _post_formula(output: torch.Tensor, residual: torch.Tensor,
 
 class TestPipelinedMhcPost(unittest.TestCase):
     """Keep local fused execution inside the decoder's DTensor boundaries."""
+
+    def setUp(self) -> None:
+        """Restore process-wide backend configuration after the test."""
+        self.addCleanup(ops.set_backends, ops.get_backends())
 
     def tearDown(self) -> None:
         """Remove backend-less meshes before other distributed tests run."""
@@ -91,18 +96,19 @@ class TestPipelinedMhcPost(unittest.TestCase):
                         inputs = [DTensor.from_local(value, mesh, placements) for value in local]
                         kernel = Mock(side_effect=lambda residual, combine, output, post:
                                       _post_formula(output, residual, post, combine))
-                        ops = ModuleType("cann_ops_transformer.ops")
-                        ops.mhc_post = kernel
+                        extension = ModuleType("cann_ops_transformer.ops")
+                        extension.mhc_post = kernel
                         package = ModuleType("cann_ops_transformer")
-                        package.ops = ops
+                        package.ops = extension
 
+                        ops.set_backends({"mhc_post": "cann" if fused else "native"})
                         with ExitStack() as stack:
                             if fused:
                                 stack.enter_context(patch.dict(sys.modules, {
-                                    "cann_ops_transformer": package, "cann_ops_transformer.ops": ops,
+                                    "cann_ops_transformer": package, "cann_ops_transformer.ops": extension,
                                 }))
                                 stack.enter_context(patch.object(
-                                    torch.Tensor, "device", property(lambda _: SimpleNamespace(type="npu")),
+                                    torch.Tensor, "device", property(lambda _: torch.device("npu")),
                                 ))
                             first = pipelined_mhc_post(*inputs)
                             second = pipelined_mhc_post(inputs[0], first, inputs[2], inputs[3])

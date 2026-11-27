@@ -21,7 +21,9 @@ import torch
 
 from hyper_parallel.components.ops.catalog import builtin_registry
 from tests.common.op_precision import PrecisionCase
-from tests.common.op_precision_cases import attention_cases, expert_cases, linear_attention_cases, pointwise_cases
+from tests.common.op_precision_basic import pointwise_cases
+from tests.common.op_precision_experts import aggregate_hidden_cases, expert_cases
+from tests.common.op_precision_sequence import attention_cases, linear_attention_cases
 from tests.common.op_precision_dsa import dsa_cases
 
 FAMILY_BUILDERS: dict[str, Callable[..., list[PrecisionCase]]] = {
@@ -33,8 +35,9 @@ FAMILY_BUILDERS: dict[str, Callable[..., list[PrecisionCase]]] = {
     "grouped_matmul": expert_cases,
     "grouped_swiglu": expert_cases,
     "moe_router": expert_cases,
-    "moe_token_reorder": expert_cases,
-    "mome": expert_cases,
+    "moe_token_permute": expert_cases,
+    "moe_token_unpermute": expert_cases,
+    "aggregate_hidden": aggregate_hidden_cases,
     "attention": attention_cases,
     "causal_conv1d": linear_attention_cases,
     "gdn": linear_attention_cases,
@@ -56,7 +59,7 @@ def backend_precision_dtypes(family: str, backend: str) -> tuple[torch.dtype, ..
     if backend == "torch_grouped_mm":
         return (torch.bfloat16,)
     if family in ("rms_norm", "swiglu", "rope", "attention", "grouped_matmul",
-                  "grouped_swiglu", "moe_token_reorder"):
+                  "grouped_swiglu", "moe_token_permute", "moe_token_unpermute"):
         return (torch.float32, torch.float16, torch.bfloat16)
     if family == "sinkhorn":
         return (torch.float32,)

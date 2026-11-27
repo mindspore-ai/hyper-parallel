@@ -23,7 +23,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from hyper_parallel import init_device_mesh
-from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
+from hyper_parallel.components.ops import moe_token_permute
 from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts import EPGroupedExperts
 from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (
     GroupedExpertsConfig,
@@ -181,7 +181,7 @@ def _ep_case(device: torch.device, rank: int, world_size: int, mode: str) -> Non
         "hyper_parallel.components.modules.moe.grouped_experts.grouped_experts.moe_token_permute",
         wraps=moe_token_permute,
     ) as source_permute, patch(
-        "hyper_parallel.components.functional.moe_token_permute.moe_token_permute",
+        "hyper_parallel.distributed.expert_parallel.ep_context.moe_token_permute",
         wraps=moe_token_permute,
     ) as receive_permute:
         actual = candidate(hidden, expert_ids, probabilities)

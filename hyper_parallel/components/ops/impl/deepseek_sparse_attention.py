@@ -27,12 +27,19 @@ from hyper_parallel.components.functional.sparse_flash_mla import sparse_flash_m
 
 from .._dependency import load_cann, require_package, require_symbol
 from .._dsa_layout import DsaQueryLayout, packed_segments, selected_packed_keys, selected_packed_scores
+from ..factory import _select_for_call
 from ..registry import OpRegistry
 from ..spec import OpSpec
 
 
 class DsaCompressedBanksFn(Protocol):
-    """Attend raw and compressed KV banks in the same document coordinates."""
+    """Attend a causal raw-token window and optional selected compressed keys.
+
+    Raw and compressed keys share logical document coordinates supplied by
+    layout and the bank offsets. The keys also supply attention values; sinks
+    contribute to the softmax normalization. No attention crosses document
+    boundaries. Return BSND output while retaining gradients through attention states.
+    """
 
     def __call__(
         self, x: torch.Tensor, raw_key: torch.Tensor, compressed_key: torch.Tensor | None,
@@ -40,29 +47,247 @@ class DsaCompressedBanksFn(Protocol):
         layout: DsaQueryLayout, global_sequence_length: int, raw_key_offset: int = 0,
         main_key_offset: int = 0, global_key_length: int | None = None,
     ) -> torch.Tensor:
-        """Return attention output in BSND layout."""
+        """Return attention output in BSND layout.
+
+        Args:
+            x: Attention queries [batch, heads, query_length, head_dim] in BNSD layout.
+            raw_key: Raw-token key/value bank [batch, 1, key_length, head_dim].
+            compressed_key: Optional compressed key/value bank [batch, 1, compressed_length, head_dim].
+            topk_indices: Optional selected compressed-key IDs; -1 denotes an unused slot.
+            sinks: Per-head attention sink logits.
+            scale: Query-key score multiplier.
+            window: Number of raw positions in the causal sliding window.
+            layout: Logical query and document geometry.
+            global_sequence_length: Global raw-token sequence length.
+            raw_key_offset: Global raw-token offset of the supplied raw bank.
+            main_key_offset: Global compressed-key offset of the supplied main bank.
+            global_key_length: Optional full compressed-bank length for visibility checks.
+
+        Returns:
+            Attention states in BSND layout.
+        """
 
 
-DSA_COMPRESSED_BANKS = OpSpec[DsaCompressedBanksFn](config_key="deepseek_sparse_attention", variant="compressed_banks")
+def deepseek_sparse_attention_compressed_banks(
+    x: torch.Tensor,
+    raw_key: torch.Tensor,
+    compressed_key: torch.Tensor | None,
+    topk_indices: torch.Tensor | None,
+    sinks: torch.Tensor,
+    *,
+    scale: float,
+    window: int,
+    layout: DsaQueryLayout,
+    global_sequence_length: int,
+    raw_key_offset: int = 0,
+    main_key_offset: int = 0,
+    global_key_length: int | None = None,
+) -> torch.Tensor:
+    """Attend a sliding window and optional compressed keys in logical document coordinates.
+
+    Args:
+        x: Attention queries [batch, heads, query_length, head_dim] in BNSD layout.
+        raw_key: Raw-token key/value bank [batch, 1, key_length, head_dim].
+        compressed_key: Optional compressed key/value bank [batch, 1, compressed_length, head_dim].
+        topk_indices: Optional selected compressed-key IDs; -1 denotes an unused slot.
+        sinks: Per-head attention sink logits.
+        scale: Query-key score multiplier.
+        window: Number of raw positions in the causal sliding window.
+        layout: Logical query and document geometry.
+        global_sequence_length: Global raw-token sequence length.
+        raw_key_offset: Global raw-token offset of the supplied raw bank.
+        main_key_offset: Global compressed-key offset of the supplied main bank.
+        global_key_length: Optional full compressed-bank length for visibility checks.
+
+    Returns:
+        Attention states in BSND layout.
+
+    Notes:
+        Attend a causal raw-token window and optional selected compressed keys.
+
+        Raw and compressed keys share logical document coordinates supplied by
+        layout and the bank offsets. The keys also supply attention values; sinks
+        contribute to the softmax normalization. No attention crosses document
+        boundaries. Return BSND output while retaining gradients through attention states.
+    """
+    implementation = _select_for_call(DSA_COMPRESSED_BANKS, device=x.device)
+    return implementation(
+        x,
+        raw_key,
+        compressed_key,
+        topk_indices,
+        sinks,
+        scale=scale,
+        window=window,
+        layout=layout,
+        global_sequence_length=global_sequence_length,
+        raw_key_offset=raw_key_offset,
+        main_key_offset=main_key_offset,
+        global_key_length=global_key_length,
+    )
+
+
+DSA_COMPRESSED_BANKS = OpSpec[DsaCompressedBanksFn](config_key='deepseek_sparse_attention', variant='compressed_banks')
 
 
 class PackedDeepseekSparseAttentionFn(Protocol):
-    """Attend packed, absorbed MLA states and expose per-head sparse softmax statistics."""
+    """Compute sparse absorbed MLA inside packed, right-aligned causal documents.
+
+    Gather document-local TopK keys and combine latent and rotary query-key
+    scores before softmax. Without parameter sinks, values come from latent
+    keys and the rotary output tail is zero-padded. Optional learned sink
+    keys/values participate in attention. Returned sparse statistics are detached
+    teacher values; their max/sum describe the selected non-sink scores.
+    """
 
     def __call__(
         self, x: torch.Tensor, key: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
         topk_indices: torch.Tensor, scale: float, query_ends: torch.Tensor, key_ends: torch.Tensor,
         *, sink_key: torch.Tensor | None = None, sink_value: torch.Tensor | None = None, dropout: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return padded BSND output and sparse max/sum in KV-head, token, group layout."""
+        """Return padded BSND output and sparse max/sum in KV-head, token, group layout.
+
+        Args:
+            x: Absorbed query states in BSND layout.
+            key: Latent key/value states in BSND layout.
+            query_rope: Rotary query components in BSND layout.
+            key_rope: Rotary key components in BSND layout.
+            topk_indices: Document-local key IDs [total_queries, kv_heads, top_k], with -1 padding.
+            scale: Multiplier applied to the combined latent and rotary scores.
+            query_ends: Cumulative packed query document ends.
+            key_ends: Cumulative packed key document ends.
+            sink_key: Optional learned sink keys for the parameter-sink variant.
+            sink_value: Optional learned sink values paired with sink_key.
+            dropout: Attention probability dropout for the parameter-sink path.
+
+        Returns:
+            A tuple of padded BSND outputs and detached sparse softmax maxima/sums in [kv_heads,
+            total_queries, groups] layout.
+        """
 
 
 DSA_ABSORBED = OpSpec[PackedDeepseekSparseAttentionFn](
-    config_key="deepseek_sparse_attention", variant="absorbed_with_stats",
+    config_key='deepseek_sparse_attention', variant='absorbed_with_stats'
 )
 DSA_ABSORBED_SINK = OpSpec[PackedDeepseekSparseAttentionFn](
-    config_key="deepseek_sparse_attention", variant="absorbed_with_parameter_sink",
+    config_key='deepseek_sparse_attention', variant='absorbed_with_parameter_sink'
 )
+
+
+def deepseek_sparse_attention_absorbed(
+    x: torch.Tensor,
+    key: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    topk_indices: torch.Tensor,
+    scale: float,
+    query_ends: torch.Tensor,
+    key_ends: torch.Tensor,
+    *,
+    sink_key: torch.Tensor | None = None,
+    sink_value: torch.Tensor | None = None,
+    dropout: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return padded BSND output and sparse max/sum in KV-head, token, group layout.
+
+    Args:
+        x: Absorbed query states in BSND layout.
+        key: Latent key/value states in BSND layout.
+        query_rope: Rotary query components in BSND layout.
+        key_rope: Rotary key components in BSND layout.
+        topk_indices: Document-local key IDs [total_queries, kv_heads, top_k], with -1 padding.
+        scale: Multiplier applied to the combined latent and rotary scores.
+        query_ends: Cumulative packed query document ends.
+        key_ends: Cumulative packed key document ends.
+        sink_key: Optional learned sink keys for the parameter-sink variant.
+        sink_value: Optional learned sink values paired with sink_key.
+        dropout: Attention probability dropout for the parameter-sink path.
+
+    Returns:
+        A tuple of padded BSND outputs and detached sparse softmax maxima/sums in [kv_heads,
+        total_queries, groups] layout.
+
+    Notes:
+        Compute sparse absorbed MLA inside packed, right-aligned causal documents.
+
+        Gather document-local TopK keys and combine latent and rotary query-key
+        scores before softmax. Without parameter sinks, values come from latent
+        keys and the rotary output tail is zero-padded. Optional learned sink
+        keys/values participate in attention. Returned sparse statistics are detached
+        teacher values; their max/sum describe the selected non-sink scores.
+    """
+    operation = _select_for_call(DSA_ABSORBED, device=x.device)
+    return operation(
+        x,
+        key,
+        query_rope,
+        key_rope,
+        topk_indices,
+        scale,
+        query_ends,
+        key_ends,
+        sink_key=sink_key,
+        sink_value=sink_value,
+        dropout=dropout,
+    )
+
+
+def deepseek_sparse_attention_with_sink(
+    x: torch.Tensor,
+    key: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    topk_indices: torch.Tensor,
+    scale: float,
+    query_ends: torch.Tensor,
+    key_ends: torch.Tensor,
+    *,
+    sink_key: torch.Tensor | None = None,
+    sink_value: torch.Tensor | None = None,
+    dropout: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return padded BSND output and sparse max/sum in KV-head, token, group layout.
+
+    Args:
+        x: Absorbed query states in BSND layout.
+        key: Latent key/value states in BSND layout.
+        query_rope: Rotary query components in BSND layout.
+        key_rope: Rotary key components in BSND layout.
+        topk_indices: Document-local key IDs [total_queries, kv_heads, top_k], with -1 padding.
+        scale: Multiplier applied to the combined latent and rotary scores.
+        query_ends: Cumulative packed query document ends.
+        key_ends: Cumulative packed key document ends.
+        sink_key: Optional learned sink keys for the parameter-sink variant.
+        sink_value: Optional learned sink values paired with sink_key.
+        dropout: Attention probability dropout for the parameter-sink path.
+
+    Returns:
+        A tuple of padded BSND outputs and detached sparse softmax maxima/sums in [kv_heads,
+        total_queries, groups] layout.
+
+    Notes:
+        Compute sparse absorbed MLA inside packed, right-aligned causal documents.
+
+        Gather document-local TopK keys and combine latent and rotary query-key
+        scores before softmax. Without parameter sinks, values come from latent
+        keys and the rotary output tail is zero-padded. Optional learned sink
+        keys/values participate in attention. Returned sparse statistics are detached
+        teacher values; their max/sum describe the selected non-sink scores.
+    """
+    operation = _select_for_call(DSA_ABSORBED_SINK, device=x.device)
+    return operation(
+        x,
+        key,
+        query_rope,
+        key_rope,
+        topk_indices,
+        scale,
+        query_ends,
+        key_ends,
+        sink_key=sink_key,
+        sink_value=sink_value,
+        dropout=dropout,
+    )
 
 
 def _native_absorbed(
@@ -271,7 +496,7 @@ def native_deepseek_sparse_attention(
     )
 
 
-def attention_native_only(
+def _attention_input_error(
     x: torch.Tensor, layout: DsaQueryLayout, window: int, topk_indices: torch.Tensor | None,
     global_sequence_length: int, global_key_length: int | None,
 ) -> str | None:
@@ -292,6 +517,9 @@ def _cann_attention(
     main_key_offset: int = 0, global_key_length: int | None = None,
 ) -> torch.Tensor:
     """Run compressed-bank sparse MLA through the CANN adapter."""
+    reason = _attention_input_error(x, layout, window, topk_indices, global_sequence_length, global_key_length)
+    if reason is not None:
+        raise ValueError(reason)
     del global_sequence_length, global_key_length
     output = sparse_flash_mla(
         x, raw_key, compressed_key, topk_indices, sinks, scale, layout.compress_ratio, window,

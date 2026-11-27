@@ -31,7 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
-from hyper_parallel.components.functional import (
+from hyper_parallel.components.ops import (
     grouped_matmul,
     moe_token_permute,
     moe_token_unpermute,
@@ -41,7 +41,7 @@ from hyper_parallel.components.functional import (
 
 @module_replacement
 class GroupedExperts(nn.Module):
-    """Transformers-compatible NPU grouped routed experts.
+    """Transformers-compatible routed experts using selectable grouped operators.
 
     Holds gate_up_proj/up_proj, down_proj (and optional bias1, bias2) as nn.Parameters.
     Computation logic is handled by _grouped_gemm_expert_forward.
@@ -390,7 +390,7 @@ class GroupedExperts(nn.Module):
     def _grouped_gemm_expert_forward(
         self, gate_up_proj, down_proj, permuted, tokens_per_expert, permuted_probs
     ):
-        """GroupGemm expert computation (NPU-only)."""
+        """Run expert-major projections through the configured grouped GEMM backend."""
         self._tokens_per_expert_gmm = tokens_per_expert.to(device=permuted.device)
         self._group_list = self._tokens_per_expert_gmm.cumsum(dim=0)
 
@@ -401,7 +401,7 @@ class GroupedExperts(nn.Module):
         numel = permuted.nelement()
         if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
             fc1_output = grouped_matmul(  # pylint: disable=not-callable
-                permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
+                permuted, gate_up_proj, group_list=self._group_list,
             )
             if self.add_bias:
                 b1 = self.bias1.view(self.num_local_experts, -1)
@@ -412,10 +412,8 @@ class GroupedExperts(nn.Module):
 
         # down
         if not self.router_gating_in_fp32 and permuted_probs is not None:
-            fc1_output = (
-                self.activation_func(fc1_output)
-                * permuted_probs.reshape(*fc1_output.shape[:-1], 1)
-            )
+            activated = self.activation_func(fc1_output)
+            fc1_output = (activated * permuted_probs.reshape(*fc1_output.shape[:-1], 1)).to(activated.dtype)
         else:
             fc1_output = self.activation_func(fc1_output)
 
@@ -425,7 +423,7 @@ class GroupedExperts(nn.Module):
         numel = fc1_output.nelement()
         if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
             fc2_output = grouped_matmul(  # pylint: disable=not-callable
-                fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
+                fc1_output, down_proj, group_list=self._group_list,
             )
             if self.add_bias:
                 b2 = self.bias2.view(self.num_local_experts, -1)
@@ -471,18 +469,14 @@ class GroupedExperts(nn.Module):
         """Run grouped experts with the Transformers Experts interface."""
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        permuted_tokens, sorted_indices = moe_token_permute(  # pylint: disable=not-callable
+        permuted_tokens, order, positions = moe_token_permute(  # pylint: disable=not-callable
             hidden_states_flat,
             top_k_index,
         )
         flatten_probs = top_k_weights.view(-1)
-        permuted_probs = flatten_probs.index_select(0, sorted_indices)
-        tokens_per_expert = torch.histc(
-            top_k_index.view(-1).float(),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        ).long()
+        permuted_probs = flatten_probs.index_select(0, order)
+        ids = top_k_index.reshape(-1).long()
+        tokens_per_expert = ids.new_zeros(self.num_experts).scatter_add_(0, ids, torch.ones_like(ids))
         expert_outputs = self.forward_expert_major(
             permuted_tokens,
             tokens_per_expert,
@@ -490,8 +484,8 @@ class GroupedExperts(nn.Module):
         )
         output = moe_token_unpermute(  # pylint: disable=not-callable
             expert_outputs,
-            sorted_indices,
-            top_k_weights,
+            positions,
+            top_k_weights if self.router_gating_in_fp32 else torch.ones_like(top_k_weights),
         )
         return output.view(hidden_shape)
 

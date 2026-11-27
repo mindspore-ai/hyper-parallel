@@ -173,6 +173,8 @@ class BuildPy(build_py):
 
     def run(self) -> None:
         """Build Python sources and copy the explicitly prepared indexed helper."""
+        if self.editable_mode:
+            return
         shutil.rmtree(self.build_lib, ignore_errors=True)
         super().run()
         target_lib_dir = os.path.join(self.build_lib, 'hyper_parallel')
@@ -252,6 +254,7 @@ if __name__ == '__main__':
         platforms=[get_platform()],
         include_package_data=True,
         package_data={
+            'hyper_parallel.components.ops': ['py.typed'],
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
             'hyper_parallel.components.functional._triton.gated_delta_net': ['GDN_LICENSE'],
             'hyper_parallel.components.functional._triton.kimi_delta_attention': ['KDA_README.md'],

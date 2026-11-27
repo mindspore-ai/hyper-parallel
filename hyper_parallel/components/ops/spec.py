@@ -14,6 +14,8 @@
 # ============================================================================
 """Typed contracts for selectable operator implementations."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, Literal, TypeVar
@@ -24,12 +26,17 @@ Fn = TypeVar("Fn", bound=Callable[..., object])
 
 @dataclass(frozen=True, init=False)
 class OpSpec(Generic[Fn]):
-    """Identify one callable contract within a YAML-configurable family."""
+    """Identify an operator family and variant with a typed backend contract."""
 
     config_key: str
     variant: str = "standard"
 
-    def __init__(self, *, config_key: str, variant: str = "standard") -> None:
+    def __init__(
+        self,
+        *,
+        config_key: str,
+        variant: str = "standard",
+    ) -> None:
         """Initialize the keyword-only contract without version-specific dataclass options."""
         object.__setattr__(self, "config_key", config_key)
         object.__setattr__(self, "variant", variant)

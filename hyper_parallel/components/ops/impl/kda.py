@@ -25,22 +25,104 @@ from torch.nn import functional as F
 from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import PackedSequenceInfo
 
 from .._dependency import require_package, require_symbol
+from ..factory import _select_for_call
 from ..registry import ImplementationUnavailable, OpRegistry
 from ..spec import OpSpec
 
 
 class KdaFn(Protocol):
-    """Compute KDA with normalized Q/K and a lower-bounded gate."""
+    """Evaluate local Kimi Delta Attention from a zero recurrent state.
+
+    L2-normalize Q/K and expand grouped key heads to value heads. Convert beta
+    logits with sigmoid. Convert shifted gate logits using a_log and dt_bias:
+    use -exp(a_log) * softplus(shifted) without a lower bound, otherwise use
+    lower_bound * sigmoid(exp(a_log) * shifted). Reset state between packed
+    documents. The native reference computes the recurrence in FP32.
+    """
 
     def __call__(
         self, x: torch.Tensor, key: torch.Tensor, value: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor,
         *, a_log: torch.Tensor, dt_bias: torch.Tensor, lower_bound: float | None,
         chunk_size: int = 64, scale: float | None = None, info: PackedSequenceInfo | None = None,
     ) -> torch.Tensor:
-        """Interpret gate and beta as logits and reset recurrence between packed documents."""
+        """Interpret gate and beta as logits and reset recurrence between packed documents.
+
+        Args:
+            x: Queries [batch, sequence, key_heads, key_dim].
+            key: Keys with the same layout as x.
+            value: Values [batch, sequence, value_heads, value_dim].
+            gate: Raw per-channel gate logits [batch, sequence, value_heads, key_dim].
+            beta: Raw update logits [batch, sequence, value_heads].
+            a_log: Learned log decay coefficients, one per value head.
+            dt_bias: Learned gate offsets, one per value-head/key-dimension pair.
+            lower_bound: Optional negative gate lower bound; None selects the softplus gate.
+            chunk_size: Positive number of tokens per recurrence chunk.
+            scale: Optional query scaling; defaults to key_dim ** -0.5.
+            info: Optional local packed-document metadata with zero-state resets.
+
+        Returns:
+            Attention states [batch, sequence, value_heads, value_dim] in the value dtype.
+        """
 
 
-KDA = OpSpec[KdaFn](config_key="kda", variant="zero_state")
+def kda(
+    x: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    chunk_size: int = 64,
+    scale: float | None = None,
+    info: PackedSequenceInfo | None = None,
+) -> torch.Tensor:
+    """Compute zero-state KDA with raw gate and beta logits.
+
+    Args:
+        x: Queries [batch, sequence, key_heads, key_dim].
+        key: Keys with the same layout as x.
+        value: Values [batch, sequence, value_heads, value_dim].
+        gate: Raw per-channel gate logits [batch, sequence, value_heads, key_dim].
+        beta: Raw update logits [batch, sequence, value_heads].
+        a_log: Learned log decay coefficients, one per value head.
+        dt_bias: Learned gate offsets, one per value-head/key-dimension pair.
+        lower_bound: Optional negative gate lower bound; None selects the softplus gate.
+        chunk_size: Positive number of tokens per recurrence chunk.
+        scale: Optional query scaling; defaults to key_dim ** -0.5.
+        info: Optional local packed-document metadata with zero-state resets.
+
+    Returns:
+        Attention states [batch, sequence, value_heads, value_dim] in the value dtype.
+
+    Notes:
+        Evaluate local Kimi Delta Attention from a zero recurrent state.
+
+        L2-normalize Q/K and expand grouped key heads to value heads. Convert beta
+        logits with sigmoid. Convert shifted gate logits using a_log and dt_bias:
+        use -exp(a_log) * softplus(shifted) without a lower bound, otherwise use
+        lower_bound * sigmoid(exp(a_log) * shifted). Reset state between packed
+        documents. The native reference computes the recurrence in FP32.
+    """
+    operation = _select_for_call(KDA, device=x.device)
+    return operation(
+        x,
+        key,
+        value,
+        gate,
+        beta,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        chunk_size=chunk_size,
+        scale=scale,
+        info=info,
+    )
+
+
+KDA = OpSpec[KdaFn](config_key='kda', variant='zero_state')
 
 
 def _inverse_unit_lower_triangular(strict_lower: torch.Tensor) -> torch.Tensor:
@@ -227,20 +309,45 @@ def _implementation(backend: str) -> KdaFn:
     chunk_kda = import_module("hyper_parallel.components.functional.kimi_delta_attention").chunk_kda
 
     def run(
-        x: torch.Tensor, key: torch.Tensor, value: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor,
-        *, a_log: torch.Tensor, dt_bias: torch.Tensor, lower_bound: float | None,
-        chunk_size: int = 64, scale: float | None = None, info: PackedSequenceInfo | None = None,
+        x: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float | None,
+        chunk_size: int = 64,
+        scale: float | None = None,
+        info: PackedSequenceInfo | None = None,
     ) -> torch.Tensor:
         """Run the selected fused KDA kernel with per-call document boundaries."""
+        _validate_fused_inputs(
+            x, key, value, gate, beta, lower_bound=lower_bound, chunk_size=chunk_size, backend=backend
+        )
         offsets = None
         if info is not None:
-            offsets = (info.materialize(x.device, chunk_size).cu_seqlens if backend == "triton" else info.local_offsets)
+            offsets = info.materialize(x.device, chunk_size).cu_seqlens if backend == "triton" else info.local_offsets
         output, _ = chunk_kda(
-            x, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale, lower_bound=lower_bound,
-            chunk_size=chunk_size, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True, backend=backend, cu_seqlens=offsets,
+            x,
+            key,
+            value,
+            gate,
+            beta,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            lower_bound=lower_bound,
+            chunk_size=chunk_size,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            backend=backend,
+            cu_seqlens=offsets,
         )
         return output
+
     return run
 
 
@@ -268,3 +375,39 @@ def register_kda(registry: OpRegistry) -> None:
     registry.register_impl(KDA, name="native", devices=("cpu", "cuda", "npu"), load=lambda: _native)
     registry.register_impl(KDA, name="triton_ascend", devices=("npu",), load=_load_triton)
     registry.register_impl(KDA, name="ascendc", devices=("npu",), load=_load_ascendc)
+
+
+def _validate_fused_inputs(
+    x: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    lower_bound: float | None,
+    chunk_size: int = 64,
+    backend: str,
+) -> None:
+    """Reject unsupported inputs in the selected fused implementation."""
+    reason = None
+    if (
+        lower_bound is None
+        or not -5.0 <= lower_bound < 0
+        or chunk_size != 64
+        or (x.shape[-1] != 128)
+        or (value.shape[-1] != 128)
+        or (x.dtype != torch.bfloat16)
+        or (key.dtype != x.dtype)
+        or (value.dtype != x.dtype)
+    ):
+        reason = 'fused KDA requires a safe gate, chunk size 64, head dimension 128 and BF16 Q/K/V'
+    blocked = []
+    if gate.dtype != x.dtype or beta.dtype != x.dtype:
+        blocked.append(('triton_ascend', 'requires BF16 gate and beta'))
+    if x.shape[2] != value.shape[2]:
+        blocked.append(('ascendc', 'requires matching Q/K/V head counts'))
+    if reason is not None:
+        raise ValueError(reason)
+    for name, message in blocked:
+        if name == {'triton': 'triton_ascend'}.get(backend, backend):
+            raise ValueError(message)
