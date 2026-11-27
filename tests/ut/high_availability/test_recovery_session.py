@@ -30,7 +30,7 @@ from hyper_parallel.high_availability.group_registry import (
 )
 from hyper_parallel.high_availability.recovery_session import MetadataMirrorError, RecoverySession
 from hyper_parallel.high_availability.recovery_state import ModelOptimizerState, TrainState
-from hyper_parallel.high_availability.replica_transport import DeviceMetadataBank, deserialize_metadata
+from hyper_parallel.high_availability.replica_transport import DeviceMetadataBank
 from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.muon import Muon
 from tests.ut.high_availability.test_recovery_state import StatefulValue
@@ -121,8 +121,8 @@ class TestRecoverySession(unittest.TestCase):
             events.append("optimizer_and_scheduler")
         self.assertEqual(events, ["start", "optimizer_and_scheduler", "metadata_ack", ("end", 1, 0)])
         self.assertEqual(self.session.step, 1)
-        metadata = deserialize_metadata(self.session.metadata_bank.get(1, 1)["payload"].numpy().tobytes())
-        self.assertEqual(metadata["state"]["rank_state"]["loader"]["value"], 1)
+        metadata = self.session.metadata_bank.get_rank_metadata(1, 1)
+        self.assertEqual(metadata["rank_state"]["loader"]["value"], 1)
 
     def test_hccl_update_uses_barrier_without_a_duplicate_pre_update_device_fence(self) -> None:
         """Feature: One HCCL barrier covers local readiness before the SDK update window.
@@ -591,6 +591,34 @@ class TestRecoverySession(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "replica repair"):
             self.session._rollback(1, [], None)
 
+    def test_rollback_restores_buffers_from_cpu_for_every_rank(self):
+        """Restore both local and received CPU buffer snapshots through the same rollback path."""
+        for received in (False, True):
+            with self.subTest(received=received):
+                self.model.register_buffer("counter", torch.tensor([8]))
+                self.session.model_state = ModelOptimizerState(self.model, AdamW(self.model.parameters()))
+                self.session.step = self.session._device_state_step = 0
+                with self.session.update(1):
+                    pass
+                metadata = self.session.metadata_bank.get_rank_metadata(1, 1)
+                if received:
+                    received_metadata = {**metadata, "buffers": {"counter": torch.tensor([10])}}
+                    replica_state = self.session.metadata_bank.get_replica_state(1)
+                    self.session.metadata_bank.put_snapshot(1, received_metadata, replica_state)
+                self.model.counter.fill_(9)
+                restore = self.session.model_state.restore_model_state
+                with patch.object(
+                    self.session.model_state, "restore_model_state", wraps=restore
+                ) as restore_state:
+                    self.session._rollback(1, [], None)
+                    restore_state.assert_called_once_with(
+                        self.session.metadata_bank.get_rank_metadata(1, 1)["buffers"], {}
+                    )
+                self.assertEqual(self.model.counter.item(), 10 if received else 8)
+                self.model.counter.fill_(11)
+                self.session._rollback(1, [], None)
+                self.assertEqual(self.model.counter.item(), 10 if received else 8)
+
     def test_repair_uses_mindio_rank_list_and_releases_temporary_group(self):
         """Feature: MindIO-selected repair participants.
 
@@ -1015,8 +1043,7 @@ class TestProcessorBootstrap(unittest.TestCase):
                         self.assertEqual(session.rank, 13 if initialized else 9)
                         self.assertEqual(session.world_size, 32 if initialized else 16)
                         self.assertEqual(session.local_rank, 1)
-                        self.assertEqual(session.metadata_bank.rank, session.rank)
-                        self.assertEqual(session.metadata_bank.device, torch.device("cpu"))
+                        self.assertIsNone(session.metadata_bank)
                         self.assertEqual(session.reboot, reboot)
                         npu.set_device.assert_called_once_with(1)
                         self.assertEqual(get_rank.call_count, int(initialized))

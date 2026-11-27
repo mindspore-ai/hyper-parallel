@@ -209,15 +209,16 @@ class TestDeviceState(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "optimizer-state ownership mismatch"):
             state.prepare_receive(metadata)
 
-    def test_rank_buffers_stay_on_their_original_device(self):
+    def test_rank_buffers_have_independent_cpu_snapshots(self):
         model = torch.nn.Linear(4, 4)
         model.register_buffer("counter", torch.tensor([8]))
         state = ModelOptimizerState(model, AdamW(model.parameters()))
         saved = state.rank_state()
         model.counter.fill_(9)
-        state.restore_rank_state(saved["buffers"], saved["extra"])
+        state.restore_model_state(saved["buffers"], saved["extra"])
         self.assertEqual(model.counter.item(), 8)
-        self.assertEqual(saved["buffers"]["counter"].device, model.counter.device)
+        self.assertEqual(saved["buffers"]["counter"].device, torch.device("cpu"))
+        self.assertNotEqual(saved["buffers"]["counter"].data_ptr(), model.counter.data_ptr())
 
     def test_reboot_defers_shape_collectives_until_groups_are_rebuilt(self):
         """Rebuild shard metadata after bootstrap and reuse the existing optimizer plan."""
@@ -377,7 +378,7 @@ class TestTrainState(unittest.TestCase):
         self.assertEqual(set(saved["rank_state"]["rng"]), {"python", "numpy", "torch", "device"})
         expected = (random.random(), np.random.rand(), torch.rand(3), torch.rand(3, generator=generator))
         loader.value, scheduler.value = 9, 90
-        codec.restore(saved)
+        codec.restore(saved["rank_state"], saved["replica_state"])
         self.assertEqual(events, [8, 80])
         iter(())
         codec.restore_pending_rng()
@@ -398,7 +399,7 @@ class TestTrainState(unittest.TestCase):
         codec = TrainState(StatefulValue(8), {}, device=device)
         saved = codec.capture()
         expected = torch.rand(3, generator=generator)
-        codec.restore(saved)
+        codec.restore(saved["rank_state"], saved["replica_state"])
         device.set_rng_state.assert_not_called()
         with self.assertRaisesRegex(RuntimeError, "RNG restore failed"):
             codec.restore_pending_rng()
@@ -440,7 +441,7 @@ class TestTrainState(unittest.TestCase):
         saved = codec.capture()
         expected = (random.random(), np.random.rand(), torch.rand(3))
         loader.value, scheduler.value = 9, 90
-        codec.restore(saved)
+        codec.restore(saved["rank_state"], saved["replica_state"])
         self.assertEqual(loader.value, 8)
         self.assertEqual(scheduler.value, 80)
         iter(())
@@ -465,7 +466,7 @@ class TestTrainState(unittest.TestCase):
             np.random.rand()
             torch.rand(1)
             torch.rand(1, generator=generator)
-        codec.restore(saved)
+        codec.restore(saved["rank_state"], saved["replica_state"])
         random.random()
         np.random.rand()
         torch.rand(1)
@@ -516,7 +517,7 @@ class TestTrainState(unittest.TestCase):
             TrainState(StatefulValue(), replica_providers={"scheduler": object()})
         del snapshot["replica_state"]["progress"]
         with self.assertRaisesRegex(RuntimeError, "provider schema mismatch"):
-            state.restore(snapshot)
+            state.restore(snapshot["rank_state"], snapshot["replica_state"])
 
     def test_custom_generator_and_refused_cursor(self):
         """Feature: Explicit Generator restore and rejected loader rollback.
@@ -529,13 +530,13 @@ class TestTrainState(unittest.TestCase):
         codec = TrainState(loader, {}, generators={"dropout": generator})
         saved = codec.capture()
         expected = torch.rand(4, generator=generator)
-        codec.restore(saved)
+        codec.restore(saved["rank_state"], saved["replica_state"])
         iter(())
         codec.restore_pending_rng()
         torch.testing.assert_close(torch.rand(4, generator=generator), expected, rtol=0, atol=0)
         loader.load_state_dict = lambda state: False
         with self.assertRaisesRegex(RuntimeError, "refused"):
-            codec.restore(saved)
+            codec.restore(saved["rank_state"], saved["replica_state"])
 
     def test_reentry_iterator_does_not_advance_committed_rng(self):
         """Feature: Extra iterator seed draws do not shift resumed training RNG.
@@ -557,7 +558,7 @@ class TestTrainState(unittest.TestCase):
         random.random()
         np.random.rand()
         torch.rand(1)
-        codec.restore(state)
+        codec.restore(state["rank_state"], state["replica_state"])
         iterator = iter(codec.loader)
         codec.restore_pending_rng()
         self.assertEqual(next(iterator), 8)
@@ -641,8 +642,8 @@ class TestRecomputeRecovery(unittest.TestCase):
                             self.assertEqual(name, saved_name)
                             target.copy_(source)
                     rank_state = saved["rank_state"]
-                    state.restore_rank_state(rank_state["buffers"], rank_state["extra"])
-                    train_state.restore(saved["training"])
+                    state.restore_model_state(rank_state["buffers"], rank_state["extra"])
+                    train_state.restore(saved["training"]["rank_state"], saved["training"]["replica_state"])
                     train_state.restore_pending_rng()
                     _iteration()
                 if step == 1:

@@ -128,8 +128,8 @@ class _MemorySession:
         except RuntimeError as error:
             if str(error) != "injected forward failure":
                 raise
-            self.codec.restore_rank_state(self.snapshot[0]["buffers"], self.snapshot[0]["extra"])
-            self.train_state.restore(self.snapshot[1])
+            self.codec.restore_model_state(self.snapshot[0]["buffers"], self.snapshot[0]["extra"])
+            self.train_state.restore(self.snapshot[1]["rank_state"], self.snapshot[1]["replica_state"])
             result = body()
         self.events.append("sdk_exit")
         return result
@@ -167,7 +167,7 @@ class TestTrainerReentry(unittest.TestCase):
         saved = state.capture()
         expected = loader.source_dataloader.generator.get_state()
         self.assertNotIn("_hp_generator_state", loader.source_dataloader.state_dict())
-        state.restore(saved)
+        state.restore(saved["rank_state"], saved["replica_state"])
 
         @recovery_epoch_initialized
         def _initialize(active):
@@ -207,7 +207,7 @@ class TestTrainerReentry(unittest.TestCase):
                     snapshot = state.capture()
                     keys = set(snapshot["replica_state"])
                     self.assertEqual(keys, {"progress", "profiler", "memory_profiler"} if enabled else {"progress"})
-                    state.restore(snapshot)
+                    state.restore(snapshot["rank_state"], snapshot["replica_state"])
                     return body()
 
                 session.run = _run
@@ -435,7 +435,7 @@ class TestTrainerReentry(unittest.TestCase):
             saved = training.capture()
             expected = torch.rand(3)
             torch.rand(11)
-            training.restore(saved)
+            training.restore(saved["rank_state"], saved["replica_state"])
             session.reboot = False
             actual = body()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -26,11 +26,14 @@ class WorkerRecoveryConfig:
         enable: Enable process recovery; disabled by default.
         controller_ip: Rank zero's reachable address; omit to use TaskD.
         controller_port: Rank-zero listening port; defaults to 8000 when an IP is supplied.
+        mirror_metadata: Mirror rank-specific state each step. Disable only when replica
+            RNG, data state, buffers and extra state are interchangeable.
     """
 
     enable: bool = False
     controller_ip: str = ""
     controller_port: Optional[int] = None
+    mirror_metadata: bool = True
 
     def __post_init__(self) -> None:
         """Distinguish omitted endpoints from explicitly hosted Controllers."""

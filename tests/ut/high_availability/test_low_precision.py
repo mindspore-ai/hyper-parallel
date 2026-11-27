@@ -181,7 +181,7 @@ class TestLowPrecisionRecovery(unittest.TestCase):
                         with torch.no_grad():
                             for name, tensor in donor_state.tensor_items():
                                 destination[name].copy_(tensor)
-                        target_state.restore_rank_state(rank_state["buffers"], rank_state["extra"])
+                        target_state.restore_model_state(rank_state["buffers"], rank_state["extra"])
                         self._step(donor, donor_optimizer, value)
                         self._step(target, target_optimizer, value)
                         destination = dict(target_state.tensor_items())

@@ -72,7 +72,7 @@ class RecoverySession:
             raise ValueError("TORCH_DIST_INIT_BARRIER must be 0 for replacement worker construction")
         self.npu.set_device(self.local_rank)
         self.groups = GroupRegistry()
-        self.metadata_bank = DeviceMetadataBank(self.rank, torch.device("npu", self.local_rank))
+        self.metadata_bank = None
         self.replica_transport = None
         self.topology = None
         self.model_adapter = None
@@ -193,18 +193,29 @@ class RecoverySession:
         for name, handler in handlers.items():
             getattr(self.sdk, f"tft_register_{name}_handler")(handler)
         group = self.topology.get_metadata_group(self.rank, self.groups)
+        self.metadata_bank = DeviceMetadataBank(
+            self.rank,
+            torch.device("npu", self.local_rank),
+        )
         self.replica_transport = ReplicaTransport(
             group,
             self.metadata_bank,
             self.model_state,
             torch.device("npu", self.local_rank),
+            mirror_metadata=self.config.mirror_metadata,
         )
         self.groups.sealed = True
 
     def _capture_metadata(self, step: int) -> None:
         """Keep rank-specific metadata and mutable buffers; never snapshot weights or moments."""
-        state = self.model_state.rank_state()
-        self.metadata_bank.put(step, {"state": self.train_state.capture(), "extra": state["extra"]}, state["buffers"])
+        model_state = self.model_state.rank_state()
+        training_state = self.train_state.capture()
+        rank_metadata = {
+            "rank_state": training_state["rank_state"],
+            "extra": model_state["extra"],
+            "buffers": model_state["buffers"],
+        }
+        self.metadata_bank.put_snapshot(step, rank_metadata, training_state["replica_state"])
 
     def initialize_training_progress(self, step: int) -> None:
         """Align the initial progress after native start callbacks without mirroring state.
@@ -411,11 +422,11 @@ class RecoverySession:
         # MindIO waits for all rebuild and repair replies before global rollback.
         # Muon's shape collectives must not run while a peer still clears HCCL keys.
         self.model_state.rebuild_runtime_state()
-        snapshot = self.metadata_bank.get(self.rank, step)
         self.npu.set_device(self.local_rank)
-        metadata = self.metadata_bank.metadata(self.rank, step)
-        self.model_state.restore_rank_state(snapshot["buffers"], metadata["extra"])
-        self.train_state.restore(metadata["state"])
+        rank_metadata = self.metadata_bank.get_rank_metadata(self.rank, step)
+        replica_state = self.metadata_bank.get_replica_state(step)
+        self.model_state.restore_model_state(rank_metadata["buffers"], rank_metadata["extra"])
+        self.train_state.restore(rank_metadata["rank_state"], replica_state)
         # Replacements have no saved plans. All ranks must rebuild together so
         # the next checkpoint uses the same sequence of planning collectives.
         standard_planner.StandardSavePlanner.cached_save_result.clear()
