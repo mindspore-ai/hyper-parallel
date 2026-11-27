@@ -70,6 +70,7 @@ class DeepseekV41MegaGate(MegaGate):
                 scoring_func=module.scoring_func,
                 routed_scaling_factor=module.routed_scaling_factor,
                 vision_enabled=module.bias_vl is not None,
+                initializer_range=module.initializer_range,
             )
 
         self.weight = module.weight
@@ -87,6 +88,11 @@ class DeepseekV41MegaGate(MegaGate):
             value=torch.zeros(2, self.num_experts, dtype=torch.long, device="cpu"),
         )
         self.train(module.training)
+
+    @staticmethod
+    def make_transforms() -> list:
+        """Preserve the source router's checkpoint parameter names and layouts."""
+        return []
 
     def forward(
             self,
