@@ -820,47 +820,57 @@ def test_swap_muon_packed_swap() -> None:
 
 
 def test_swap_muon_packed_mixed_dtype() -> None:
-    """Compare packed and bare Muon updates across separate dtype regions."""
+    """Compare packed and bare Muon updates for both mixed-dtype orders.
+
+    Feature: Mixed-dtype Muon state swap.
+    Description: Run bare, per-tensor swap and packed swap with one shared parameter group.
+    Expectation: Parameter and momentum trajectories match for both FP32/BF16 orders.
+    """
     print("test_swap_muon_packed_mixed_dtype")
-    initial = [
+    mixed_initial = [
         torch.arange(24, dtype=torch.float32).reshape(4, 6) * 0.01,
         torch.arange(40, dtype=torch.bfloat16).reshape(5, 8) * 0.01,
     ]
-    bare_params = [torch.nn.Parameter(value.npu()) for value in initial]
-    per_tensor_params = [torch.nn.Parameter(value.npu()) for value in initial]
-    packed_params = [torch.nn.Parameter(value.npu()) for value in initial]
-    # Match the existing per-unit foreach boundaries for exact bare parity:
-    # NPU mixed-dtype foreach has different BF16 rounding from separate calls.
-    bare = Muon([{"params": [param]} for param in bare_params], lr=0.013, momentum=0.93)
-    per_tensor = swap_optimizer(
-        Muon(per_tensor_params, lr=0.013, momentum=0.93),
-        SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=False),
-    )
-    packed = swap_optimizer(
-        Muon(packed_params, lr=0.013, momentum=0.93),
-        SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=True),
-    )
+    for initial in (mixed_initial, list(reversed(mixed_initial))):
+        bare_params = [torch.nn.Parameter(value.npu()) for value in initial]
+        per_tensor_params = [torch.nn.Parameter(value.npu()) for value in initial]
+        packed_params = [torch.nn.Parameter(value.npu()) for value in initial]
+        bare = Muon(bare_params, lr=0.013, momentum=0.93)
+        per_tensor = swap_optimizer(
+            Muon(per_tensor_params, lr=0.013, momentum=0.93),
+            SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=False),
+        )
+        packed = swap_optimizer(
+            Muon(packed_params, lr=0.013, momentum=0.93),
+            SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=True),
+        )
 
-    for step in range(3):
-        for bare_param, per_tensor_param, packed_param in zip(bare_params, per_tensor_params, packed_params):
-            grad = torch.arange(bare_param.numel(), dtype=torch.float32).reshape(bare_param.shape)
-            grad = (grad * 0.001 + step + 1).to(dtype=bare_param.dtype, device="npu")
-            bare_param.grad = grad
-            per_tensor_param.grad = grad.clone()
-            packed_param.grad = grad.clone()
-        bare.step()
-        per_tensor.step()
-        packed.step()
-        for bare_param, per_tensor_param, packed_param in zip(bare_params, per_tensor_params, packed_params):
-            torch.testing.assert_close(packed_param, bare_param, rtol=0, atol=0)
-            torch.testing.assert_close(packed_param, per_tensor_param, rtol=0, atol=0)
-            torch.testing.assert_close(
-                packed.state[packed_param]["momentum_buffer"],
-                bare.state[bare_param]["momentum_buffer"].cpu(),
-                rtol=0,
-                atol=0,
-            )
+        for step in range(3):
+            params = zip(bare_params, per_tensor_params, packed_params)
+            for bare_param, per_tensor_param, packed_param in params:
+                grad = torch.arange(bare_param.numel(), dtype=torch.float32).reshape(bare_param.shape)
+                grad = (grad * 0.001 + step + 1).to(dtype=bare_param.dtype, device="npu")
+                bare_param.grad = grad
+                per_tensor_param.grad = grad.clone()
+                packed_param.grad = grad.clone()
+            bare.step()
+            per_tensor.step()
+            packed.step()
+            params = zip(bare_params, per_tensor_params, packed_params)
+            for bare_param, per_tensor_param, packed_param in params:
+                torch.testing.assert_close(packed_param, bare_param, rtol=0, atol=0)
+                torch.testing.assert_close(packed_param, per_tensor_param, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    packed.state[packed_param]["momentum_buffer"],
+                    bare.state[bare_param]["momentum_buffer"].cpu(),
+                    rtol=0,
+                    atol=0,
+                )
 
-    assert {slot.cpu_tensor.dtype for slot in packed.adapter.all_slots()} == {torch.float32, torch.bfloat16}
-    _assert_swap_state_offloaded(packed, expected_params=2)
-    _release_device_memory()
+        slot_dtypes = {slot.cpu_tensor.dtype for slot in packed.adapter.all_slots()}
+        assert slot_dtypes == {torch.float32, torch.bfloat16}, (
+            f"Expected FP32 and BF16 momentum slots, got {slot_dtypes}"
+        )
+        _assert_swap_state_offloaded(packed, expected_params=2)
+        del bare, per_tensor, packed, bare_params, per_tensor_params, packed_params
+        _release_device_memory()
