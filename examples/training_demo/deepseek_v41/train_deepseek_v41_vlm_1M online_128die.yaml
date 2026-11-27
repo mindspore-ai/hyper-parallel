@@ -1,8 +1,8 @@
 # Multiple hosts: 128 Ascend dies, TP1/CP128/EP128, dense DP1, GBS1/micro1.
 # Retain all 40 decoder layers and 32 vision blocks, divide parameter widths by 4,
 # and use 128 routed experts for 1,048,576-token image-caption pretraining.
-# Use Host Engram, fused CSA2 attention, MegaMoe, MegaMhc, and MegaGate.
-# Candidate pools are disabled; fixed expert destinations are for benchmarking.
+# Use Host Engram, fused CSA2 attention, GroupedExperts with MegaKernel, MegaMhc, and MegaGate.
+# Fused CSA2 uses ordinary causal Indexer selection without candidate pools.
 # Use BF16 initialization and gradient reduction without FP32 main parameters.
 # Full activation recomputation is enabled; FSDP prefetching is disabled.
 # Override local paths with the paired launcher or dotted Trainer options.
@@ -28,8 +28,6 @@ model:
   moe_aux_loss_coeff: 0.0001
   # Modality load statistics and bias updates; 0 disables them.
   moe_router_bias_update_rate: 0.001
-  # Benchmark-only balanced destinations when using the new Gate family.
-  moe_router_force_load_balancing: true
   # Generic HyperAutoModel build options accepted by the builder.
   torch_dtype: bfloat16
   validate_placement: false
@@ -98,10 +96,10 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: >-
-          hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
+        _target_: hyper_parallel.components.modules.CompressedSparseAttention2
         # Fused CSA2 requires candidate pools to remain disabled and TP=1.
         use_fused_ops: true
+        main_kv_comm: all_gather
   # Image boundary embeddings stay replicated over TP; FSDP owns their sharding.
   - match: "model"
     params:
@@ -154,21 +152,14 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  # Native alternative: remove the MegaMoe expert replacement below and select
-  # deepseek_v41_ep_compute_fn with use_grouped_gemm: true.
-  - match: "model.layers.*.mlp.forward"
-    replace:
-      kind: method
-      implementation:
-        _target_: >-
-          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
-  # MegaMoe supports CP and TP+SP with EP>1 and PP=1; pair it with the compute target above.
+  # The expert family owns EP transport and preserves the model router.
   - match: "model.layers.*.mlp.experts"
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
-        dispatch_mode: push  # Set to pull for GET dispatch.
+        _target_: hyper_parallel.components.modules.GroupedExperts
+        megakernel: true
+        dispatch_mode: push
   # HyperMegaMhc reuses the original fn/base/scale parameters.
   - match:
       - "model.layers.*.attn_hc"
@@ -189,7 +180,7 @@ mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  mode: full # off
+  mode: full
   full:
     # Global order: 40 decoder layers followed by 32 vision blocks.
     recompute_layer: [0-71]

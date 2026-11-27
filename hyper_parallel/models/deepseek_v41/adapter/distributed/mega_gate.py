@@ -23,7 +23,10 @@ import torch
 from torch import nn
 
 from hyper_multicore.modules.mega_gate import MegaGate
-from hyper_parallel.models.deepseek_v41.adapter.aux_loss import update_modality_bias
+from hyper_parallel.components.modules.moe.moe_utils import local_router_metadata
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
+    DeepseekV41RouterStatistics, update_modality_bias,
+)
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
     _apply_router_training_state,
@@ -34,7 +37,7 @@ from hyper_parallel.models.replacement import module_replacement
 
 
 @module_replacement
-class DeepseekV41MegaGate(MegaGate):
+class DeepseekV41MegaGate(DeepseekV41RouterStatistics, MegaGate):
     """Adopt a DeepSeek V4.1 router's parameters without copying their storage."""
 
     fp32_parameter_names: tuple[str, ...] = ("bias", "bias_vl")
@@ -93,7 +96,7 @@ class DeepseekV41MegaGate(MegaGate):
             hidden_states: torch.Tensor,
             image_mask: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
-            sequence_partition_groups: tuple[Any, ...] = (),
+            sequence_partition_groups: tuple[Any, ...] | None = None,
             sequence_ids: torch.Tensor | None = None,
             num_sequences: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -103,16 +106,23 @@ class DeepseekV41MegaGate(MegaGate):
             hidden_states: Token activations ending in the hidden dimension.
             image_mask: Optional boolean image-token mask.
             token_mask: Optional boolean mask selecting tokens for statistics.
-            sequence_partition_groups: Token-partition process groups.
+            sequence_partition_groups: Token-partition process groups. None uses the bound groups.
             sequence_ids: Optional logical sample IDs.
             num_sequences: Total logical sample count for packed inputs.
 
         Returns:
             Router logits, training-aware weights, and selected experts.
         """
+        image_mask = local_router_metadata(image_mask, hidden_states, self.router_tp_mesh)
+        token_mask = local_router_metadata(token_mask, hidden_states, self.router_tp_mesh)
+        sequence_ids = local_router_metadata(sequence_ids, hidden_states, self.router_tp_mesh)
+        if sequence_partition_groups is None:
+            sequence_partition_groups = self.sequence_partition_groups
         if image_mask is not None and (
                 image_mask.shape != hidden_states.shape[:-1] or image_mask.dtype != torch.bool):
             raise ValueError("image_mask must be boolean and match the hidden-state token dimensions")
+        if image_mask is not None:
+            image_mask = image_mask.contiguous()
         logits, weights, indices = super().forward(hidden_states, image_mask=image_mask)
         scores = None
         if self.training and self.aux_loss_coeff:

@@ -26,13 +26,15 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.modules.engram import local_token_mask
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
+    configure_router_statistics as _configure_router_statistics,
+)
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts, _swiglu_limit,
 )
@@ -94,26 +96,6 @@ def _local_router_metadata(tensor: torch.Tensor | None, states: torch.Tensor, tp
     if tp_mesh is None or tensor.shape[-1] != local_length * tp_mesh.size():
         raise ValueError("router metadata must match the local or TP-gathered token dimensions")
     return tensor.narrow(-1, tp_mesh.get_local_rank() * local_length, local_length)
-
-
-def _configure_router_statistics(gate: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any) -> tuple[Any, ...]:
-    """Configure bias-update groups and return the router's token-partition groups."""
-    sequence_groups = tuple(
-        axis.get_group() for axis in (cp_mesh, tp_mesh)
-        if axis is not None and axis.size() > 1
-    )
-    # A local compute region can receive a TP submesh. Bias counts cover the
-    # entire data batch, so recover its DP axes from the job mesh.
-    statistics_mesh = mesh
-    if isinstance(mesh, DeviceMesh) and mesh.root_mesh is not None:
-        statistics_mesh = mesh.root_mesh
-    mesh_axes = statistics_mesh.mesh_dim_names or () if statistics_mesh is not None else ()
-    dp_groups = tuple(
-        statistics_mesh[name].get_group() for name in mesh_axes
-        if name in ("dp", "dp_replicate", "dp_shard") and statistics_mesh[name].size() > 1
-    )
-    gate.expert_bias_update_groups = dp_groups + sequence_groups
-    return sequence_groups
 
 
 @module_replacement
