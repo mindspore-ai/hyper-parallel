@@ -40,8 +40,8 @@ fsdp_config:        # dp_shard_size > 1 enables FSDPPass parameter sharding
   dp_shard_size: 8
 activation_checkpoint:   # projected onto PassConfig.ac_mode
   mode: full             # off / full / selective
-  selection:
-    source: default
+  full:
+    recompute_layer: [0, 1, 2, 3]   # projected to ac_layer_indices
 model:
   _target_: ...simple_model.model.build_model
   num_layers: 4          # repeated recompute blocks
@@ -100,9 +100,10 @@ hyper_parallel.compile.passes.activation_checkpoint: Activation checkpointing
 (mode=full) recomputed 80 node(s)
 ```
 
-To recompute only a subset of blocks, set the safe-region source with exactly
-one selector: `selection.source: model_adapter_safe_regions` plus
-`layer_count: 2` (or `layer_indices: [1, 3]`).
+To recompute only a subset of blocks, set
+`activation_checkpoint.full.recompute_layer` (the full-mode layer selector),
+or pass a programmatic `PassConfig(ac_mode="full", ac_layer_count=2)` /
+`ac_layer_indices=[1, 3]`.
 
 ## Contract for a custom (toy) model
 

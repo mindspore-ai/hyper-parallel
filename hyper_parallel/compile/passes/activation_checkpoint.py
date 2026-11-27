@@ -18,19 +18,20 @@ FX-level activation recomputation for the joint forward+backward graph,
 following torchtitan graph_trainer's ``tag_with_memory_policy_pass`` +
 ``selective_activation_remat_pass`` design while reusing the dynamic-graph
 configuration vocabulary (``ActivationCheckpointConfig``: ``mode`` =
-off/full/selective, layer selection, model-adapter safe regions):
+off/full/selective, with layer selection):
 
 1. Tag: forward ``call_function`` nodes inside the checkpoint scope get a
-   ``CheckpointPolicy`` in ``node.meta["recompute"]``. The scope is the
+   ``CheckpointPolicy`` in ``node.meta["recompute"]``. ``full`` scopes the
    discovered transformer blocks (the same HuggingFace-marker discovery the
-   eager path requires), narrowed by the optional layer selectors and the
-   model adapter's safe regions. Nodes outside the blocks (embedding, head,
-   the ``train_fn`` loss chain) and compute/communication intensive
-   operators under ``selective`` stay saved; everything else is a recompute
-    candidate (``full`` forces every scoped node). Structural exceptions are
-    always saved: RNG ops (the graph cannot replay random state), in-place
-    mutations with their consumers and the readers of every tensor sharing
-    the mutated storage (including view aliases), SymInt scalars.
+   eager path requires), narrowed by the optional layer selectors.
+   ``selective`` scopes only the eager-aligned module/region targets
+   (``selective.recompute`` projected onto ``ac_selective_recompute_*``), so
+   it recomputes the same modules as the eager path and saves everything
+   else. Nodes outside the scope (embedding, head, the ``train_fn`` loss
+   chain) stay saved. Structural exceptions are always saved: RNG ops (the
+   graph cannot replay random state), in-place mutations with their consumers
+   and the readers of every tensor sharing the mutated storage (including view
+   aliases), SymInt scalars.
 2. Remat: every tagged node that the backward half consumes (transitively
    through other tagged nodes) is duplicated in front of its earliest
    backward consumer and the backward consumers are redirected to the
@@ -54,14 +55,13 @@ parameter all-gathers and the backward re-gathers around them correctly
 consumers). Running AC after FSDP would make recompute read sharded
 placeholders. ``PpPass`` runs later and inherits the rewrite value-level.
 
-Operator policy sets and transformer-block discovery are shared with the
-eager path (``hyper_parallel.distributed.activation_checkpoint``), so a
-model sees the same save/recompute vocabulary in both modes. RNG ops are
-saved in every mode (a graph cannot replay random state). For collectives,
-the eager selective must-save set (all-to-all/reduce-scatter/in-place
-allreduce) is always saved; other collectives follow the mode policy.
-``ac_save_forward_all_gather`` may opt forward (TP/SP/CP) all-gathers into
-backward replay.
+Transformer-block discovery is shared with the eager path
+(``hyper_parallel.distributed.activation_checkpoint``), so a model is
+AC-eligible in both modes under the same contract. RNG ops are saved in every
+mode (a graph cannot replay random state). For collectives, the must-save set
+(all-to-all/reduce-scatter/in-place allreduce) is always saved; other
+collectives follow the mode policy. ``ac_save_forward_all_gather`` may opt
+forward (TP/SP/CP) all-gathers into backward replay.
 """
 
 from __future__ import annotations
@@ -80,29 +80,58 @@ from torch._functorch import compile_utils
 from torch._ops import OpOverload
 from torch.utils.checkpoint import CheckpointPolicy
 
-# Same-package reuse of the eager AC machinery: operator save/recompute sets,
-# HF transformer-block discovery and model-adapter recompute specs. They are
-# module-level privates because the eager module never exported them, but the
-# coupling is the point: one policy vocabulary for both modes.
+# Transformer-block discovery is shared with the eager path: one HF-marker
+# contract decides which modules form recompute units in both modes.
 from hyper_parallel.distributed.activation_checkpoint import (
-    _SELECTIVE_AC_COMM_OP_NAMES,
-    _SELECTIVE_AC_FORCE_RECOMPUTE_OPS,
-    _SELECTIVE_AC_MUST_SAVE_OPS,
-    _adapter_recompute_spec,
-    _existing_ops,
     _find_transformer_layer_container_infos,
-    _resolve_op_attr,
-    _resolve_torch_op,
-    _select_excluded_targets,
-    _select_layer_region_roots,
-    _selected_checkpoint_layer_fqns,
-    _validate_region_exclusions,
+    _flatten_layer_container_infos,
 )
 
 from ..pass_config import PassConfig
 from .base import GraphPass
 
 _LOG = logging.getLogger(__name__)
+
+
+def _resolve_torch_op(dotted_path: str) -> Optional[Any]:
+    """Resolve a torch operator to its default overload when available."""
+    if dotted_path.count(".") == 1:
+        dotted_path = f"{dotted_path}.default"
+    obj = torch.ops
+    try:
+        for part in dotted_path.split("."):
+            obj = getattr(obj, part)
+    except AttributeError:
+        return None
+    return obj
+
+
+def _resolve_op_attr(root: object, dotted_path: str) -> Optional[Any]:
+    """Resolve an optional operator outside the regular ``torch.ops`` tree."""
+    obj = root
+    try:
+        for part in dotted_path.split("."):
+            obj = getattr(obj, part)
+    except AttributeError:
+        return None
+    return obj
+
+
+def _existing_ops(*ops: Any) -> frozenset:
+    """Return the available operators, omitting optional torch operators."""
+    return frozenset(op for op in ops if op is not None)
+
+
+# Collectives that must stay saved in every mode: replaying all-to-all,
+# reduce-scatter, or an in-place all-reduce would duplicate communication and
+# re-run a mutation. Other collectives follow the mode policy.
+_SELECTIVE_AC_COMM_OP_NAMES = (
+    "aten.all_to_all_single",
+    "aten.reduce_scatter_tensor",
+    "_c10d_functional.all_to_all_single",
+    "_c10d_functional.reduce_scatter_tensor",
+    "c10d.allreduce_",
+)
 
 # FSDP all-gathers are inserted after this pass, but forward (TP/SP/CP)
 # all-gathers are already in the traced forward; saving them avoids a second
@@ -185,11 +214,16 @@ class _CheckpointScope:
     Attributes:
         region_fqns: FQNs whose subtree may recompute. Empty (or ``None``)
             makes every node ineligible (the pass becomes a no-op).
-        exclude_fqns: FQNs whose subtree must stay saved (adapter exclusions).
+        exclude_fqns: FQNs whose subtree must stay saved. No production
+            caller sets this now that the model-adapter region source is gone;
+            retained for direct callers that narrow the scope. The layer
+            selectors leave it empty.
         unit_fqns: Boundary units for the cross-unit save rule. Empty (or
             ``None``) disables the rule.
-        on_applied: Adapter runtime hook that must run before the model's
-            forward is traced, when the adapter's region shape is in effect.
+        on_applied: Optional hook run before the model's forward is traced.
+            No production caller sets this now that the model-adapter region
+            source is gone; retained for direct callers. The layer selectors
+            leave it ``None``.
     """
 
     def __init__(
@@ -206,59 +240,132 @@ class _CheckpointScope:
         self.on_applied = on_applied
 
 
-def _adapter_scope(
+def _validate_selected_layer_indices(layer_indices: Any, blocks: list) -> None:
+    """Validate an explicit list of layer indices against the blocks."""
+    if not isinstance(layer_indices, (list, tuple)) or not layer_indices:
+        raise ValueError(
+            "activation checkpoint layer_indices must be a non-empty sequence"
+        )
+    if any(
+        isinstance(index, bool) or not isinstance(index, int) or index < 0
+        for index in layer_indices
+    ):
+        raise ValueError(
+            "activation checkpoint layer_indices must contain only "
+            "non-negative integers"
+        )
+    if len(set(layer_indices)) != len(layer_indices):
+        raise ValueError(
+            "activation checkpoint layer_indices must not contain duplicates"
+        )
+    if max(layer_indices) >= len(blocks):
+        raise ValueError(
+            "activation checkpoint layer index "
+            f"{max(layer_indices)} exceeds the maximum index {len(blocks) - 1}"
+        )
+
+
+def _validate_selected_layer_count(layer_count: Any, blocks: list) -> None:
+    """Validate a leading layer count against the blocks."""
+    if (
+        isinstance(layer_count, bool)
+        or not isinstance(layer_count, int)
+        or layer_count < 0
+    ):
+        raise ValueError(
+            "activation checkpoint layer_count must be a non-negative integer"
+        )
+    if layer_count > len(blocks):
+        raise ValueError(
+            f"activation checkpoint layer_count {layer_count} exceeds discovered "
+            f"layers {len(blocks)}"
+        )
+
+
+def _selected_checkpoint_layer_fqns(
+    containers: list,
+    selection: Any,
+) -> set:
+    """Select a leading layer count or exact layer indices."""
+    blocks = _flatten_layer_container_infos(containers)
+    layer_count = getattr(selection, "layer_count", None)
+    layer_indices = getattr(selection, "layer_indices", None)
+    if (layer_count is None) == (layer_indices is None):
+        raise ValueError(
+            "activation checkpoint layer selection requires exactly one of "
+            "layer_count or layer_indices"
+        )
+    if layer_indices is not None:
+        _validate_selected_layer_indices(layer_indices, blocks)
+        return {blocks[index].fqn for index in layer_indices}
+
+    _validate_selected_layer_count(layer_count, blocks)
+    if layer_count == 0:
+        return set()
+    return {blocks[index].fqn for index in range(layer_count)}
+
+
+def _resolve_selective_target_fqns(
     model: torch.nn.Module,
-    selected_layers: frozenset,
-    unit_fqns: frozenset,
-    recompute_spec: Any,
-) -> _CheckpointScope:
-    """Build a scope from the adapter-declared recompute regions."""
+    pass_config: PassConfig,
+    containers: list,
+) -> frozenset:
+    """Resolve eager-aligned selective recompute targets to module FQNs.
+
+    Layer-relative region targets are expanded per selected transformer block
+    (``<block_fqn>.<module_path>``); model-root targets are used as-is. Every
+    resolved FQN must name a module of the live model, mirroring the eager
+    ``activation_checkpoint.selective.recompute`` contract.
+    """
+    blocks = _flatten_layer_container_infos(containers)
     module_by_fqn = dict(model.named_modules())
-    roots = _select_layer_region_roots(module_by_fqn, selected_layers, recompute_spec)
-    if not roots:
-        raise ValueError(
-            "model adapter recompute patterns matched no region in the selected layers"
-        )
-    excluded = _select_excluded_targets(module_by_fqn, roots, recompute_spec)
-    if recompute_spec.exclude_patterns and not excluded:
-        raise ValueError(
-            "model adapter recompute exclusions matched no module "
-            "inside the selected regions"
-        )
-    _validate_region_exclusions(roots, excluded)
-    return _CheckpointScope(
-        region_fqns=frozenset(fqn for fqn, _ in roots),
-        exclude_fqns=frozenset(fqn for fqn, _ in excluded),
-        unit_fqns=unit_fqns,
-        on_applied=recompute_spec.on_applied,
-    )
+    target_fqns = set()
+    for module_path, layer_indices in pass_config.ac_selective_recompute_regions or ():
+        for layer_index in layer_indices:
+            if layer_index >= len(blocks):
+                raise ValueError(
+                    "activation checkpoint selective target layer index "
+                    f"{layer_index} exceeds the maximum index {len(blocks) - 1}"
+                )
+            block = blocks[layer_index]
+            fqn = f"{block.fqn}.{module_path}" if module_path else block.fqn
+            if fqn not in module_by_fqn:
+                raise ValueError(
+                    "activation checkpoint selective target "
+                    f"{module_path!r} does not resolve to a module in layer "
+                    f"{block.fqn}"
+                )
+            target_fqns.add(fqn)
+    for module_path in pass_config.ac_selective_recompute_modules or ():
+        if module_path not in module_by_fqn:
+            raise ValueError(
+                "activation checkpoint selective target "
+                f"{module_path!r} is not a module of the model"
+            )
+        target_fqns.add(module_path)
+    return frozenset(target_fqns)
 
 
 def _resolve_scope(
     model: Optional[torch.nn.Module], pass_config: PassConfig
 ) -> _CheckpointScope:
-    """Resolve the checkpoint scope from the dynamic-config vocabulary.
+    """Resolve the checkpoint scope from the mode and selectors.
 
-    The recompute scope and the boundary units are the discovered
-    transformer blocks — the same HuggingFace-marker discovery the eager
-    path requires (``_resolve_activation_checkpoint_containers``), so a
-    model is AC-eligible in both modes under the same contract. Nodes
-    outside the blocks (embedding, head, the ``train_fn`` loss chain) are
-    never tagged, which also keeps the head/epilogue backward from pulling
-    the whole forward into one recompute chain. With
-    ``ac_layer_count`` / ``ac_layer_indices`` only the selected blocks
-    recompute; an adapter ``RecomputePolicy`` (``model_adapter_safe_regions``
-    in the dynamic config) narrows the selected blocks to its region
-    patterns and pulls ``exclude_patterns`` back out of the recompute.
+    The recompute scope and the boundary units are the discovered transformer
+    blocks — the same HuggingFace-marker discovery the eager path requires, so
+    a model is AC-eligible in both modes under the same contract. Nodes outside
+    the blocks (embedding, head, the ``train_fn`` loss chain) are never tagged,
+    which also keeps the head/epilogue backward from pulling the whole forward
+    into one recompute chain.
 
-    ``full`` with the default selection mirrors the eager auto-upgrade: when
-    the model owns a ``RecomputePolicy``, all blocks are selected through its
-    regions instead of recomputing every op in the blocks.
+    ``full`` recomputes every discovered block, or only the blocks chosen by
+    ``ac_layer_count`` / ``ac_layer_indices``. ``selective`` recomputes only
+    the eager-aligned module/region targets in ``ac_selective_recompute_*``;
+    each target module is its own boundary unit.
 
     Raises:
-        ValueError: When the live model is missing, no transformer blocks
-            are discovered, an explicitly requested safe-region selection has
-            no adapter, or the adapter declares no recompute region.
+        ValueError: When the live model is missing, no transformer blocks are
+            discovered, or a selective target does not resolve in the model.
     """
     if model is None:
         raise ValueError(
@@ -267,6 +374,18 @@ def _resolve_scope(
             "checkpoint"
         )
     containers = _find_transformer_layer_container_infos(model)
+    if pass_config.ac_mode == "selective":
+        if pass_config.ac_selective_recompute_regions and not containers:
+            raise ValueError(
+                f"{type(model).__name__} has no module with a "
+                "'gradient_checkpointing' attribute and a non-empty repeated "
+                "block container; selective layer-relative targets cannot "
+                "resolve their layers"
+            )
+        target_fqns = _resolve_selective_target_fqns(model, pass_config, containers)
+        if not target_fqns:
+            _LOG.info("activation checkpoint selective targets matched no module")
+        return _CheckpointScope(region_fqns=target_fqns, unit_fqns=target_fqns)
     if not containers:
         raise ValueError(
             f"{type(model).__name__} has no module with a 'gradient_checkpointing' "
@@ -276,62 +395,37 @@ def _resolve_scope(
     block_fqns = frozenset(
         block.fqn for container in containers for block in container.blocks
     )
-    explicit_regions = pass_config.ac_region_source == "model_adapter_safe_regions"
     has_count = pass_config.ac_layer_count is not None
     has_indices = pass_config.ac_layer_indices is not None
     if not has_count and not has_indices:
-        if pass_config.ac_mode == "full":
-            recompute_spec = _adapter_recompute_spec(model, required=explicit_regions)
-            if recompute_spec is not None:
-                if not recompute_spec.region_patterns:
-                    raise ValueError(
-                        "model adapter recompute requires "
-                        "RecomputePolicy.region_patterns"
-                    )
-                return _adapter_scope(model, block_fqns, block_fqns, recompute_spec)
         return _CheckpointScope(region_fqns=block_fqns, unit_fqns=block_fqns)
     selection = SimpleNamespace(
         layer_count=pass_config.ac_layer_count,
         layer_indices=pass_config.ac_layer_indices,
     )
     selected_layers = frozenset(_selected_checkpoint_layer_fqns(containers, selection))
-    recompute_spec = _adapter_recompute_spec(model, required=explicit_regions)
-    if explicit_regions:
-        if recompute_spec is None:
-            raise ValueError(
-                "activation_checkpoint.selection.source=model_adapter_safe_regions "
-                "requires ModelAdapterSpec.recompute"
-            )
-        if not recompute_spec.region_patterns:
-            raise ValueError(
-                "model adapter recompute requires RecomputePolicy.region_patterns"
-            )
     if not selected_layers:
         # Zero selected layers is a no-op, not an error.
         _LOG.info("activation checkpoint layer selection matched zero layers")
-        return _CheckpointScope(region_fqns=frozenset(), unit_fqns=block_fqns)
-    if recompute_spec is None or not recompute_spec.region_patterns:
-        return _CheckpointScope(region_fqns=selected_layers, unit_fqns=block_fqns)
-    return _adapter_scope(model, selected_layers, block_fqns, recompute_spec)
+    return _CheckpointScope(region_fqns=selected_layers, unit_fqns=block_fqns)
 
 
 def prepare_activation_checkpoint(
     model: Optional[torch.nn.Module], pass_config: PassConfig
 ) -> _CheckpointScope:
-    """Resolve the AC scope and run the adapter hook before tracing.
+    """Resolve the AC scope before tracing.
 
-    The adapter's ``on_applied`` hook configures runtime state the model's
-    forward reads, so it must run before the joint graph is traced.
-    ``GraphCompiler`` calls this once pre-trace and hands the scope to the
-    pass, which avoids a second hook invocation.
+    ``GraphCompiler`` calls this once pre-trace and hands the resolved scope
+    to the pass, so block discovery happens exactly once. A scope supplied
+    directly (tests, or a caller that narrows the regions) may still carry an
+    ``on_applied`` hook, which runs here before the model's forward is traced.
 
     Args:
         model: The live model whose transformer blocks define the scope.
         pass_config: Parallel configuration driving ``ac_mode``.
 
     Returns:
-        The resolved scope, including the adapter runtime hook when one is
-        declared.
+        The resolved scope.
     """
     scope = _resolve_scope(model, pass_config)
     if scope.on_applied is not None and model is not None:
@@ -356,31 +450,6 @@ def _is_eligible(node: fx.Node, scope: _CheckpointScope) -> bool:
     return _first_container(fqns, scope.region_fqns) is not None
 
 
-def _make_policy_fn(pass_config: PassConfig) -> Callable[[fx.Node], CheckpointPolicy]:
-    """Build the per-node policy for ``ac_mode``.
-
-    ``full`` recomputes every scoped node. ``selective`` saves the shared
-    compute/communication operator set and forces recompute only on the
-    operators the eager policy must re-replay (in-place-unsafe outputs such
-    as ``topk``); everything else prefers recompute.
-    """
-    if pass_config.ac_mode == "full":
-        return lambda node: CheckpointPolicy.MUST_RECOMPUTE
-
-    must_save = _SELECTIVE_AC_MUST_SAVE_OPS
-    force_recompute = _SELECTIVE_AC_FORCE_RECOMPUTE_OPS
-
-    def selective_policy(node: fx.Node) -> CheckpointPolicy:
-        """Apply the shared selective-AC operator policy."""
-        if node.target in force_recompute:
-            return CheckpointPolicy.MUST_RECOMPUTE
-        if node.target in must_save:
-            return CheckpointPolicy.MUST_SAVE
-        return CheckpointPolicy.PREFER_RECOMPUTE
-
-    return selective_policy
-
-
 def _unit_of(node: fx.Node, scope: _CheckpointScope) -> Optional[str]:
     """Return ``node``'s boundary block unit, if any."""
     if not scope.unit_fqns:
@@ -393,15 +462,15 @@ def _tag_policy_pass(
     pass_config: PassConfig,
     scope: _CheckpointScope,
 ) -> None:
-    """Tag forward nodes per policy, applying the structural exceptions.
+    """Tag every in-scope forward node ``MUST_RECOMPUTE``.
 
-    RNG ops and SymInt scalars stay saved; getitem/wait_tensor inherit their
-    parent's decision. The selective communication set is saved in every mode
-    (including ``full``), matching the eager selective policy; all-gathers join
-    the saved set when ``ac_save_forward_all_gather`` is enabled. Other
-    collectives (functional all-reduce/broadcast) follow the mode policy.
+    The scope already encodes the mode: ``full`` selects whole blocks (or the
+    chosen layers), while ``selective`` selects the eager-aligned module/region
+    targets. RNG ops and SymInt scalars stay saved; getitem/wait_tensor inherit
+    their parent's decision. The communication set is saved in every mode;
+    all-gathers join the saved set when ``ac_save_forward_all_gather`` is
+    enabled.
     """
-    policy_fn = _make_policy_fn(pass_config)
     comm_ops = _GRAPH_AC_COMM_OPS
     if pass_config.ac_save_forward_all_gather:
         comm_ops = comm_ops | _GRAPH_FORWARD_ALL_GATHER_OPS
@@ -422,7 +491,7 @@ def _tag_policy_pass(
         if isinstance(value, torch.SymInt):
             node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
             continue
-        node.meta["recompute"] = policy_fn(node)
+        node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
 
 
 def _flatten_getitems(graph_module: fx.GraphModule) -> None:
@@ -802,10 +871,11 @@ class ActivationCheckpointPass(GraphPass):
     """Static-graph activation checkpointing (tag + recompute-materialize).
 
     Configure through ``PassConfig.ac_mode`` (``"off"`` / ``"full"`` /
-    ``"selective"``) and the optional ``ac_layer_count`` /
-    ``ac_layer_indices`` layer selectors. The trainer-level
-    ``activation_checkpoint`` section is projected onto these fields by
-    ``build_pass_config_from_trainer_config``.
+    ``"selective"``). ``"full"`` uses the optional ``ac_layer_count`` /
+    ``ac_layer_indices`` layer selectors; ``"selective"`` uses the
+    ``ac_selective_recompute_regions`` / ``ac_selective_recompute_modules``
+    targets. The trainer-level ``activation_checkpoint`` section is projected
+    onto these fields by ``build_pass_config_from_trainer_config``.
     """
 
     name = "activation_checkpoint"
@@ -824,8 +894,9 @@ class ActivationCheckpointPass(GraphPass):
             **kwargs: ``model`` (the live module) is required whenever
                 ``ac_mode != "off"``: block discovery resolves the recompute
                 scope from it. ``ac_scope`` is the pre-resolved scope from
-                ``GraphCompiler`` (it also ran the adapter hook before
-                tracing); direct callers may omit it.
+                ``GraphCompiler`` (a direct-caller scope may still carry an
+                ``on_applied`` hook, which that pre-trace step runs); direct
+                callers may omit it.
 
         Returns:
             The transformed graph module.

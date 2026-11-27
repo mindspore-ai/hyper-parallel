@@ -57,12 +57,11 @@ compile:
 activation_checkpoint:
   # off       - save every activation (no recompute pass)
   # full      - recompute every op in the discovered blocks
-  # selective - save matmul/attention/communication ops, recompute the rest
+  # selective - recompute only the declared target modules, save the rest
   mode: full
-  selection:
-    # Omit both selectors to recompute every block. Real HF models may set
-    # source: model_adapter_safe_regions with layer_count / layer_indices.
-    source: default
+  full:
+    # Omit to recompute every block; list layer indices to narrow the scope.
+    recompute_layer: [0, 1, 2, 3]
 
 dataset:
   _target_: hyper_parallel.compile.examples.simple_model.data.build_dataset
