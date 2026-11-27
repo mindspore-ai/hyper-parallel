@@ -219,6 +219,14 @@ class EnvironMeterCallback(Callback):
         reduced = all_reduce(value, op=op, group=self._metric_group())
         return float(reduced)
 
+    def _pipeline_max(self, value: float) -> float:
+        """Extend a DP+CP maximum across physical pipeline stages."""
+        mesh = getattr(self.trainer, "mesh", None)
+        pp_mesh = getattr(mesh, "pp_mesh", None)
+        if get_world_size_safe() <= 1 or int(getattr(mesh, "pp_size", 1)) <= 1 or pp_mesh is None:
+            return float(value)
+        return float(all_reduce(value, op="max", group=pp_mesh.get_group()))
+
     @staticmethod
     def _accumulate_scalar(current: Any, value: Any) -> Any:
         """Add one batch scalar to a running per-step total.
@@ -298,8 +306,8 @@ class EnvironMeterCallback(Callback):
         if get_device_type() == "cpu":
             return {}
         device = get_torch_device()
-        allocated = self._reduce(device.max_memory_allocated(), op="max")
-        reserved = self._reduce(device.max_memory_reserved(), op="max")
+        allocated = self._pipeline_max(self._reduce(device.max_memory_allocated(), op="max"))
+        reserved = self._pipeline_max(self._reduce(device.max_memory_reserved(), op="max"))
         gibibyte = 1024 ** 3
         return {
             "memory/device_max_allocated_gb": allocated / gibibyte,
@@ -399,8 +407,14 @@ class EnvironMeterCallback(Callback):
             **kwargs: Unused callback context.
         """
         del state, kwargs
+        mesh = getattr(self.trainer, "mesh", None)
+        pp_active = int(getattr(mesh, "pp_size", 1)) > 1 and getattr(mesh, "pp_mesh", None) is not None
+        if get_device_type() != "cpu" and pp_active:
+            synchronize = getattr(get_torch_device(), "synchronize", None)
+            if callable(synchronize):
+                synchronize()
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
-        global_step_time = self._reduce(step_time, op="max")
+        global_step_time = self._pipeline_max(self._reduce(step_time, op="max"))
         local_step_tokens = 0 if self._local_step_tokens is None else self._local_step_tokens
         global_tokens = int(self._reduce(local_step_tokens, op="sum"))
         global_samples = self._global_samples()

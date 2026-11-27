@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, List, Literal, Optional
 
 from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
+from hyper_parallel.models.pipeline import PipelineConfig
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.high_availability.config import HighAvailabilityConfig
 from hyper_parallel.components.ops.catalog import builtin_registry
@@ -90,6 +91,7 @@ class TrainerConfig:
     magi: Optional[Any] = None
     peft: Optional[Any] = None
     ops: dict[str, str] = field(default_factory=dict)
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
 
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
@@ -116,6 +118,15 @@ class TrainerConfig:
             if (checkpoint is not None and checkpoint.mode in ("selective", "hybrid")
                     and checkpoint.selective is not None and checkpoint.selective.swap_regions):
                 raise ValueError("hyper_offload cannot be combined with activation swapping")
+        eager_pipeline = self.accelerator.pp_size > 1 and not self.compile.selects_graph_compiler()
+        if self.pipeline.schedule in ("interleaved_1f1b", "mpipe") and not eager_pipeline:
+            raise ValueError(f"{self.pipeline.schedule} requires eager Trainer PP with pp_size > 1")
+        if self.pipeline.schedule == "mpipe" and (self.accelerator.tp_size != 1 or self.accelerator.cp_size != 1
+                                                  or self.accelerator.encoder_parallel.enabled):
+            raise ValueError("MPipe VLM training requires TP1, CP1 and encoder_parallel disabled")
+        if (self.checkpoint.save_hf_weights and self.accelerator.pp_size > 1
+                and not self.compile.selects_graph_compiler()):
+            raise ValueError("HF export cannot gather eager pipeline stages. Use checkpoint.save_ckpt for DCP")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(

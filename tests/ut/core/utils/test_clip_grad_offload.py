@@ -21,11 +21,18 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.utils.clip_grad import _all_reduce_offloaded, _get_total_norm
+from hyper_parallel.core.utils.clip_grad import _all_reduce_offloaded, _get_total_norm, _norm_scalar_device
 
 
 class TestOffloadedReduction(unittest.TestCase):
     """Transfer offloaded inputs only when the process group requires it."""
+
+    def test_external_norm_scalar_uses_mesh_device_for_offloaded_parameters(self):
+        """CPU parameters must not select CPU scalar collectives on an NPU mesh."""
+        for backend in ("npu", "cuda", "cpu"):
+            context = SimpleNamespace(device_mesh=SimpleNamespace(device_type=backend))
+            self.assertEqual(_norm_scalar_device(torch.device("cpu"), context), torch.device(backend))
+        self.assertEqual(_norm_scalar_device(torch.device("cpu"), None), torch.device("cpu"))
 
     def test_gloo_reduces_cpu_tensor_without_copy(self):
         """CPU-capable groups keep the original tensor."""
