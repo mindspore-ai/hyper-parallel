@@ -167,12 +167,12 @@ class TestGQAFamilyContracts(unittest.TestCase):
         for factory, arguments in ((GroupedQueryAttention, {"fuse_qkv": True}),
                                    (GroupedQueryAttention, {"fuse_qkv": False}),
                                    (GatedGroupedQueryAttention, {})):
-            local = factory(module=self._source(factory is GatedGroupedQueryAttention),
-                            cp_comm_overlap=True, **arguments)
-            self.assertNotIn("cp_comm_overlap", inspect.signature(type(local)).parameters)
+            local = factory(module=self._source(factory is GatedGroupedQueryAttention), overlap=True, **arguments)
+            self.assertNotIn("overlap", inspect.signature(type(local)).parameters)
+            self.assertNotIn("ulysses_degree", vars(local))
             self.assertNotIn("attn_groupnorm", vars(local))
             self.assertNotIn("attn_elementwise_gate", vars(local))
-            self.assertTrue(get_family_build_info(local).request.kwargs["cp_comm_overlap"])
+            self.assertTrue(get_family_build_info(local).request.kwargs["overlap"])
             for attribute in ("tp_degree", "tensor_parallel", "bind_parallel", "parallel_module_spec"):
                 self.assertFalse(hasattr(local, attribute), attribute)
             model = nn.Module()
@@ -185,7 +185,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
             for name, parameter in tp_member.named_parameters():
                 self.assertIs(parameter, local.get_parameter(name))
             parallel = factory(module=tp_member, context={"cp_size": 2, "tp_size": 2},
-                               cp_comm_overlap=True, ulysses_cp_size=1, kv_cp_size=2, **arguments)
+                               overlap=True, ulysses_degree=1, **arguments)
             self.assertEqual(get_family_build_info(parallel).resolved.variant, "cp")
             self.assertEqual(set(dict(local.named_parameters())), set(dict(parallel.named_parameters())))
             for name, parameter in parallel.named_parameters():
@@ -318,10 +318,8 @@ class TestGQAFamilyContracts(unittest.TestCase):
                 config = SimpleNamespace(hidden_size=16, num_attention_heads=4, num_key_value_heads=2,
                                          qk_norm=True, dtype=torch.float64)
                 with torch.device("meta"):
-                    local = factory(config=config, cp_comm_overlap=True, ulysses_cp_size=1, kv_cp_size=2,
-                                    **arguments)
-                    direct_cp = factory(config=config, context={"cp_size": 2}, cp_comm_overlap=True,
-                                         ulysses_cp_size=1, kv_cp_size=2, **arguments)
+                    local = factory(config=config, overlap=True, **arguments)
+                    direct_cp = factory(config=config, context={"cp_size": 2}, overlap=True, **arguments)
                 self.assertTrue(all(parameter.is_meta for parameter in direct_cp.parameters()))
                 self.assertEqual(get_family_build_info(direct_cp).resolved.variant, "cp")
                 local.to_empty(device="cpu")
@@ -341,8 +339,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
                 for name, parameter in promoted.named_parameters(remove_duplicate=False):
                     self.assertIs(parameter, parameters[name])
                     torch.testing.assert_close(parameter, values[name], atol=0, rtol=0)
-                copied = factory(module=promoted, context={"cp_size": 2},
-                                 ulysses_cp_size=1, kv_cp_size=2, **arguments)
+                copied = factory(module=promoted, context={"cp_size": 2}, **arguments)
                 self.assertEqual(copied.make_transforms(), [])
                 self.assertIs(copied.q_norm.weight, copied.k_norm.weight)
                 for invalid in ({"num_key_value_heads": 0}, {"head_dim": 0}, {"qk_norm": "yes"}):
@@ -430,7 +427,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
             with self.subTest(fused=fused):
                 events.clear()
                 member = SimpleNamespace(
-                    cp_comm_overlap=True, fuse_qkv=fused, ulysses_cp_size=2, all_gather_degree=2,
+                    overlap=True, fuse_qkv=fused, ulysses_degree=2, all_gather_degree=2,
                     cp_context=SimpleNamespace(size=4),
                     ulysses_context=SimpleNamespace(launch_sequence_to_head=launch),
                     query_context=SimpleNamespace(launch_gather_sequence=gather),

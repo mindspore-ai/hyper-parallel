@@ -56,8 +56,7 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: triton
         conv_backend: eager
-        ulysses_cp_size: 1
-        ring_cp_size: 2
+        ulysses_degree: 1
   - match: "model.language_model.layers.*.mlp.experts"
     replace:
       kind: module

@@ -25,9 +25,6 @@ from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, register_module_family,
 )
-from hyper_parallel.components.modules.attention.cp_config import (
-    resolve_attention_cp_config, validate_supported_cp_options,
-)
 from hyper_parallel.components.modules.attention.linear_attention_utils.parallel_layout import (
     linear_attention_local_spec, linear_attention_sharding,
 )
@@ -55,23 +52,17 @@ def validate_kda_family(*, config: Any, module: nn.Module | None, context: Any, 
     del context
     backend = validate_backend_options(member.arguments)
     cp = member.axis_sizes["cp"]
-    cp_config = resolve_attention_cp_config(member)
-    validate_supported_cp_options(
-        cp_config, "KDA", ulysses_strategies=("alltoall",),
-        ring_strategies=("p2p", "allgather"), allow_ulysses=True, allow_kv=False,
-        allow_ring=True,
-    )
-    degree = cp_config["ulysses_cp_size"]
+    degree = member.arguments.get("ulysses_degree", 1)
+    degree = cp if degree is None else degree
     if (not isinstance(degree, int) or isinstance(degree, bool)) or degree < 1 or (cp > 1 and cp % degree):
-        raise ValueError("ulysses_cp_size must be a positive divisor of cp_size")
+        raise ValueError("ulysses_degree must be a positive divisor of CP size")
     source = config if module is None else module
     kh = getattr(source, "num_heads", None)
     vh = getattr(source, "num_v_heads", None) or kh
     head_degree = member.axis_sizes["tp"] * (degree if cp > 1 else 1)
     if kh is not None and (kh % head_degree or vh % head_degree):
-        raise ValueError("TP times ulysses_cp_size must divide both query and value heads")
-    state_method = member.arguments.get("state_cp_method") or cp_config["ring_cp_strategy"]
-    _validate_kda_state_protocol({**member.arguments, "state_cp_method": state_method}, cp, degree, backend)
+        raise ValueError("TP times Ulysses degree must divide both query and value heads")
+    _validate_kda_state_protocol(member.arguments, cp, degree, backend)
 
 
 def kda_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
@@ -107,40 +98,13 @@ def kda_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: An
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     backend: str = "eager", conv_backend: str | None = None, chunk_size: int = 64,
-    input_layout: str = "BSH",
-    state_cp_method: str | None = None, allgather_group_size: int = 1,
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
+    input_layout: str = "BSH", ulysses_degree: int | None = 1,
+    state_cp_method: str = "p2p", allgather_group_size: int = 1,
 ) -> nn.Module:
     """Keep CP selection in the family request, outside the standalone algorithm."""
-    del (module_fqn, context, state_cp_method, allgather_group_size,
-         ulysses_cp_size, ulysses_cp_strategy, kv_cp_size, kv_cp_strategy, kv_cp_load_balance,
-         ring_cp_size, ring_cp_strategy, ring_cp_load_balance, cp_comm_overlap)
+    del module_fqn, context, ulysses_degree, state_cp_method, allgather_group_size
     return KimiDeltaAttentionModule(config=config, module=module, backend=backend, conv_backend=conv_backend,
                                      chunk_size=chunk_size, input_layout=input_layout)
-
-
-def _build_cp(
-    *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
-    backend: str = "eager", conv_backend: str | None = None, chunk_size: int = 64,
-    input_layout: str = "BSH", state_cp_method: str | None = None, allgather_group_size: int = 1,
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
-) -> nn.Module:
-    """Map Ulysses and Ring domains onto KDA's head and recurrent-state groups."""
-    del module_fqn
-    method = state_cp_method or ring_cp_strategy
-    from .cp_kimi_delta_attention import CPKimiDeltaAttentionModule  # pylint: disable=C0415
-
-    return CPKimiDeltaAttentionModule(
-        config=config, module=module, context=context, backend=backend, conv_backend=conv_backend,
-        chunk_size=chunk_size, input_layout=input_layout, ulysses_cp_size=ulysses_cp_size,
-        state_cp_method=method, allgather_group_size=allgather_group_size,
-    )
 
 
 # Public factories follow the ModuleFamily class-style naming convention.
@@ -148,12 +112,8 @@ def _build_cp(
 def KimiDeltaAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, backend: str = "eager", conv_backend: str | None = None,
-    chunk_size: int = 64, input_layout: str = "BSH",
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
-    state_cp_method: str | None = None, allgather_group_size: int = 1,
+    chunk_size: int = 64, input_layout: str = "BSH", ulysses_degree: int | None = 1,
+    state_cp_method: str = "p2p", allgather_group_size: int = 1,
     hidden_size: int | None = None, num_heads: int = 32, num_v_heads: int | None = None,
     head_k_dim: int = 128, head_v_dim: int = 128, conv_kernel_size: int = 4,
     gate_lower_bound: float = -5.0, use_full_rank_gate: bool = True, rms_norm_eps: float = 1e-6,
@@ -171,17 +131,9 @@ def KimiDeltaAttention(  # pylint: disable=invalid-name
         conv_backend: Independent convolution implementation; omission preserves scheduling defaults.
         chunk_size: Local chunk length; fused implementations require 64.
         input_layout: BSH or TH, determining the external token shard axis.
-        ulysses_cp_size: Number of ranks in the Ulysses head-exchange domain.
-        ulysses_cp_strategy: KDA currently supports ``alltoall``.
-        kv_cp_size: Must be one; KDA transports recurrent state rather than a KV attention bank.
-        kv_cp_strategy: Reserved for KDA; current state exchange is configured by the Ring domain.
-        kv_cp_load_balance: KV-domain zigzag balance; unsupported by KDA.
-        ring_cp_size: Number of ranks in the recurrent-state exchange domain.
-        ring_cp_strategy: KDA currently maps ``p2p`` or ``allgather`` to its state protocol.
-        ring_cp_load_balance: Ring zigzag balance; unsupported by KDA.
-        cp_comm_overlap: General CP overlap toggle; currently unsupported by KDA.
-        state_cp_method: Legacy KDA-specific state-exchange selector.
-        allgather_group_size: Legacy grouped-AllGather extension.
+        ulysses_degree: Head-exchange degree; None selects pure Ulysses scheduling.
+        state_cp_method: Ordered state exchange: p2p, allgather, grouped_allgather_p2p or recursive_doubling.
+        allgather_group_size: Contiguous state-group width for grouped_allgather_p2p.
         hidden_size: Legacy direct-construction model width; exclusive with config and module.
         num_heads: Query/key head count for direct construction.
         num_v_heads: Value head count; defaults to num_heads.
@@ -202,12 +154,7 @@ def KimiDeltaAttention(  # pylint: disable=invalid-name
                                  rms_norm_eps=rms_norm_eps, layer_idx=layer_idx)
     return build_family(KimiDeltaAttention, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, backend=backend, conv_backend=conv_backend,
-                        chunk_size=chunk_size, input_layout=input_layout,
-                        ulysses_cp_size=ulysses_cp_size, ulysses_cp_strategy=ulysses_cp_strategy,
-                        kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy,
-                        kv_cp_load_balance=kv_cp_load_balance, ring_cp_size=ring_cp_size,
-                        ring_cp_strategy=ring_cp_strategy, ring_cp_load_balance=ring_cp_load_balance,
-                        cp_comm_overlap=cp_comm_overlap,
+                        chunk_size=chunk_size, input_layout=input_layout, ulysses_degree=ulysses_degree,
                         state_cp_method=state_cp_method, allgather_group_size=allgather_group_size)
 
 
@@ -217,7 +164,7 @@ register_module_family(ModuleFamily(
         "local": ("hyper_parallel.components.modules.attention.kimi_delta_attention."
                   "kimi_delta_attention_family._build_local"),
         "cp": ("hyper_parallel.components.modules.attention.kimi_delta_attention."
-               "kimi_delta_attention_family._build_cp"),
+               "cp_kimi_delta_attention.CPKimiDeltaAttentionModule"),
     },
     default_variant="local", parallel_axis="cp", variant_rules=(VariantRule({"parallel": True}, "cp"),),
     sharding=kda_sharding, validate=validate_kda_family,

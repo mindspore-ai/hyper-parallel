@@ -30,13 +30,12 @@ from hyper_parallel.models.module_build import prepare_model_components
 
 
 def _layer(kind, **options):
-    chunk_size = options.pop("chunk_size", 4)
     if kind == "kda":
         return KimiDeltaAttention(hidden_size=16, num_heads=2, head_k_dim=4, head_v_dim=3,
-                                  chunk_size=chunk_size, **options)
+                                  chunk_size=4, **options)
     return GatedDeltaNet(config=SimpleNamespace(hidden_size=16, linear_num_key_heads=2,
                          linear_num_value_heads=4, linear_key_head_dim=4, linear_value_head_dim=3),
-                         chunk_size=chunk_size, **options)
+                         chunk_size=4, **options)
 
 
 class TestLinearAttentionFamily(unittest.TestCase):
@@ -56,7 +55,7 @@ class TestLinearAttentionFamily(unittest.TestCase):
                 source.source_activation = nn.SiLU()
                 if kind == "kda":
                     source.k_proj = source.q_proj
-                local = factory(module=source, chunk_size=4, ulysses_cp_size=2)
+                local = factory(module=source, chunk_size=4, ulysses_degree=None)
                 self.assertIs(local.source_activation, source.source_activation)
                 names = dict(source.named_parameters(remove_duplicate=False))
                 self.assertEqual(tuple(local.state_dict()), tuple(source.state_dict()))
@@ -84,7 +83,7 @@ class TestLinearAttentionFamily(unittest.TestCase):
         for kind in ("kda", "gdn"):
             for layout, axis in (("BSH", 1), ("TH", 0)):
                 with self.subTest(kind=kind, layout=layout):
-                    module = _layer(kind, input_layout=layout, context={"cp_size": 2}, ulysses_cp_size=2)
+                    module = _layer(kind, input_layout=layout, context={"cp_size": 2}, ulysses_degree=None)
                     context = FamilyShardingContext(("cp",), {"cp": 2, "tp": 1}, {})
                     member = get_family_build_info(module).resolved
                     spec = member.family.sharding(module=module, module_fqn="", member=member, context=context)
@@ -104,38 +103,13 @@ class TestLinearAttentionFamily(unittest.TestCase):
                     self.assertEqual(spec.out_src["output"]["tp"], Partial())
                     self.assertEqual(spec.out_dst["output"]["tp"], Shard(axis) if sp else Replicate())
                     self.assertIn("num_k_heads", spec.tp_divide_attrs)
-        with self.assertRaisesRegex(ValueError, "TP times ulysses_cp_size"):
-            _layer("gdn", context={"tp_size": 2, "cp_size": 2}, ulysses_cp_size=2)
+        with self.assertRaisesRegex(ValueError, "TP times Ulysses"):
+            _layer("gdn", context={"tp_size": 2, "cp_size": 2}, ulysses_degree=2)
         with self.assertRaisesRegex(NotImplementedError, "GDN state CP"):
             GatedDeltaNet(config=SimpleNamespace(linear_num_key_heads=8, linear_num_value_heads=8),
-                          backend="ascendc", context={"cp_size": 4}, ring_cp_size=4)
-        with self.assertRaisesRegex(ValueError, "cp_size"):
-            _layer("kda", context={"cp_size": 4}, ulysses_cp_size=3)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_canonical_ring_domains_select_linear_attention_cp(self):
-        """Feature: Unified Ring-domain arguments for recurrent attention state.
-        Description: Select KDA hybrid state exchange and GDN pure state P2P with public CP fields.
-        Expectation: Supported topologies construct CP members and unsupported hybrids fail early.
-        """
-        kda = KimiDeltaAttention(
-            hidden_size=256, num_heads=2, head_k_dim=128, head_v_dim=128,
-            backend="triton", chunk_size=64, context={"cp_size": 4},
-            ulysses_cp_size=2, ring_cp_size=2,
-        )
-        self.assertTrue(type(kda).__name__.startswith("CP"))
-
-        gdn_config = SimpleNamespace(
-            hidden_size=512, linear_num_key_heads=4, linear_num_value_heads=4,
-            linear_key_head_dim=128, linear_value_head_dim=128,
-        )
-        gdn = GatedDeltaNet(config=gdn_config, backend="triton", chunk_size=64,
-                            context={"cp_size": 4}, ulysses_cp_size=1, ring_cp_size=4)
-        self.assertTrue(type(gdn).__name__.startswith("CP"))
-        with self.assertRaisesRegex(NotImplementedError, "pure Ulysses or state P2P"):
-            GatedDeltaNet(config=gdn_config, backend="triton", chunk_size=64,
-                          context={"cp_size": 4}, ulysses_cp_size=2, ring_cp_size=2)
+                          backend="ascendc", context={"cp_size": 4})
+        with self.assertRaisesRegex(ValueError, "ulysses_degree"):
+            _layer("kda", context={"cp_size": 4}, ulysses_degree=3)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

@@ -39,51 +39,23 @@ def validate_gated_mla_family(*, config: Any, module: nn.Module | None, context:
 
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
-    kv_exchange: str = "all_gather",
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
+    strategy: str = "expanded_ulysses", overlap: bool = False,
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
 ) -> nn.Module:
     """Consume family-only options; the saved request retains them for CP preparation."""
     # Resolve after family registration; concrete members import this module's layout validators.
     implementation = import_module('.gated_multi_latent_attention', __package__).GatedMultiLatentAttentionModule
 
-    del (module_fqn, context, kv_exchange, ulysses_cp_size,
-         ulysses_cp_strategy, kv_cp_size, kv_cp_strategy, kv_cp_load_balance, ring_cp_size,
-         ring_cp_strategy, ring_cp_load_balance, cp_comm_overlap)
+    del module_fqn, context, strategy, overlap, ulysses_degree, kv_exchange
     return implementation(config=config, module=module)
-
-
-def _build_cp(
-    *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
-    kv_exchange: str = "all_gather", ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
-) -> nn.Module:
-    """Adapt the public domain configuration to the gated MLA CP executor."""
-    del module_fqn
-    selected_strategy = ulysses_cp_strategy
-    if selected_strategy == "alltoall":
-        selected_strategy = "expanded_ulysses"
-    from .cp_gated_multi_latent_attention import CPGatedMultiLatentAttentionModule  # pylint: disable=C0415
-
-    return CPGatedMultiLatentAttentionModule(
-        config=config, module=module, context=context, ulysses_cp_strategy=selected_strategy,
-        cp_comm_overlap=cp_comm_overlap, ulysses_cp_size=ulysses_cp_size,
-        kv_exchange=kv_exchange,
-    )
 
 
 @module_replacement
 def GatedMultiLatentAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Any = None, mesh: Any = None,
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False, kv_exchange: str = "all_gather",
+    strategy: str = "expanded_ulysses", overlap: bool = False,
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
 ) -> nn.Module:
     """Build the local gated NoPE MLA member.
 
@@ -93,15 +65,9 @@ def GatedMultiLatentAttention(  # pylint: disable=invalid-name
         module_fqn: Source path supplied by model replacement.
         context: Logical build constraints. Topology selects the local or CP implementation.
         mesh: Optional existing job mesh used by the shared layout planner.
-        ulysses_cp_size: Number of ranks in the Ulysses domain.
-        ulysses_cp_strategy: ``alltoall``/``expanded_ulysses`` or ``latent_kv_head``.
-        kv_cp_size: Number of ranks in the KV AllGather domain.
-        kv_cp_strategy: MLA currently supports ``allgather``; P2P is not implemented.
-        kv_cp_load_balance: KV-domain zigzag balance; currently unsupported by MLA.
-        ring_cp_size: Number of ranks in the Ring domain; currently must be one.
-        ring_cp_strategy: Ring transport selector, reserved for future MLA support.
-        ring_cp_load_balance: Ring-domain zigzag balance; currently unsupported by MLA.
-        cp_comm_overlap: Enable existing forward/backward scheduling windows.
+        strategy: Expanded QKV Ulysses or shared latent-KV communication.
+        overlap: Enable existing forward and supported backward scheduling.
+        ulysses_degree: CP head-parallel factor; the remaining factor partitions queries.
         kv_exchange: Full AllGather or selective causal-document AllToAllV.
 
     Returns:
@@ -109,11 +75,7 @@ def GatedMultiLatentAttention(  # pylint: disable=invalid-name
     """
     return build_family(GatedMultiLatentAttention, config=config, module=module,
                         module_fqn=module_fqn, context=context, mesh=mesh,
-                        ulysses_cp_size=ulysses_cp_size, ulysses_cp_strategy=ulysses_cp_strategy,
-                        kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy,
-                        kv_cp_load_balance=kv_cp_load_balance, ring_cp_size=ring_cp_size,
-                        ring_cp_strategy=ring_cp_strategy, ring_cp_load_balance=ring_cp_load_balance,
-                        cp_comm_overlap=cp_comm_overlap, kv_exchange=kv_exchange)
+                        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange)
 
 
 register_module_family(ModuleFamily(
@@ -121,8 +83,10 @@ register_module_family(ModuleFamily(
     variants={"local": (
         "hyper_parallel.components.modules.attention.gated_multi_latent_attention."
         "gated_multi_latent_attention_family._build_local"
-    ), "cp": "hyper_parallel.components.modules.attention.gated_multi_latent_attention."
-          "gated_multi_latent_attention_family._build_cp"},
+    ), "cp": (
+        "hyper_parallel.components.modules.attention.gated_multi_latent_attention."
+        "cp_gated_multi_latent_attention.CPGatedMultiLatentAttentionModule"
+    )},
     default_variant="local", parallel_axis="cp",
     variant_rules=(VariantRule({"parallel": True}, "cp"),),
     sharding=mla_sharding, validate=validate_gated_mla_family, parallel_spec=mla_local_parallel_spec,

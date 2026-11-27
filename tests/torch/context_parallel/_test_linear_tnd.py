@@ -80,10 +80,9 @@ def _wrapper(model, kind, mesh, npu, degree=1, method="p2p"):
     options = {"backend": "triton" if npu else "eager", "chunk_size": 64 if npu else 4}
     if kind == "kda":
         return _bind_family(KimiDeltaAttention, mesh,
-            module=model, ulysses_cp_size=degree, state_cp_method=method,
+            module=model, ulysses_degree=degree, state_cp_method=method,
             allgather_group_size=2 if method == "grouped_allgather_p2p" else 1, **options)
-    return _bind_family(GatedDeltaNet, mesh, module=model,
-                        ulysses_cp_size=mesh.size() if degree > 1 else 1, **options)
+    return _bind_family(GatedDeltaNet, mesh, module=model, ulysses_degree=None if degree > 1 else 1, **options)
 
 
 def _execute(model, wrapper, inputs, gradients, boundaries, *, live=False):
@@ -256,8 +255,7 @@ def test_linear_tnd_npu():
 
 def _tp_family_model(kind, cp, tp, flat):
     """Use native whole-head parameters so the test does not manually shard weights."""
-    options = {"context": {"cp_size": cp, "tp_size": tp}, "chunk_size": 4,
-               "ulysses_cp_size": cp,
+    options = {"context": {"cp_size": cp, "tp_size": tp}, "chunk_size": 4, "ulysses_degree": None,
                "input_layout": "TH" if flat else "BSH"}
     if kind == "kda":
         attention = KimiDeltaAttention(hidden_size=16, num_heads=4, num_v_heads=4,

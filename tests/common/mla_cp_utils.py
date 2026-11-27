@@ -143,21 +143,19 @@ def make_mla(
     return result
 
 
-def make_cp_mla(module: MultiLatentAttentionModule, mesh: TestCPMesh, ulysses_cp_strategy: str,
+def make_cp_mla(module: MultiLatentAttentionModule, mesh: TestCPMesh, strategy: str,
                 **options: Any) -> MultiLatentAttentionModule:
     """Bind the production CP class, including a singleton for CPU contract tests.
 
     Args:
         module: Source MLA mathematical member.
         mesh: Existing CP process group or singleton.
-        ulysses_cp_strategy: Expanded or latent KV communication.
+        strategy: Expanded or latent KV communication.
         **options: Additional CP selectors and test callbacks.
     """
     implementation = CPKimiMultiLatentAttentionModule if isinstance(module, KimiMultiLatentAttentionModule) else (
         CPMultiLatentAttentionModule)
-    options.setdefault("ulysses_cp_size", mesh.size())
-    result = implementation(module=module, context={"cp_size": mesh.size()},
-                            ulysses_cp_strategy=ulysses_cp_strategy, **options)
+    result = implementation(module=module, context={"cp_size": mesh.size()}, strategy=strategy, **options)
     logical = LogicalDeviceMesh(("cp",), (mesh.size(),))
     result.bind_parallel(ParallelBinding(MeshBinding(MeshContext(device_mesh=logical)), CPContext(mesh)))
     return result

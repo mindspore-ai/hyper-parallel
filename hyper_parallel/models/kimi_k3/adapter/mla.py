@@ -86,46 +86,20 @@ def _kimi_mla_sharding(*, module: nn.Module, module_fqn: str, member: Any, conte
 
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
-    kv_exchange: str = "all_gather",
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
+    strategy: str = "expanded_ulysses", overlap: bool = False,
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
 ) -> nn.Module:
     """Retain CP options in the family request without passing them to local math."""
-    del (module_fqn, context, kv_exchange, ulysses_cp_size,
-         ulysses_cp_strategy, kv_cp_size, kv_cp_strategy, kv_cp_load_balance, ring_cp_size,
-         ring_cp_strategy, ring_cp_load_balance, cp_comm_overlap)
+    del module_fqn, context, strategy, overlap, ulysses_degree, kv_exchange
     return KimiMultiLatentAttentionModule(config=config, module=module)
-
-
-def _build_cp(
-    *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
-    kv_exchange: str = "all_gather", ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
-) -> nn.Module:
-    """Adapt public CP domains to Kimi's tensor-returning gated MLA member."""
-    del module_fqn
-    selected_strategy = ulysses_cp_strategy
-    if selected_strategy == "alltoall":
-        selected_strategy = "expanded_ulysses"
-    return CPKimiMultiLatentAttentionModule(
-        config=config, module=module, context=context, ulysses_cp_strategy=selected_strategy,
-        cp_comm_overlap=cp_comm_overlap, ulysses_cp_size=ulysses_cp_size,
-        kv_exchange=kv_exchange,
-    )
 
 
 @module_replacement
 def KimiMultiLatentAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Any = None, mesh: Any = None,
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False, kv_exchange: str = "all_gather",
+    strategy: str = "expanded_ulysses", overlap: bool = False,
+    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
 ) -> nn.Module:
     """Select the shared gated MLA algorithm while retaining the Kimi model API.
 
@@ -135,15 +109,9 @@ def KimiMultiLatentAttention(  # pylint: disable=invalid-name
         module_fqn: Replacement path used by the planner and code generator.
         context: Logical topology selecting the local or CP member.
         mesh: Existing framework mesh, without creating a separate process group.
-        ulysses_cp_size: Number of ranks in the Ulysses domain.
-        ulysses_cp_strategy: ``alltoall``/``expanded_ulysses`` or ``latent_kv_head``.
-        kv_cp_size: Number of ranks in the KV AllGather domain.
-        kv_cp_strategy: Kimi MLA currently supports ``allgather``.
-        kv_cp_load_balance: KV-domain zigzag balance; currently unsupported.
-        ring_cp_size: Ring domain size; currently must be one.
-        ring_cp_strategy: Ring transport selector, reserved for future support.
-        ring_cp_load_balance: Ring-domain zigzag balance; currently unsupported.
-        cp_comm_overlap: Enable existing forward/backward overlap windows.
+        strategy: Expanded QKV or shared latent KV communication.
+        overlap: Enable existing forward and supported backward scheduling.
+        ulysses_degree: Head-parallel CP factor, defaulting to the full CP group.
         kv_exchange: Full AllGather or selective causal-document AllToAllV.
 
     Returns:
@@ -151,18 +119,14 @@ def KimiMultiLatentAttention(  # pylint: disable=invalid-name
     """
     return build_family(KimiMultiLatentAttention, config=config, module=module,
                         module_fqn=module_fqn, context=context, mesh=mesh,
-                        ulysses_cp_size=ulysses_cp_size, ulysses_cp_strategy=ulysses_cp_strategy,
-                        kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy,
-                        kv_cp_load_balance=kv_cp_load_balance, ring_cp_size=ring_cp_size,
-                        ring_cp_strategy=ring_cp_strategy, ring_cp_load_balance=ring_cp_load_balance,
-                        cp_comm_overlap=cp_comm_overlap, kv_exchange=kv_exchange)
+                        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange)
 
 
 register_module_family(ModuleFamily(
     name="kimi_multi_latent_attention", baseline=KimiMultiLatentAttention,
     variants={
         "local": "hyper_parallel.models.kimi_k3.adapter.mla._build_local",
-        "cp": "hyper_parallel.models.kimi_k3.adapter.mla._build_cp",
+        "cp": "hyper_parallel.models.kimi_k3.adapter.mla.CPKimiMultiLatentAttentionModule",
     },
     default_variant="local", parallel_axis="cp",
     variant_rules=(VariantRule({"parallel": True}, "cp"),),

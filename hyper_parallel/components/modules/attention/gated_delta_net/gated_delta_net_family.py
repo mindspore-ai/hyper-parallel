@@ -24,9 +24,6 @@ from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, register_module_family,
 )
-from hyper_parallel.components.modules.attention.cp_config import (
-    resolve_attention_cp_config, validate_supported_cp_options,
-)
 from hyper_parallel.components.modules.attention.linear_attention_utils.parallel_layout import (
     linear_attention_local_spec, linear_attention_sharding,
 )
@@ -48,20 +45,16 @@ def validate_gdn_family(*, config: Any, module: nn.Module | None, context: Any, 
     del context
     backend = validate_backend_options(member.arguments)
     cp = member.axis_sizes["cp"]
-    cp_config = resolve_attention_cp_config(member)
-    validate_supported_cp_options(
-        cp_config, "GDN", ulysses_strategies=("alltoall",), ring_strategies=("p2p",),
-        allow_ulysses=True, allow_kv=False, allow_ring=True,
-    )
-    degree = cp_config["ulysses_cp_size"]
+    degree = member.arguments.get("ulysses_degree", 1)
+    degree = cp if degree is None else degree
     if (not isinstance(degree, int) or isinstance(degree, bool)) or degree < 1 or (cp > 1 and cp % degree):
-        raise ValueError("ulysses_cp_size must be a positive divisor of cp_size")
+        raise ValueError("ulysses_degree must be a positive divisor of CP size")
     source = config if module is None else module
     kh = getattr(source, "num_k_heads", None) if module is not None else source.linear_num_key_heads
     vh = getattr(source, "num_v_heads", None) if module is not None else source.linear_num_value_heads
     head_degree = member.axis_sizes["tp"] * (degree if cp > 1 else 1)
     if kh is not None and (kh % head_degree or vh % head_degree):
-        raise ValueError("TP times ulysses_cp_size must divide both query and value heads")
+        raise ValueError("TP times Ulysses degree must divide both query and value heads")
     _validate_gdn_protocol(cp, degree, backend)
 
 
@@ -87,36 +80,12 @@ def gdn_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: An
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     backend: str = "eager", conv_backend: str | None = None, chunk_size: int = 64,
-    input_layout: str = "BSH",
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
+    input_layout: str = "BSH", ulysses_degree: int | None = 1,
 ) -> nn.Module:
     """Keep CP selection in the family request, outside the standalone algorithm."""
-    del (module_fqn, context, ulysses_cp_size, ulysses_cp_strategy, kv_cp_size,
-         kv_cp_strategy, kv_cp_load_balance, ring_cp_size, ring_cp_strategy, ring_cp_load_balance,
-         cp_comm_overlap)
+    del module_fqn, context, ulysses_degree
     return GatedDeltaNetModule(config=config, module=module, backend=backend, conv_backend=conv_backend,
                                      chunk_size=chunk_size, input_layout=input_layout)
-
-
-def _build_cp(
-    *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
-    backend: str = "eager", conv_backend: str | None = None, chunk_size: int = 64,
-    input_layout: str = "BSH", ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
-) -> nn.Module:
-    """Map Ulysses and Ring domains onto GDN head and state communication."""
-    del module_fqn
-    from .cp_gated_delta_net import CPGatedDeltaNetModule  # pylint: disable=C0415
-
-    return CPGatedDeltaNetModule(
-        config=config, module=module, context=context, backend=backend, conv_backend=conv_backend,
-        chunk_size=chunk_size, input_layout=input_layout, ulysses_cp_size=ulysses_cp_size,
-    )
 
 
 # Public factories follow the ModuleFamily class-style naming convention.
@@ -124,11 +93,7 @@ def _build_cp(
 def GatedDeltaNet(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, backend: str = "eager", conv_backend: str | None = None,
-    chunk_size: int = 64, input_layout: str = "BSH",
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-    cp_comm_overlap: bool = False,
+    chunk_size: int = 64, input_layout: str = "BSH", ulysses_degree: int | None = 1,
 ) -> nn.Module:
     """Build the complete local or CP training member with source checkpoint names.
 
@@ -142,24 +107,11 @@ def GatedDeltaNet(  # pylint: disable=invalid-name
         conv_backend: Independent convolution implementation; omission preserves scheduling defaults.
         chunk_size: Local chunk length; fused implementations require 64.
         input_layout: BSH or TH, determining the external token shard axis.
-        ulysses_cp_size: Number of ranks in the Ulysses head-exchange domain.
-        ulysses_cp_strategy: GDN currently supports ``alltoall``.
-        kv_cp_size: Must be one; GDN carries recurrent state rather than an attention KV bank.
-        kv_cp_strategy: Reserved for future GDN KV-domain communication.
-        kv_cp_load_balance: KV-domain zigzag balance; unsupported by GDN.
-        ring_cp_size: Number of ranks in the state P2P domain; cannot combine with partial Ulysses.
-        ring_cp_strategy: GDN currently supports ``p2p`` for state exchange.
-        ring_cp_load_balance: Ring zigzag balance; unsupported by GDN.
-        cp_comm_overlap: General CP overlap toggle; currently unsupported by GDN.
+        ulysses_degree: Head-exchange degree; None selects pure Ulysses scheduling.
     """
     return build_family(GatedDeltaNet, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, backend=backend, conv_backend=conv_backend,
-                        chunk_size=chunk_size, input_layout=input_layout,
-                        ulysses_cp_size=ulysses_cp_size, ulysses_cp_strategy=ulysses_cp_strategy,
-                        kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy,
-                        kv_cp_load_balance=kv_cp_load_balance, ring_cp_size=ring_cp_size,
-                        ring_cp_strategy=ring_cp_strategy, ring_cp_load_balance=ring_cp_load_balance,
-                        cp_comm_overlap=cp_comm_overlap)
+                        chunk_size=chunk_size, input_layout=input_layout, ulysses_degree=ulysses_degree)
 
 
 register_module_family(ModuleFamily(
@@ -168,7 +120,7 @@ register_module_family(ModuleFamily(
         "local": ("hyper_parallel.components.modules.attention.gated_delta_net."
                   "gated_delta_net_family._build_local"),
         "cp": ("hyper_parallel.components.modules.attention.gated_delta_net."
-               "gated_delta_net_family._build_cp"),
+               "cp_gated_delta_net.CPGatedDeltaNetModule"),
     },
     default_variant="local", parallel_axis="cp", variant_rules=(VariantRule({"parallel": True}, "cp"),),
     sharding=gdn_sharding, validate=validate_gdn_family,

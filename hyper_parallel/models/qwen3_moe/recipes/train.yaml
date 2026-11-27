@@ -1,7 +1,7 @@
 # Qwen3-30B-A3B 完整训练配方（唯一对外交付的 Qwen3-MoE recipe）。
 #
 # 预期资源：单机 8 卡 Ascend NPU（hccl backend）。attention family 按 cp_size
-# 自动选择 local/CP 成员；U=1、KV=1 是当前 CP1 配置。
+# 自动选择 local/CP 成员；本配方的 ulysses_degree: 1 在 CP>1 时选择 KV AllGather。
 # EP 仍由 `when: ep` 启用；调整并行度时需同步匹配 DP/FSDP 与任务设备总数。
 #
 # 默认加载公开 Hugging Face 资源（模型、tokenizer、dataset）。本地或离线
@@ -65,8 +65,9 @@ plan_overrides:
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
       implementation:
         _target_: hyper_parallel.components.modules.GroupedQueryAttention
-        ulysses_cp_size: 1
-        kv_cp_size: 1
+        # U=1 selects KV AllGather when cp_size>1; U=cp_size selects pure Ulysses.
+        # Other divisors select Ulysses + KV AllGather. overlap defaults to false.
+        ulysses_degree: 1
   # The experts module is always the same grouped-GEMM implementation;
   # enabling EP changes only token dispatch/combine around this boundary.
   - match: "model.layers.*.mlp.experts"

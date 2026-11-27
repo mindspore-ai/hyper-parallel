@@ -100,7 +100,7 @@ train:
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
       implementation:
         _target_: hyper_parallel.components.modules.GroupedQueryAttention
-        ulysses_cp_size: 1
+        ulysses_degree: 1
   - match: '*.mlp.experts'
     replace:
       kind: module

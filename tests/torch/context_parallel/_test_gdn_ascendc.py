@@ -68,7 +68,7 @@ def _check_layer(mesh, length):
     rank, size = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(451)
     model = _GDN(96, 128).float().npu()
-    wrapper = _bind_family(GatedDeltaNet, mesh, module=model, backend="ascendc", ulysses_cp_size=mesh.size())
+    wrapper = _bind_family(GatedDeltaNet, mesh, module=model, backend="ascendc", ulysses_degree=None)
     local = (torch.randn(length, 32) * .05).bfloat16().npu()
     grad_output = (torch.randn(length, 32) * .01).bfloat16().npu()
     tails = (0, length + length // 2 + 1, 3 * length, size * length - 1, size * length)

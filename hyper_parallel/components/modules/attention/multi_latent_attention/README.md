@@ -22,25 +22,22 @@ plan_overrides:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.MultiLatentAttention
-        ulysses_cp_size: 4
-        ulysses_cp_strategy: latent_kv_head
-        kv_cp_size: 1
-        cp_comm_overlap: true
+        strategy: latent_kv_head
+        overlap: true
 ```
 
 `cp_size: 1` 使用 local 成员；大于 1 时选择 CP 成员。其余 DP/FSDP 拓扑与模型配置沿用完整配方。
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `ulysses_cp_size` | `1` | Ulysses 域大小；须与 KV/Ring 域乘积等于总 CP 大小 |
-| `ulysses_cp_strategy` | `alltoall` | `expanded_ulysses` 使用展开 QKV；`latent_kv_head` 通信压缩 KV，再展开所需头 |
-| `kv_cp_size` | `1` | KV AllGather 域大小 |
-| `cp_comm_overlap` | `false` | 开启该拓扑已支持的前向和反向调度 |
+| `strategy` | `expanded_ulysses` | expanded_ulysses 使用展开 QKV；latent_kv_head 通信压缩 KV，再展开所需头 |
+| `ulysses_degree` | null | 省略/null 为纯 Ulysses；1 为 KV AG；其他整除 CP 大小的值为 Ulysses×AG |
+| `overlap` | false | 开启该拓扑已支持的前向和反向调度 |
 | `kv_exchange` | `all_gather` | AG/混合路径可改为 all_to_all_v，按因果文档需要选择性发送 KV |
 
-令 `P=cp_size`、`U=ulysses_cp_size`、`A=kv_cp_size`，要求 `P=U×A`（Ring 当前为 1）。
-例如 CP4 下，U4/A1 为纯 Ulysses，U1/A4 为 KV AG，U2/A2 为混合。
-`ulysses_cp_strategy` 选择通信表示，域大小选择并行拓扑。
+令 `P=cp_size`、`U=ulysses_degree`，AG 子组大小为 `P/U`。
+例如 CP4 下，省略 U 为 U4，U=1 为 AG4，U=2 为 U2×AG2。
+strategy 选择通信表示，U 选择并行拓扑；虽然默认策略名含 ulysses，也可通过 U 选择 AG/混合。
 
 ## Latent CP 与前反向掩盖
 
@@ -49,7 +46,7 @@ plan_overrides:
 latent 可减少 KV 通信量，实际节省取决于 latent 宽度、头数和 CP 拓扑；FA 仍计算展开后的 Q/K/V。
 混合 CP 同时按头和 query 区间分工，AG 维补齐各 query 区间所需的 KV。
 
-`cp_comm_overlap: true` 同时启用该拓扑支持的前向和反向调度。纯 Ulysses、TP1 的主要窗口如下
+`overlap: true` 同时启用该拓扑支持的前向和反向调度。纯 Ulysses、TP1 的主要窗口如下
 （A2A 为 AllToAll，AG 为 AllGather，RS 为 ReduceScatter）：
 
 | 路径 | 通信与计算怎样重叠 |
@@ -81,7 +78,7 @@ latent 可减少 KV 通信量，实际节省取决于 latent 宽度、头数和 
 输入准备计算 down 投影与 Norm，得到 Q/KV latent 和共享 K。交换阶段按策略安排上投影与通信：
 expanded 先展开再发送，latent KV 先通信再展开所需头。
 数学方法和 forward 由算法类共享，CP 成员只负责通信与调度。
-开启 `cp_comm_overlap` 时可提前提交已就绪的数据，不要求各阶段串行执行。
+开启 overlap 时可提前提交已就绪的数据，不要求各阶段串行执行。
 
 ## 支持范围
 
@@ -92,7 +89,7 @@ expanded 先展开再发送，latent KV 先通信再展开所需头。
 - RoPE 使用模型提供的本地 token 位置表，TND 文档边界不替代位置编码。MoME、parameter-sink 来源不受支持。
 - all_to_all_v 仅用于存在 query 分区的 AG/混合路径，不能配置在纯 Ulysses 上。
 
-| `cp_comm_overlap` 路径 | 已支持的调度 |
+| overlap 路径 | 已支持的调度 |
 | --- | --- |
 | 纯 Ulysses、TP1 | 上述输入前向、配对输入反向及输出反向调度 |
 | AG/混合、TP1 | 输入前向重叠；混合 U>1 可复用输出反向调度，输入反向仍用原生 collective |

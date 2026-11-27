@@ -41,7 +41,7 @@ plan_overrides:
         backend: triton
         conv_backend: eager
         state_cp_method: grouped_allgather_p2p
-        ulysses_cp_size: 2
+        ulysses_degree: 2
         allgather_group_size: 2
 ```
 
@@ -51,19 +51,19 @@ See [module families](linear_attention_module_families.md) for ownership, TND la
 
 With CP8, this example creates U2, state CP4, within-group AG2, and a two-owner P2P chain.
 Total CP size comes from the training parallel configuration. `state_cp_method` selects only the state CP method; the full strategy also depends on
-`ulysses_cp_size` and `allgather_group_size`. For example, `state_cp_method: p2p` with `ulysses_cp_size: 2`
+`ulysses_degree` and `allgather_group_size`. For example, `state_cp_method: p2p` with `ulysses_degree: 2`
 means Ulysses + P2P. The family defaults `chunk_size` to 64; fused backends require 64, while eager accepts other positive sizes.
 
 | Parameter | Default | Meaning and constraints |
 |------|--------|------------|
 | `backend` | `eager` | Local KDA backend. Local and pure-U execution support `eager`; P2P, AG, grouped AG, RD, and their Ulysses combinations support `triton` and `ascendc`. |
 | `state_cp_method` | `p2p` | State CP method: `p2p`, `allgather`, `grouped_allgather_p2p`, or `recursive_doubling`. |
-| `ulysses_cp_size` | `1` | U, a positive integer dividing CP size; both query/key and value head counts must be divisible by U. |
+| `ulysses_degree` | `1` | U, a positive integer dividing CP size; both query/key and value head counts must be divisible by U. |
 | `allgather_group_size` | `1` | g, the number of state ranks per within-group AllGather, which must divide R. Used only for `grouped_allgather_p2p`; pure `allgather` gathers the full R group automatically and leaves this at 1. |
 
 Common CP8 combinations:
 
-| Method | `state_cp_method` | `ulysses_cp_size` | `allgather_group_size` |
+| Method | `state_cp_method` | `ulysses_degree` | `allgather_group_size` |
 |------|---------------------|------------------|--------------|
 | P2P | `p2p` | 1 | 1 |
 | AG | `allgather` | 1 | 1 |
@@ -79,7 +79,7 @@ With `U=1`, Ulysses is skipped. With `U=P`, state CP size is 1 and only local KD
 The grouped protocol reduces to P2P at `g=1` and to AG at `g=R`.
 Legacy wrappers have been removed. Migrate their configuration to the complete module family.
 Choose convolution independently with `conv_backend`, and use `input_layout: TH` for flat packed tokens.
-`ulysses_cp_size: P` selects pure-U scheduling with convolution after head exchange; `U=P` preserves pre-exchange halo/convolution.
+`ulysses_degree: null` selects pure-U scheduling with convolution after head exchange; integer `U=P` preserves pre-exchange halo/convolution.
 
 ## Input and Mesh Constraints
 
@@ -129,7 +129,7 @@ local M on every rank. Each invocation owns its state cache independently to sup
 ## Recursive Doubling and TND
 
 `state_cp_method: recursive_doubling` propagates state summaries through ordered recursive doubling and computes backward state gradients using transitions cached during forward.
-It composes with `ulysses_cp_size`, with `allgather_group_size` fixed at 1; it does not use intragroup AllGather.
+It composes with `ulysses_degree`, with `allgather_group_size` fixed at 1; it does not use intragroup AllGather.
 This option reuses the same Triton local operators and supports dense inputs and the linked
 [TND contiguous sharding](linear_attention_tnd_cp.md). Actual resets use zero effective transitions and do not propagate state across documents.
 The TND entry therefore prunes sends/receives, summary production, and caches that have no consumers, without extra configuration or changes to existing process groups.
@@ -171,13 +171,13 @@ plan_overrides:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.KimiDeltaAttention
-        ulysses_cp_size: 8
+        ulysses_degree: 8
         state_cp_method: p2p
         backend: ascendc
         conv_backend: ascendc
 ```
 
-When `ulysses_cp_size` equals the CP mesh size, the state communication group has size 1 and only Ulysses AllToAll runs.
+When `ulysses_degree` equals the CP mesh size, the state communication group has size 1 and only Ulysses AllToAll runs.
 The Ascend C backend also supports state P2P, AG, grouped AG, and RD described below.
 
 Inputs retain raw Q/K, gate, and beta logits. Prepare handles Q/K normalization and the gate/beta forward operations.
@@ -193,7 +193,7 @@ Initial/final states and their gradients, and double backward, are not yet expos
 
 With an unmodified fla-npu package providing native CP summaries and separate backward-phase interfaces, `backend: ascendc` supports
 `state_cp_method: p2p`, `allgather`, `grouped_allgather_p2p`, and `recursive_doubling`.
-All compose with `ulysses_cp_size`; the grouped method also uses `allgather_group_size`.
+All compose with `ulysses_degree`; the grouped method also uses `allgather_group_size`.
 Every combination in the preceding CP8 configuration table can use this backend.
 
 Local execution, pure Ulysses, and all four state protocols share prepare, h, finalize, and separate bwd_prepare, dhu, and bwd_finalize phases.

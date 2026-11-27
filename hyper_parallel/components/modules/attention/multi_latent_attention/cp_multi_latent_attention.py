@@ -89,25 +89,27 @@ class MLACPPlan:
 
     dimensions: MLADimensions
     cp_degree: int
-    ulysses_cp_strategy: MLACPStrategy = "expanded_ulysses"
+    strategy: MLACPStrategy = "expanded_ulysses"
     tp_degree: int = 1
-    cp_comm_overlap: bool = False
-    ulysses_cp_size: int = 1
+    overlap: bool = False
+    ulysses_degree: int | None = None
     kv_exchange: Literal["all_gather", "all_to_all_v"] = "all_gather"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.cp_comm_overlap, bool):
-            raise ValueError("cp_comm_overlap must be bool")
-        for name in ("cp_degree", "tp_degree", "ulysses_cp_size"):
+        if not isinstance(self.overlap, bool):
+            raise ValueError("overlap must be bool")
+        if self.ulysses_degree is None:
+            object.__setattr__(self, "ulysses_degree", self.cp_degree)
+        for name in ("cp_degree", "tp_degree", "ulysses_degree"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if self.ulysses_cp_strategy not in MLA_CP_STRATEGIES:
-            raise ValueError(f"Unknown MLA CP strategy: {self.ulysses_cp_strategy}")
-        if self.cp_degree % self.ulysses_cp_size:
-            raise ValueError("ulysses_cp_size must divide cp_degree")
-        if self.dimensions.heads % (self.tp_degree * self.ulysses_cp_size):
-            raise ValueError("MLA heads must be divisible by TP degree times ulysses_cp_size")
+        if self.strategy not in MLA_CP_STRATEGIES:
+            raise ValueError(f"Unknown MLA CP strategy: {self.strategy}")
+        if self.cp_degree % self.ulysses_degree:
+            raise ValueError("ulysses_degree must divide cp_degree")
+        if self.dimensions.heads % (self.tp_degree * self.ulysses_degree):
+            raise ValueError("MLA heads must be divisible by TP degree times Ulysses degree")
         if self.kv_exchange not in ("all_gather", "all_to_all_v"):
             raise ValueError("kv_exchange must be all_gather or all_to_all_v")
         if self.kv_exchange == "all_to_all_v" and self.all_gather_degree == 1:
@@ -123,12 +125,12 @@ class MLACPPlan:
     @property
     def compute_heads(self) -> int:
         """Heads used by this rank's query-partition attention kernel."""
-        return self.local_heads // self.ulysses_cp_size
+        return self.local_heads // self.ulysses_degree
 
     @property
     def all_gather_degree(self) -> int:
         """Number of query owners for each Ulysses head partition."""
-        return self.cp_degree // self.ulysses_cp_size
+        return self.cp_degree // self.ulysses_degree
 
     def validate_scale(self, scale: float) -> None:
         """Reject invalid scales without replacing an explicit YaRN scale.
@@ -371,8 +373,8 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
 
     def __init__(self, *, module: nn.Module | None = None, config: Any = None,
                  module_fqn: str = "", context: Any = None,
-                 ulysses_cp_strategy: str = "expanded_ulysses", cp_comm_overlap: bool = False,
-                 ulysses_cp_size: int = 1, kv_exchange: str = "all_gather",
+                 strategy: str = "expanded_ulysses", overlap: bool = False,
+                 ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
                  rotary_fn: Callable | None = None, attention_interface: Callable | None = None) -> None:
         """Choose CP ownership before parameter sharding and FSDP construction.
 
@@ -381,9 +383,9 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
             config: Native mathematical configuration, exclusive with module.
             module_fqn: Construction context supplied by the family framework.
             context: Logical CP and TP sizes before resources are bound.
-            ulysses_cp_strategy: Expanded QKV or latent KV representation for communication.
-            cp_comm_overlap: Enable the existing supported forward/backward schedules.
-            ulysses_cp_size: CP ranks assigned to attention heads.
+            strategy: Expanded QKV or latent KV representation for communication.
+            overlap: Enable the existing supported forward/backward schedules.
+            ulysses_degree: CP ranks assigned to attention heads.
             kv_exchange: AllGather or selective variable-size KV exchange.
             rotary_fn: Optional BSND position callback; must preserve shape and dtype.
             attention_interface: Optional FA callback returning BSND output and weights.
@@ -403,10 +405,8 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         dimensions = MLADimensions(self.config.num_attention_heads, self.q_lora_rank, self.kv_lora_rank,
                                    self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim)
         cp_degree = (context or {}).get("cp_size", 1)
-        self.cp_plan = MLACPPlan(dimensions, cp_degree, ulysses_cp_strategy=ulysses_cp_strategy,
-                                 tp_degree=(context or {}).get("tp_size", 1),
-                                 cp_comm_overlap=cp_comm_overlap, ulysses_cp_size=ulysses_cp_size,
-                                 kv_exchange=kv_exchange)
+        self.cp_plan = MLACPPlan(dimensions, cp_degree, strategy=strategy, tp_degree=(context or {}).get("tp_size", 1),
+                                 overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange)
         self.cp_plan.validate_scale(self.scaling)
         self.cp_context = self.ulysses_context = self.query_context = None
         self.cp_mesh = self.ulysses_mesh = self.all_gather_mesh = None
@@ -416,7 +416,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
 
     def prepare_output_projection(self) -> None:
         """Keep the existing managed dO/wgrad scheduling boundary."""
-        if self.cp_plan.cp_comm_overlap and self.cp_plan.tp_degree == 1 and self.cp_plan.ulysses_cp_size > 1:
+        if self.cp_plan.overlap and self.cp_plan.tp_degree == 1 and self.cp_plan.ulysses_degree > 1:
             self.o_proj = CPMLAOutputLinear(self.o_proj)
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
@@ -441,14 +441,14 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         if context.size != self.cp_plan.cp_degree:
             raise ValueError("MLACPPlan degree must match the CP mesh")
         self.cp_context, self.cp_mesh = context, context.mesh
-        self.query_rank, self.head_rank = divmod(context.rank, self.cp_plan.ulysses_cp_size)
-        self.ulysses_context, self.query_context = context.split(self.cp_plan.ulysses_cp_size)
+        self.query_rank, self.head_rank = divmod(context.rank, self.cp_plan.ulysses_degree)
+        self.ulysses_context, self.query_context = context.split(self.cp_plan.ulysses_degree)
         self.ulysses_mesh, self.all_gather_mesh = self.ulysses_context.mesh, self.query_context.mesh
 
     def _overlap_output_backward(self) -> bool:
         """Keep the existing TP1 output adjoint; input pairing also requires pure Ulysses."""
         plan = self.cp_plan
-        return plan.cp_comm_overlap and plan.tp_degree == 1 and plan.ulysses_cp_size > 1 and torch.is_grad_enabled()
+        return plan.overlap and plan.tp_degree == 1 and plan.ulysses_degree > 1 and torch.is_grad_enabled()
 
     def project_output(self, attention_output: torch.Tensor, hidden_states: torch.Tensor,
                        output_state: Any) -> torch.Tensor:
@@ -531,7 +531,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         if self.cp_plan.all_gather_degree > 1:
             _validate_query_partition(causal, attention_mask)
             partition = _causal_partition(
-                lengths or (sequence * degree,), sequence * self.cp_plan.ulysses_cp_size, self.query_rank, batch)
+                lengths or (sequence * degree,), sequence * self.cp_plan.ulysses_degree, self.query_rank, batch)
             lengths, key_lengths = partition.query_lengths, partition.key_lengths
         positions = _positions(positions, state, dimensions.rope_dim)
         _validate_state(self, self.cp_plan, state)
@@ -550,9 +550,9 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         retain native input collective adjoints; their output dO overlap is
         selected independently by the output stage.
         """
-        use_forward_overlap = self.cp_plan.cp_comm_overlap and self.cp_plan.cp_degree > 1
+        use_forward_overlap = self.cp_plan.overlap and self.cp_plan.cp_degree > 1
         pure_ulysses = self.cp_plan.all_gather_degree == 1
-        expanded = self.cp_plan.ulysses_cp_strategy == "expanded_ulysses"
+        expanded = self.cp_plan.strategy == "expanded_ulysses"
         supports_input_gate = use_forward_overlap and pure_ulysses and expanded
         if input_gate is not None and not supports_input_gate:
             raise ValueError("Input gate overlap requires expanded pure Ulysses with overlap enabled")
@@ -597,8 +597,8 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         if self._overlap_output_backward():
             return output, MLAOutputProjectionState(self.ulysses_mesh, self.v_head_dim)
         batch, sequence = output.shape[:2]
-        sequence //= self.cp_plan.ulysses_cp_size
-        if self.cp_plan.ulysses_cp_size > 1:
+        sequence //= self.cp_plan.ulysses_degree
+        if self.cp_plan.ulysses_degree > 1:
             output = self.ulysses_context.head_to_sequence(output)
         expected = (batch, sequence, self.cp_plan.local_heads, self.cp_plan.dimensions.value_dim)
         if tuple(output.shape) != expected:
@@ -612,7 +612,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
 
     def _exchange_qkv(self, query, key, value, partition):
         """Exchange completed expanded operands without performing projection math."""
-        if self.cp_plan.ulysses_cp_size > 1:
+        if self.cp_plan.ulysses_degree > 1:
             widths = (query.shape[-1], key.shape[-1], value.shape[-1])
             payload = torch.cat(tuple(tensor.transpose(1, 2) for tensor in (query, key, value)), dim=-1)
             payload = self.ulysses_context.sequence_to_head(payload)
@@ -629,7 +629,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
 
     def _latent_inputs(self, state, query, key_rope, partition=None):
         """Exchange Q heads, gather shared KV latents, then expand only owned heads."""
-        if self.cp_plan.ulysses_cp_size > 1:
+        if self.cp_plan.ulysses_degree > 1:
             query = self.ulysses_context.sequence_to_head(query, seq_dim=2, head_dim=1)
         payload = torch.cat((state.kv_latent, key_rope), dim=-1)
         payload = self._launch_latent_kv(payload, partition, overlap=False).wait()
@@ -638,7 +638,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
     def _launch_latent_kv(self, payload, partition=None, *, overlap=True):
         """Exchange compressed KV before the algorithm's head-selective expansion."""
         if self.cp_plan.kv_exchange == "all_to_all_v":
-            return _selective_kv_launch(payload, partition, self.cp_mesh, self.cp_plan.ulysses_cp_size, overlap)
+            return _selective_kv_launch(payload, partition, self.cp_mesh, self.cp_plan.ulysses_degree, overlap)
         return self.cp_context.launch_gather_sequence(payload).collective
 
     def _expand_latent(self, payload, partition=None):
@@ -658,7 +658,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         """Overlap KV transfer with Q preparation, respecting the two-stage hybrid dependency."""
         key, value = self.project_key_value(state.kv_latent, key_rope, heads=self.cp_plan.local_heads)
         payload = torch.cat((key.transpose(1, 2), value.transpose(1, 2)), dim=-1)
-        use_ulysses = self.cp_plan.ulysses_cp_size > 1
+        use_ulysses = self.cp_plan.ulysses_degree > 1
         if use_ulysses:
             kv_transfer_handle = self.ulysses_context.launch_sequence_to_head(payload)
         else:
@@ -689,7 +689,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         query = self.project_query(state.query_latent, positions, heads=self.cp_plan.local_heads, rotary_fn=rotary_fn)
         payload = kv_transfer_handle.wait()
         query_a2a_handle = (self.ulysses_context.launch_sequence_to_head(query.transpose(1, 2))
-                            if self.cp_plan.ulysses_cp_size > 1 else None)
+                            if self.cp_plan.ulysses_degree > 1 else None)
         key, value = self._expand_latent(payload, partition)
         if query_a2a_handle is not None:
             query = query_a2a_handle.wait().transpose(1, 2)

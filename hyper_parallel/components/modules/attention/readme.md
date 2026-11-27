@@ -13,12 +13,6 @@ family 提供统一的公共入口。各算法的使用参数见对应文档。
 | [Multi-head Latent Attention](multi_latent_attention/README.md) | 多头潜变量注意力 |
 | [Gated Multi-head Latent Attention](gated_multi_latent_attention/README.md) | 不使用位置编码、带输出门控的多头潜变量注意力 |
 | [DeepSeek Sparse Attention](deepseek_sparse_attention/readme.md) | DeepSeek-V3.2 稀疏注意力 |
-| [Compressed Sparse Attention 2](compressed_sparse_attention2/README.md) | DeepSeek-V4.1 压缩稀疏注意力 |
-| Kimi Delta Attention | Kimi 递归状态线性注意力 |
-| Gated DeltaNet | 递归状态线性注意力 |
-
-所有 attention family 共用 CP 参数名，但可支持的并行域和具体策略因算法而异；
-详见[CP 参数迁移记录](cp_parameter_migration.md)。
 
 ## 文件结构
 
@@ -74,11 +68,9 @@ plan_overrides:
       kind: module
       implementation:
         _target_: hyper_parallel.components.modules.GroupedQueryAttention
-        ulysses_cp_size: 2
-        kv_cp_size: 2
-        cp_comm_overlap: true
+        ulysses_degree: 2
+        overlap: true
 ```
 
-CP 总度须满足 `cp_size = ulysses_cp_size × kv_cp_size × ring_cp_size`。
-各算法支持的并行域和策略不同，详见[参数迁移与支持范围](cp_parameter_migration.md)及
-[Grouped Query Attention 文档](grouped_query_attention/README.md)。
+`ulysses_degree: 2` 将 4 路上下文并行分为 2 路 Ulysses 与 2 路 KV AllGather，
+`overlap: true` 开启通信重叠。参数说明见 [Grouped Query Attention 文档](grouped_query_attention/README.md)。

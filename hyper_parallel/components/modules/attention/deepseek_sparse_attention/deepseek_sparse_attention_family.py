@@ -23,9 +23,6 @@ from torch import nn
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, register_module_family,
 )
-from hyper_parallel.components.modules.attention.cp_config import (
-    resolve_attention_cp_config, validate_supported_cp_options,
-)
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.distributed._builder.family_layout import validate_tp_boundary
 from hyper_parallel.distributed.module_binding import ParallelModuleSpec
@@ -36,14 +33,9 @@ from hyper_parallel.models.replacement import module_replacement
 def validate_sparse_attention_family(*, config: Any, module: nn.Module | None, context: Any, member: Any) -> None:
     """Check logical topology before allocating native or replacement parameters."""
     # Local/meta construction can retain a CP request before the job topology exists.
-    cp_config = resolve_attention_cp_config(member)
-    validate_supported_cp_options(
-        cp_config, "DeepSeek sparse attention", allow_ulysses=False, allow_kv=True, allow_overlap=True,
-    )
-    configured_cp_size = context.get("cp_size")
-    if configured_cp_size is not None and configured_cp_size != (
-            cp_config["ulysses_cp_size"] * cp_config["kv_cp_size"] * cp_config["ring_cp_size"]):
-        raise ValueError("DeepSeek sparse attention CP domains must multiply to the configured cp_size")
+    cp_size = context.get("cp_size")
+    if cp_size is not None and member.arguments.get("kv_cp_size", 1) != cp_size:
+        raise ValueError("kv_cp_size must equal the job cp_size")
     config = config if module is None else module.config
     if member.axis_sizes["pp"] > 1:
         raise ValueError("DeepSeek sparse attention does not support pipeline parallelism")
@@ -125,9 +117,7 @@ def sparse_attention_parallel_spec(*, module: nn.Module, member: Any) -> Paralle
 def DeepseekSparseAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None,
-    ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
+    kv_cp_size: int = 1, kv_cp_strategy: str = "allgather",
     cp_comm_overlap: bool = False, dense_warmup: bool | None = None,
 ) -> nn.Module:
     """Build a local or CP member while retaining V3.2 source and checkpoint contracts.
@@ -138,14 +128,8 @@ def DeepseekSparseAttention(  # pylint: disable=invalid-name
         module_fqn: Source path supplied by the replacement executor.
         context: Logical job topology used for family selection.
         mesh: Optional existing MeshContext for shared layout planning and binding.
-        ulysses_cp_size: Ulysses domain size; this family currently requires one.
-        ulysses_cp_strategy: Reserved Ulysses strategy; DSA currently has no Ulysses path.
-        kv_cp_size: KV domain size; must account for all active CP ranks.
-        kv_cp_strategy: KV transport; currently only ``allgather`` is supported.
-        kv_cp_load_balance: KV-domain zigzag balance; currently unsupported by DSA.
-        ring_cp_size: Ring domain size; this family currently requires one.
-        ring_cp_strategy: Reserved Ring strategy; DSA currently has no Ring path.
-        ring_cp_load_balance: Ring-domain zigzag balance; currently unsupported by DSA.
+        kv_cp_size: KV domain size; must equal the job CP size for this implementation.
+        kv_cp_strategy: KV transport; currently only allgather is supported.
         cp_comm_overlap: Submit all key-bank gathers before waiting when true; defaults to False.
         dense_warmup: None follows the mutable model stage; bool pins the stage.
 
@@ -154,11 +138,8 @@ def DeepseekSparseAttention(  # pylint: disable=invalid-name
     """
     return build_family(
         DeepseekSparseAttention, config=config, module=module, module_fqn=module_fqn, context=context,
-        mesh=mesh, ulysses_cp_size=ulysses_cp_size, ulysses_cp_strategy=ulysses_cp_strategy,
-        kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy, kv_cp_load_balance=kv_cp_load_balance,
-        ring_cp_size=ring_cp_size, ring_cp_strategy=ring_cp_strategy,
-        ring_cp_load_balance=ring_cp_load_balance, cp_comm_overlap=cp_comm_overlap,
-        dense_warmup=dense_warmup,
+        mesh=mesh, kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy,
+        cp_comm_overlap=cp_comm_overlap, dense_warmup=dense_warmup,
     )
 
 

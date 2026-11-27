@@ -53,29 +53,28 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
         hidden = torch.ones(1, 2, 4)
         implementation = context_parallel.CPMultiLatentAttentionModule
         self.assertIs(implementation.forward, context_parallel.MultiLatentAttentionModule.forward)
-        for overlap, tp_degree, ulysses_cp_size, gather_degree, grad_enabled in (
+        for overlap, tp_degree, ulysses_degree, gather_degree, grad_enabled in (
             (False, 1, 2, 1, True), (True, 1, 2, 1, True), (True, 1, 2, 2, True),
             (True, 2, 2, 1, True), (True, 1, 1, 2, True), (True, 1, 2, 1, False),
         ):
-            with self.subTest(overlap=overlap, tp=tp_degree, ulysses=ulysses_cp_size,
+            with self.subTest(overlap=overlap, tp=tp_degree, ulysses=ulysses_degree,
                               gather=gather_degree, grad=grad_enabled):
-                module = implementation(module=make_mla(), context={"cp_size": 2},
-                                        ulysses_cp_size=2)
+                module = implementation(module=make_mla(), context={"cp_size": 2})
                 module.cp_plan = SimpleNamespace(
-                    cp_comm_overlap=overlap, tp_degree=tp_degree,
-                    ulysses_cp_size=ulysses_cp_size, all_gather_degree=gather_degree,
-                    local_heads=ulysses_cp_size, dimensions=SimpleNamespace(value_dim=4))
+                    overlap=overlap, tp_degree=tp_degree,
+                    ulysses_degree=ulysses_degree, all_gather_degree=gather_degree,
+                    local_heads=ulysses_degree, dimensions=SimpleNamespace(value_dim=4))
                 module.cp_context = object()
                 module.ulysses_mesh, module.v_head_dim = object(), 4
-                restored = torch.ones(1, 2, ulysses_cp_size, 4)
-                attention = torch.ones(1, 2 * ulysses_cp_size, 1, 4)
+                restored = torch.ones(1, 2, ulysses_degree, 4)
+                attention = torch.ones(1, 2 * ulysses_degree, 1, 4)
                 module.ulysses_context = SimpleNamespace(head_to_sequence=Mock(return_value=restored))
                 module.rotary_fn, module.rotary_interleaved = None, False
                 module.apply_position = lambda value, *args, **kwargs: value
                 module._attention_layout = Mock(return_value=(None, None, None, {}))
                 module._prepare_distributed_inputs = Mock(return_value=(hidden, hidden, hidden))
                 module.o_proj.forward = Mock(return_value=hidden)
-                output_overlap = overlap and tp_degree == 1 and ulysses_cp_size > 1 and grad_enabled
+                output_overlap = overlap and tp_degree == 1 and ulysses_degree > 1 and grad_enabled
                 with torch.set_grad_enabled(grad_enabled), patch.object(
                     context_parallel.MultiLatentAttentionModule, "project_output", return_value=hidden,
                 ) as project_output:
@@ -95,7 +94,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
                     project_output.assert_not_called()
                 else:
                     self.assertIsNone(state)
-                    if ulysses_cp_size > 1:
+                    if ulysses_degree > 1:
                         module.ulysses_context.head_to_sequence.assert_called_once_with(attention)
                     else:
                         module.ulysses_context.head_to_sequence.assert_not_called()
@@ -112,8 +111,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
         Description: Pass a cache to the shared forward before resources are bound.
         Expectation: Validation fails before any projection or communication.
         """
-        module = context_parallel.CPMultiLatentAttentionModule(
-            module=make_mla(), context={"cp_size": 2}, ulysses_cp_size=2)
+        module = context_parallel.CPMultiLatentAttentionModule(module=make_mla(), context={"cp_size": 2})
         with patch.object(module, "project_latent_inputs") as project:
             with self.assertRaisesRegex(ValueError, "KV cache"):
                 module(torch.ones(1, 2, 12), past_key_values=object())
@@ -130,8 +128,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
                            tp_size=2, cp_size=2, dp_size=1, dp_shard_size=2)
         requests = tuple(ModuleReplacementRequest(
             (f"model.layers.{index}.self_attn",), MultiLatentAttention,
-            kwargs={"ulysses_cp_strategy": strategy, "cp_comm_overlap": bool(index),
-                    "ulysses_cp_size": 2, "kv_cp_size": 1},
+            kwargs={"strategy": strategy, "overlap": bool(index)},
         ) for index, strategy in enumerate(("expanded_ulysses", "latent_kv_head")))
         setup = DistributedSetup(mesh_context=mesh, module_replacement_requests=requests)
         with TemporaryDirectory() as directory, \
@@ -160,7 +157,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
             self.assertIn("_hp_tp", actual.forward.__func__.__code__.co_names)
             self.assertIs(type(actual).__bases__[0], type(expected))
             self.assertEqual(asdict(actual.cp_plan), asdict(expected.cp_plan))
-            self.assertEqual(actual.cp_plan.cp_comm_overlap, bool(index))
+            self.assertEqual(actual.cp_plan.overlap, bool(index))
 
     def test_uniform_mla_is_constructed_at_the_decoder_call_site(self) -> None:
         """Uniform native choices become direct concrete constructors with layer identity intact."""
@@ -169,8 +166,7 @@ class TestMLAContextParallelCompatibility(unittest.TestCase):
                            tp_size=2, cp_size=2, dp_size=1, dp_shard_size=2)
         setup = DistributedSetup(mesh_context=mesh, module_replacement_requests=(ModuleReplacementRequest(
             ("model.layers.*.self_attn",), MultiLatentAttention,
-            kwargs={"ulysses_cp_strategy": "expanded_ulysses", "cp_comm_overlap": False,
-                    "ulysses_cp_size": 2, "kv_cp_size": 1},
+            kwargs={"strategy": "expanded_ulysses", "overlap": False},
         ),))
         with TemporaryDirectory() as directory, \
                 patch.object(auto_model, "_current_device", return_value=torch.device("cpu")), \

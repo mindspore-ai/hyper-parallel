@@ -46,19 +46,18 @@ class CPGatedDeltaNetModule(GatedDeltaNetModule):
     def __init__(self, *, config: Any = None, module: torch.nn.Module | None = None,
                  module_fqn: str = "", context: Any = None, backend: str = "eager",
                  conv_backend: str | None = None, chunk_size: int = 64,
-                 input_layout: str = "BSH", ulysses_cp_size: int = 1) -> None:
+                 input_layout: str = "BSH", ulysses_degree: int | None = 1) -> None:
         """Retain the explicitly requested algorithm and deferred CP resources."""
-        del module_fqn
-        self.ulysses_cp_size = ulysses_cp_size
-        cp_size = (context or {}).get("cp_size", 1)
-        if conv_backend is None and ulysses_cp_size == 1:
+        del module_fqn, context
+        self.ulysses_degree = ulysses_degree
+        if conv_backend is None and ulysses_degree == 1:
             conv_backend = "eager"
         super().__init__(config=config, module=module,
                          backend=backend, conv_backend=conv_backend, chunk_size=chunk_size, input_layout=input_layout)
         self.cp_rank, self.cp_size = 0, 1
         self.ulysses_size, self.state_size = 1, 1
         self.cp_context = None
-        self.convolve_after_exchange = cp_size <= 1 or cp_size == ulysses_cp_size
+        self.convolve_after_exchange = ulysses_degree is None
 
     def prepare_input(self, hidden_states: torch.Tensor, options: dict) -> tuple:
         """Resolve real document boundaries against this CP rank's physical shard.
@@ -85,13 +84,13 @@ class CPGatedDeltaNetModule(GatedDeltaNetModule):
             raise ValueError("GDN CP requires CPContext")
         self.cp_context = binding.cp_context
         self.cp_rank, self.cp_size = self.cp_context.rank, self.cp_context.size
-        degree = self.ulysses_cp_size
+        degree = self.cp_size if self.ulysses_degree is None else self.ulysses_degree
         if degree not in (1, self.cp_size):
-            raise NotImplementedError("GDN supports pure Ulysses or state P2P, not a mixed domain")
+            raise NotImplementedError("GDN supports pure Ulysses or P2P, not a mixed degree")
         self.ulysses_size, self.state_size = degree, self.cp_size // degree
-        self.convolve_after_exchange = 1 < self.cp_size == degree or self.cp_size <= 1
+        self.convolve_after_exchange = self.ulysses_degree is None or (1 < self.cp_size == degree)
         if self.convolve_after_exchange and (self.num_k_heads % degree or self.num_v_heads % degree):
-            raise ValueError("GDN ulysses_cp_size must divide query and value heads")
+            raise ValueError("GDN Ulysses degree must divide query and value heads")
         if not self.convolve_after_exchange and self.cp_size > 1 and self.backend != "triton":
             raise NotImplementedError("GDN state CP requires Triton; use local/pure Ulysses for other backends")
 

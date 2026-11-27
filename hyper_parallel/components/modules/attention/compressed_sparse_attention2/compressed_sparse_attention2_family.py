@@ -24,9 +24,6 @@ from torch import nn
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, SelectorSpec, VariantRule, build_family, register_module_family,
 )
-from hyper_parallel.components.modules.attention.cp_config import (
-    resolve_attention_cp_config, validate_supported_cp_options,
-)
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.distributed._builder.family_layout import validate_tp_boundary
 from hyper_parallel.distributed.context_parallel.indexer_balance import (
@@ -111,12 +108,7 @@ def _validate(*, config: Any, module: nn.Module | None, context: Any, member: An
         if any(not hasattr(config, name) for name in required):
             raise ValueError("CSA2 config must include compression ratios and Full/Reindex source layers")
     arguments = member.arguments
-    cp_config = resolve_attention_cp_config(member)
-    validate_supported_cp_options(
-        cp_config, "CSA2", allow_ulysses=False, allow_kv=True,
-        allow_kv_load_balance=True,
-    )
-    mode = _resolve_indexer_load_balance(arguments, cp_config)
+    mode = arguments.get("indexer_load_balance", "none")
     resolve_indexer_balance_block_size(mode, arguments.get("indexer_balance_block_size"))
     validate_indexer_hybrid_threshold(mode, arguments.get("indexer_zigzag_min_length"))
     if arguments.get("main_kv_comm", "all_gather") not in ("all_gather", "all_to_all_v"):
@@ -125,77 +117,28 @@ def _validate(*, config: Any, module: nn.Module | None, context: Any, member: An
         raise NotImplementedError("CSA2 fusion and Indexer load balancing currently require TP=1")
 
 
-def _resolve_indexer_load_balance(arguments: dict[str, Any], cp_config: Any) -> str:
-    """Map KV-domain zigzag to CSA2's existing Indexer-task balance mode."""
-    legacy_mode = arguments.get("indexer_load_balance", "none")
-    configured = cp_config["kv_cp_load_balance"]
-    if configured and legacy_mode not in ("none", configured):
-        raise ValueError("kv_cp_load_balance conflicts with indexer_load_balance")
-    return configured if configured else legacy_mode
-
-
 def _build_local(*, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
                  module_fqn: str = "", context: Any = None, use_fused_ops: bool = False,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
                  indexer_balance_block_size: int | None = None,
-                 indexer_zigzag_min_length: int | None = None, ulysses_cp_size: int = 1,
-                 ulysses_cp_strategy: str = "alltoall", kv_cp_size: int = 1,
-                 kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-                 ring_cp_size: int = 1, ring_cp_strategy: str = "p2p",
-                 ring_cp_load_balance: bool | str = False, cp_comm_overlap: bool = False) -> nn.Module:
+                 indexer_zigzag_min_length: int | None = None) -> nn.Module:
     """Retain CP options in family provenance without adding them to local math."""
-    del (module_fqn, indexer_load_balance, main_kv_comm, indexer_balance_block_size,
-         indexer_zigzag_min_length, ulysses_cp_size, ulysses_cp_strategy, kv_cp_size, kv_cp_strategy,
-         kv_cp_load_balance, ring_cp_size, ring_cp_strategy, ring_cp_load_balance, cp_comm_overlap)
+    del module_fqn, indexer_load_balance, main_kv_comm, indexer_balance_block_size, indexer_zigzag_min_length
     implementation = (_TPCompressedSparseAttention2 if context is not None and context.get("tp_size", 1) > 1
                       else CompressedSparseAttention2Module)
     return implementation(module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops)
 
 
-def _build_cp_member(
-    *, use_fused_ops: bool, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
-    module_fqn: str = "", context: Any = None, indexer_load_balance: str = "none",
-    main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
-    indexer_zigzag_min_length: int | None = None, ulysses_cp_size: int = 1,
-    ulysses_cp_strategy: str = "alltoall", kv_cp_size: int = 1,
-    kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-    ring_cp_size: int = 1, ring_cp_strategy: str = "p2p",
-    ring_cp_load_balance: bool | str = False, cp_comm_overlap: bool = False,
-) -> nn.Module:
-    """Adapt supported KV-domain settings to the CSA2 executor."""
-    del module_fqn
-    cp_config = {
-        "ulysses_cp_size": ulysses_cp_size, "ulysses_cp_strategy": ulysses_cp_strategy,
-        "kv_cp_size": kv_cp_size, "kv_cp_strategy": kv_cp_strategy,
-        "kv_cp_load_balance": kv_cp_load_balance, "ring_cp_size": ring_cp_size,
-        "ring_cp_strategy": ring_cp_strategy, "ring_cp_load_balance": ring_cp_load_balance,
-        "cp_comm_overlap": cp_comm_overlap,
-    }
-    if cp_config["kv_cp_strategy"] != "allgather":
-        raise NotImplementedError("CSA2 currently supports kv_cp_strategy='allgather' only")
-    mode = cp_config["kv_cp_load_balance"] if cp_config["kv_cp_load_balance"] else indexer_load_balance
-    return CPCompressedSparseAttention2(
-        module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops,
-        indexer_load_balance=mode, main_kv_comm=main_kv_comm,
-        indexer_balance_block_size=indexer_balance_block_size,
-        indexer_zigzag_min_length=indexer_zigzag_min_length,
-    )
-
-
 _reference = partial(_build_local, use_fused_ops=False)
 _fused = partial(_build_local, use_fused_ops=True)
-_cp_reference = partial(_build_cp_member, use_fused_ops=False)
-_cp_fused = partial(_build_cp_member, use_fused_ops=True)
+_cp_reference = partial(CPCompressedSparseAttention2, use_fused_ops=False)
+_cp_fused = partial(CPCompressedSparseAttention2, use_fused_ops=True)
 
 
 @module_replacement
 def CompressedSparseAttention2(  # pylint: disable=invalid-name
         *, config: Any = None, module: nn.Module | None = None, layer_idx: int = 0,
         module_fqn: str = "", context: Any = None, mesh: Any = None,
-        ulysses_cp_size: int = 1, ulysses_cp_strategy: str = "alltoall",
-        kv_cp_size: int = 1, kv_cp_strategy: str = "allgather", kv_cp_load_balance: bool | str = False,
-        ring_cp_size: int = 1, ring_cp_strategy: str = "p2p", ring_cp_load_balance: bool | str = False,
-        cp_comm_overlap: bool = False,
         use_fused_ops: bool = False, indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
         indexer_zigzag_min_length: int | None = None,
@@ -209,15 +152,6 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
         module_fqn: Model path supplied by the generic replacement executor.
         context: Job topology and construction facts.
         mesh: Optional prebuilt mesh for direct construction and layout binding.
-        ulysses_cp_size: CSA2 currently requires one Ulysses rank.
-        ulysses_cp_strategy: Reserved; CSA2 currently has no Ulysses implementation.
-        kv_cp_size: KV communication domain; must account for all CP ranks.
-        kv_cp_strategy: CSA2 currently supports ``allgather``; P2P is unsupported.
-        kv_cp_load_balance: ``zigzag`` maps to existing Indexer-task balancing.
-        ring_cp_size: CSA2 currently requires one Ring rank.
-        ring_cp_strategy: Reserved for a future CSA2 Ring implementation.
-        ring_cp_load_balance: Ring-domain zigzag balance; unsupported by CSA2.
-        cp_comm_overlap: CSA2 uses its own stage schedule and has no general toggle.
         use_fused_ops: Select all three native entries; unsupported calls raise explicitly.
         indexer_load_balance: none, zigzag, greedy or hybrid; only selection tasks move.
         main_kv_comm: all_gather or document-prefix all_to_all_v.
@@ -227,10 +161,6 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
     return build_family(
         CompressedSparseAttention2, config=config, module=module, layer_idx=layer_idx,
         module_fqn=module_fqn, context=context, mesh=mesh, use_fused_ops=use_fused_ops,
-        ulysses_cp_size=ulysses_cp_size, ulysses_cp_strategy=ulysses_cp_strategy,
-        kv_cp_size=kv_cp_size, kv_cp_strategy=kv_cp_strategy, kv_cp_load_balance=kv_cp_load_balance,
-        ring_cp_size=ring_cp_size, ring_cp_strategy=ring_cp_strategy,
-        ring_cp_load_balance=ring_cp_load_balance, cp_comm_overlap=cp_comm_overlap,
         indexer_load_balance=indexer_load_balance, main_kv_comm=main_kv_comm,
         indexer_balance_block_size=indexer_balance_block_size,
         indexer_zigzag_min_length=indexer_zigzag_min_length,

@@ -20,7 +20,7 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.KimiDeltaAttention
         backend: triton
         conv_backend: eager
-        ulysses_cp_size: 2
+        ulysses_degree: 2
         state_cp_method: recursive_doubling
 ```
 
@@ -35,12 +35,12 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.GatedDeltaNet
         backend: triton
         conv_backend: eager
-        ulysses_cp_size: 1
+        ulysses_degree: 1
 ```
 
-纯 Ulysses 使用 `ulysses_cp_size: P`（P 为总 CP 大小），可同时设置 `conv_backend: triton` 或 `ascendc`。
-该配置绑定时使用整个 CP 域，且采用先交换 token/head、再做本地卷积的调度。
-KDA 中显式的整数 `ulysses_cp_size=P` 则保留状态 CP 入口的调度：先沿原序列交换 halo 和卷积，
+纯 Ulysses 使用 `ulysses_degree: null`，可同时设置 `conv_backend: triton` 或 `ascendc`。
+`null` 的含义是绑定时使用整个 CP 域，且采用先交换 token/head、再做本地卷积的调度。
+KDA 中显式的整数 `ulysses_degree=P` 则保留状态 CP 入口的调度：先沿原序列交换 halo 和卷积，
 再做 AllToAll，状态域退化为 1。二者都没有跨卡状态递推，但卷积位置和默认后端并不相同。
 
 不设置 `when: cp` 时，同一模块请求在 CP1 选择普通成员，在 CP>1 选择 CP 成员。
@@ -55,7 +55,7 @@ KDA 中显式的整数 `ulysses_cp_size=P` 则保留状态 CP 入口的调度：
 | `conv_backend` | 独立选择卷积；建议显式配置，避免把 core 后端和卷积性能混在一起比较。 |
 | `input_layout` | `BSH` 或 `TH`；用于声明外部 token 分片轴，分别为 1 和 0。flat packed 输入配置 `TH`。 |
 | `chunk_size` | 默认 64。融合后端要求 64；eager 可显式使用其他正整数。不是通信包长。 |
-| `ulysses_cp_size` | 正整数；CP>1 时必须整除总 CP；`TP × Ulysses` 必须整除 query/value head 数。 |
+| `ulysses_degree` | 正整数或 `null`；CP>1 时整数必须整除总 CP；`TP × Ulysses` 必须整除 query/value head 数。 |
 | `state_cp_method` | KDA 专用：`p2p`、`allgather`、`grouped_allgather_p2p`、`recursive_doubling`。 |
 | `allgather_group_size` | KDA 分组 AG 专用，必须整除状态域大小；其他协议保持 1。 |
 
@@ -248,7 +248,7 @@ CP 驱动负责注入 H/dHT、执行通信和保存每次调用的资源；后�
 拓扑统一为 `CP = ulysses_size × state_size`。`state_size=1` 直接调用本地 core，
 不构造状态通信执行器。卷积位置是独立的内部调度，保持既有行为：
 
-- `ulysses_cp_size=P`：先交换投影结果，再对局部 heads 卷积。
+- `ulysses_degree=None`：先交换投影结果，再对局部 heads 卷积。
 - KDA 的整数 U 配置：先在原 CP token 分片上执行 halo 卷积，再交换 heads；即使 U 等于 CP 大小也保留此顺序。
 
 独立的 `conv_backend`、checkpoint 参数名及每调用缓存生命周期均保留。
