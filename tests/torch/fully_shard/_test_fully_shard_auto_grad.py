@@ -16,6 +16,7 @@
 # pylint: disable=W0611,C0413,C0412
 from copy import deepcopy
 
+import pytest
 import torch
 import torch_npu
 from torch import nn, optim
@@ -67,7 +68,7 @@ class TransformerWithChunkLoss(SimpleTransformer):
         return torch.stack(chunk_losses).sum()
 
 
-def _apply_fully_shard_with_prefetch(model, mesh) -> None:
+def _apply_fully_shard_with_prefetch(model, mesh, comm_fusion: bool = False) -> None:
     """Shard the model in-place and configure prefetch in execution order.
 
     Each transformer block is an independent fully_shard unit. The root owns
@@ -81,8 +82,8 @@ def _apply_fully_shard_with_prefetch(model, mesh) -> None:
         cast_forward_inputs=False,
     )
     for transformer_layer in model.layers:
-        fully_shard(transformer_layer, mesh=mesh, mp_policy=mixed_precision_policy)
-    fully_shard(model, mesh=mesh, mp_policy=mixed_precision_policy)
+        fully_shard(transformer_layer, mesh=mesh, mp_policy=mixed_precision_policy, comm_fusion=comm_fusion)
+    fully_shard(model, mesh=mesh, mp_policy=mixed_precision_policy, comm_fusion=comm_fusion)
     model.set_reduce_op_type("sum")
 
     model.set_modules_to_forward_prefetch([model.layers[0]])
@@ -212,7 +213,8 @@ def test_hsdp_ffbb_autograd_parity():
     _run_fully_shard_autograd_parity((2, 1), ("replicate", "shard"), forward_pass_count=2)
 
 
-def test_fsdp_transformer_chunkloss_ga_mem() -> None:
+@pytest.mark.parametrize("comm_fusion", [False, True], ids=["unfused", "fused"])
+def test_fsdp_transformer_chunkloss_ga_mem(comm_fusion: bool) -> None:
     """Check Transformer chunk loss, accumulated gradients, and RS storage lifetime.
 
     Feature: FSDP gradient accumulation.
@@ -232,15 +234,17 @@ def test_fsdp_transformer_chunkloss_ga_mem() -> None:
     sharded_model = TransformerWithChunkLoss(**model_config).npu()
     sharded_model.load_state_dict(base_model.state_dict())
     del base_model
-    fully_shard(sharded_model.head, mesh=mesh)
-    _apply_fully_shard_with_prefetch(sharded_model, mesh)
+    fully_shard(sharded_model.head, mesh=mesh, comm_fusion=comm_fusion)
+    _apply_fully_shard_with_prefetch(sharded_model, mesh, comm_fusion=comm_fusion)
     sharded_model.layers[-1].set_modules_to_forward_prefetch([sharded_model.head])
     sharded_model.set_modules_to_backward_prefetch([sharded_model.head])
     sharded_model.head.set_modules_to_backward_prefetch([sharded_model.layers[-1]])
     standalone_model.layers = nn.ModuleList(
         MemTrackerWrapper(layer, enabled=False) for layer in standalone_model.layers
     )
-    sharded_model.layers = nn.ModuleList(MemTrackerWrapper(layer) for layer in sharded_model.layers)
+    sharded_model.layers = nn.ModuleList(
+        MemTrackerWrapper(layer, comm_fusion=comm_fusion) for layer in sharded_model.layers
+    )
     for layer, next_layer in zip(sharded_model.layers[:-1], sharded_model.layers[1:]):
         layer.set_next_layer(next_layer)
 
