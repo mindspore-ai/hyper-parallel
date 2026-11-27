@@ -45,6 +45,18 @@ def validate_gqa_family(*, config: Any, module: nn.Module | None, context: Any, 
     # Declarative replacement requests omit defaults, unlike a direct Python factory call.
     if not isinstance(member.arguments.get("overlap", False), bool):
         raise TypeError("GQA overlap must be boolean")
+    if member.arguments.get("cp_algorithm", "ulysses") not in ("ulysses", "ring"):
+        raise ValueError("GQA cp_algorithm must be ulysses or ring")
+    if (member.arguments.get("cp_algorithm", "ulysses") == "ring"
+            and member.arguments.get("ulysses_degree") not in (None, 1)):
+        raise ValueError("Ring GQA currently requires ulysses_degree=1")
+    if member.arguments.get("load_balance", "none") not in ("none", "zigzag"):
+        raise ValueError("Ring GQA load_balance must be none or zigzag")
+    if (member.arguments.get("cp_algorithm", "ulysses") != "ring"
+            and member.arguments.get("load_balance", "none") != "none"):
+        raise ValueError("GQA load_balance is only supported with cp_algorithm='ring'")
+    if not isinstance(member.arguments.get("prune_documents", True), bool):
+        raise TypeError("GQA prune_documents must be boolean")
     _validate_gqa_degrees(config, member)
 
 
@@ -52,7 +64,8 @@ def _validate_gqa_degrees(config, member):
     """Check TP/CP factors against whole Q and KV groups."""
     degree = member.arguments.get("ulysses_degree")
     cp = member.axis_sizes["cp"]
-    degree = cp if degree is None else degree
+    default_degree = 1 if member.arguments.get("cp_algorithm", "ulysses") == "ring" else cp
+    degree = default_degree if degree is None else degree
     if (not isinstance(degree, int) or isinstance(degree, bool)) or degree < 1 or (cp > 1 and cp % degree):
         raise ValueError("GQA Ulysses degree must be a positive integer dividing CP degree")
     tp = member.axis_sizes["tp"]
@@ -66,6 +79,7 @@ def _validate_gqa_degrees(config, member):
 
     if cp > 1 and (config.num_attention_heads // tp % degree or config.num_key_value_heads // tp % degree):
         raise ValueError("GQA Ulysses degree must divide TP-local Q and KV heads")
+
 
 def gqa_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
     """Own all GQA parameters and declare the actual external token layout."""
@@ -119,9 +133,10 @@ def gqa_local_parallel_spec(*, module: nn.Module, member: Any) -> ParallelModule
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None,
+    cp_algorithm: str = "ulysses", load_balance: str = "none", prune_documents: bool = True,
 ) -> nn.Module:
     """Build standalone math; the family retains CP options and owns parallel layouts."""
-    del module_fqn, context, overlap, ulysses_degree
+    del module_fqn, context, overlap, ulysses_degree, cp_algorithm, load_balance, prune_documents
     return GroupedQueryAttentionModule(config=config, module=module, fuse_qkv=fuse_qkv)
 
 
@@ -129,7 +144,8 @@ def _build_local(
 def GroupedQueryAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, fuse_qkv: bool = True,
-    overlap: bool = False, ulysses_degree: int | None = None,
+    overlap: bool = False, ulysses_degree: int | None = None, cp_algorithm: str = "ulysses",
+    load_balance: str = "none", prune_documents: bool = True,
 ) -> nn.Module:
     """Build one GQA family with fixed projections and independent CP scheduling.
 
@@ -141,14 +157,18 @@ def GroupedQueryAttention(  # pylint: disable=invalid-name
         mesh: Existing job mesh, borrowed by the shared execution binder.
         fuse_qkv: Use grouped linear_qkv (True) or independent Q/K/V Parameters (False); fixed at construction.
         overlap: Submit ready Q/K/V transfers before independent projection stages.
-        ulysses_degree: Head-parallel CP factor; 1 selects KV AG, None selects pure Ulysses.
+        ulysses_degree: Ulysses head-parallel CP factor; Ring requires omitted or 1.
+        cp_algorithm: CP attention implementation, either existing Ulysses/AG or Ring.
+        load_balance: Ring query distribution, either contiguous or Zigzag.
+        prune_documents: Prune unused packed-document KV routes in Ring mode.
 
     Returns:
         The local or CP member with fixed parameter names and family provenance.
     """
     return build_family(GroupedQueryAttention, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, fuse_qkv=fuse_qkv,
-                        overlap=overlap, ulysses_degree=ulysses_degree)
+                        overlap=overlap, ulysses_degree=ulysses_degree, cp_algorithm=cp_algorithm,
+                        load_balance=load_balance, prune_documents=prune_documents)
 
 
 register_module_family(ModuleFamily(

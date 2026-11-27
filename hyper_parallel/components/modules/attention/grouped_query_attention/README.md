@@ -5,6 +5,42 @@
 - Q 与 KV 使用各自的头数，默认融合 QKV 投影，也支持独立投影表示。
 - 支持 Ulysses、KV AllGather、混合 CP，以及已就绪输入的通算重叠。
 - 支持 packed 文档和非 packed 的 padding mask；带输出 gate 的变体见 [gated GQA](../gated_grouped_query_attention/README.md)。
+- 同一个 `GroupedQueryAttention` family 根据 `cp_algorithm` 选择既有 Ulysses/KV-AllGather 路径或 Ring CP 路径。
+
+## Ring CP
+
+在现有 Qwen3-MoE 配方中保留 `GroupedQueryAttention`，通过 family 参数选择 Ring CP：
+
+```yaml
+accelerator:
+  cp_size: 4
+
+plan_overrides:
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedQueryAttention
+        cp_algorithm: ring
+        overlap: false
+        load_balance: zigzag
+        prune_documents: true
+```
+
+family 将 `cp_algorithm`、`load_balance` 和 `prune_documents` 传给同一个 CP attention member；实际 CP mesh 由模块绑定提供。Ring 固定使用完整 CP group，不叠加 Ulysses head/sequence 交换。模块输入为 dense BSH，或携带全局累计边界的 batch-one packed 输入，后者投影后使用 TND 布局。Ring 不支持显式 mask、训练 dropout、KV cache、sliding window 或自定义 attention scale。`prune_documents` 默认开启；它只对带文档边界的 TND 输入生效。基础算法、反向和输入布局要求见 [Ring CP 实现](../../../../distributed/context_parallel/ring_attention.py)。
+
+packed 输入可以同时启用文档裁剪和负载均衡：
+
+```yaml
+implementation:
+  _target_: hyper_parallel.components.modules.GroupedQueryAttention
+  cp_algorithm: ring
+  load_balance: zigzag
+  prune_documents: true
+```
+
+组合模式先按每篇文档与原始连续 token 分片的交集确定其活跃 CP 子环，再仅在该子环内分配 query 任务。`load_balance` 只支持 `none` 和 `zigzag`；每个 query 任务仍只在所属文档内计算。反向通过逆向任务路由恢复原始 token 顺序。全局累计边界须在所有 rank 一致。当前跨 rank KV 路由按 owner 汇总多文档所需片段，通信轮数取该 owner 最远消费者的上界；多文档场景可能多走少量环跳，后续可再细化为逐文档路由。
 
 ## YAML 配置
 
@@ -26,11 +62,11 @@ plan_overrides:
         overlap: true
 ```
 
-`cp_size: 1` 选择 local 成员；大于 1 时选择 CP 成员。DP/FSDP 等拓扑仍需与总设备数匹配。
+`cp_size: 1` 选择 local 成员；大于 1 时选择 CP 成员。选择 `cp_algorithm: ring` 时使用完整 CP group，`ulysses_degree` 只能省略或设为 1。DP/FSDP 等拓扑仍需与总设备数匹配。
 完整示例见 [Qwen3-MoE packed 配方](../../../../models/qwen3_moe/recipes/train.yaml) 和
 [dense 离线配方](../../../../../examples/training_demo/qwen3_moe/train_parallel_full_offline.yaml)。
 
-令 `P=cp_size`、`U=ulysses_degree`，KV AllGather 子组大小为 `A=P/U`：
+当 `cp_algorithm` 为默认 `ulysses` 时，令 `P=cp_size`、`U=ulysses_degree`，KV AllGather 子组大小为 `A=P/U`：
 
 | ulysses_degree（P>1） | 并行方式 | CP4 示例 |
 | --- | --- | --- |
@@ -62,7 +98,7 @@ GQA 的反向使用已有可微通信接口；这里主要优化输入前向调�
 | --- | --- |
 | [grouped_query_attention.py](grouped_query_attention.py) | 参数构造与转换、投影/Norm/RoPE、FA 和共享 forward |
 | [grouped_query_attention_family.py](grouped_query_attention_family.py) | 选择 local/CP 成员，声明布局并校验配置 |
-| [cp_grouped_query_attention.py](cp_grouped_query_attention.py) | CP 输入通信、文档与 mask 映射、输出恢复 |
+| [cp_grouped_query_attention.py](cp_grouped_query_attention.py) | Ulysses/KV-AllGather 与 Ring CP 调度、输入通信、packed 元数据和输出恢复 |
 
 ## 执行流程
 

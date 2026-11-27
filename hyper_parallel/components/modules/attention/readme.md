@@ -33,7 +33,7 @@ grouped_query_attention/
 ├── __init__.py
 ├── grouped_query_attention.py         # GroupedQueryAttentionModule
 ├── grouped_query_attention_family.py  # GroupedQueryAttention
-├── cp_grouped_query_attention.py      # CPGroupedQueryAttentionModule
+├── cp_grouped_query_attention.py                           # CPGroupedQueryAttentionModule
 └── README.md
 ```
 
