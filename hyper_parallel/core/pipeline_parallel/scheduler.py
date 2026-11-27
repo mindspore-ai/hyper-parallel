@@ -36,7 +36,7 @@ from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     swap_wait_offload,
     unregister_layer_swap_hooks,
 )
-from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec, MetaStep, MetaStepType
+from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec, MetaStep, MetaStepType, _RecvInfo
 from hyper_parallel.core.pipeline_parallel._microbatch import _MicroBatch
 from hyper_parallel.core.pipeline_parallel._p2p import (
     create_p2p_multi_stream_groups,
@@ -1515,14 +1515,15 @@ def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
         if stage_index >= stage_num - 1:
             return None
         peer = stage_to_rank(stage_index + 1)
-        return peer if peer != stage_to_rank(stage_index) else None
+        # V shapes place the mirrored half on the same rank; that edge is a real P2P hop.
+        return peer
 
     def _bwd_peer(stage_index: int):
         """Return the rank that receives this stage's backward gradient, or None."""
         if stage_index <= 0:
             return None
         peer = stage_to_rank(stage_index - 1)
-        return peer if peer != stage_to_rank(stage_index) else None
+        return peer
 
     def _insert_comms_for_step(step, rank, new_schedule):
         """Insert send/recv for a single FWD, BWD, or composite OVERLAP step.
@@ -1719,13 +1720,14 @@ def auto_align_and_add_send_recv(scheduler, stage_num, real_stage_num, style='lo
         if stage_index >= stage_num - 1:
             return None
         peer = stage_to_rank(stage_index + 1)
-        return peer if peer != stage_to_rank(stage_index) else None
+        # V shapes place the mirrored half on the same rank; that edge is a real P2P hop.
+        return peer
 
     def _bwd_peer(stage_index: int):
         if stage_index <= 0:
             return None
         peer = stage_to_rank(stage_index - 1)
-        return peer if peer != stage_to_rank(stage_index) else None
+        return peer
 
     # ---- Phase 1: strip None, detect 1F1B boundary, insert transition padding ----
 
@@ -2548,3 +2550,183 @@ def validate_pipeline_execution(order_list: dict[int, list[MetaStep]],
         'has_cycle': bool(cycle_path)
     }
     return result
+
+
+class ScheduleDualPipeV(PipelineScheduleRuntime):
+    """DualPipeV: V-shaped bidirectional schedule (DeepSeek DualPipe cut-in-half).
+
+    Each rank owns two stages: the forward half at stage ``rank`` and the
+    mirrored half at stage ``stage_num - 1 - rank``. Micro-batches flow down
+    the first half and back up the second half (V shape), with the loss on the
+    last stage (rank 0's second half). The eight-phase order follows DeepSeek's
+    DualPipeV: forward warmup, alternating halves, bidirectional forward/backward
+    steady state, then backward cooldown. Weight-gradient deferral
+    (zero-bubble) is not applied in this implementation.
+
+    Reference: https://github.com/deepseek-ai/DualPipe (dualpipev.py ``step``).
+    """
+
+    def __init__(self,
+                 stages: list,
+                 micro_batch_num: int,
+                 args_batch_dim: Any = None,
+                 kwargs_batch_dim: Any = None,
+                 output_concat_dim: Any = None,
+                 swap: bool = False) -> None:
+        """Initialize the two-local-stage DualPipeV schedule."""
+        super().__init__(stages,
+                         micro_batch_num,
+                         args_batch_dim=args_batch_dim,
+                         kwargs_batch_dim=kwargs_batch_dim,
+                         output_concat_dim=output_concat_dim,
+                         overlap_p2p=True,
+                         swap=swap)
+        self.build_exec_order()
+
+    def _build_stage_to_rank_index(self) -> None:
+        self._stage_to_rank_index = generate_stage_to_rank_mapping(
+            self.real_stage_num, self._stage_num, style='v'
+        )
+        for stage in self.stages:
+            stage._stage_to_rank = self._stage_to_rank_index  # pylint: disable=protected-access
+            stage._async_meta_send = True  # pylint: disable=protected-access
+
+    def _is_local_fold(self, stage_index: int, forward: bool) -> bool:
+        boundary = self.real_stage_num if forward else self.real_stage_num - 1
+        return self.stages[0].stage_index == self.real_stage_num - 1 and stage_index == boundary
+
+    def recv_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
+        """Connect the V-shaped fold locally; receive other inputs from the peer."""
+        if not self._is_local_fold(stage.stage_index, forward=True):
+            super().recv_fwd(stage, micro_index)
+            return
+        source = self._stage_dict[stage.stage_index - 1]
+        outputs = source.fwd_outputs_cache.pop(micro_index)
+        source.grad_recv_info[micro_index] = [
+            _RecvInfo(dist.get_rank()) for output in outputs if output.requires_grad
+        ]
+        recv_infos = []
+        for output in outputs:
+            requires_grad = output.requires_grad
+            buffer = output.detach().requires_grad_(requires_grad)
+            recv_infos.append(_RecvInfo(dist.get_rank(), buffer, requires_grad=requires_grad))
+        stage.args_recv_info[micro_index] = recv_infos
+
+    def send_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
+        """Complete local forward handoff, or send output to the next rank."""
+        if not self._is_local_fold(stage.stage_index, forward=False):
+            super().send_fwd(stage, micro_index)
+
+    def recv_bwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
+        """Use gradients handed off by the local second half, or receive from the peer."""
+        if not self._is_local_fold(stage.stage_index, forward=False):
+            super().recv_bwd(stage, micro_index)
+
+    def send_bwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
+        """Return local fold gradients directly to the first half's receive buffers."""
+        if not self._is_local_fold(stage.stage_index, forward=True):
+            super().send_bwd(stage, micro_index)
+            return
+        destination = self._stage_dict[stage.stage_index - 1]
+        gradients = stage.bwd_cache.pop(micro_index)
+        for recv_info, gradient in zip(destination.grad_recv_info[micro_index], gradients):
+            recv_info.buffer = gradient
+
+    def construct_exec_order(self) -> None:
+        """Expand DualPipeV's eight phases into per-rank FWD/BWD steps."""
+        if self.micro_batch_num < 2 * self.real_stage_num:
+            raise ValueError(
+                f"DualPipeV requires at least {2 * self.real_stage_num} micro-batches, "
+                f"got {self.micro_batch_num}"
+            )
+        for rank in range(self.real_stage_num):
+            self.exec_order[rank] = self._construct_rank_exec_order(rank)
+
+    def _construct_rank_exec_order(self, rank: int) -> list:
+        """Translate DualPipeV's per-rank phases into this rank's mixed step sequence."""
+        num_ranks = self.real_stage_num
+        num_chunks = self.micro_batch_num
+        first_half = rank  # stage index of the forward half
+        second_half = self._stage_num - 1 - rank  # stage index of the mirrored half
+        warmup = (num_ranks - rank - 1) * 2
+        start = rank + 1
+        first_bwd = num_ranks - rank - 1
+        main = num_chunks - 2 * num_ranks + rank + 1
+        tail_bwd = num_ranks - rank - 1
+        last_bwd = rank + 1
+        steps = []
+        pending_steps = []
+        pending_recvs = []
+        pending_sends = []
+        local_fold = rank == num_ranks - 1
+
+        def flush() -> None:
+            """Emit pending receives, ready computations, then their sends."""
+            steps.extend(pending_recvs)
+            steps.extend(pending_steps)
+            steps.extend(pending_sends)
+            pending_recvs.clear()
+            pending_sends.clear()
+            pending_steps.clear()
+
+        def fwd(stage: int, micro: int) -> None:
+            """Queue one stage forward and its boundary operations."""
+            if local_fold and stage == num_ranks:
+                pending_steps.append(MetaStep(micro, MetaStepType.FWD_RECV, stage))
+            elif stage != 0:
+                pending_recvs.append(MetaStep(micro, MetaStepType.FWD_RECV, stage))
+                pending_steps.append(MetaStep(micro, MetaStepType.DATA_RECV, stage))
+            pending_steps.append(MetaStep(micro, MetaStepType.FWD, stage))
+            if stage != self._stage_num - 1 and not (local_fold and stage == num_ranks - 1):
+                pending_sends.append(MetaStep(micro, MetaStepType.FWD_SEND, stage))
+                pending_steps.append(MetaStep(micro, MetaStepType.DATA_SEND, stage))
+
+        def bwd(stage: int, micro: int) -> None:
+            """Queue one stage backward and its boundary operations."""
+            if stage != self._stage_num - 1 and not (local_fold and stage == num_ranks - 1):
+                pending_recvs.append(MetaStep(micro, MetaStepType.BWD_RECV, stage))
+            pending_steps.append(MetaStep(micro, MetaStepType.BWD, stage))
+            if local_fold and stage == num_ranks:
+                pending_steps.append(MetaStep(micro, MetaStepType.BWD_SEND, stage))
+            elif stage != 0:
+                pending_sends.append(MetaStep(micro, MetaStepType.BWD_SEND, stage))
+
+        # Step 1 (nF0): forward warmup on the first half.
+        for micro in range(warmup):
+            fwd(first_half, micro)
+            flush()
+        # Step 2 (nF0F1): alternate both halves' forwards.
+        for i in range(start):
+            fwd(first_half, warmup + i)
+            flush()
+            fwd(second_half, i)
+            flush()
+        # Step 3 (nB1W1F1): second-half backward, then more forwards.
+        for i in range(first_bwd):
+            bwd(second_half, i)
+            fwd(second_half, start + i)
+            flush()
+        # Step 4 (main): overlapped F0B1 and F1B0 alternating per iteration.
+        for i in range(main):
+            fwd(first_half, warmup + start + i)
+            bwd(second_half, first_bwd + i)
+            flush()
+            fwd(second_half, start + first_bwd + i)
+            bwd(first_half, i)
+            flush()
+        # Step 5 (nB1F1B0): second-half backward, then forward+backward.
+        for i in range(tail_bwd):
+            bwd(second_half, first_bwd + main + i)
+            fwd(second_half, start + first_bwd + main + i)
+            bwd(first_half, main + i)
+            flush()
+        # Step 6 (nB1B0): backward on both halves.
+        for i in range(last_bwd):
+            bwd(second_half, first_bwd + main + tail_bwd + i)
+            bwd(first_half, main + tail_bwd + i)
+            flush()
+        # Step 7 (nWB0): remaining backward on the first half.
+        for i in range(num_ranks - rank - 1):
+            bwd(first_half, main + tail_bwd + last_bwd + i)
+            flush()
+        return steps

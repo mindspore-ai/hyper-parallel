@@ -17,7 +17,7 @@ from hyper_parallel.core.pipeline_parallel.stage import PipelineStage
 from hyper_parallel.core.pipeline_parallel.scheduler import (
     ScheduleInterleaved1F1B, PipelineContext,
 )
-from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleGPipe, Schedule1F1B
+from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleGPipe, Schedule1F1B, ScheduleDualPipeV
 from hyper_parallel.core.pipeline_parallel.scheduler import auto_align_and_add_send_recv
 from hyper_parallel.core.pipeline_parallel.mpipe import ScheduleMPipeTranspose
 from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec, MetaStep, MetaStepType

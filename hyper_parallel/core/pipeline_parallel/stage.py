@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """pipeline stage"""
+import pickle
 from typing import Optional
 
 import torch
@@ -122,6 +123,7 @@ class PipelineStage(PipelineStageBase):
         self.dst_stage = self._check_dst_stage(dst_stage)
         self._has_init = False
         self.last_stage_outputs = None
+        self._stage_to_rank: Optional[dict[int, int]] = None
         self.args_recv_info = {}
         self.grad_recv_info = {}
         # micro_index -> list of metas (matching ``_extract_meta_from_tensor``).  Captured at fwd-send
@@ -130,6 +132,8 @@ class PipelineStage(PipelineStageBase):
         self._fwd_output_meta = {}
         self._meta_been_send = False
         self._meta_been_recv = False
+        self._async_meta_send = False
+        self._meta_send_handles = []
         self._dyn_shape = dyn_shape
         self._shared_parameters = self._check_shared_parameters(shared_parameters)
         self._virtual_chunk_num = 1
@@ -182,6 +186,14 @@ class PipelineStage(PipelineStageBase):
                 else dist.new_group(rank_ids, use_local_synchronization=True)
             )
 
+    def clear_cache(self) -> None:
+        """Clear stage caches after completing asynchronous metadata sends."""
+        for handles, _, _ in self._meta_send_handles:
+            for handle in handles:
+                handle.wait()
+        self._meta_send_handles.clear()
+        super().clear_cache()
+
     def clear_states(self):
         """clear fwd and bwd recv_info list."""
         self.args_recv_info.clear()
@@ -227,7 +239,10 @@ class PipelineStage(PipelineStageBase):
 
     def _global_rank(self, stage_index):
         real_stage_num = self.stage_num // self._virtual_chunk_num
-        real_stage_index = stage_index % real_stage_num
+        if self._stage_to_rank is None:
+            real_stage_index = stage_index % real_stage_num
+        else:
+            real_stage_index = self._stage_to_rank[stage_index]
         if self.mesh is not None:
             # mesh is a 1-D PP sub-mesh; rank_list[i] is the global rank of stage i.
             return self.mesh.rank_list[real_stage_index]
@@ -330,7 +345,10 @@ class PipelineStage(PipelineStageBase):
             device_num = dist.get_world_size()
             real_stage_num = self.stage_num // self._virtual_chunk_num
             device_num_per_stage = device_num // real_stage_num
-            index = self.stage_index % real_stage_num
+            if self._stage_to_rank is None:
+                index = self.stage_index % real_stage_num
+            else:
+                index = self._stage_to_rank[self.stage_index]
             rank_list = tuple(range(index * device_num_per_stage, (index + 1) * device_num_per_stage))
         layout.rank_list = rank_list
         layout.update_mesh()
@@ -406,7 +424,14 @@ class PipelineStage(PipelineStageBase):
         """communicate meta."""
         if meta_send is not None:
             if self._dyn_shape or not self._meta_been_send:
-                dist.send_object_list([meta_send], global_rank)
+                if self._async_meta_send:
+                    payload = pickle.dumps(meta_send)
+                    size = torch.tensor([len(payload)], dtype=torch.int64)
+                    data = torch.tensor(list(payload), dtype=torch.uint8)
+                    handles = [dist.isend(size, global_rank), dist.isend(data, global_rank)]
+                    self._meta_send_handles.append((handles, size, data))
+                else:
+                    dist.send_object_list([meta_send], global_rank)
                 self._meta_been_send = True
             return None
 

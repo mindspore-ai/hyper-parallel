@@ -119,3 +119,4 @@ class ModelAdapterSpec:
     sharding: Optional[Callable[..., Any]] = None
     native_parallel: Optional[Callable[..., Any]] = None
     dit: Optional[Callable[..., Any]] = None
+    pipeline_parallel: Optional[Callable[..., Any]] = None

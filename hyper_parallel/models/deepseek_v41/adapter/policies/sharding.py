@@ -79,7 +79,11 @@ def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
         or (module_fqn.endswith(".engram.embed")
             and not isinstance(module_by_fqn[module_fqn], HostEngramTable))
     )
-    return _get_visual_fsdp_wrap_modules(model) + engram_units
+    drafter_units = tuple(
+        fqn for fqn in module_by_fqn
+        if fqn.startswith("dspark.stages.") and fqn.count(".") == 2
+    )
+    return _get_visual_fsdp_wrap_modules(model) + engram_units + drafter_units
 
 
 def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
