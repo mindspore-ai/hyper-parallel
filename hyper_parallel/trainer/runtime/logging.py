@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,8 +16,10 @@
 """Trainer-side logging helpers.
 
 Split out of the former ``auto_models/components/utils/helper.py`` in stage 7
-(05 §10.4); function names and signatures are unchanged.
+(05 §10.4).
 """
+
+from __future__ import annotations
 
 __all__ = [
     "create_logger",
@@ -44,12 +47,18 @@ def _is_rank_0() -> bool:
     return True
 
 
-def setup_logging() -> None:
-    """Setup logging with rank filter."""
+def setup_logging(level: str | None = None) -> None:
+    """Set up log output and optionally configure the Trainer namespace.
+
+    Args:
+        level: Minimum severity for Trainer loggers that inherit their level.
+    """
     builtin_logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=builtin_logging.INFO,
     )
+    if level is not None:
+        builtin_logging.getLogger("hyper_parallel.trainer").setLevel(level)
 
 
 def _info_rank0(message: str) -> None:
@@ -58,9 +67,14 @@ def _info_rank0(message: str) -> None:
         logger.info(message)
 
 
-def create_logger(name: str | None = None) -> "builtin_logging._Logger":
-    """
-    Creates a pretty logger for the third-party program.
+def create_logger(name: str | None = None) -> builtin_logging.Logger:
+    """Create a formatted logger that inherits its level.
+
+    Args:
+        name: Logger name passed to the standard logging module.
+
+    Returns:
+        The logger with a dedicated stdout handler.
     """
     new_logger = builtin_logging.getLogger(name)
     formatter = builtin_logging.Formatter(
@@ -69,7 +83,6 @@ def create_logger(name: str | None = None) -> "builtin_logging._Logger":
     handler = builtin_logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
     new_logger.addHandler(handler)
-    new_logger.setLevel(builtin_logging.INFO)
     new_logger.propagate = False
     return new_logger
 

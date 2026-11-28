@@ -85,6 +85,9 @@ class LoggingCallback(Callback):
             return
         if self._last_logged_step == state.global_step:
             return
+        # The tqdm writer bypasses logging, so check the threshold before reading metrics.
+        if not logger.isEnabledFor(logging.INFO):
+            return
 
         metrics = dict(getattr(self.trainer, "step_env_metrics", {}))
         if "training/router_aux_loss" not in metrics:

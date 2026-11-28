@@ -22,6 +22,7 @@ training:
   max_grad_norm: 1.0
   seed: 42
   enable_full_determinism: true
+  logging_level: INFO
 
 accelerator:
   tp_size: 1

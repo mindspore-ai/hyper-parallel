@@ -334,8 +334,7 @@ class BaseTrainer(Stateful, ABC):
 
     def _setup(self):
         """Initialize logging, distributed state, and the local device."""
-        # log args
-        setup_logging()
+        setup_logging(self.config.training.logging_level)
 
         # Initialize distributed process group
         backend = getattr(self.config.training, "backend", "nccl")
