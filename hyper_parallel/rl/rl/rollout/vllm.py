@@ -14,6 +14,8 @@
 # ============================================================================
 """Process-isolated vLLM rollout adapter."""
 import asyncio
+import hashlib
+import logging
 import json
 import logging
 import os
@@ -60,6 +62,8 @@ from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
 from rl.weight_sync.config import resolve_weight_sync_config
 from rl.unified_execution.contract import parse_unified_payload
+
+logger = logging.getLogger(__name__)
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",
@@ -1388,9 +1392,14 @@ class VLLMGenerationEngine:
 
     def _validate_tp_request(self, request: GenerationRequest) -> None:
         """Require TP siblings to submit the same logical generation request."""
+        def signature(tensor: torch.Tensor) -> tuple[tuple[int, ...], str, bytes]:
+            values = tensor.detach().cpu().contiguous()
+            digest = hashlib.sha256(memoryview(values.view(torch.uint8).numpy())).digest()
+            return tuple(values.shape), str(values.dtype), digest
+
         contract = (
-            request.input_ids.detach().cpu().tolist(),
-            request.attention_mask.detach().cpu().tolist(),
+            signature(request.input_ids),
+            signature(request.attention_mask),
             request.row_seeds,
             repr(request.settings),
         )
@@ -1568,9 +1577,16 @@ class VLLMGenerationEngine:
 
     def close(self) -> None:
         """Release weight-transfer resources and stop an owned vLLM server."""
-        if isinstance(self._client, _VLLMHTTPClient):
-            synchronized_call("shared vLLM server shutdown", self._client.close)
-            self._client = None
+        try:
+            if isinstance(self._client, _VLLMHTTPClient):
+                synchronized_call("shared vLLM server shutdown", self._client.close)
+                self._client = None
+        except BaseException:
+            try:
+                self._weight_sync.close()
+            except BaseException:
+                logger.exception("Secondary error releasing weight-transfer resources")
+            raise
         self._weight_sync.close()
 
 
