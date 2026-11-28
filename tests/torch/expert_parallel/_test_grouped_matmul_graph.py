@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Exercise native grouped forward/dgrad/wgrad with runtime expert loads."""
+"""Dynamic GMM graph tracing across empty and populated expert loads."""
 
 import os
 
@@ -22,9 +22,9 @@ from torch import _check
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from hyper_parallel.compile.tracer.graph_tracer import run_traced_graph, trace_model_graph
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.functional.grouped_matmul import grouped_matmul
 from hyper_parallel.components.functional.npu_grouped_swiglu import _get_npu_grouped_matmul
+from hyper_parallel.components.modules.moe.grouped_experts import GroupedExperts, GroupedExpertsConfig
 from hyper_parallel.distributed.expert_parallel.collectives import ep_split_sizes
 
 
@@ -63,18 +63,14 @@ def test_grouped_runtime_loads(dtype):
 
 
 class _RuntimeExperts(torch.nn.Module):
-    """Keep input gradients and runtime receive lengths in the expert graph."""
+    """Keep input gradients and runtime receive lengths in the canonical expert graph."""
 
     def __init__(self) -> None:
         super().__init__()
-        source = torch.nn.Module()
-        source.num_experts = 4
-        source.hidden_size = 64
-        source.intermediate_size = 64
-        source.gate_up_proj = torch.nn.Parameter(torch.empty(4, 128, 64))
-        source.down_proj = torch.nn.Parameter(torch.empty(4, 64, 64))
         self.projection = torch.nn.Linear(64, 64, bias=False)
-        self.experts = GroupedExperts(module=source)
+        self.experts = GroupedExperts(
+            config=GroupedExpertsConfig(4, 64, 64, routing_weight_mode="output", num_layers=1),
+        )
         for parameter in self.parameters():
             torch.nn.init.normal_(parameter, std=0.02)
 
@@ -83,7 +79,9 @@ class _RuntimeExperts(torch.nn.Module):
         rows = sum(ep_split_sizes(counts))
         _check(rows <= inputs.shape[0])
         received = self.projection(inputs).narrow(0, 0, rows)
-        return self.experts.forward_expert_major(received, counts)
+        return self.experts.compute_experts(
+            received, counts, self.experts.gate_up_proj, self.experts.down_proj,
+        )
 
 
 def _expert_loss(model, inputs, counts):

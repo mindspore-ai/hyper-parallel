@@ -35,7 +35,7 @@ from hyper_parallel.components.quantization.functional.linear_strategy_factory i
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import (
     MXFP8LinearStrategy,
 )
-from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.quantization.modules import GroupedExperts
 from hyper_parallel.components.modules.linear import LowPrecisionLinear
 from hyper_parallel.components.quantization.tensor import QuantizedTensorStorage
 from hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement import (
@@ -134,8 +134,8 @@ class TestGroupedExpertsConversion(unittest.TestCase):
 
         reference = _reference_experts(source, hidden, indices, weights)
         with mock.patch(
-            "hyper_parallel.components.quantization.modules.grouped_experts."
-            "_GroupedLinearFunction.apply",
+            "hyper_parallel.components.modules.moe.grouped_experts."
+            "low_precision_grouped_experts._GroupedLinearFunction.apply",
             side_effect=_dense_grouped_apply,
         ):
             actual = converted(hidden, indices, weights)
@@ -195,7 +195,7 @@ class TestGroupedExpertsFactory(unittest.TestCase):
         )
         strategy = FakeW4A8GroupedLinear()
         patch_path = (
-            "hyper_parallel.components.quantization.modules.replacement."
+            "hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts."
             "build_low_precision_strategy"
         )
         with mock.patch(patch_path, return_value=strategy) as build:

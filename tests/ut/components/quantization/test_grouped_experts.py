@@ -25,7 +25,7 @@ from hyper_parallel.components.quantization.functional.fake_w4a8_gmm_func import
 from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import HiFloat8GroupedLinear
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from hyper_parallel.components.quantization.functional.w4a8_gmm_func import W4A8GroupedLinear
-from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.quantization.modules import GroupedExperts
 
 
 def _cpu_projection(
@@ -100,7 +100,8 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
         indices = torch.stack([torch.arange(top_k).roll(token) for token in range(hidden.shape[0])])
         probabilities = torch.softmax(torch.randn(5, top_k), dim=-1).to(route_dtype).requires_grad_(True)
         with mock.patch(
-            "hyper_parallel.components.quantization.modules.grouped_experts._GroupedLinearFunction.apply",
+            "hyper_parallel.components.modules.moe.grouped_experts."
+            "low_precision_grouped_experts._GroupedLinearFunction.apply",
             side_effect=_cpu_projection,
         ):
             actual = module(hidden, indices, probabilities)

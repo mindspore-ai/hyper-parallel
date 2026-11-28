@@ -44,7 +44,6 @@ from hyper_parallel.components.quantization.ops import (
     validate_fake_w4a8_gmm_runtime,
     validate_w4a8_gmm_runtime,
 )
-from hyper_parallel.components.quantization.modules import GroupedExperts
 from hyper_parallel.components.quantization.quantizers import (
     HiFloat8Quantizer,
     MXFP8Quantizer,
@@ -64,7 +63,10 @@ from hyper_parallel.components.quantization.tensor import (
 )
 
 if TYPE_CHECKING:
-    from hyper_parallel.components.quantization.modules import LowPrecisionLinear
+    from hyper_parallel.components.quantization.modules import (
+        GroupedExperts,
+        LowPrecisionLinear,
+    )
 
 __all__ = [
     "HiFloat8NpuOps",
@@ -105,9 +107,12 @@ __all__ = [
     "validate_fake_w4a8_gmm_runtime",
 ]
 
+_LAZY_MODULE_EXPORTS = frozenset({"GroupedExperts", "LowPrecisionLinear"})
+
+
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
-    """Defer the Linear compatibility export to avoid a cycle with its canonical package."""
-    if name != "LowPrecisionLinear":
+    """Defer module compatibility exports to avoid cycles with canonical module packages."""
+    if name not in _LAZY_MODULE_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     modules_pkg = importlib.import_module("hyper_parallel.components.quantization.modules")
     value = getattr(modules_pkg, name)

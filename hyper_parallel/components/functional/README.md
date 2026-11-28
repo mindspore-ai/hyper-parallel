@@ -41,7 +41,7 @@ output = moe_token_unpermute(expert_outputs, sorted_indices, routing_probs)
 ```
 
 In this example, `experts` is an instance of the legacy
-`hyper_parallel.components.modules.grouped_experts.GroupedExperts`. It contains only local expert weights and computation;
+`hyper_parallel.components.modules.moe.grouped_experts.GroupedExpertsModule`. It contains local expert weights and computation;
 routing, expert-parallel communication, and shared experts remain outside the module.
 The public [GroupedExperts family](../modules/moe/grouped_experts/README.md) accepts token-level top-k routes and owns
 permutation, expert computation and local/EP transport.

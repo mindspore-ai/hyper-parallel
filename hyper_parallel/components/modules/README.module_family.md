@@ -2,9 +2,8 @@
 
 Module Family 在构建阶段为同一种模块选择具体实现。用户通过统一的 replacement 入口填写选择参数，框架根据模块族声明的白名单规则选出实现，再复用现有的 Module Replacement 完成模型层匹配和实例安装。
 
-公共 `hyper_parallel.components.modules.GroupedExperts` 使用[新专家族](moe/grouped_experts/README.md)，
-根据作业拓扑选择 local/EP 成员。本页 MXFP8 示例使用保留的旧专家族，显式路径为
-`hyper_parallel.components.modules.grouped_experts.GroupedExperts`。更多模块可通过注册自己的 Family 接入。
+公共 `hyper_parallel.components.modules.GroupedExperts` 使用统一的[路由专家族](moe/grouped_experts/README.md)，
+根据作业拓扑与低精配置自动选择 local / EP / MoonEP 及 MXFP8 / W4A8 / HiF8 成员。更多模块可通过注册自己的 Family 接入。
 
 ## 使用 GroupedExperts Family
 
@@ -22,7 +21,7 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.components.modules.grouped_experts.GroupedExperts
+        _target_: hyper_parallel.components.modules.GroupedExperts
         use_mxfp8: true
         use_fused_mxfp8: true
 ```
@@ -46,7 +45,7 @@ plan_overrides:
 
 这里的两个开关直接选择固定 MXFP8 路径，不通过 `training.low_precision` 选择数值策略。配置中不要再给同一替换条目绑定 W4/fake 等命名 dtype scheme。Scheme 驱动的 QAT 接口不属于本页描述的入口。
 
-默认实现和低精实现共用 [GroupedExperts](grouped_experts.py) 的持久权重布局与 checkpoint 转换：Gate/Up 为 `[E,H,2I]`，Down 为 `[E,I,H]`。非 meta 源参数需要转置时复制已有值；布局已匹配时复用原 Parameter；meta 参数通过原 checkpoint 或初始化流程填值。应在替换完成后建立优化器。
+默认实现和低精实现共用 [grouped_experts.py](moe/grouped_experts/grouped_experts.py) 的持久权重布局与 checkpoint 转换：Gate/Up 为 `[E,2I,H]`，Down 为 `[E,H,I]`。布局已匹配时复用原 Parameter；meta 参数通过原 checkpoint 或初始化流程填值。应在替换完成后建立优化器。
 
 ## 配置如何生效
 
@@ -71,12 +70,12 @@ flowchart TD
 `ReplacementTarget` 同时保留用户请求的 baseline、显式选择参数和最终 callable。重新选择或序列化时保留配置意图；真正构建时，选择参数已从普通构造参数中移除。
 
 ```python
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.modules import GroupedExperts
 from hyper_parallel.trainer.config.replacement import ReplacementTarget
 
 target = ReplacementTarget(
     GroupedExperts,
-    target_path="hyper_parallel.components.modules.grouped_experts.GroupedExperts",
+    target_path="hyper_parallel.components.modules.GroupedExperts",
     use_mxfp8=True,
 )
 fused = target.replace(use_fused_mxfp8=True)
@@ -201,8 +200,8 @@ plan_overrides:
 | 位置 | 职责 |
 | --- | --- |
 | [family.py](family.py) | 注册、白名单匹配与构造参数检查 |
-| [grouped_experts.py](grouped_experts.py) | 内置 Family 登记、参数与路由契约 |
-| [mxfp8_grouped_swiglu.py](mxfp8_grouped_swiglu.py) | 两种低精模块的本地计算 |
+| [grouped_experts_family.py](moe/grouped_experts/grouped_experts_family.py) | 路由与低精专家 Family 登记、切分与校验 |
+| [low_precision_grouped_experts.py](moe/grouped_experts/low_precision_grouped_experts.py) | 低精专家本地计算与策略绑定（复用 local/EP/MoonEP） |
 | [trainer/config/replacement.py](../../trainer/config/replacement.py) | 选型配置、复制与序列化 |
 | [trainer/config/resolver.py](../../trainer/config/resolver.py) | replacement 专用解析入口 |
 | [trainer/config/parallelism.py](../../trainer/config/parallelism.py) | 配置到替换规格的接线 |

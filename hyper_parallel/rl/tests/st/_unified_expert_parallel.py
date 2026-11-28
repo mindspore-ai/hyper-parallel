@@ -20,17 +20,15 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+from rl.unified_execution.training.grouped_experts import bind_native_unpermute
+from rl.unified_execution.vllm.moe.fused_experts import AscendFusedExpertsBackend
+from rl.unified_execution.vllm.moe.grouped_experts import rollout_experts
 
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
-from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
-from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward
+from hyper_parallel.components.modules import GroupedExperts
 from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts import EPGroupedExperts
 from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsConfig
 from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
 from hyper_parallel.distributed.module_binding import ParallelBinding
-from rl.unified_execution.training.grouped_experts import bind_native_unpermute
-from rl.unified_execution.vllm.moe.fused_experts import AscendFusedExpertsBackend
-from rl.unified_execution.vllm.moe.grouped_experts import rollout_experts
 
 
 def _experts(count: int, offset: int) -> torch.nn.Module:
@@ -38,7 +36,7 @@ def _experts(count: int, offset: int) -> torch.nn.Module:
     source = torch.nn.Module()
     source.num_experts, source.hidden_size, source.intermediate_size = count, 2048, 768
     source.is_transposed = False
-    source.config = SimpleNamespace(hidden_act="silu", initializer_range=.02)
+    source.config = SimpleNamespace(hidden_act="silu", initializer_range=.02, num_hidden_layers=1)
     gate, down = [], []
     for expert in range(offset, offset + count):
         torch.manual_seed(12000 + expert)
@@ -48,20 +46,18 @@ def _experts(count: int, offset: int) -> torch.nn.Module:
     source.down_proj = torch.nn.Parameter(torch.stack(down))
     module = torch.nn.Module()
     module.experts = GroupedExperts(module=source)
-    # The fixture already owns a shard; HP's binding reads the local tensor shape.
-    bind_local_expert_forward(module, 1, use_grouped_gemm=True)
+    with torch.no_grad():
+        for parameter in (module.experts.gate_up_proj, module.experts.down_proj):
+            parameter.set_(parameter.transpose(-1, -2).contiguous().transpose(-1, -2))
     return module
 
 
 def _reference_forward(full: torch.nn.Module, states: torch.Tensor, ids: torch.Tensor,
                        weights: torch.Tensor) -> torch.Tensor:
     """Evaluate each local token against a complete expert bank without EP routing."""
-    slots = ids.shape[1]
-    routes = full.experts(states.repeat_interleave(slots, 0), ids.flatten())
     if not states.shape[0]:
         return torch.empty_like(states)
-    inverse = torch.arange(ids.numel(), dtype=torch.int32, device=ids.device)
-    return moe_token_unpermute(routes.contiguous(), inverse, weights.contiguous())
+    return full.experts(states, ids, weights)
 
 
 def _update_weights(module: torch.nn.Module, full: torch.nn.Module) -> None:
@@ -87,7 +83,7 @@ def _training_experts(module, options):
     with torch.device("meta"):
         experts = EPGroupedExperts(config=config)
     for name in ("gate_up_proj", "down_proj"):
-        local = getattr(module.experts, name).detach().transpose(-1, -2).contiguous()
+        local = getattr(module.experts, name).detach().clone()
         setattr(experts, name, torch.nn.Parameter(local))
     experts.bind_parallel(ParallelBinding(mesh_binding=None, ep_context=EPContext(mesh, num_experts=128)))
     bind_native_unpermute(experts)
@@ -109,8 +105,7 @@ def _gradients(module: torch.nn.Module, states: torch.Tensor, ids: torch.Tensor,
     upstream = torch.randn_like(states)
     experts = _training_experts(module, options)
     experts(x, ids, probs).float().mul(upstream).sum().backward()
-    actual = [x.grad, probs.grad, experts.gate_up_proj.grad.transpose(-1, -2),
-              experts.down_proj.grad.transpose(-1, -2)]
+    actual = [x.grad, probs.grad, experts.gate_up_proj.grad, experts.down_proj.grad]
     full = _experts(128, 0)
     with torch.no_grad():
         full.experts.gate_up_proj.copy_(gather(module.experts.gate_up_proj))
@@ -118,7 +113,10 @@ def _gradients(module: torch.nn.Module, states: torch.Tensor, ids: torch.Tensor,
     all_x = gather(states).requires_grad_()
     all_probs = gather(weights).requires_grad_()
     all_ids, all_upstream = gather(ids), gather(upstream)
-    routes = full.experts(all_x.repeat_interleave(8, 0), all_ids.flatten()).view(size * states.shape[0], 8, 2048)
+    unit_weights = torch.ones((all_ids.numel(), 1), device=all_x.device, dtype=torch.float32)
+    routes = full.experts(all_x.repeat_interleave(8, 0), all_ids.flatten().unsqueeze(-1), unit_weights).view(
+        size * states.shape[0], 8, 2048
+    )
     # Independent FP32 weighted sum supplies the autograd reference.
     expected_output = (routes.float() * all_probs.float().unsqueeze(-1)).sum(dim=1).to(routes.dtype)
     expected_output.float().mul(all_upstream).sum().backward()
@@ -204,7 +202,12 @@ def main() -> None:
         def candidate(states=x, choices=ids, probabilities=weights) -> torch.Tensor:
             with override_forward_context(context):
                 return rollout_experts(
-                    states, choices, probabilities, module.experts.gate_up_proj, module.experts.down_proj, "experts",
+                    states,
+                    choices,
+                    probabilities,
+                    module.experts.gate_up_proj.transpose(-1, -2),
+                    module.experts.down_proj.transpose(-1, -2),
+                    "experts",
                 )
 
         with torch.no_grad():

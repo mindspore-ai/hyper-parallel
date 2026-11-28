@@ -117,6 +117,10 @@ class FamilyBuildInfo:
     origin: str
     layout: _FamilyLayout | None = None
 
+    def __deepcopy__(self, _memo: dict[int, Any]) -> "FamilyBuildInfo":
+        """Preserve immutable construction provenance across module deepcopy."""
+        return self
+
 
 @dataclass(frozen=True)
 class FamilyBoundary:

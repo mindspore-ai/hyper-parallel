@@ -308,7 +308,7 @@ plan_overrides:
       kind: module
       source_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
       implementation:
-        _target_: hyper_parallel.components.modules.grouped_experts.GroupedExperts
+        _target_: hyper_parallel.components.modules.GroupedExperts
         low_precision_dtype_scheme: experts_mxfp8
         fused: true
 ```

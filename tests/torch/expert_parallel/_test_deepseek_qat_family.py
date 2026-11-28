@@ -146,11 +146,11 @@ def test_deepseek_qat_family(fake: bool, weight_format: str) -> None:
         expected_loss.backward()
         torch.testing.assert_close(actual_input.grad, expected_input.grad, rtol=0, atol=0)
         for actual_weight, expected_weight in zip(actual_weights, reference_weights):
-            torch.testing.assert_close(actual_weight.grad, expected_weight.grad.transpose(-2, -1), rtol=0, atol=0)
+            torch.testing.assert_close(actual_weight.grad, expected_weight.grad, rtol=0, atol=0)
         optimizer.step()
         reference_optimizer.step()
         for actual_weight, expected_weight in zip(actual_weights, reference_weights):
-            torch.testing.assert_close(actual_weight, expected_weight.transpose(-2, -1), rtol=0, atol=0)
+            torch.testing.assert_close(actual_weight, expected_weight, rtol=0, atol=0)
         assert torch.isfinite(loss)
         losses.append(loss.item())
     assert all(not torch.equal(before, after) for before, after in zip(initial, actual_weights))
