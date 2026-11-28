@@ -25,6 +25,9 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from hyper_parallel.components.modules.common.attention_residual import (
+        AttentionResidual, AttentionResidualModule,
+    )
     from hyper_parallel.components.modules.attention.multi_latent_attention import (
         MultiLatentAttention, MultiLatentAttentionModule,
     )
@@ -54,6 +57,8 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.mlp import SwiGLUMLP, SwiGLUMLPModule
 
 _EXPORT_TO_MODULE = {
+    "AttentionResidual": "common.attention_residual",
+    "AttentionResidualModule": "common.attention_residual",
     "CausalLMHead": "common.causal_lm_head",
     "CausalLMHeadModule": "common.causal_lm_head",
     "SiTUMLP": "common.situ_mlp",

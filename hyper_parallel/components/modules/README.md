@@ -10,6 +10,7 @@ Python or declaratively replace existing model modules through Trainer YAML.
 | Attention | `GroupedQueryAttention`, `GatedGroupedQueryAttention`, `MultiLatentAttention`, `GatedMultiLatentAttention`, `DeepseekSparseAttention` |
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
+| Residual | `AttentionResidual` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
 
 Reusable high-performance functions are provided separately in [`hyper_parallel.components.functional`](../functional/README.md).
