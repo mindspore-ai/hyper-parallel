@@ -774,11 +774,13 @@ def apply_model_infrastructure(
         model, mesh, sharding_planner, is_hf_model, validate_placement,
     )
 
-    model = _apply_activation_features(
-        model,
-        activation_checkpoint,
-        compile_for_execution,
-    )
+    # The joint graph applies activation recomputation after tracing.
+    if compile_config is None or not compile_config.selects_graph_compiler():
+        model = _apply_activation_features(
+            model,
+            activation_checkpoint,
+            compile_for_execution,
+        )
     external = _create_external_state(
         model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,
         validate_placement, compile_for_execution, distributed_setup, fsdp2_manager,

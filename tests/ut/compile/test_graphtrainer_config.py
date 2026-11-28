@@ -42,6 +42,7 @@ from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import (
     AcceleratorConfig,
+    ActivationCheckpointConfig,
     OptimizerConfig,
     Target,
     TrainerConfig,

@@ -1,15 +1,16 @@
-# Graph standard-regression YAML:
-# - Qwen3-0.6B structure + local indexed (pretokenized) dataset
-# - TP2 + FSDP2 four-card setup
-# - used to verify the standard scripts/train_lm.py graph entry
-# - no absolute model path in this file; inject it at runtime, e.g.
-#   --model.pretrained_model_name_or_path=/path/to/Qwen3-0.6B
+# Qwen3-0.6B with fixed-length WikiText batches on four Ascend NPUs.
+model_init_dtype: bfloat16
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ./output/models/Qwen3-0.6B
+  load_base_model: false
   torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
+  config_overrides:
+    # Give the LM head its own TP parameter and communication boundary.
+    tie_word_embeddings: false
 
 optimizer:
   _target_: hyper_parallel.components.optim.builders.AdamW
@@ -39,11 +40,14 @@ accelerator:
   cp_size: 1
   ep_size: 1
   pp_size: 1
-  sequence_parallel: false
+  sequence_parallel: true
   loss_parallel: false
 
 fsdp_config:
   dp_shard_size: 2
+
+activation_checkpoint:
+  mode: full
 
 compile:
   enabled: true
@@ -55,7 +59,7 @@ compile:
 dataset:
   _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
   # Pretokenized .bin/.idx prefix; override with --dataset.data_path=<prefix>
-  data_path: ./output/automodel_text_graph/indexed_text_document
+  data_path: ./output/dataset/wikitext_text_document
   model_assets:
     chat_template: null
     tokenizer:
@@ -66,6 +70,8 @@ dataset:
       eod_token_id: 151645
   data_config:
     seq_length: 128
+    low_level_dataset:
+      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
     split: "1, 0, 0"
     mock_data: false
     distributed_walk: true
