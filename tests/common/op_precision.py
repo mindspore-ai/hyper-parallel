@@ -44,6 +44,8 @@ class PrecisionCase:
     kwargs: dict[str, Any] = field(default_factory=dict)
     precision_dtype: torch.dtype = torch.float32
     expert_parameters: tuple[int, ...] = ()
+    # Explicit per-input exceptions for fused VJPs; native/oracle checks keep default limits.
+    backend_gradient_tolerances: dict[str, Tolerance] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,7 @@ _LIMITS = {
 
 def assert_precision(
     actual: torch.Tensor, expected: torch.Tensor, *, dtype: torch.dtype,
-    backward: bool = False, label: str = "tensor",
+    backward: bool = False, label: str = "tensor", tolerance: Tolerance | None = None,
 ) -> None:
     """Check metadata, finite values, exact discrete values, allclose and relative L2.
 
@@ -106,7 +108,7 @@ def assert_precision(
         f"expected={target.flatten()[worst].item():.6g}"
     )
     logging.getLogger(__name__).info(diagnostic)
-    tolerance = _LIMITS[dtype][int(backward)]
+    tolerance = tolerance or _LIMITS[dtype][int(backward)]
     torch.testing.assert_close(actual, expected, atol=tolerance.atol, rtol=tolerance.rtol, msg=diagnostic)
     if relative_l2 > tolerance.relative_l2:
         raise AssertionError(f"{diagnostic}; limit={tolerance.relative_l2}")
@@ -181,10 +183,14 @@ def check_case(case: PrecisionCase, *, backend: str = "native", device: str = "c
     """
     failures = []
 
-    def compare(value: torch.Tensor, target: torch.Tensor, label: str, backward: bool = False) -> None:
+    def compare(
+        value: torch.Tensor, target: torch.Tensor, label: str, backward: bool = False,
+        tolerance: Tolerance | None = None,
+    ) -> None:
         """Collect a tensor comparison failure without hiding later VJP diagnostics."""
         try:
-            assert_precision(value, target, dtype=case.precision_dtype, backward=backward, label=label)
+            assert_precision(value, target, dtype=case.precision_dtype, backward=backward, label=label,
+                             tolerance=tolerance)
         except AssertionError as error:
             # Report every VJP even when an earlier output fails its budget.
             failures.append(str(error))
@@ -207,7 +213,8 @@ def check_case(case: PrecisionCase, *, backend: str = "native", device: str = "c
                 failures.append(f"{label}: actual={value}, expected={target}")
                 continue
             if target is not None:
-                compare(value, target, label, backward=True)
+                tolerance = case.backend_gradient_tolerances.get(name) if backend != "native" else None
+                compare(value, target, label, backward=True, tolerance=tolerance)
                 if name in {f"args.{index}" for index in case.expert_parameters}:
                     for expert, (expert_value, expert_target) in enumerate(zip(value, target)):
                         compare(expert_value, expert_target, f"{label}/expert[{expert}]", backward=True)

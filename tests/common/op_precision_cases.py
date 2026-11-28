@@ -26,7 +26,7 @@ import torch
 
 from hyper_parallel.components import ops as operators
 from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import PackedSequenceInfo
-from tests.common.op_precision import PrecisionCase
+from tests.common.op_precision import PrecisionCase, Tolerance
 
 
 class Inputs:
@@ -422,4 +422,135 @@ def linear_attention_cases(dtype: torch.dtype, hardware: bool = False) -> list[P
             cases.append(PrecisionCase(family, "zero_state", f"packed_{packed}", operation, _delta_rule,
                                        (inputs.tensor(1, length, 2, width), inputs.tensor(1, length, 2, width),
                                         inputs.tensor(1, length, 2, width), gate, beta), kwargs, dtype))
+    return cases
+
+
+def _gated_residual_reference(x, down, up, gamma, gate=None, *, channels=4, eps=1e-6):
+    """HF equations, expressed independently of the implementation helpers."""
+    shape = (*x.shape[:-1], channels, x.shape[-1] // channels)
+    streams = x.float().reshape(shape)
+    normalized = streams * torch.rsqrt(streams.pow(2).mean(-1, keepdim=True) + eps)
+    normalized = (normalized.reshape_as(x) * (1.0 + gamma.float())).to(x.dtype)
+    low = torch.nn.functional.silu(torch.nn.functional.linear(normalized, down) / channels)
+    read_gate = torch.sigmoid(torch.nn.functional.linear(low, up)).reshape(shape)
+    mixed = (read_gate * normalized.reshape(shape)).mean(-2)
+    if gate is None:
+        return mixed
+    return mixed, 2 * torch.sigmoid(torch.nn.functional.linear(normalized, gate) / channels)
+
+
+def gated_residual_cases(dtype: torch.dtype, hardware: bool = False) -> list[PrecisionCase]:
+    """Read-only and read/inject paths, with all trainable weights included."""
+    generator = torch.Generator().manual_seed(49)
+    channels, hidden, rank = (4, 256, 64) if hardware else (4, 8, 8)
+    width = channels * hidden
+    def _tensor(shape, scale=1.0, dt=dtype):
+        return (torch.randn(shape, generator=generator) * scale).to(dt).requires_grad_()
+    inputs = (_tensor((2, 7, width)), _tensor((rank, width), 0.02), _tensor((width, rank), 0.02),
+              _tensor((width,), 0.1, torch.float32))
+    return [PrecisionCase(
+        family="gated_residual", variant="standard", name=f"combine_{combine}_{dtype}",
+        operation=operators.gated_residual, reference=_gated_residual_reference,
+        args=(*inputs, _tensor((channels, width), 0.02) if combine else None),
+        kwargs={"channels": channels}, precision_dtype=dtype,
+    ) for combine in (False, True)]
+
+
+def _pooled_route_sorted(query, key, **kwargs):
+    return operators.pooled_indexer(query, key, **kwargs).sort(-1).values
+
+
+def _monotonic_pooled_route(query, key, *, pool_size, token_budget):
+    """For the fixture's positive monotonic scores, select the most recent blocks."""
+    del key
+    result = torch.full((query.shape[0], token_budget + pool_size - 1), -1,
+                        dtype=torch.int32, device=query.device)
+    for row in range(query.shape[0]):
+        complete = (row + 1) // pool_size
+        count = min(complete, token_budget // pool_size)
+        result[row, :count * pool_size] = torch.arange((complete-count)*pool_size, complete*pool_size,
+                                                       device=query.device, dtype=torch.int32)
+        tail = torch.arange(complete*pool_size, row+1, device=query.device, dtype=torch.int32)
+        result[row, token_budget:token_budget+tail.numel()] = tail
+    return result.sort(-1).values
+
+
+def _pooled_attention_reference(query, key, value, indices, *, block_size, scale):
+    """Small dense oracle: independently materialize selected-token visibility."""
+    batch, length, heads, _ = query.shape
+    allowed = torch.zeros(batch, length, length, dtype=torch.bool, device=query.device)
+    for row in range(length):
+        for b in range(batch):
+            for block in indices[b, row].tolist():
+                if block >= 0:
+                    allowed[b, row, block*block_size:(block+1)*block_size] = True
+        allowed[:, row, ((row+1)//block_size)*block_size:row+1] = True
+    grouped_key = key.float().repeat_interleave(heads // key.shape[2], dim=2)
+    grouped_value = value.float().repeat_interleave(heads // value.shape[2], dim=2)
+    logits = torch.einsum("bqhd,bkhd->bhqk", query.float(), grouped_key) * scale
+    logits = logits.masked_fill(~allowed[:, None], float("-inf"))
+    output = torch.einsum("bhqk,bkhd->bqhd", logits.softmax(-1), grouped_value).to(query.dtype)
+    return output, logits.logsumexp(-1).transpose(1, 2).detach()
+
+
+def _pooled_mla_reference(query, key_value, indices, *, block_size, scale):
+    # Share the FP32 cast so K/V contributions accumulate before returning to BF16.
+    bank = key_value.float()
+    return _pooled_attention_reference(query, bank, bank, indices, block_size=block_size, scale=scale)
+
+
+def _pooled_kl_reference(query, key, weights, indices, teacher, *, pool_size):
+    del pool_size
+    logits = torch.einsum("bqhd,bkd->bqhk", query.float(), key.float()) * query.shape[-1]**-0.5
+    logits = (logits.relu() * weights.float()[..., None]).sum(2)
+    logits = logits.gather(-1, indices.clamp_min(0).long())
+    valid = indices >= 0
+    logits = logits.masked_fill(~valid, float("-inf"))
+    logits = torch.where(valid.any(-1, keepdim=True), logits, torch.zeros_like(logits))
+    target = teacher.detach().float()
+    log_prob = logits.log_softmax(-1).masked_fill(~valid, 0)
+    return (target * (target.clamp_min(1e-30).log() - log_prob)).sum()
+
+
+def pooled_cases(dtype: torch.dtype, hardware: bool = False) -> list[PrecisionCase]:
+    """One independent fixture per pooled-routing, sparse-core and KL contract."""
+    generator = torch.Generator().manual_seed(493)
+    pool, heads = 4, 4
+    length, dim, budget = (2305, 128, 2048) if hardware else (17, 8, 8)
+    query = torch.zeros(length, heads, dim, dtype=dtype)
+    query[..., 0] = 1
+    key = torch.zeros(length//pool, dim, dtype=dtype)
+    key[:, 0] = torch.arange(1, length//pool+1).to(dtype)
+    cases = [PrecisionCase("pooled_indexer", "standard", "causal_blocks_and_tail", _pooled_route_sorted,
+                           _monotonic_pooled_route, (query, key),
+                           {"pool_size": pool, "token_budget": budget}, precision_dtype=dtype)]
+    length, dim = 17, (128 if hardware else 8)
+    indices = torch.arange(length//pool, dtype=torch.int32)[None, None].expand(1, length, -1).clone()
+    complete = torch.arange(1, length+1)//pool
+    indices.masked_fill_(indices >= complete[None, :, None], -1)
+    def _tensor(shape):
+        return (torch.randn(shape, generator=generator)*0.3).to(dtype).requires_grad_()
+    cases.append(PrecisionCase(
+        "block_sparse_attention", "standard", "gqa_forced_tail", operators.block_sparse_attention,
+        _pooled_attention_reference, (_tensor((1, length, heads, dim)), _tensor((1, length, 2, dim)),
+                                     _tensor((1, length, 2, dim)), indices),
+        {"block_size": pool, "scale": dim**-0.5}, precision_dtype=dtype))
+    mla_dim, mla_heads = (512, 64) if hardware else (8, 4)
+    cases.append(PrecisionCase(
+        "block_sparse_attention", "mla", "shared_bank_forced_tail", operators.block_sparse_mla,
+        _pooled_mla_reference, (_tensor((1, length, mla_heads, mla_dim)), _tensor((1, length, 1, mla_dim)), indices),
+        {"block_size": pool, "scale": 256**-0.5}, precision_dtype=dtype,
+        # 64-head accumulation can amplify absolute error at cancelled KV coordinates.
+        # Keep relative L2 and all other outputs/gradients at the common limits.
+        backend_gradient_tolerances={"args.1": Tolerance(0.025, 0.02, 0.01)}
+        if hardware and dtype == torch.bfloat16 else (
+            {"args.1": Tolerance(0.004, 0.003, 0.003)} if hardware and dtype == torch.float16 else {})))
+    teacher = (indices >= 0).float()
+    teacher = teacher / teacher.sum(-1, keepdim=True).clamp_min(1)
+    cases.append(PrecisionCase(
+        "pooled_indexer_kl", "standard", "zero_teacher_prefix", operators.pooled_indexer_kl,
+        _pooled_kl_reference, (_tensor((1, length, heads, dim)), _tensor((1, length//pool, dim)),
+                              torch.ones(1, length, heads, dtype=torch.float32, requires_grad=True),
+                              indices, teacher.requires_grad_()),
+        {"pool_size": pool}, precision_dtype=dtype))
     return cases

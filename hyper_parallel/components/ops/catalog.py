@@ -15,12 +15,16 @@
 """Assemble the shared catalog of built-in operator backends."""
 
 from .auto_policy import apply_auto_policy
+from .impl.block_sparse_attention import register_block_sparse_attention
+from .impl.pooled_indexer import register_pooled_indexer
+from .impl.pooled_indexer_kl import register_pooled_indexer_kl
 from .impl.attention import register_attention
 from .impl.causal_conv1d import register_causal_conv1d
 from .impl.dsa_indexer import register_dsa_indexer
 from .impl.dsa_indexer_kl import register_dsa_indexer_kl
 from .impl.deepseek_sparse_attention import register_deepseek_sparse_attention
 from .impl.gdn import register_gdn
+from .impl.gated_residual import register_gated_residual
 from .impl.grouped_matmul import register_grouped_matmul
 from .impl.grouped_swiglu import register_grouped_swiglu
 from .impl.kda import register_kda
@@ -36,6 +40,7 @@ from .registry import OpRegistry
 
 builtin_registry = OpRegistry()
 register_rms_norm(builtin_registry)
+register_gated_residual(builtin_registry)
 register_rope(builtin_registry)
 register_swiglu(builtin_registry)
 register_mhc_post(builtin_registry)
@@ -52,5 +57,8 @@ register_sinkhorn(builtin_registry)
 register_dsa_indexer(builtin_registry)
 register_deepseek_sparse_attention(builtin_registry)
 register_dsa_indexer_kl(builtin_registry)
+register_block_sparse_attention(builtin_registry)
+register_pooled_indexer_kl(builtin_registry)
+register_pooled_indexer(builtin_registry)
 apply_auto_policy(builtin_registry)
 builtin_registry.seal()

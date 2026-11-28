@@ -23,8 +23,13 @@ from hyper_parallel.components.ops.catalog import builtin_registry
 from tests.common.op_precision import PrecisionCase
 from tests.common.op_precision_cases import attention_cases, expert_cases, linear_attention_cases, pointwise_cases
 from tests.common.op_precision_dsa import dsa_cases
+from tests.common.op_precision_cases import gated_residual_cases, pooled_cases
 
 FAMILY_BUILDERS: dict[str, Callable[..., list[PrecisionCase]]] = {
+    "gated_residual": gated_residual_cases,
+    "pooled_indexer": pooled_cases,
+    "block_sparse_attention": pooled_cases,
+    "pooled_indexer_kl": pooled_cases,
     "rms_norm": pointwise_cases,
     "swiglu": pointwise_cases,
     "rope": pointwise_cases,
@@ -53,6 +58,9 @@ def backend_precision_dtypes(family: str, backend: str) -> tuple[torch.dtype, ..
     The built-in Torch NPU pointwise, attention and grouped kernels cover all
     three training dtypes. CUDA grouped_mm only accepts BF16.
     """
+    if family in ("gated_residual", "pooled_indexer", "block_sparse_attention", "pooled_indexer_kl"):
+        return (torch.float16, torch.bfloat16) if backend == "cann" else (
+            torch.float32, torch.float16, torch.bfloat16)
     if backend == "torch_grouped_mm":
         return (torch.bfloat16,)
     if family in ("rms_norm", "swiglu", "rope", "attention", "grouped_matmul",

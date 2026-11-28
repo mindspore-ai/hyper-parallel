@@ -25,6 +25,17 @@ from hyper_parallel.components.functional.npu_fusion_attention import resolve_pa
 
 from ._dsa_layout import DsaQueryLayout, ReduceSum
 from .factory import _dispatch, _select_for_call, ops
+from .impl.block_sparse_attention import (
+    BLOCK_SPARSE_ATTENTION, BLOCK_SPARSE_MLA, cann_rejection as block_attention_rejection,
+    mla_cann_rejection,
+    validate_inputs as validate_block_attention,
+)
+from .impl.pooled_indexer import (
+    POOLED_INDEXER, cann_rejection as pooled_indexer_rejection, validate_inputs as validate_pooled_indexer,
+)
+from .impl.pooled_indexer_kl import (
+    POOLED_INDEXER_KL, cann_rejection as pooled_kl_rejection, validate_inputs as validate_pooled_kl,
+)
 from .impl.attention import (
     GROUPED_QUERY_ATTENTION, MULTI_LATENT_ATTENTION, MULTI_LATENT_ATTENTION_WITH_STATS, VISION_ATTENTION,
     DenseAttentionFn, MultiLatentAttentionStatsFn, VisionAttentionFn,
@@ -41,6 +52,7 @@ from .impl.deepseek_sparse_attention import (
     DSA_ABSORBED, DSA_ABSORBED_SINK, DSA_COMPRESSED_BANKS, PackedDeepseekSparseAttentionFn, attention_native_only,
 )
 from .impl.gdn import GDN
+from .impl.gated_residual import GATED_RESIDUAL, cann_rejection, validate_inputs as validate_gated_residual
 from .impl.grouped_matmul import GROUPED_MATMUL, GroupedMatmulFn
 from .impl.grouped_swiglu import GROUPED_SWIGLU
 from .impl.kda import KDA
@@ -55,6 +67,7 @@ from .impl.swiglu import SWIGLU, SWIGLU_CLAMPED, ClampedSwiGLUFn, SwiGLUFn
 from .spec import OpSpec
 
 __all__ = [
+    "block_sparse_attention", "block_sparse_mla", "pooled_indexer", "pooled_indexer_kl",
     "DsaQueryLayout", "causal_conv1d", "dsa_indexer", "dsa_indexer_kl", "dsa_indexer_kl_dense",
     "dsa_indexer_kl_packed", "dsa_indexer_packed",
     "deepseek_sparse_attention_absorbed", "deepseek_sparse_attention_compressed_banks",
@@ -64,7 +77,7 @@ __all__ = [
     "moe_router", "moe_token_reorder", "moe_token_restore", "mome", "ops", "rms_norm", "rms_norm_fp32_affine",
     "router_scores",
     "rope", "rope_interleaved", "rope_qk",
-    "sinkhorn", "swiglu", "swiglu_clamped", "vision_attention",
+    "gated_residual", "sinkhorn", "swiglu", "swiglu_clamped", "vision_attention",
 ]
 
 grouped_matmul: GroupedMatmulFn = _dispatch(GROUPED_MATMUL)
@@ -84,6 +97,18 @@ sinkhorn: SinkhornFn = _dispatch(SINKHORN)
 swiglu: SwiGLUFn = _dispatch(SWIGLU)
 swiglu_clamped: ClampedSwiGLUFn = _dispatch(SWIGLU_CLAMPED)
 vision_attention: VisionAttentionFn = _dispatch(VISION_ATTENTION)
+
+
+def gated_residual(
+    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor, gamma: torch.Tensor,
+    gate: torch.Tensor | None = None, *, channels: int = 4, eps: float = 1e-6,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Read Qwen residual streams with eager or training-capable fused operations."""
+    validate_gated_residual(x, down, up, gamma, gate, channels, eps)
+    reason = cann_rejection(x, down, channels)
+    blocked = () if reason is None else (("cann", reason),)
+    operation = _select_for_call(GATED_RESIDUAL, x, blocked_backends=blocked)
+    return operation(x, down, up, gamma, gate, channels=channels, eps=eps)
 
 
 def _dense_mask(mask: torch.Tensor | None, key_length: int, packed: bool) -> torch.Tensor | None:
@@ -325,3 +350,62 @@ def moe_router(
         native_only = "MegaGate requires nonempty batched tokens and sqrtsoftplus scoring"
     route = _select_for_call(MOE_ROUTER, x, native_only=native_only)
     return route(x, weight, bias, vision_bias, image_mask, top_k, scoring_func, scale)
+
+
+def block_sparse_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, indices: torch.Tensor, *,
+    block_size: int, scale: float, query_chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Causal BSHD attention on complete blocks plus the visible tail; return output and detached LSE."""
+    validate_block_attention(query, key, value, indices, block_size, scale, query_chunk_size)
+    reason = block_attention_rejection(query, key, block_size)
+    operation = _select_for_call(BLOCK_SPARSE_ATTENTION, query,
+                                 blocked_backends=() if reason is None else (("cann", reason),))
+    return operation(query, key, value, indices, block_size=block_size, scale=scale,
+                     query_chunk_size=query_chunk_size)
+
+
+def block_sparse_mla(
+    query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor, *,
+    block_size: int, scale: float, query_chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attend absorbed Q to one shared KV bank; return output and detached per-head LSE.
+
+    Inputs use BSHD. Complete block IDs are shared across heads and -1 padded;
+    each query's visible incomplete block is always included. Absorption does
+    not change the supplied attention scale. First-order gradients include
+    both K and V contributions to the same latent bank.
+    """
+    validate_block_attention(query, key_value, key_value, indices, block_size, scale, query_chunk_size)
+    if key_value.shape[2] != 1:
+        raise ValueError("block sparse MLA requires a single shared KV head")
+    reason = mla_cann_rejection(query)
+    operation = _select_for_call(BLOCK_SPARSE_MLA, query,
+                                 blocked_backends=() if reason is None else (("cann", reason),))
+    return operation(query, key_value, indices, block_size=block_size, scale=scale,
+                     query_chunk_size=query_chunk_size)
+
+
+def pooled_indexer_kl(
+    query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
+    teacher: torch.Tensor, *, pool_size: int, query_chunk_size: int = 64,
+) -> torch.Tensor:
+    """Return selected-block KL sum; caller owns coefficient and valid-query normalization."""
+    validate_pooled_kl(query, key, weights, indices, teacher, pool_size, query_chunk_size)
+    reason = pooled_kl_rejection(query, key, indices, pool_size)
+    operation = _select_for_call(POOLED_INDEXER_KL, query,
+                                 blocked_backends=() if reason is None else (("cann", reason),))
+    return operation(query, key, weights, indices, teacher, pool_size=pool_size,
+                     query_chunk_size=query_chunk_size)
+
+
+def pooled_indexer(
+    query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor | None = None, *,
+    pool_size: int, token_budget: int, query_chunk_size: int = 64,
+) -> torch.Tensor:
+    """Select causal whole blocks plus a forced tail; token IDs are nondifferentiable."""
+    validate_pooled_indexer(query, key, weights, pool_size, token_budget, query_chunk_size)
+    reason = pooled_indexer_rejection(query, key, pool_size, token_budget)
+    operation = _select_for_call(POOLED_INDEXER, query,
+                                 blocked_backends=() if reason is None else (("cann", reason),))
+    return operation(query, key, weights, pool_size, token_budget, query_chunk_size)

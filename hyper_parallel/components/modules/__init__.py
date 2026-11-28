@@ -25,6 +25,8 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from hyper_parallel.components.modules.gated_residual import GatedResidual, GatedResidualModule
+    from hyper_parallel.components.modules.attention.pooled_indexer import KPoolIndexer, QSAIndexer
     from hyper_parallel.components.modules.attention.multi_latent_attention import (
         MultiLatentAttention, MultiLatentAttentionModule,
     )
@@ -58,6 +60,10 @@ _EXPORT_TO_MODULE = {
     "CausalLMHeadModule": "common.causal_lm_head",
     "SiTUMLP": "common.situ_mlp",
     "SiTUMLPModule": "common.situ_mlp",
+    "KPoolIndexer": "attention.pooled_indexer",
+    "QSAIndexer": "attention.pooled_indexer",
+    "GatedResidual": "gated_residual",
+    "GatedResidualModule": "gated_residual",
     "CompressedSparseAttention2": "attention.compressed_sparse_attention2",
     "Gate": "moe.router",
     "GateModule": "moe.router",

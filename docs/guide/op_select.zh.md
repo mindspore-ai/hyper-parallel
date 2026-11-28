@@ -58,6 +58,10 @@ swiglu    standard     native
 | `rms_norm` | `standard`、`fp32_affine`，常规和 FP32 仿射缩放 | `torch_npu` | `native` | `native` |
 | `swiglu` | `standard`、`clamped_fp32`，拼接输入和独立输入裁剪 | `torch_npu` | `native` | `native` |
 | `rope` | `half`、`interleaved`，均支持部分 head 维度旋转 | `torch_npu`, `native` | `native` | `native` |
+| `gated_residual` | `standard`，Qwen 分组 RMSNorm、低秩 read gate 与 inject | `native`；`cann` 显式选择 | `native` | `native` |
+| `pooled_indexer` | `standard`，完整池化块的评分／TopK 与原始 token 路由 | `native`；`cann` 显式选择 | `native` | `native` |
+| `block_sparse_attention` | `standard` GQA、`mla` 共享 KV，完整块及可见 tail | `native`；`cann` 显式选择 | `native` | `native` |
+| `pooled_indexer_kl` | `standard`，外部块级 teacher 的 KL sum | `native`；`cann` 显式选择 | `native` | `native` |
 | `mhc_post` | `standard`，变换输出与残差流混合 | `cann`, `omni`, `native` | `native` | `native` |
 | `sinkhorn` | `standard`，mHC 混合矩阵归一化 | `omni`, `native` | `native` | `native` |
 | `mome` | `standard`，DSA 输出侧的带掩码因果卷积与残差 | `omni`, `native` | `native` | `native` |
@@ -179,3 +183,11 @@ registry.set_auto_order(SWIGLU, device="cpu", candidates=("native",))
 # components/ops/__init__.py
 swiglu: SwiGLUFn = _dispatch(SWIGLU)
 ```
+
+## Qwen 门控残差与池化稀疏训练
+
+`gated_residual` 提供 Qwen GR 的 eager 与官方融合实现。`pooled_indexer`、
+`block_sparse_attention`、`pooled_indexer_kl` 分别负责池化选路、主 attention 和 student KL。
+GLM 的共享 D512 KV 与 QSA 的独立 K/V 使用不同 attention 变体；均保留 `native` 参考。
+这些新增族的 `auto` 默认选择 `native`，安装配套官方算子后可显式选择 `cann`。
+配置、模块替换、训练流程和支持边界见 [GR 与池化稀疏训练](GR与池化稀疏训练.md)。
