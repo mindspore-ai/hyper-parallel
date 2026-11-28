@@ -19,7 +19,27 @@ See `references/known-models.md` for full model architecture tables (LLaMA, GPT-
 
 ### 1.3 Collect Hardware Info
 
-See `references/known-hardware.md` for full hardware specs (Ascend A2/A3/950DT, A100, H100/H200) and hardware-specific strategy guidelines. All values are per die — multi-die chips share bandwidth between dies.
+See [hardware reference configurations](../references/known-hardware.md) for
+deployment-specific values and the collection procedure for other hardware.
+Obtain the job-visible logical devices per node, device mapping, per-device
+memory and memory budget from the user configuration or environment inspection.
+Obtain effective communication bandwidth from applicable supplied measurements
+or an authorized probe, with the collective and message size recorded. Record
+sources and units; do not substitute installation-wide scale or advertised peak
+bandwidth for the resources allocated to the job. Request missing inputs before
+making estimates that depend on them.
+
+For A3, query the target node inventory (for example the physical card IDs in
+`npu-smi info` together with the host's device mapping). Verify whether there
+are **8 physical cards/node** (384-card supernode, 48 nodes, 16 dies/node) or
+**4 physical cards/node** (64-card supernode, 16 nodes, 8 dies/node). Both have
+two dies per card. Record the inventory source and check that the requested
+node group has the same specification. A restricted container's logical device
+count is insufficient. If querying cannot establish the specification, ask the
+user; only if it remains unspecified, assume 8 cards/node and record that assumption.
+
+Pass the confirmed physical count to SAPP as `--cards-per-node 8` or
+`--cards-per-node 4`, or select `--cluster a3_384` / `--cluster a3_64` explicitly.
 
 ### 1.3 Validate & Request Missing Info
 
@@ -39,12 +59,17 @@ See `references/known-hardware.md` for full hardware specs (Ascend A2/A3/950DT, 
 
 Complete parameter set:
 
+Hardware fields below are placeholders filled from the selected specification
+or environment evidence. They do not establish default device counts or capacity.
+
 ```
 Model:    LLaMA-2-70B
   params: 70B, L=80, h=8192, n_h=64, n_kv=8 (GQA), d_ff=28672, V=32000
   seq_len=4096, global_batch=1024, micro_batch=1
 
-Hardware: 64× Ascend A2 (1 die/chip)
-  dies/node=8, total_dies=64, nodes=8
-  mem/die=64GB, bw_intra=400GB/s, bw_inter=50GB/s, peak/die=256 TFLOPS
+Hardware: <total_devices>× <device_type> (<dies_per_card> dies/card, if applicable)
+  logical_devices/node=<devices_per_node>, total_devices=<total_devices>, nodes=<node_count>
+  memory/device=<memory_per_device_gb> GB
+  effective_bw_intra/device=<bw_intra_gbps> GB/s, effective_bw_inter/device=<bw_inter_gbps> GB/s
+  peak/device=<peak_tflops> TFLOPS, dtype=<compute_dtype>, source=<hardware_evidence>
 ```

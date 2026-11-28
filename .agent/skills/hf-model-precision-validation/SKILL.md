@@ -15,6 +15,14 @@ global gradient norm across supported execution modes.
 
 ## Load
 
+Before acceptance, follow [criterion selection](../../rules/precision-acceptance.md):
+ask for the user's window, metrics and tolerances unless already supplied. Use
+those criteria; only otherwise apply the default rule and its model-scale window.
+Record the selected criteria and their source. The matrix gates below describe
+the built-in validation protocol. If user criteria differ, report the task's
+verdict separately from compliance with that protocol, including tool limitations;
+never silently replace the requested criteria with a built-in gate.
+
 1. Read `AGENTS.md` and `.agent/rules/testing.md` before changing test harnesses.
 2. Read [references/preflight-baseline.md](references/preflight-baseline.md) for
    resource acquisition, Offline data, and the full/cropped baseline branch.
