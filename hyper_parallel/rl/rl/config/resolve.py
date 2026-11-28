@@ -15,18 +15,38 @@
 """RL configuration resolve."""
 from copy import deepcopy
 from typing import Any, Mapping
+
 import torch
-from rl.workers.engine.model import model_trust_remote_code, trainer_attention_implementation
-from rl.workers.critic import build_value_model
+
+from rl.config.schema import (
+    _normalize_dtype_name,
+    _optimizer_fp32_main_params,
+    _trainer_topology,
+    build_model_registration,
+    optional_mapping,
+    required_mapping,
+    resolve_activation_checkpoint_config,
+    router_replay_mode,
+)
+from rl.config.validate import _validate_model_scope
 from rl.workers.adapters.qwen3 import build_causal_lm
+from rl.workers.critic import build_value_model
+from rl.workers.engine.model import model_trust_remote_code, trainer_attention_implementation
+
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.components.optim import AdamW, MultiLRScheduler
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
-from hyper_parallel.trainer.config import AcceleratorConfig, ActivationCheckpointConfig, MixedPrecisionConfig, OptimizerConfig, PlanOverride, Target, TrainerConfig, TrainingConfig
+from hyper_parallel.trainer.config import (
+    AcceleratorConfig,
+    MixedPrecisionConfig,
+    OptimizerConfig,
+    PlanOverride,
+    Target,
+    TrainerConfig,
+    TrainingConfig,
+)
 from hyper_parallel.trainer.config.resolver import resolve_component
-from rl.config.schema import _activation_checkpoint_mode, _normalize_dtype_name, _optimizer_fp32_main_params, _trainer_topology, build_model_registration, optional_mapping, required_mapping, router_replay_mode
-from rl.config.validate import _validate_model_scope
 
 
 def resolve_router_replay_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -282,8 +302,6 @@ def build_runtime_config(
             accelerator_config, mixed_precision_config, dp_shard
         ),
         mixed_precision=MixedPrecisionConfig(enabled=mixed_precision_enabled),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode=_activation_checkpoint_mode(accelerator_config)
-        ),
+        activation_checkpoint=resolve_activation_checkpoint_config(accelerator_config),
         checkpoint=_build_checkpoint_config(checkpoint_config),
     )

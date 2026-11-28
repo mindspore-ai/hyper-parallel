@@ -59,7 +59,6 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
 from hyper_parallel.trainer.config.parallelism import (
-    ActivationCheckpointConfig,
     FullCheckpointConfig,
     FullExcludeRegionConfig,
     SelectiveCheckpointConfig,
@@ -1194,11 +1193,7 @@ class TestEagerWrappedModel(unittest.TestCase):
         """Graph AC warns when the model was already eagerly checkpointed."""
         torch.manual_seed(7)
         model = _Model()
-        config = ActivationCheckpointConfig(
-            mode="full",
-            full=FullCheckpointConfig(recompute_layer=[0, 1]),
-        )
-        wrapped = _apply_activation_checkpointing(model, config, enable_compile=False)
+        wrapped = _apply_activation_checkpointing(model, "full", enable_compile=False)
         joint = _trace(wrapped, torch.randn(4, 8), torch.randn(4, 8))
 
         with self.assertLogs(

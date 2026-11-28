@@ -17,7 +17,6 @@
 import json
 import tempfile
 import unittest
-from unittest.mock import patch
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,13 +40,6 @@ class TestQwen35Runtime(unittest.TestCase):
 
     def setUp(self) -> None:
         """Resolve a production GRPO recipe against a local hybrid identity."""
-        accelerator_patch = patch.object(
-            torch.accelerator,
-            "current_accelerator",
-            return_value=SimpleNamespace(type="npu"),
-        )
-        accelerator_patch.start()
-        self.addCleanup(accelerator_patch.stop)
         # The fixture remains alive through the test; unittest owns its cleanup.
         self.directory = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
         self.addCleanup(self.directory.cleanup)

@@ -19,12 +19,10 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import yaml
-import torch
 
 import rl
 from rl.algorithm import build_algorithm
@@ -41,13 +39,6 @@ class TestCodeAgentRecipes(unittest.TestCase):
 
     def setUp(self) -> None:
         """Create only the checkpoint identity and public SWE data needed by validation."""
-        accelerator_patch = patch.object(
-            torch.accelerator,
-            "current_accelerator",
-            return_value=SimpleNamespace(type="npu"),
-        )
-        accelerator_patch.start()
-        self.addCleanup(accelerator_patch.stop)
         directory = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name)

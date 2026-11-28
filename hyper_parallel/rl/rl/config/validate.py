@@ -28,7 +28,26 @@ from rl.workers.engine.model import ModelRegistration, resolve_model, resolve_vl
 from rl.reward_model.scoring import load_reward_function
 from rl.rollout.registry import ROLLOUT_ENGINES
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.config.schema import AsyncTrainingConfig, ColocateAsyncConfig, _EXPECTED_TOP_LEVEL, _HCCL_MAX_PORT, _HCCL_MIN_PORT, _async_integer, _normalize_dtype_name, _optimizer_fp32_main_params, _positive_integer, _require_async, _trainer_topology, _trainer_world_size, build_model_registration, optional_mapping, required_mapping, router_replay_mode, uses_colocated_vllm
+from rl.config.schema import (
+    AsyncTrainingConfig,
+    ColocateAsyncConfig,
+    _EXPECTED_TOP_LEVEL,
+    _HCCL_MAX_PORT,
+    _HCCL_MIN_PORT,
+    _async_integer,
+    _normalize_dtype_name,
+    _optimizer_fp32_main_params,
+    _positive_integer,
+    _require_async,
+    _trainer_topology,
+    _trainer_world_size,
+    build_model_registration,
+    optional_mapping,
+    required_mapping,
+    resolve_activation_checkpoint_config,
+    router_replay_mode,
+    uses_colocated_vllm,
+)
 
 
 def _path_value(section: Mapping[str, Any], name: str) -> str:
@@ -883,6 +902,7 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     if train.get("model_init_cpu_threads") is not None:
         _positive_integer(train, "model_init_cpu_threads", "train")
     accelerator = required_mapping(train, "accelerator")
+    resolve_activation_checkpoint_config(accelerator)
     _validate_training_residency(config, algorithm)
     _validate_accelerator_options(train, accelerator)
     _validate_training_optimizer(train, rollout, model, algorithm)

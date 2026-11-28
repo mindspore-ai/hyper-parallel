@@ -39,8 +39,9 @@ from typing import Any, Iterator, Mapping, Optional
 import torch
 from transformers import AutoTokenizer
 
-from hyper_parallel import HSDPModule
 from rl.workers.adapters.moe_rotary import rebuild_qwen3_moe_rotary_state
+
+from hyper_parallel import HSDPModule
 
 _TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
 
@@ -173,14 +174,13 @@ def build_role_model(
         not isinstance(cpu_threads, int) or isinstance(cpu_threads, bool) or cpu_threads <= 0
     ):
         raise ValueError("cpu_threads must be a positive integer or None")
-    activation_checkpoint = getattr(runtime_config.activation_checkpoint, "mode", "off")
     previous_threads = None if cpu_threads is None else torch.get_num_threads()
     try:
         if cpu_threads is not None:
             torch.set_num_threads(cpu_threads)
         model = runtime_config.model.build(
             distributed_setup=distributed_setup,
-            activation_checkpoint=activation_checkpoint,
+            activation_checkpoint=runtime_config.activation_checkpoint,
             peft_config=runtime_config.peft,
         )
     finally:

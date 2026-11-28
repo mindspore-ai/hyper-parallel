@@ -134,7 +134,7 @@ class ObservedTrainer(SyncTrainer):
             raise RuntimeError("Configured R3 mode does not match the observed Actor")
         if self.replay_observer is not None:
             router_after = self._expert_samples((".mlp.gate.weight",))
-            checkpoint = self.resolved_config["train"]["accelerator"]["activation_checkpoint"]
+            checkpoint = self.runtime_config.activation_checkpoint.mode
             evidence["replay"] = self.replay_observer.finish_step(checkpoint)
             evidence["replay"]["router_sample_max_deltas"] = {
                 name: float((router_after[name] - before).abs().max())

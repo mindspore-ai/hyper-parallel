@@ -247,17 +247,34 @@ class TestCpuOffloadConfig(unittest.TestCase):
 
 
 class TestGraphModeSwapWiring(unittest.TestCase):
-    """The unified off configuration leaves the live model unwrapped."""
+    """Graph mode must leave the live model unwrapped for the pass."""
 
-    def test_off_mode_leaves_model_unwrapped(self):
-        """An inactive unified configuration is a no-op before graph capture."""
+    def test_graph_mode_controls_eager_wrapper(self):
+        """Graph mode skips the eager wrapper; the default path applies it."""
         model = nn.Linear(4, 4)
-        result = _apply_activation_features(
-            model,
-            SimpleNamespace(mode="off"),
-            False,
-        )
+        with patch(
+            "hyper_parallel.models._transformers.model_builder.apply_attention_swap"
+        ) as apply_swap:
+            result = _apply_activation_features(
+                model,
+                "off",
+                "attention",
+                False,
+                SimpleNamespace(pp_size=1),
+                apply_swap=False,
+            )
         self.assertIs(result, model)
+        apply_swap.assert_not_called()
+
+        with patch(
+            "hyper_parallel.models._transformers.model_builder.apply_attention_swap",
+            return_value=model,
+        ) as apply_swap:
+            result = _apply_activation_features(
+                model, "off", "attention", False, SimpleNamespace(pp_size=1)
+            )
+        self.assertIs(result, model)
+        apply_swap.assert_called_once_with(model, "attention")
 
 
 class TestCpuOffloadPipeline(unittest.TestCase):

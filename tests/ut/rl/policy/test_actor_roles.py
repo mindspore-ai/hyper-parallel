@@ -23,9 +23,11 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
+from rl.workers.actor import Actor
 from rl.workers.engine.model import build_role_model
 from rl.workers.engine.optimizer import build_role_optimizer
-from rl.workers.actor import Actor
+
+from hyper_parallel.trainer.config import ActivationCheckpointConfig
 
 
 def test_actor_runtime_distinguishes_trainable_and_reference_roles() -> None:
@@ -74,11 +76,12 @@ def test_actor_runtime_distinguishes_trainable_and_reference_roles() -> None:
     model_builder = Builder(reference_model)
     optimizer_builder = Builder(OptimizerProduct())
     scheduler_builder = Builder(SchedulerProduct())
+    activation_checkpoint = ActivationCheckpointConfig(mode="full")
     runtime = type(
         "Runtime",
         (),
         {
-            "activation_checkpoint": type("Activation", (), {"mode": "full"})(),
+            "activation_checkpoint": activation_checkpoint,
             "model": model_builder,
             "peft": "peft",
             "optimizer": type("OptimizerConfig", (), {"target": optimizer_builder})(),
@@ -92,7 +95,7 @@ def test_actor_runtime_distinguishes_trainable_and_reference_roles() -> None:
     assert built_reference is reference_model
     assert model_builder.kwargs == {
         "distributed_setup": "distributed",
-        "activation_checkpoint": "full",
+        "activation_checkpoint": activation_checkpoint,
         "peft_config": "peft",
     }
     assert built_optimizer is optimizer
@@ -117,7 +120,9 @@ def test_model_init_threads_are_scoped_before_optimizer(
     product = SimpleNamespace(get_optimizer=lambda: optimizer)
     optimizer_builder = Mock(side_effect=lambda **_kwargs: observed.append(("optimizer", current[0])) or product)
     runtime = SimpleNamespace(
-        model=SimpleNamespace(build=model_builder), activation_checkpoint=SimpleNamespace(mode="off"), peft=None,
+        model=SimpleNamespace(build=model_builder),
+        activation_checkpoint=ActivationCheckpointConfig(mode="off"),
+        peft=None,
         optimizer=SimpleNamespace(target=SimpleNamespace(build=optimizer_builder)), lr_scheduler=None,
     )
     with monkeypatch.context() as cpu:
@@ -144,7 +149,7 @@ def test_model_init_threads_restore_after_builder_failure(monkeypatch: pytest.Mo
     setter = Mock(side_effect=lambda value: current.__setitem__(0, value))
     runtime = SimpleNamespace(
         model=SimpleNamespace(build=Mock(side_effect=RuntimeError("builder failed"))),
-        activation_checkpoint=SimpleNamespace(mode="off"), peft=None,
+        activation_checkpoint=ActivationCheckpointConfig(mode="off"), peft=None,
     )
     monkeypatch.setattr(torch, "get_num_threads", lambda: current[0])
     monkeypatch.setattr(torch, "set_num_threads", setter)

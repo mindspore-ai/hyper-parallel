@@ -16,14 +16,16 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 
 from rl.algorithm import build_algorithm
 from rl.data.contracts import ExperienceBatch
-from rl.workers.engine.model import build_role_model
 from rl.workers.actor import Actor
+from rl.workers.engine.model import build_role_model
+
+from hyper_parallel.trainer.config import ActivationCheckpointConfig
 
 
 class _ProbabilityModel(torch.nn.Module):
@@ -63,12 +65,19 @@ class TestTokenLogProbs(unittest.TestCase):
                 parameters = list(model.parameters())
                 target = Mock()
                 target.build.return_value = model
-                runtime = SimpleNamespace(model=target, activation_checkpoint=SimpleNamespace(mode="full"), peft=None)
+                activation_checkpoint = ActivationCheckpointConfig(mode="full")
+                runtime = SimpleNamespace(
+                    model=target,
+                    activation_checkpoint=activation_checkpoint,
+                    peft=None,
+                )
                 setup = object()
                 result = build_role_model(runtime, setup, frozen=frozen)
                 self.assertIs(result, model)
                 target.build.assert_called_once_with(
-                    distributed_setup=setup, activation_checkpoint="full", peft_config=None,
+                    distributed_setup=setup,
+                    activation_checkpoint=activation_checkpoint,
+                    peft_config=None,
                 )
                 self.assertTrue(model.supports_token_log_probs)
                 self.assertTrue(all(left is right for left, right in zip(parameters, model.parameters())))

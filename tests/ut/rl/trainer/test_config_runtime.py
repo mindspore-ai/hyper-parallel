@@ -38,11 +38,7 @@ def _validated_recipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     """Provide a valid baseline so each negative case isolates one configuration error."""
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(
-        torch.accelerator,
-        "current_accelerator",
-        lambda: SimpleNamespace(type="npu"),
-    )
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
     monkeypatch.setitem(config_module.ENVIRONMENTS._items, "ut-config-environment", lambda _context: object())
     config = resolve_vllm_automatic_limits(_complete_config(tmp_path))
     validate_config(config, build_algorithm(config["algorithm"]))
@@ -238,11 +234,7 @@ def test_complete_config_resolves_validates_and_builds_runtime(
     config = _complete_config(tmp_path)
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(
-        torch.accelerator,
-        "current_accelerator",
-        lambda: SimpleNamespace(type="npu"),
-    )
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
     monkeypatch.setitem(
         config_module.ENVIRONMENTS._items,
         "ut-config-environment",
@@ -269,10 +261,74 @@ def test_complete_config_resolves_validates_and_builds_runtime(
     assert runtime.fsdp_config.mix_precision.param_dtype == "bfloat16"
     assert runtime.fsdp_config.mix_precision.reduce_dtype == "float32"
     assert runtime.activation_checkpoint.mode == "selective"
+    assert runtime.activation_checkpoint.selective.recompute_regions[0].module_path == "self_attn"
+    assert runtime.activation_checkpoint.selective.recompute_regions[0].layers == (0, 1)
     assert runtime.checkpoint.save_ckpt
     assert runtime.model.to_dict()["_target_"] == "rl.workers.adapters.qwen3.build_causal_lm"
     assert runtime.model.torch_dtype == "bfloat16"
     assert runtime.optimizer.target.to_dict()["_target_"] == "hyper_parallel.components.optim.AdamW"
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected_mode"),
+    [(False, "off"), (True, "full"), ("off", "off"), ("full", "full")],
+)
+def test_activation_checkpoint_scalar_shorthand_resolves_to_typed_config(
+    validated_recipe: dict, configured: object, expected_mode: str,
+) -> None:
+    """Legacy RL scalar shorthand should normalize before reaching model construction."""
+    validated_recipe["train"]["accelerator"]["activation_checkpoint"] = configured
+
+    runtime = build_runtime_config(validated_recipe)
+
+    assert runtime.activation_checkpoint.mode == expected_mode
+    assert runtime.activation_checkpoint.to_dict() == {"mode": expected_mode}
+
+
+def test_activation_checkpoint_replacement_schema_preserves_swap_config(validated_recipe: dict) -> None:
+    """Structured hybrid configuration should retain exact recompute and swap targets."""
+    validated_recipe["train"]["accelerator"]["activation_checkpoint"] = {
+        "mode": "hybrid",
+        "full": {
+            "recompute_layer": [0],
+            "exclude_region": {
+                "swap": {
+                    "group_swap": False,
+                    "cpu_pool": 512,
+                    "self_attn": [0],
+                },
+            },
+        },
+        "selective": {
+            "recompute": {"mlp": [1]},
+            "swap": {
+                "group_swap": True,
+                "cpu_pool": 256,
+                "self_attn": [1],
+            },
+        },
+    }
+
+    runtime = build_runtime_config(validated_recipe)
+
+    checkpoint = runtime.activation_checkpoint
+    assert checkpoint.mode == "hybrid"
+    assert checkpoint.full.recompute_layers == (0,)
+    assert checkpoint.full.swap_regions[0].module_path == "self_attn"
+    assert checkpoint.full.cpu_pool_mb == 512
+    assert not checkpoint.full.group_swap
+    assert checkpoint.selective.recompute_regions[0].module_path == "mlp"
+    assert checkpoint.selective.swap_regions[0].layers == (1,)
+    assert checkpoint.selective.cpu_pool_mb == 256
+    assert checkpoint.selective.group_swap
+
+
+def test_activation_checkpoint_rejects_legacy_selective_without_targets(validated_recipe: dict) -> None:
+    """Selective mode should fail validation before distributed model startup without exact targets."""
+    validated_recipe["train"]["accelerator"]["activation_checkpoint"] = "selective"
+
+    with pytest.raises(ValueError, match="requires activation_checkpoint.selective"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
 @pytest.mark.parametrize(
@@ -329,11 +385,7 @@ def fixture_validation_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     config["rollout"]["vllm"]["max_num_seqs"] = 2
     config["train"]["accelerator"]["dp_shard"] = 2
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
-    monkeypatch.setattr(
-        torch.accelerator,
-        "current_accelerator",
-        lambda: SimpleNamespace(type="npu"),
-    )
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
     monkeypatch.setitem(config_module.ENVIRONMENTS._items, "ut-config-environment", lambda _context: object())
     return config
 
@@ -434,7 +486,10 @@ def _training_config(tmp_path):
             "cpu_offload": False,
             "reshard_after_forward": True,
             "comm_fusion": True,
-            "activation_checkpoint": "selective",
+            "activation_checkpoint": {
+                "mode": "selective",
+                "selective": {"recompute": {"self_attn": [0, 1]}},
+            },
         },
         "optimizer": {
             "lr": 1.0e-6,

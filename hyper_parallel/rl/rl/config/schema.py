@@ -16,8 +16,11 @@
 import math
 from dataclasses import dataclass, field as dataclass_field, fields
 from typing import Any, Mapping, Optional
+
 from rl.workers.engine.model import ModelRegistration, resolve_model
 
+from hyper_parallel.trainer.config import ActivationCheckpointConfig
+from hyper_parallel.trainer.config.resolver import resolve_component
 
 
 _HCCL_MIN_PORT = 1024
@@ -151,19 +154,27 @@ def _normalize_dtype_name(name: Any) -> Optional[str]:
     return canonical_name
 
 
-def _activation_checkpoint_mode(accelerator_config: Mapping[str, Any]) -> str:
-    """Normalize the activation-checkpoint mode."""
+def resolve_activation_checkpoint_config(
+    accelerator_config: Mapping[str, Any],
+) -> ActivationCheckpointConfig:
+    """Normalize the RL shorthand or replacement-schema activation configuration."""
     configured_value = accelerator_config.get("activation_checkpoint", "off")
     if isinstance(configured_value, bool):
-        mode = "full" if configured_value else "off"
+        config_node = {"mode": "full" if configured_value else "off"}
+    elif isinstance(configured_value, str):
+        config_node = {"mode": configured_value.lower()}
+    elif isinstance(configured_value, Mapping):
+        config_node = dict(configured_value)
     else:
-        mode = str(configured_value).lower()
-    if mode not in ("off", "full", "selective"):
         raise ValueError(
-            "train.accelerator.activation_checkpoint must be off, full, selective, "
-            f"or a Boolean, got {configured_value!r}"
+            "train.accelerator.activation_checkpoint must be a Boolean, mode string, "
+            f"or mapping, got {type(configured_value).__name__}"
         )
-    return mode
+    return resolve_component(
+        config_node,
+        annotation=ActivationCheckpointConfig,
+        path="train.accelerator.activation_checkpoint",
+    )
 
 
 def _optimizer_fp32_main_params(optimizer_config: Mapping[str, Any]) -> bool:
