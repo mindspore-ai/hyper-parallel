@@ -104,6 +104,10 @@ torchrun --standalone --nproc_per_node=8 \
 
 See [Training Configuration and Components](hyper_parallel/models/README.md) for field definitions and parsing rules.
 
+KDA/GDN Ascend C backends use the official FLA-NPU `26.10.0+feature` release.
+See [backend installation](hyper_parallel/components/functional/README.md#linear-attention-backends)
+and [linear-attention CP configuration](docs/guide/linear_attention_tnd_cp.md) for supported protocols and runtime requirements.
+
 ### Use the HyperParallel Core API
 
 The following example applies `fully_shard` on a data-parallel DeviceMesh to shard model parameters:

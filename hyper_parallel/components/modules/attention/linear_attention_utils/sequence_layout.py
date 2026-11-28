@@ -20,6 +20,7 @@ Keep it independent of module-family registration, backends and collectives.
 from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Callable, Mapping, Sequence
 
 import torch
@@ -232,6 +233,46 @@ class PackedSequenceInfo:
         if self.num_sequences == 1:
             return state
         return torch.cat((state.new_zeros((self.num_sequences - 1, *state.shape[1:])), state))
+
+
+@dataclass(frozen=True)
+class PackedSummaryExchangePlan:
+    """Host-only forward edges; reverse communication uses their transpose."""
+
+    send_counts: tuple[int, ...]
+    recv_counts: tuple[int, ...]
+    active: bool
+
+
+@lru_cache(maxsize=32)
+def _packed_summary_exchange_plan(documents: PackedDocumentInfo, length: int,
+                                  rank: int, size: int) -> PackedSummaryExchangePlan:
+    """Build summary counts for this rank's tail consumers and head producers."""
+    offsets = documents.offsets
+    if offsets[-1] != length * size:
+        raise ValueError("Sparse summaries require equal contiguous token shards covering the document offsets.")
+    start, end = rank * length, (rank + 1) * length
+    first = offsets[bisect_right(offsets, start) - 1] // length
+    last = (offsets[bisect_left(offsets, end)] - 1) // length
+    sends = tuple(int(rank < peer <= last) for peer in range(size))
+    receives = tuple(int(first <= peer < rank) for peer in range(size))
+    # A single global decision lets all ranks skip an empty collective together.
+    # Inspect rank cuts rather than walking a potentially much longer document list.
+    active = any(offsets[bisect_left(offsets, cut)] != cut for cut in range(length, length * size, length))
+    return PackedSummaryExchangePlan(sends, receives, active)
+
+
+def plan_packed_summary_exchange(info: PackedSequenceInfo, rank: int, size: int) -> PackedSummaryExchangePlan:
+    """Cache exact head/tail document dependencies without device metadata reads.
+
+    Args:
+        info: Host document metadata after any Ulysses token redistribution.
+        rank: Chronological rank within the state group.
+        size: Number of equal contiguous token shards in that group.
+    """
+    if not 0 <= rank < size or info.start != rank * info.length:
+        raise ValueError("Sparse summary metadata must match the chronological state-group rank.")
+    return _packed_summary_exchange_plan(info.documents, info.length, rank, size)
 
 
 def _offset_tuple(value: torch.Tensor | Sequence[int]) -> tuple[int, ...]:

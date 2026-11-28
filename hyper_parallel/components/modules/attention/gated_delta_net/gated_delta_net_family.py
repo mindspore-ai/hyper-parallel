@@ -25,19 +25,24 @@ from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, register_module_family,
 )
 from hyper_parallel.components.modules.attention.linear_attention_utils.parallel_layout import (
-    linear_attention_local_spec, linear_attention_sharding,
+    linear_attention_local_spec, linear_attention_sharding, validate_state_packets,
 )
 from hyper_parallel.components.modules.attention.linear_attention_utils.layer_adapter import validate_backend_options
 from hyper_parallel.models.replacement import module_replacement
 from .gated_delta_net import GatedDeltaNetModule
 
 
-def _validate_gdn_protocol(cp, degree, backend):
+def _validate_gdn_protocol(cp, degree, backend, arguments):
     """Reject unimplemented combinations before creating communication groups."""
-    if cp > 1 and degree not in (1, cp):
-        raise NotImplementedError("GDN currently supports pure Ulysses or state P2P, not their hybrid")
-    if cp > degree and backend != "triton":
-        raise NotImplementedError("GDN state CP requires Triton; eager and Ascend C support local/pure Ulysses")
+    if 1 < degree < cp and backend != "ascendc":
+        raise NotImplementedError("GDN hybrid Ulysses/state CP currently requires Ascend C")
+    method = arguments.get("state_cp_method", "p2p")
+    if method not in ("p2p", "allgather"):
+        raise ValueError("GDN state_cp_method must be p2p or allgather")
+    if cp > degree and backend not in ("triton", "ascendc"):
+        raise NotImplementedError("GDN state CP requires Triton or Ascend C")
+    if method == "allgather" and backend != "ascendc":
+        raise NotImplementedError("GDN AllGather currently requires Ascend C")
 
 
 def validate_gdn_family(*, config: Any, module: nn.Module | None, context: Any, member: Any) -> None:
@@ -55,7 +60,8 @@ def validate_gdn_family(*, config: Any, module: nn.Module | None, context: Any, 
     head_degree = member.axis_sizes["tp"] * (degree if cp > 1 else 1)
     if kh is not None and (kh % head_degree or vh % head_degree):
         raise ValueError("TP times Ulysses degree must divide both query and value heads")
-    _validate_gdn_protocol(cp, degree, backend)
+    _validate_gdn_protocol(cp, degree, backend, member.arguments)
+    validate_state_packets(member.arguments, cp, degree, backend, None if vh is None else vh // head_degree)
 
 
 def gdn_sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
@@ -81,9 +87,10 @@ def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     backend: str = "eager", conv_backend: str | None = None, chunk_size: int = 64,
     input_layout: str = "BSH", ulysses_degree: int | None = 1,
+    state_cp_method: str = "p2p", p2p_head_chunks: int = 1, reuse_cp_state_on_recompute: bool = False,
 ) -> nn.Module:
     """Keep CP selection in the family request, outside the standalone algorithm."""
-    del module_fqn, context, ulysses_degree
+    del module_fqn, context, ulysses_degree, state_cp_method, p2p_head_chunks, reuse_cp_state_on_recompute
     return GatedDeltaNetModule(config=config, module=module, backend=backend, conv_backend=conv_backend,
                                      chunk_size=chunk_size, input_layout=input_layout)
 
@@ -94,6 +101,7 @@ def GatedDeltaNet(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, backend: str = "eager", conv_backend: str | None = None,
     chunk_size: int = 64, input_layout: str = "BSH", ulysses_degree: int | None = 1,
+    state_cp_method: str = "p2p", p2p_head_chunks: int = 1, reuse_cp_state_on_recompute: bool = False,
 ) -> nn.Module:
     """Build the complete local or CP training member with source checkpoint names.
 
@@ -108,10 +116,15 @@ def GatedDeltaNet(  # pylint: disable=invalid-name
         chunk_size: Local chunk length; fused implementations require 64.
         input_layout: BSH or TH, determining the external token shard axis.
         ulysses_degree: Head-exchange degree; None selects pure Ulysses scheduling.
+        state_cp_method: p2p, or allgather for the native state-CP backend.
+        p2p_head_chunks: Number of native state packets, independent of local Prepare.
+        reuse_cp_state_on_recompute: Retain the native CP entry across outer checkpoint replay; default False.
     """
     return build_family(GatedDeltaNet, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, backend=backend, conv_backend=conv_backend,
-                        chunk_size=chunk_size, input_layout=input_layout, ulysses_degree=ulysses_degree)
+                        chunk_size=chunk_size, input_layout=input_layout, ulysses_degree=ulysses_degree,
+                        state_cp_method=state_cp_method,
+                        p2p_head_chunks=p2p_head_chunks, reuse_cp_state_on_recompute=reuse_cp_state_on_recompute)
 
 
 register_module_family(ModuleFamily(

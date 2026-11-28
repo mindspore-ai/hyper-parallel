@@ -56,7 +56,9 @@ KDA 中显式的整数 `ulysses_degree=P` 则保留状态 CP 入口的调度：�
 | `input_layout` | `BSH` 或 `TH`；用于声明外部 token 分片轴，分别为 1 和 0。flat packed 输入配置 `TH`。 |
 | `chunk_size` | 默认 64。融合后端要求 64；eager 可显式使用其他正整数。不是通信包长。 |
 | `ulysses_degree` | 正整数或 `null`；CP>1 时整数必须整除总 CP；`TP × Ulysses` 必须整除 query/value head 数。 |
-| `state_cp_method` | KDA 专用：`p2p`、`allgather`、`grouped_allgather_p2p`、`recursive_doubling`。 |
+| `state_cp_method` | KDA：`p2p`、`allgather`、`alltoallv`、`grouped_allgather_p2p`、`recursive_doubling`；GDN Ascend C：`p2p`、`allgather`。 |
+| `p2p_head_chunks` | Ascend C 状态 P2P 的包数，默认 1；不切分 Prepare 和摘要生产。 |
+| `reuse_cp_state_on_recompute` | 默认 `false`。在 HyperParallel 外层 checkpoint 中保留本次真实入口 H，重放时跳过原生 P2P/AG 的前向摘要与状态通信；正常反向不变。 |
 | `allgather_group_size` | KDA 分组 AG 专用，必须整除状态域大小；其他协议保持 1。 |
 
 | 算法与后端 | 当前 CP 能力 |
@@ -65,16 +67,66 @@ KDA 中显式的整数 `ulysses_degree=P` 则保留状态 CP 入口的调度：�
 | KDA Triton / Ascend C | P2P、AG、分组 AG＋P2P、RD，以及现有 Ulysses 混合 |
 | GDN eager | 本地、纯 Ulysses |
 | GDN Triton | 纯 Ulysses、状态 P2P |
-| GDN Ascend C | 本地与纯 Ulysses |
+| GDN Ascend C | 本地、纯 Ulysses、P2P、AG，以及 Ulysses＋P2P/AG |
 
 模块族支持按 head 的 TP，并复用框架的 SP 边界。GDN 的 CP 能力仍限于上表，
-不因接入 TP 而新增 AG/RD 或 Ulysses × P2P。训练成员不支持推理状态缓存。
+GDN RD 和分组 AG 尚未开放。训练成员不支持推理状态缓存。
 本次 KDA 的 TP/SP 验收范围为 Q/K/V 同头数；GDN 按配置读取 key/value heads，
-不固定为两倍，需要 GVA 时保留进入 core 前展开 Q/K 的既有方式。底层算子的其他形状限制仍然适用。
+不固定为两倍；Ascend C 保留紧凑 GVA，Triton/eager 沿用 core 前展开 Q/K 的方式。底层算子的其他形状限制仍然适用。
 显式选择后端时缺少依赖或能力会报错，不自动切换到另一后端。
 
 省略卷积选项时，为兼容原调度：普通成员和纯 Ulysses 跟随 `backend`；KDA 状态/混合入口的
 Triton/eager 默认 eager 卷积，Ascend C 默认 Ascend C 卷积；GDN P2P 默认 eager 卷积。
+
+Ascend C KDA/GDN 使用同一份未修改的 fla-npu `26.10.0+feature` release；安装、运行时和接口要求见
+[functional 后端说明](../../hyper_parallel/components/functional/README.md#linear-attention-backends)。
+
+## KDA 算子内部重计算
+
+Ascend C KDA 与 Triton 采用对应的保存/重建流程：前向不长期保留 W/U、门控中间量和 h/v_new，
+正常 backward 使用 `chunk_kda_bwd_recompute` 重建 WY，再从保存的真实入口 H 重新执行本地 h。
+Q/K 归一化辅助量、有效 beta 和 Aqk/Akk 仍保存；不是重新执行整个层，也不重新通信状态。
+本地、纯 Ulysses 和状态 CP 共用该流程，不新增算子重计算开关。
+GDN 的保存集合和算子接口不同，本次不改变其内部策略。
+
+## 外层重计算保留 CP 入口
+
+Ascend C KDA/GDN 的普通状态 P2P 或 AllGather 可以设置 `reuse_cp_state_on_recompute: true`，
+与训练的 `activation_checkpoint.mode: full` 配合使用。该选项不改变本地算子的保存/重建策略。
+它是 attention 模块的布尔选项，放在模块替换的 `implementation` 下，默认关闭；
+名称强调“外层重算时复用 CP 状态”，避免将其误解为推理缓存或所有激活的缓存。
+
+```yaml
+activation_checkpoint:
+  mode: full
+plan_overrides:
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.KimiDeltaAttention
+        backend: ascendc
+        state_cp_method: p2p
+        ulysses_degree: 1
+        reuse_cp_state_on_recompute: true
+```
+
+`match` 需对应模型的实际 attention 路径；GDN 替换成 `GatedDeltaNet`，协议也可选择 `allgather`。
+
+原始前向仍正常生成摘要并通信，得到本次调用真实的 FP32 入口 H。缓存复制该入口，
+不引用可被异步收发覆盖的缓冲区。重放时仍执行投影、卷积、Prepare、本地状态递推与输出，
+只省去前向 S/M 和状态协议；正常 backward 的 G/N、状态梯度通信完整保留。
+因此无需将整个 core 排除出外层 checkpoint。卷积 halo、Ulysses 和 TP 通信不在本选项的消除范围内。
+
+缓存由框架的每次 checkpoint 调用持有，并按区域内的调用顺序消费；不保存在共享模块上。
+重放会核对模块、通信组、形状和文档区间，退出或异常时释放资源。没有外层 checkpoint 时不产生此缓存。
+B1、H96、K=V128 的一份入口为 6 MiB；多个层或微批次同时在途时需按实际调用数累计。
+
+已验证的是普通非重入 checkpoint：单次 backward、多层、同一区域重复调用、
+多个在途微批次及逆序 backward。重复 backward 消费已清理资源时会明确报错。
+嵌套/重入 checkpoint、编译捕获和 CP 子组/TP/Ulysses 的组合尚未取得本选项的验收资格；
+不能据现有 CP 能力推断缓存优化已经覆盖这些组合。RD、分组 AG 和稀疏 AllToAllV 的缓存模式暂不开放。
+此处仅说明已验证范围，不改变这些协议在不开入口缓存时的原有能力。
 
 ## TP 与 SP
 
@@ -113,7 +165,8 @@ GDN 的原始 Qwen QKV 权重按 `[全部 Q, 全部 K, 全部 V]` 排列，不�
 GDN 的比例 `r = linear_num_value_heads / linear_num_key_heads` 由模型配置决定，
 不是固定的 2，也不要求是 2 的幂。每组一般形式为 `[Q[i], K[i], V[i*r], ..., V[i*r+r-1]]`，
 组宽为 `2 * head_k_dim + r * head_v_dim`。QKV、卷积、gate 和输出投影共同保持完整组的归属；
-TP/Ulysses 分片后比例不变，进入 core 前按 `r` 展开 Q/K。当前要求 value heads 是 key heads 的正整数倍，
+TP/Ulysses 分片后比例不变；Ascend C core 直接消费紧凑 Q/K，Triton/eager 在 core 前按 `r` 展开。
+当前要求 value heads 是 key heads 的正整数倍，
 并且 `TP × Ulysses` 分别整除 key/value heads，不是只检查 value heads 的整除关系。
 
 例如 Qwen3.5 的官方配置并不统一：
@@ -194,8 +247,8 @@ flowchart TD
     L --> M
 ```
 
-- `components/modules/attention/kimi_delta_attention/`：完整本地层和族工厂独立。`cp_kimi_delta_attention.py` 包含层级 CP 调度、mesh 拆分、AG/分组协议与 Triton 状态 autograd；`cp_state_ascendc.py` 仅适配原生状态前反向，由 CP 层调用，并非另一套完整层；`cp_recursive_doubling.py` 保留 RD 计划和执行。
-- `components/modules/attention/gated_delta_net/`：完整本地层、族工厂和 `cp_gated_delta_net.py`；Ulysses/P2P 层级调度及当前状态 autograd 在同一个 CP 文件中。
+- `components/modules/attention/kimi_delta_attention/`：完整本地层和族工厂独立。`cp_kimi_delta_attention.py` 集中层级 CP 调度、mesh 拆分、AG/分组协议，以及 Triton 和 Ascend C 各自的状态 autograd；`cp_recursive_doubling.py` 保留 RD 计划和执行。
+- `components/modules/attention/gated_delta_net/`：完整本地层、族工厂和 `cp_gated_delta_net.py`；Ulysses/状态协议的层级调度，以及 Triton 和 Ascend C 各自的状态 autograd 在同一个 CP 文件中。
 - `components/modules/attention/linear_attention_utils/`：`layer_adapter.py` 负责来源参数与输入适配，`parallel_layout.py` 负责公共 TP/SP token 边界，各算法族声明参数的 head 归属，`cp_convolution.py` 包含 Q/K/V halo 打包、相邻 rank 交换及本地卷积调度。`sequence_layout.py` 集中文档区间、状态槽位、局部文档执行和 chunk 索引；它只依赖 Torch 与标准库，供 functional、模块族及模型 runtime 共同使用。
 - `components/functional/`：每个算法使用公共数学入口、Triton、Ascend C 三个文件。公共入口包含 eager 及简单状态 apply，Triton 文件包含本地阶段和 summary/merge 前端，原始 kernels 保留在 `_triton/`。本地卷积独立；这些文件不持有通信组、不执行跨卡通信。
 - `distributed/context_parallel/collectives.py`：保留公共 Tensor 交换原语；因果卷积专用的邻居选择归 `linear_attention_utils/cp_convolution.py`。
@@ -242,6 +295,8 @@ KDA 的 FLA 适配也在后者，不再单列 `kimi_delta_attention_fla_adapter.
 Ascend C 的 prepare、forward finalize、backward prepare/finalize 由本地入口与 CP 驱动复用。
 CP 驱动负责注入 H/dHT、执行通信和保存每次调用的资源；后端阶段保留自己的 layout、保存张量和
 反向合同。Triton 复用缓存的前向 M，Ascend C 使用原生反向 G/N，不能把 N 默认为 M 的转置。
+两个后端的状态 autograd 按算法集中在各自 CP 文件；可选原生包仍在实际选择后端时加载。
+KDA/GDN 共用的原生状态传输和重算入口缓存由 `linear_attention_utils/cp_state_exchange.py` 管理。
 
 ### Ulysses 拓扑与卷积位置
 
@@ -252,7 +307,8 @@ CP 驱动负责注入 H/dHT、执行通信和保存每次调用的资源；后�
 - KDA 的整数 U 配置：先在原 CP token 分片上执行 halo 卷积，再交换 heads；即使 U 等于 CP 大小也保留此顺序。
 
 独立的 `conv_backend`、checkpoint 参数名及每调用缓存生命周期均保留。
-GDN 当前仍只支持纯 Ulysses 或 Triton P2P，不由公共目录自动获得 KDA 的 AG/RD 或混合协议能力。
+GDN 的 Triton 状态路径支持 P2P；Ascend C 支持 P2P/AG 及其 Ulysses 混合。
+GDN 不由公共目录自动获得 KDA 的 RD 或分组 AG 协议能力。
 
 ### Qwen 完整文本模型的 packed mask
 

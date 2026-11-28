@@ -56,8 +56,9 @@ means Ulysses + P2P. The family defaults `chunk_size` to 64; fused backends requ
 
 | Parameter | Default | Meaning and constraints |
 |------|--------|------------|
-| `backend` | `eager` | Local KDA backend. Local and pure-U execution support `eager`; P2P, AG, grouped AG, RD, and their Ulysses combinations support `triton` and `ascendc`. |
-| `state_cp_method` | `p2p` | State CP method: `p2p`, `allgather`, `grouped_allgather_p2p`, or `recursive_doubling`. |
+| `backend` | `eager` | Local KDA backend. Local and pure-U execution support `eager`; P2P, AG, sparse AllToAllV, grouped AG, RD, and their Ulysses combinations support `triton` and `ascendc`. |
+| `state_cp_method` | `p2p` | State CP method: `p2p`, `allgather`, `alltoallv`, `grouped_allgather_p2p`, or `recursive_doubling`. |
+| `p2p_head_chunks` | `1` | Ascend C state P2P only: relay H/dH in this many head packets. Prepare and S/M/G/N production retain the full local head count. Packet count must not exceed heads after TP/Ulysses; uneven head partitions are allowed. |
 | `ulysses_degree` | `1` | U, a positive integer dividing CP size; both query/key and value head counts must be divisible by U. |
 | `allgather_group_size` | `1` | g, the number of state ranks per within-group AllGather, which must divide R. Used only for `grouped_allgather_p2p`; pure `allgather` gathers the full R group automatically and leaves this at 1. |
 
@@ -67,6 +68,7 @@ Common CP8 combinations:
 |------|---------------------|------------------|--------------|
 | P2P | `p2p` | 1 | 1 |
 | AG | `allgather` | 1 | 1 |
+| Sparse TND summary collection | `alltoallv` | 1 | 1 |
 | Ulysses + P2P | `p2p` | 2 | 1 |
 | Ulysses + AG | `allgather` | 2 | 1 |
 | RD | `recursive_doubling` | 1 | 1 |
@@ -161,7 +163,8 @@ logarithmic round counts do not guarantee performance at arbitrary CP sizes.
 
 ## Ascend C Ulysses Backend
 
-Pure Ulysses can select `backend: ascendc`, using fla-npu local attention and ShortConv together.
+Pure Ulysses can select `backend: ascendc` for fla-npu local attention.
+Choose ShortConv independently with `conv_backend`; the example below uses Ascend C for both.
 For dependencies and public operator interfaces, see the [functional documentation](../../hyper_parallel/components/functional/README.md#linear-attention-backends).
 
 ```yaml
@@ -181,8 +184,16 @@ When `ulysses_degree` equals the CP mesh size, the state communication group has
 The Ascend C backend also supports state P2P, AG, grouped AG, and RD described below.
 
 Inputs retain raw Q/K, gate, and beta logits. Prepare handles Q/K normalization and the gate/beta forward operations.
-Backward uses saved normalization intermediates. Native fused beta backward is used directly when available; otherwise, the corresponding FLA helper is used,
-without applying the sigmoid chain rule twice. Forward and backward use save mode without exposing internal operator recomputation options.
+Backward uses saved normalization intermediates. Beta sigmoid backward uses Torch's `aten.sigmoid_backward` with the FP32 effective beta saved by Prepare;
+native beta backward stays disabled, so the sigmoid chain rule is applied once without a device-name branch or an FLA beta helper.
+Prepare uses BSND inputs directly. Its stage outputs retain their native head-major layout; backward converts the saved BSND V only when needed.
+Forward retains normalized Q/K and their auxiliaries, V/gate, effective beta, Aqk/Akk, and the actual FP32 entry state.
+It releases gk/W/U/qg/kg and h/v_new after forward. Backward rebuilds WY with `chunk_kda_bwd_recompute`,
+then h/v_new with `chunk_fwd_h` from the saved entry; neither step communicates states.
+This default save/rebuild structure matches Triton, without requiring bitwise equality across backends.
+An outer checkpoint covering the whole CP module normally replays forward communication.
+For native P2P/AllGather, `reuse_cp_state_on_recompute: true` can retain the actual entry state and skip state-protocol replay;
+see the [checkpoint entry-cache contract](linear_attention_module_families.md).
 
 TND calls pass global document offsets; after Ulysses exchange, local operators execute using complete document boundaries.
 Document ends need not align to chunks; the same public native interface handles final document chunks.
@@ -192,11 +203,11 @@ Initial/final states and their gradients, and double backward, are not yet expos
 ## Ascend C State P2P, AllGather, RD, and Hybrids
 
 With an unmodified fla-npu package providing native CP summaries and separate backward-phase interfaces, `backend: ascendc` supports
-`state_cp_method: p2p`, `allgather`, `grouped_allgather_p2p`, and `recursive_doubling`.
+`state_cp_method: p2p`, `allgather`, `alltoallv`, `grouped_allgather_p2p`, and `recursive_doubling`.
 All compose with `ulysses_degree`; the grouped method also uses `allgather_group_size`.
 Every combination in the preceding CP8 configuration table can use this backend.
 
-Local execution, pure Ulysses, and all four state protocols share prepare, h, finalize, and separate bwd_prepare, dhu, and bwd_finalize phases.
+Local execution, pure Ulysses, and all state protocols share prepare, h, finalize, and separate bwd_recompute, bwd_prepare, dhu, and bwd_finalize phases.
 Only state protocols add S/M and G/N summaries and communication; there is no separate local implementation with composite backward.
 After receiving entry state, P2P first computes and sends `S + M @ H`, then completes local h. Backward first computes and sends `G + N @ D`,
 then completes local dhu. Receives are posted early, and send buffers remain alive per call until completion; the full local recurrence is excluded from the state relay chain.
@@ -211,7 +222,7 @@ Actual resets remove irrelevant rounds. Fragments without exit consumers skip su
 Composition currently uses FP32 matrix multiplication and addition with autocast disabled, without device pipelining.
 
 Unlike Triton's local/per-round M caching, this path regenerates G/N during backward and does not cache M across forward and backward.
-Intragroup gather buffers, sent states, and receive buffers belong only to the current call. Save mode still retains activations such as local h/v_new.
+Intragroup gather buffers, sent states, and receive buffers belong only to the current call. The local entry H is saved until backward; h/v_new are rebuilt when needed.
 Temporary gather size is group width g for grouped AG and state-domain size R for ordinary AG; these figures do not represent peak memory for the whole layer.
 
 The state path currently requires BF16, B=1, equal Q/K/V head counts, K=V=128, safe gate, and BT64.
@@ -221,3 +232,21 @@ Grouped paths zero effective transitions at actual resets, preventing connection
 
 For native dependencies and interface requirements, see the [functional backend documentation](../../hyper_parallel/components/functional/README.md).
 Missing required interfaces raise explicit errors without switching to another backend.
+
+## Sparse TND Summary Collection
+
+Set `state_cp_method: alltoallv` for an explicit alternative to full AllGather on equal-length, contiguous TND shards.
+It composes with `ulysses_degree` and uses `allgather_group_size: 1`. Both Triton and Ascend C preserve their existing summary arithmetic.
+Dense inputs without document metadata retain the AllGather implementation.
+
+A forward rank sends its tail-document summary only to later ranks that consume that document, and receives only earlier fragments of its head document.
+Backward uses the transposed dependency edges. Head and tail can belong to different documents. The existing chronological merge kernels read the compact receive buffer directly.
+The plan uses host offsets and the existing state process group; it does not create document-specific groups or read offsets back from the device.
+Every rank participates in the collective when any edge is active, including ranks with zero local counts. Only a globally empty plan skips the collective.
+
+This change prunes summary transport and merge inputs, not all unused summary production.
+A long document spanning the whole group still requires O(R) storage at the busiest rank; source-side payload replication and AllToAllV startup may make it slower than AllGather.
+For short dependency chains, the temporary buffers scale with relevant send/receive counts instead of the full group. It remains opt-in rather than replacing AG automatically.
+
+Neither sparse collection nor local state recomputation removes a true backward dependency: a rank still needs gradients contributed by later fragments of the same document.
+Real document resets can remove those edges exactly; omitting an active gradient edge changes the training algorithm.

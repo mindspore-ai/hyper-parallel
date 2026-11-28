@@ -5,6 +5,7 @@ family 提供统一的公共入口。各算法的使用参数见对应文档。
 
 `linear_attention_utils/` 提供 KDA、GDN 共用的序列、模块适配、并行布局和卷积通信辅助功能，
 不注册独立的注意力模块族。具体算法实现仍位于各自的算法目录中。
+Ascend C 的 KDA/GDN 共用状态传输和 CP mesh 划分，算子阶段及梯度合同仍由各自适配层负责。
 
 | 算法 | 说明 |
 | --- | --- |
@@ -13,6 +14,8 @@ family 提供统一的公共入口。各算法的使用参数见对应文档。
 | [Multi-head Latent Attention](multi_latent_attention/README.md) | 多头潜变量注意力 |
 | [Gated Multi-head Latent Attention](gated_multi_latent_attention/README.md) | 不使用位置编码、带输出门控的多头潜变量注意力 |
 | [DeepSeek Sparse Attention](deepseek_sparse_attention/readme.md) | DeepSeek-V3.2 稀疏注意力 |
+| [Kimi Delta Attention](../../../../docs/guide/kda_context_parallel.zh.md) | KDA：Ulysses 与状态 P2P、AG、稀疏 AllToAllV、分组 AG/P2P、RD |
+| [Gated DeltaNet](../../../../docs/guide/linear_attention_tnd_cp.md#gdn-的-ascend-c-后端) | GDN：本地、Ulysses；Ascend C 支持 P2P/AG 及其 Ulysses 混合 |
 
 ## 文件结构
 

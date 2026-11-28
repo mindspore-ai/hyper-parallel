@@ -105,9 +105,16 @@ class TestLinearAttentionFamily(unittest.TestCase):
                     self.assertIn("num_k_heads", spec.tp_divide_attrs)
         with self.assertRaisesRegex(ValueError, "TP times Ulysses"):
             _layer("gdn", context={"tp_size": 2, "cp_size": 2}, ulysses_degree=2)
-        with self.assertRaisesRegex(NotImplementedError, "GDN state CP"):
-            GatedDeltaNet(config=SimpleNamespace(linear_num_key_heads=8, linear_num_value_heads=8),
-                          backend="ascendc", context={"cp_size": 4})
+        config = SimpleNamespace(hidden_size=16, linear_num_key_heads=4, linear_num_value_heads=12,
+                                 linear_key_head_dim=128, linear_value_head_dim=128)
+        for method in ("p2p", "allgather"):
+            for degree in (1, 2):
+                module = GatedDeltaNet(config=config, backend="ascendc", context={"cp_size": 4},
+                                      ulysses_degree=degree, state_cp_method=method)
+                self.assertEqual(module.state_cp_method, method)
+                self.assertEqual(module.ulysses_degree, degree)
+        with self.assertRaisesRegex(NotImplementedError, "AllGather"):
+            GatedDeltaNet(config=config, backend="triton", context={"cp_size": 4}, state_cp_method="allgather")
         with self.assertRaisesRegex(ValueError, "ulysses_degree"):
             _layer("kda", context={"cp_size": 4}, ulysses_degree=3)
 

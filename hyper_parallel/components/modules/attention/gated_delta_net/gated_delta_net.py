@@ -221,9 +221,9 @@ class GatedDeltaNetModule(nn.Module):
         beta = beta_logits.sigmoid()
         decay = -a_log.float().exp() * F.softplus(decay_logits.float() + dt_bias)
         groups = self.num_v_heads // self.num_k_heads
-        if groups > 1:
-            # Value heads share Q/K within each GVA group; current cores consume
-            # matched head counts. Expand after convolution and Ulysses exchange.
+        if groups > 1 and self.backend != "ascendc":
+            # The native GVA kernels index shared Q/K directly. Existing eager
+            # and Triton state kernels still require matched head counts.
             query = query.repeat_interleave(groups, dim=2)
             key = key.repeat_interleave(groups, dim=2)
         return query, key, value, decay, beta
