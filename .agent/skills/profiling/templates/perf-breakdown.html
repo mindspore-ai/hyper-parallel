@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>性能拆解报告</title>
+<style>
+  body { font-family: Consolas, "Courier New", monospace; margin: 24px; color: #171c23; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 24px; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #b9c0c8; padding: 4px 12px; text-align: left; }
+  th { background: #edf3fa; }
+  .note { color: #555e68; font-size: 13px; }
+  .todo { color: #a5322e; }
+</style>
+</head>
+<body>
+<h1>性能拆解报告</h1>
+<p class="note">来源 profiling 目录：<code><!--SOURCE--></code></p>
+<p class="note">采集环境：<!--PROVENANCE--></p>
+<p class="note">规则版本：breakdown-dimensions v2（按真实输出字段解析）。占比为相对值，采集开销不计入真实步时。</p>
+
+<h2>一、步时拆解（每步均值）</h2>
+<table>
+  <tr><th>维度</th><th>耗时(us)</th><th>占 Stage</th><th>说明</th></tr>
+  <!--STEP_ROWS-->
+</table>
+<p class="note">加和项取自 <code>step_trace_time.csv</code>，三者之和即 <code>Stage</code>。
+优化器取自 <code>operator_details.csv</code> 的 <code>Optimizer.step#</code> 区间，
+它<b>落在 Computing 内部</b>，单列出来是为了看占比，不参与加和。</p>
+
+<h2>二、计算维度（按 Core Type）</h2>
+<table>
+  <tr><th>类别</th><th>耗时(us)</th><th>占设备算子时间</th></tr>
+  <!--COMPUTE_ROWS-->
+</table>
+<p class="note">取自 <code>op_statistic.csv</code> 的 <code>Core Type</code> 列，为全采集窗口累计值（非每步）。</p>
+
+<h2>三、AI_CPU 回退热点</h2>
+<table>
+  <tr><th>算子类型</th><th>耗时(us)</th><th>占比</th></tr>
+  <!--FALLBACK_ROWS-->
+</table>
+<p class="note">已排除 HCCL 的 AI CPU launch kernel（<code>*AicpuKernel</code>）——它在 AI CPU 上跑，
+但属于通信，不是需要消除的算子回退。真回退（如整型 ArgSort）交 perf-playbook 选手段。</p>
+
+<h2>四、通信维度</h2>
+<table>
+  <tr><th>项</th><th>值</th><th>说明</th></tr>
+  <!--COMM_ROWS-->
+</table>
+<p class="note">取自 <code>communication.json</code>；每步聚合读 <code>Total Op Info</code>，
+枚举单算子时排除该键。Wait 占比高说明瓶颈在同步等待而非带宽。
+通信域→并行轴的映射见 <code>profiler_metadata.json</code> 的 <code>parallel_group_info</code>（上方采集环境行）。</p>
+
+<h2>五、一致性校验</h2>
+<table>
+  <tr><th>校验</th><th>结果</th><th>明细</th></tr>
+  <!--CHECK_ROWS-->
+</table>
+<p class="note">校验不通过时本报告的对应数字不可直接采信。退出码：0=全通过，2=有不通过项。</p>
+
+<h2>六、瓶颈与下一步</h2>
+<p>最大可动项：<!--VERDICT--></p>
+<p class="note">拆解只定位瓶颈；选手段见 perf-playbook skill。</p>
+</body>
+</html>
