@@ -33,7 +33,10 @@ def _table_names(section: str) -> set[str]:
 def main() -> int:
     """Compare AGENTS.md catalogs to on-disk skills and agents."""
     root = Path(__file__).resolve().parents[2]
-    agents_md = (root / "AGENTS.md").read_text(encoding="utf-8")
+    catalog = root / ".agent" / "AGENTS.md"
+    if not catalog.is_file():
+        catalog = root / "AGENTS.md"
+    agents_md = catalog.read_text(encoding="utf-8")
     skills_sec = agents_md.split("### Skills")[1].split("### Commands")[0]
     agents_sec = agents_md.split("### Agents")[1].split("### Rules")[0]
     listed_skills = _table_names(skills_sec)
