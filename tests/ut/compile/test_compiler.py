@@ -47,7 +47,7 @@ from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
-from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
@@ -375,6 +375,84 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
             torch.allclose(comp.model.weight.grad, 2 * first),
             "an identical second step must double the accumulated gradient",
         )
+
+    def test_single_rank_respects_fsdp_intent_for_reduce_dtype(self):
+        """Single-rank precision works with source metadata and no FSDP mesh."""
+        x, y = _fixed_batch()
+        source_mesh = init_device_mesh(
+            "cpu", (1,), mesh_dim_names=("tp",), rank_list=(0,), init_backend=False,
+        )
+        for automatic, reduce_dtype in ((True, "bfloat16"), (True, None), (False, "bfloat16")):
+            with self.subTest(automatic=automatic, reduce_dtype=reduce_dtype):
+                config = FSDP2Config(
+                    wrapper_class=["Linear"],
+                    mix_precision=FSDP2MixedPrecisionConfig(reduce_dtype=reduce_dtype),
+                )
+                model = nn.Sequential(_make_model())
+                expected = torch.autograd.grad(_mse_train_fn(model, x=x, y=y), tuple(model.parameters()))
+                compiler = GraphCompiler(
+                    model, _mse_train_fn, None if automatic else PassConfig(fsdp_enabled=False),
+                    device=torch.device("cpu"), trainer_config=SimpleNamespace(fsdp_config=config),
+                    source_shard_info={"0.weight": ((Replicate(),), source_mesh)},
+                )
+                compiler.forward_backward(x=x, y=y)
+                self.assertFalse(compiler.pass_config.fsdp_enabled)
+                for parameter, gradient in zip(model.parameters(), expected):
+                    reference = gradient.bfloat16().float() if automatic and reduce_dtype else gradient
+                    torch.testing.assert_close(parameter.grad, reference, rtol=0, atol=0)
+
+    def test_late_dist_initialization_keeps_unsharded_policy(self):
+        """Resolve the single-rank precision exception when the graph is compiled."""
+        x, y = _fixed_batch()
+        model = nn.Sequential(_make_model())
+        config = FSDP2Config(
+            wrapper_class=["Linear"],
+            mix_precision=FSDP2MixedPrecisionConfig(reduce_dtype="bfloat16"),
+        )
+        expected = torch.autograd.grad(_mse_train_fn(model, x=x, y=y), tuple(model.parameters()))
+        with (
+            patch("hyper_parallel.compile.compiler.dist") as dist,
+            patch.object(GraphCompiler, "_init_device_mesh") as init_mesh,
+        ):
+            dist.is_initialized.return_value = False
+            compiler = GraphCompiler(
+                model, _mse_train_fn, device=torch.device("cpu"), trainer_config=SimpleNamespace(fsdp_config=config),
+            )
+            dist.is_initialized.return_value = True
+            dist.get_world_size.return_value = 4
+            compiler.forward_backward(x=x, y=y)
+
+        init_mesh.assert_not_called()
+        self.assertFalse(compiler.pass_config.fsdp_enabled)
+        for parameter, gradient in zip(model.parameters(), expected):
+            torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
+
+    def test_tp_precision_guard_checks_live_storage_dtype(self):
+        """An FP32 policy allows FP32 storage and still detects a BF16-to-FP32 cast."""
+        dense = init_device_mesh("cpu", (1, 2), mesh_dim_names=("fsdp_shard", "tp"),
+                                 rank_list=(0, 1), init_backend=False)
+        context = MeshContext(fsdp_non_moe_mesh=dense, tp_size=2)
+        x, y = _fixed_batch()
+        for compute, storage in (("float32", torch.float32), (None, torch.float32), ("float32", torch.bfloat16)):
+            with self.subTest(compute=compute, storage=storage), patch.object(GraphCompiler, "_register_mesh_group"):
+                model = nn.Sequential(_make_model()).to(dtype=storage)
+                config = FSDP2Config(
+                    wrapper_class=["Linear"],
+                    mix_precision=FSDP2MixedPrecisionConfig(param_dtype=compute, reduce_dtype="float32"),
+                )
+                compiler = GraphCompiler(
+                    model, _mse_train_fn, PassConfig(fsdp_enabled=True), device=torch.device("cpu"),
+                    mesh_context=context, trainer_config=SimpleNamespace(fsdp_config=config),
+                    source_shard_info={name: ((Replicate(),), dense["tp"]) for name, _ in model.named_parameters()},
+                )
+                if storage == torch.bfloat16:
+                    with self.assertRaisesRegex(ValueError, "requires one DP/EDP replica and TP=CP=1"):
+                        compiler.forward_backward(x=x, y=y)
+                    continue
+                expected = torch.autograd.grad(_mse_train_fn(model, x=x, y=y), tuple(model.parameters()))
+                compiler.forward_backward(x=x, y=y)
+                for parameter, gradient in zip(model.parameters(), expected):
+                    torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
 
     def test_gradients_match_parameter_layout(self):
         """Preserve eager's optimizer-facing layout for dense and transposed weights."""

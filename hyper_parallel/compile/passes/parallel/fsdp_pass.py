@@ -68,7 +68,7 @@ from torch import fx, nn
 from torch._subclasses import FakeTensor
 from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.fx.node import _side_effectful_functions
-from torch.ops import _c10d_functional
+from torch.ops import _c10d_functional, prims
 
 from ...graph_parallel_plan import GraphParallelPlan
 from ...pass_config import GradientReduction, PassConfig, normalize_dp_mode
@@ -196,7 +196,7 @@ def _annotate_ag_spec(node: fx.Node, degree: int, params: dict) -> None:
     node.meta["fsdp_bucket_spec"] = {
         "input_shape": shape,
         "output_shape": (shape[0] * degree, *shape[1:]),
-        "dtype": param.dtype,
+        "dtype": node.meta.get("fsdp_compute_dtype", param.dtype),
         "device": str(param.device),
     }
 
@@ -224,6 +224,19 @@ def annotate_fsdp_bucket_specs(graph_module: fx.GraphModule, model: nn.Module) -
             _annotate_rs_spec(node, degree)
         else:
             _annotate_ag_spec(node, degree, params)
+
+
+def _gather_input(graph: fx.Graph, parameter: fx.Node) -> fx.Node:
+    """Cast the local shard before gathering it in the compute dtype."""
+    dtype = parameter.meta.get("fsdp_compute_dtype")
+    if dtype is None:
+        return parameter
+    # The prefetch pass can move this functional cast with its AllGather.
+    result = graph.call_function(prims.convert_element_type.default, args=(parameter, dtype))
+    value = parameter.meta.get("val")
+    if value is not None:
+        result.meta["val"] = value.to(dtype)
+    return result
 
 
 def _free_tensor_storage(tensor: torch.Tensor) -> None:
@@ -777,7 +790,8 @@ class FSDPPass(GraphPass):
         # Newly inserted collective nodes have no shape-propagated ``val``.
         value = param if param is not None else node.meta.get("val")
         if isinstance(value, torch.Tensor) and isinstance(value.numel(), int):
-            node.meta["fsdp_unsharded_nbytes"] = value.numel() * value.element_size()
+            dtype = node.meta.get("fsdp_compute_dtype", value.dtype)
+            node.meta["fsdp_unsharded_nbytes"] = value.numel() * dtype.itemsize
         self._fsdp_modules.add(self._get_parent_module_fqn(fqn))
         return node
 
@@ -1044,10 +1058,15 @@ class FSDPPass(GraphPass):
             # AllGather + immediate wait for correctness; FsdpOverlapPass may
             # sink the wait past independent compute later.
             with _insertion_point(graph, anchor, param_node):
+                gather_input = _gather_input(graph, param_node)
+            with _insertion_point(graph, anchor, gather_input):
                 ag_node = graph.call_function(
                     _c10d_functional.all_gather_into_tensor,
-                    args=(param_node, degree, group_name),
+                    args=(gather_input, degree, group_name),
                 )
+                dtype = param_node.meta.get("fsdp_compute_dtype")
+                if dtype is not None:
+                    ag_node.meta["fsdp_compute_dtype"] = dtype
                 ag_node.meta["comm_type"] = "fsdp_all_gather"
                 ag_node.meta["comm_group"] = group_name
                 ag_node.meta["param_node"] = param_node.name
@@ -1095,8 +1114,16 @@ class FSDPPass(GraphPass):
                 replacement.meta["param_name"] = param_node.meta.get("param_name")
                 replacement.meta["state_idx"] = param_node.meta.get("state_idx")
 
-            for user in list(param_node.users.keys()):
-                if user not in (ag_node, wait_node):
+            for user in list(param_node.users):
+                if user in (gather_input, ag_node, wait_node):
+                    continue
+                schema = getattr(user.target, "_schema", None)
+                schema_key = (getattr(schema, "name", None), getattr(schema, "overload_name", None))
+                if dtype is not None and schema_key == ("aten::_to_copy", "") and user.kwargs == {"dtype": dtype}:
+                    # Preserve reshard's last-reader tracking without a second full-size copy.
+                    user.replace_all_uses_with(replacement)
+                    graph.erase_node(user)
+                else:
                     user.replace_input_with(param_node, replacement)
 
             self._processed_params.add(param_node.name)
@@ -1525,10 +1552,16 @@ class FSDPPass(GraphPass):
             record.param_node.meta.get("param_name", "")
         )
         with graph.inserting_before(anchor):
+            gather_input = _gather_input(graph, record.param_node)
+            if gather_input is not record.param_node:
+                gather_input.meta["autograd_backward"] = True
             ag_node = graph.call_function(
                 _c10d_functional.all_gather_into_tensor,
-                args=(record.param_node, degree, group_name),
+                args=(gather_input, degree, group_name),
             )
+            dtype = record.param_node.meta.get("fsdp_compute_dtype")
+            if dtype is not None:
+                ag_node.meta["fsdp_compute_dtype"] = dtype
             ag_node.meta["comm_type"] = "fsdp_all_gather_backward"
             ag_node.meta["comm_group"] = group_name
             ag_node.meta["param_node"] = record.param_node.name

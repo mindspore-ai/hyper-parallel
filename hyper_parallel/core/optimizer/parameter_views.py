@@ -196,10 +196,10 @@ class OptimizerParameterViews:
                     "rebuild the trainer"
                 )
         for binding in self.bindings:
-            if binding.optimizer is binding.model:
-                continue
             grad = getattr(binding.model, "main_grad", None)
             if grad is None:
+                if binding.optimizer is binding.model:
+                    continue
                 grad = binding.model.grad
             if grad is not None:
                 grad = binding.local_view(to_local_if_dtensor(grad).detach())

@@ -53,10 +53,13 @@ import torch
 from torch import fx, nn
 
 from hyper_parallel.compile.compiler import GraphCompiler
+from hyper_parallel.compile.mixed_precision import GraphMixedPrecision
 from hyper_parallel.compile.pass_config import GradientReduction, PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FsdpParamSpec, FsdpPlan
 from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan
+from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed.mesh import MeshContext
 
@@ -418,6 +421,42 @@ class TestFSDPPassRunSharding(unittest.TestCase):
             {"avg"},
             "FSDP grads must reduce_scatter with 'avg', not 'sum'",
         )
+
+    def test_mixed_precision_cast_precedes_gather_without_reshard(self):
+        """The compute dtype cast must precede the unsunk AllGather."""
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2, fsdp_reshard_after_forward=False)
+        gm = _linear_joint_graph()
+        weight = next(iter(gm.graph.nodes))
+        weight.meta["fsdp_compute_dtype"] = torch.bfloat16
+        model = nn.Linear(4, 4)
+
+        with _patch_dist(world_size=2, rank=0, initialized=True):
+            FSDPPass().run(gm, cfg, model=model, fsdp_group_name="fsdp")
+
+        gm.graph.lint()
+        gather = next(node for node in gm.graph.nodes
+                      if node.meta.get("comm_type") == "fsdp_all_gather" and node.meta.get("param_name") == "weight")
+        shard_cast = gather.args[0]
+        self.assertEqual(shard_cast.target, torch.ops.prims.convert_element_type.default)
+        self.assertEqual(shard_cast.args, (weight, torch.bfloat16))
+
+    def test_mixed_precision_backward_gather_marks_only_new_cast(self):
+        """Keep the shared parameter placeholder out of the backward phase."""
+        model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        precision = GraphMixedPrecision(model, MixedPrecisionPolicy(param_dtype=torch.bfloat16), (model,))
+        joint = trace_model_graph(
+            model, lambda model, x: model(x).float().square().mean(),
+            {"x": torch.ones(2, 4)}, mixed_precision=precision,
+        )
+        gm = joint.graph_module
+        with _patch_dist():
+            FSDPPass().run(gm, PassConfig(fsdp_enabled=True, fsdp_degree=2), model=model, fsdp_group_name="fsdp")
+
+        gather = next(node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_all_gather_backward")
+        cast = gather.args[0]
+        self.assertIs(cast.meta.get("autograd_backward"), True)
+        self.assertNotIn("autograd_backward", cast.args[0].meta)
+        gm.graph.lint()
 
     def test_run_skips_frozen_params(self):
         """Test frozen params are not all-gathered or sharded.

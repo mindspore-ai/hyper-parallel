@@ -74,6 +74,7 @@ from torch.fx.passes.runtime_assert import insert_deferred_runtime_asserts
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
 
+from ..mixed_precision import GraphMixedPrecision
 from .dynamic_shapes import InputGuards, build_symbolic_inputs
 
 # Older torch's make_fx predates record_stack_traces / record_module_stack
@@ -443,6 +444,7 @@ def _make_fwd_bwd_fn(
     state_is_param: list[bool],
     state_spec: Any,
     user_inputs_spec: Any,
+    mixed_precision: GraphMixedPrecision | None = None,
 ) -> tuple[Callable, list[str]]:
     """Build the joint callable and its named-loss output metadata."""
     num_state_inputs = len(state_fqns)
@@ -458,9 +460,12 @@ def _make_fwd_bwd_fn(
         user_args = torch.utils._pytree.tree_unflatten(
             list(user_wrapped), user_inputs_spec
         )
+        model_state = state_t["model"]
+        if mixed_precision is not None:
+            model_state = mixed_precision.cast_state(model_state)
 
         with (
-            _reparametrize_train_state(model, state_t["model"]),
+            _reparametrize_train_state(model, model_state),
             _patch_engine_backward(),
         ):
             out = train_fn(model, **user_args)
@@ -483,28 +488,40 @@ def _make_fwd_bwd_fn(
             else:
                 loss, loss_dict_keys, loss_dict_values = out, [], []
 
-            # Read params from state_t["model"] so the exact trace-time
-            # tensors (not the live module's) drive autograd.grad.
-            params = []
-            for idx, fqn in enumerate(state_fqns):
-                if state_is_param[idx]:
-                    param = state_t["model"][fqn]
-                    if param.requires_grad:
-                        params.append(param)
-
-            grads = torch.autograd.grad(loss, params, allow_unused=True)
+            # Differentiate compute weights. An autograd cast back to the storage
+            # dtype here would round the gradient before the reduction cast.
+            params = {fqn: model_state[fqn] for fqn, is_param in zip(state_fqns, state_is_param)
+                      if is_param and model_state[fqn].requires_grad}
+            grads = torch.autograd.grad(loss, tuple(params.values()), allow_unused=True)
 
         # Replace None grads with zeros so the output arity is stable.
         processed_grads = []
-        for grad, param in zip(grads, params):
+        for (name, param), grad in zip(params.items(), grads):
             if grad is None:
-                processed_grads.append(torch.zeros_like(param))
-            else:
-                processed_grads.append(grad)
+                grad = torch.zeros_like(param)
+            if mixed_precision is not None:
+                grad = mixed_precision.cast_gradient(name, grad)
+            processed_grads.append(grad)
 
         return [loss] + processed_grads + loss_dict_values
 
     return _fwd_bwd_fn, loss_dict_keys_box
+
+
+def _annotate_fsdp_compute_dtypes(
+    graph_module: torch.fx.GraphModule,
+    model_state: dict[str, torch.Tensor],
+    mixed_precision: GraphMixedPrecision,
+    num_inputs: int,
+) -> None:
+    """Record the compute dtype on state placeholders for the FSDP pass."""
+    placeholders = graph_module.graph.find_nodes(op="placeholder")
+    if len(placeholders) != num_inputs:
+        raise ValueError(f"Expected {num_inputs} graph input placeholders, got {len(placeholders)}")
+    for (name, value), node in zip(model_state.items(), placeholders):
+        dtype, _ = mixed_precision.parameter_dtypes.get(name, (None, None))
+        if dtype is not None and value.is_floating_point():
+            node.meta["fsdp_compute_dtype"] = dtype
 
 
 def trace_model_graph(  # pylint: disable=too-many-locals
@@ -514,6 +531,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     *,
     dynamic: bool = False,
     dynamic_arg_dims: dict[str, int | list[int]] | None = None,
+    mixed_precision: GraphMixedPrecision | None = None,
 ) -> JointGraph:
     """
     Trace model to generate complete forward + backward graph
@@ -527,6 +545,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         dynamic_arg_dims: Dotted input paths to dynamic dimensions (supports negative indices).
             Providing a mapping enables selective symbolic tracing, even when dynamic is False.
             Parameters and buffers always remain static.
+        mixed_precision: Resolved FSDP policy for capture without eager HSDP hooks.
 
     Returns:
         JointGraph: Joint forward-backward computation graph
@@ -568,7 +587,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     num_state_inputs = len(state_flat)
 
     _fwd_bwd_fn, loss_dict_keys_box = _make_fwd_bwd_fn(  # pylint: disable=C0103
-        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec
+        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec, mixed_precision
     )
 
     # make_fx only records ``nn_module_stack`` when the traced callable
@@ -588,6 +607,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         _skip_nested_compile(),
         torch.autograd.set_multithreading_enabled(False),
         _non_strict_tracing_context(),
+        mixed_precision.module_casts() if mixed_precision is not None else contextlib.nullcontext(),
     ):
         # Native constant padding can specialize SymInt sizes (notably on
         # NPU). Its upstream decomposition preserves causal-LM label lengths.
@@ -620,6 +640,8 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     traced_graph.state_fqns = state_fqns
     traced_graph.state_is_param = state_is_param
     traced_graph.num_state_inputs = num_state_inputs
+    if mixed_precision is not None:
+        _annotate_fsdp_compute_dtypes(traced_graph, model_state, mixed_precision, len(fake_args))
     # Kept for ``run_traced_graph`` to validate the runtime inputs' pytree
     # structure against the traced one.
     traced_graph.user_inputs_spec = user_inputs_spec
