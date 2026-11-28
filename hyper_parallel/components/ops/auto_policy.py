@@ -22,6 +22,10 @@ from .impl.dsa_indexer import DSA_INDEXER, DSA_PACKED_INDEXER
 from .impl.dsa_indexer_kl import DSA_DENSE_KL, DSA_INDEXER_KL, DSA_PACKED_KL
 from .impl.deepseek_sparse_attention import DSA_ABSORBED, DSA_ABSORBED_SINK, DSA_COMPRESSED_BANKS
 from .impl.gdn import GDN
+from .impl.gated_residual import GATED_RESIDUAL
+from .impl.block_sparse_attention import BLOCK_SPARSE_ATTENTION, BLOCK_SPARSE_MLA
+from .impl.pooled_indexer import POOLED_INDEXER
+from .impl.pooled_indexer_kl import POOLED_INDEXER_KL
 from .impl.grouped_matmul import GROUPED_MATMUL
 from .impl.grouped_swiglu import GROUPED_SWIGLU
 from .impl.kda import KDA
@@ -38,6 +42,13 @@ from .registry import OpRegistry
 
 def apply_auto_policy(registry: OpRegistry) -> None:
     """Set device-specific priorities independently of implementation registration."""
+    for spec in (BLOCK_SPARSE_ATTENTION, BLOCK_SPARSE_MLA, POOLED_INDEXER_KL, POOLED_INDEXER):
+        for device in ("cpu", "cuda", "npu"):
+            registry.set_auto_order(spec, device=device, candidates=("native",))
+    # Keep new fusion explicit until representative training performance supports automatic selection.
+    registry.set_auto_order(GATED_RESIDUAL, device="npu", candidates=("native",))
+    registry.set_auto_order(GATED_RESIDUAL, device="cpu", candidates=("native",))
+    registry.set_auto_order(GATED_RESIDUAL, device="cuda", candidates=("native",))
     for spec in (RMS_NORM, RMS_NORM_FP32_AFFINE, SWIGLU, SWIGLU_CLAMPED):
         registry.set_auto_order(spec, device="npu", candidates=("torch_npu",))
         registry.set_auto_order(spec, device="cuda", candidates=("native",))

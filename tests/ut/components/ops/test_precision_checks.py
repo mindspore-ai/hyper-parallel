@@ -20,7 +20,7 @@ import unittest
 import torch
 
 from hyper_parallel.components.ops import ops
-from tests.common.op_precision import assert_precision, check_case
+from tests.common.op_precision import Tolerance, assert_precision, check_case
 from tests.common.op_precision_suite import (
     FAMILY_BUILDERS, backend_precision_dtypes, precision_cases, registered_backends,
 )
@@ -74,6 +74,10 @@ class TestPrecisionChecks(unittest.TestCase):
         actual[0] = 1e-4
         with self.assertRaisesRegex(AssertionError, "worst_flat_index=0"):
             assert_precision(actual, reference, dtype=torch.float32)
+        tolerance = Tolerance(2e-4, 1e-4, 1e-5)
+        assert_precision(actual, reference, dtype=torch.float32, tolerance=tolerance)
+        with self.assertRaisesRegex(AssertionError, "relative_l2=.*limit="):
+            assert_precision(reference + 1e-4, reference, dtype=torch.float32, tolerance=tolerance)
 
     def test_zero_reference_requires_exact_zero(self) -> None:
         """Masked rows and empty-expert gradients cannot pass using absolute tolerance."""
@@ -115,6 +119,7 @@ class TestPrecisionChecks(unittest.TestCase):
         case = precision_cases("rms_norm", torch.float32)[0]
 
         def scaled_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+            """Perturb the independent oracle to exercise all failure diagnostics."""
             return case.reference(x, weight, eps) * 2.0
 
         with self.assertRaises(AssertionError) as raised:
