@@ -81,8 +81,8 @@ def _reward_module(monkeypatch: pytest.MonkeyPatch, value: Any = 1.0) -> str:
     """Install one importable reward callback for Harness constructors."""
     module = ModuleType("agentic_ut_reward")
     module.score = lambda _answer, _prompt: value
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    return f"{module.__name__}:score"
+    monkeypatch.setitem(sys.modules, "agentic_ut_reward", module)
+    return "agentic_ut_reward:score"
 
 
 def _episode(modules: SimpleNamespace, **overrides: Any) -> Any:
@@ -434,7 +434,7 @@ def test_extension_loading_environment_and_mcp(tmp_path: Path, monkeypatch: pyte
 
     factory_module = ModuleType("agentic_ut_factory")
     factory_module.build = lambda settings: registry if settings == {"x": 1} else None
-    monkeypatch.setitem(sys.modules, factory_module.__name__, factory_module)
+    monkeypatch.setitem(sys.modules, "agentic_ut_factory", factory_module)
     assert modules.mcp._load_registry("agentic_ut_factory:build", {"x": 1}) is registry
     for factory in ("invalid", "agentic_ut_factory:missing"):
         with pytest.raises(ValueError):
@@ -492,7 +492,7 @@ def test_mcp_stdio_server_and_entrypoint(monkeypatch: pytest.MonkeyPatch) -> Non
 
     factory = ModuleType("agentic_ut_main_factory")
     factory.build = lambda _settings: registry
-    monkeypatch.setitem(sys.modules, factory.__name__, factory)
+    monkeypatch.setitem(sys.modules, "agentic_ut_main_factory", factory)
     served = []
 
     async def serve(selected: Any) -> None:
@@ -773,7 +773,7 @@ def test_gateway_http_routes_and_lifecycle(gateway_module: str) -> None:
         assert request("POST", proxy_path, {"messages": []} if is_deepseek else {"input": "q"})[0] == 502
         assert request("GET", "/internal/sessions/session")[1]["policy_version"] == 2
         assert request("DELETE", "/unknown")[0] == 404
-        assert request("DELETE", "/internal/sessions/missing")[0] == (404 if is_deepseek else 200)
+        assert request("DELETE", "/internal/sessions/missing")[0] == 200
         assert request("DELETE", "/internal/sessions/session")[0] == 200
     finally:
         server.close()

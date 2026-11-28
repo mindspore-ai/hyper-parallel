@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from rl.agentic.core.session_lifecycle import ReleasedSessions
 from rl.tool_protocol.protocol import inspect_tool_response
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,7 @@ class _State:
         self.protocol = DeepSeekChatProtocol()
         self.lock = threading.RLock()
         self.sessions: dict[str, _Session] = {}
+        self.released_sessions = ReleasedSessions()
 
     def register(self, session_id: str, payload: dict[str, Any]) -> None:
         """Validate and register a new gateway session and its artifact directory."""
@@ -199,6 +201,8 @@ class _State:
             generation=dict(generation),
         )
         with self.lock:
+            if session_id in self.released_sessions:
+                raise ValueError(f"DeepSeek session was already released: {session_id}")
             if session_id in self.sessions:
                 raise ValueError(f"DeepSeek session already exists: {session_id}")
             self.sessions[session_id] = session
@@ -214,7 +218,11 @@ class _State:
 
     def remove(self, session_id: str) -> None:
         """Wait for this session's current request before releasing its trace."""
-        session = self.get(session_id)
+        with self.lock:
+            self.released_sessions.add(session_id)
+            session = self.sessions.get(session_id)
+        if session is None:
+            return
         with session.request_lock:
             session.closing = True
             self.event(session_id, "session.released", {})
@@ -534,12 +542,16 @@ class DeepSeekGateway:
 
     def close(self) -> None:
         """Stop request serving and release the listening socket."""
-        if self._thread is None:
+        try:
+            if self._thread is None:
+                self._server.server_close()
+                return
+            self._server.shutdown()
             self._server.server_close()
-            return
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=10.0)
-        if self._thread.is_alive():
-            raise RuntimeError("DeepSeek gateway thread did not stop")
-        self._thread = None
+            self._thread.join(timeout=10.0)
+            if self._thread.is_alive():
+                raise RuntimeError("DeepSeek gateway thread did not stop")
+            self._thread = None
+        finally:
+            with self._server.state.lock:
+                self._server.state.released_sessions.close()
