@@ -437,6 +437,20 @@ def tiny_llama():
     return TinyLlamaForCausalLM(TinyConfig())
 
 
+@pytest.fixture(scope="package", autouse=True)
+def _teardown_package_process_group():
+    """Destroy the lazily created world_size=1 gloo group after this package.
+
+    ``_ensure_pg`` leaves the default process group initialized; under
+    pytest-xdist the same worker later runs packages whose tests assert
+    ``dist.is_initialized()`` is False (e.g. the metadata-only MegaMoe mesh
+    checks), so scope the group to this package.
+    """
+    yield
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 @pytest.fixture
 def tiny_moe():
     """MoE tiny model (gate + experts, no shared_experts)."""

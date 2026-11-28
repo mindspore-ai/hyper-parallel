@@ -216,7 +216,9 @@ class _GatedDeltaRule(torch.autograd.Function):
                 value: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor, chunk: int) -> torch.Tensor:
         """Save the inputs, the cumulated gates, beta and a chunk matrix; return an output of the values' shape."""
         batch, seq, heads, _ = key.shape
-        gates = torch.empty(batch, seq, heads, dtype=torch.float32, device=query.device)
+        # The cumulated gates follow the gate's own shape: Qwen3.5 passes per
+        # value-head gates while the chunk matrix follows the key heads.
+        gates = torch.empty_like(gate, dtype=torch.float32)
         chunks = torch.empty(batch, seq, heads, chunk, dtype=key.dtype, device=query.device)
         ctx.save_for_backward(query, key, value, gates, beta, chunks)
         del gate

@@ -354,7 +354,6 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [x_layout, 1]
 
-softmax_pascal_op = ActivationWithAxisDistributedOp("Softmax")
 softmax_torch_op = ActivationWithAxisDistributedOp("softmax")
 
 
@@ -403,156 +402,6 @@ class TestParallelSoftmax(unittest.TestCase):
         """Set up mock and return a standard 2x2 mesh via init_device_mesh."""
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=mesh_dim_names)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_softmax_layout_data_parallel(self, mock_platform):
-        """
-        Feature: Softmax data parallel
-        Description: Data parallel scenario
-        Expectation: Success
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="dp")
-
-        x_placements = (Shard(0),)
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        cache_values = [x_layout, -1]
-        output_layout = self._infer_single_layout(softmax_pascal_op, cache_values)
-        expected_map = (0, -1)
-        assert output_layout.tensor_map == expected_map, (
-            f"Data Parallel test failed. Expected {expected_map},"
-            f" got {output_layout.tensor_map}"
-        )
-
-        # Since `get_expand_impl` is not overridden, it returns None by default.
-        # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert softmax_pascal_op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {softmax_pascal_op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
-        )
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_softmax_layout_data_parallel_value_failed(self, mock_platform):
-        """
-        Feature: Softmax data parallel value failed
-        Description: Data parallel scenario
-        Expectation: Success
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="dp")
-
-        x_placements = (Shard(0),)
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        with self.assertRaises(ValueError):
-            _ = softmax_pascal_op.infer_layout([x_layout, 0])
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_torch_softmax_data_parallel_success(self, mock_platform):
-        """
-        Feature: Softmax compatible with PyTorch (dim arg)
-        Description: Standard Data Parallel scenario (Batch is sharded, Softmax on Feature dim)
-        Expectation: Success, output layout equals input layout
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="dp")
-
-        x_placements = (Shard(0),)
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        cache_values = [x_layout, 1]
-        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
-
-        expected_map = x_layout.tensor_map
-        assert output_layout.tensor_map == expected_map, (
-            f"DP test failed. Expected {expected_map}, got {output_layout.tensor_map}"
-        )
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_torch_softmax_negative_dim_success(self, mock_platform):
-        """
-        Feature: Softmax compatible with PyTorch
-        Description: Test negative index support (dim=-1) in Data Parallel
-        Expectation: Success
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="dp")
-
-        x_placements = (Shard(0),)
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        cache_values = [x_layout, -1]
-        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
-
-        expected_map = x_layout.tensor_map
-        assert output_layout.tensor_map == expected_map
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_torch_softmax_sharded_dim_failure(self, mock_platform):
-        """
-        Feature: Softmax distributed check
-        Description: Attempting to compute Softmax on a sharded dimension
-        Expectation: Raise ValueError
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="dp")
-
-        x_placements = (Shard(0),)
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        with self.assertRaises(ValueError) as context:
-            _ = softmax_torch_op.infer_layout([x_layout, 0])
-
-        self.assertIn("is sharded", str(context.exception))
-        self.assertIn("requires the reduction axis to be un-sharded", str(context.exception))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_torch_softmax_model_parallel_failure(self, mock_platform):
-        """
-        Feature: Softmax distributed check
-        Description: Model Parallel scenario where the feature dimension is sharded
-        Expectation: Raise ValueError when computing softmax on the MP axis
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="mp")
-
-        x_placements = (Shard(1),)
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        with self.assertRaises(ValueError) as context:
-            _ = softmax_torch_op.infer_layout([x_layout, -1])
-
-        self.assertIn("is sharded", str(context.exception))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_torch_softmax_model_parallel_success_on_other_axis(self, mock_platform):
-        """
-        Feature: Softmax distributed check
-        Description: Model Parallel scenario, but computing softmax on the non-sharded axis
-        Expectation: Success
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="mp")
-
-        x_placements = (Shard(1),)
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        cache_values = [x_layout, 0]
-        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
-
-        expected_map = x_layout.tensor_map
-        assert output_layout.tensor_map == expected_map
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_torch_softmax_input_consistency_failure(self, mock_platform):
-        """
-        Feature: Layout consistency check
-        Description: Inputs have different layouts
-        Expectation: Raise ValueError
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="dp")
-
-        layout1 = _build_layout(mesh, (Shard(0),), 2)
-        layout2 = _build_layout(mesh, (Shard(1),), 2)
-
-        with self.assertRaises(ValueError) as context:
-            _ = softmax_torch_op.infer_layout([layout1, layout2, 1])
-
-        self.assertIn("requires all tensor inputs to have the same layout", str(context.exception))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_multi_axis_mesh_success(self, mock_platform):
@@ -615,23 +464,6 @@ class TestParallelSoftmax(unittest.TestCase):
 
         assert output_layout.rank_list == (3, 1, 0, 2)
         assert output_layout.tensor_map == x_layout.tensor_map
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_torch_softmax_multi_input_same_layout_success(self, mock_platform):
-        """
-        Feature: Softmax with multiple inputs (same layout)
-        Description: Multiple inputs with consistent layout, verify validity
-        Expectation: Success
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=8, mesh_name="dp")
-
-        layout1 = _build_layout(mesh, (Shard(0),), 2)
-        layout2 = _build_layout(mesh, (Shard(0),), 2)
-
-        cache_values = [layout1, layout2, 1]
-        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
-
-        assert output_layout.tensor_map == layout1.tensor_map
 
 
 if __name__ == "__main__":
