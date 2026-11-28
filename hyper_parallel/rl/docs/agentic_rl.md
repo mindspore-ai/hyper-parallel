@@ -286,7 +286,7 @@ agentic:
 
 The [GSM8K environment](../examples/gsm8k/agent.py) provides single-turn QA and multi-turn calculator tasks.
 Both enter Trainer through the same `ENVIRONMENTS` registry. The YAML above is an `agentic` fragment;
-For complete training configuration, see the [base GRPO recipe](../examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml) and
+For complete training configuration, see the [base GRPO recipe](../examples/gsm8k/configs/qwen3_4b_gsm8k_native_50step.yaml) and
 [multi-turn configuration](../examples/gsm8k/README.md#rewards-and-agent-interaction); the training entry point is [train_rl.py](../train_rl.py).
 
 ### GSM8K Numeric Rewards

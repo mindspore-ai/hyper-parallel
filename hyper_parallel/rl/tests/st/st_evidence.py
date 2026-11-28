@@ -56,7 +56,6 @@ def validate_phase(output: Path, case: Any, phase: int) -> None:
             f"Expected training steps {steps}, got {list(rows)}")
     changed = False
     critic_changed = False
-    negative_control = False
     for step in steps:
         row = rows[step]
         require(all(math.isfinite(value) for value in row.values()), f"Non-finite metrics at {step}")
@@ -78,8 +77,6 @@ def validate_phase(output: Path, case: Any, phase: int) -> None:
             critic_changed |= row.get("critic/gradient_norm", 0) > 0
         require(row.get(f"weight_sync/last_{case.strategy}") == 1,
                 "Wrong completed transfer strategy")
-        if case.exact:
-            negative_control |= _validate_exact_metrics(row)
         if case.strategy == "full_gather":
             _validate_streaming_metrics(row)
     require(changed, "No non-zero learning update: inspect real rewards/advantages; do not relabel rewards")
@@ -87,16 +84,12 @@ def validate_phase(output: Path, case: Any, phase: int) -> None:
         _validate_reward_service_evidence(output, phase, rows, steps)
     if case.algorithm == "ppo":
         require(critic_changed, "No non-zero Critic update")
-    if case.exact:
-        require(negative_control, "No post-update change against the old policy")
-    if case.name == "dense-tp1-full":
-        _validate_evaluation(rows, steps)
     if case.name.startswith("reward-model-"):
         evaluation = rows[steps[-1]]
         require(evaluation.get("validation/total") == 8, "Incomplete RM evaluation")
         require("validation/reward_mean" in evaluation, "Missing RM evaluation reward")
         require("validation/accuracy" not in evaluation, "RM evaluation was mislabeled as accuracy")
-    if case.resume or case.name == "dense-tp1-full" or case.name.startswith("reward-model-"):
+    if case.resume or case.name.startswith("reward-model-"):
         _validate_checkpoint(output, case, steps)
 
 
@@ -174,20 +167,6 @@ def validate_sessions(root: Path, versions: tuple[int, ...]) -> None:
     require(seen == set(versions), f"Expected Agent policy versions {versions}, got {seen}")
 
 
-def _validate_exact_metrics(row):
-    """Validate exact replay and return whether the negative control changed."""
-    require(row.get("training/pre_update_exact_valid") == 1, "Missing successful consistency gate")
-    require(row.get("training/pre_update_exact_tokens", 0) > 0, "Empty consistency comparison")
-    for key in ("mismatch_count", "max_abs_diff", "mean_abs_diff"):
-        require(row.get("training/pre_update_" + key) == 0, f"Consistency failed: {key}")
-    tokens = row.get("training/post_update_old_policy_tokens", 0)
-    mismatches = row.get("training/post_update_old_policy_mismatch_count", -1)
-    require(tokens > 0 and 0 <= mismatches <= tokens, "Invalid post-update comparison")
-    require(row.get("training/post_update_negative_control_valid") == int(mismatches > 0),
-            "Inconsistent post-update negative control")
-    return mismatches > 0
-
-
 def _validate_streaming_metrics(row):
     """Require bounded, acknowledged and released full-gather buckets."""
     prefix = "weight_sync/streaming_"
@@ -198,18 +177,6 @@ def _validate_streaming_metrics(row):
     gathered = row.get(prefix + "max_gathered_bytes", 0)
     packed = row.get(prefix + "max_packed_bytes", 0)
     require(gathered > 0 and gathered == packed, "Invalid packed weight bytes")
-
-
-def _validate_evaluation(rows, steps):
-    """Check evaluation counts and their reported accuracy."""
-    evaluation = rows[steps[-1]]
-    total = evaluation.get("validation/total", 0)
-    correct = evaluation.get("validation/correct", -1)
-    accuracy = evaluation.get("validation/accuracy", -1)
-    require(total == 8 and 0 <= correct <= total, "Incomplete evaluation sample count")
-    require(math.isclose(accuracy, correct / total, rel_tol=0, abs_tol=1e-6),
-            "Evaluation accuracy disagrees with counts")
-    require(evaluation.get("validation/generated_tokens", 0) > 0, "Evaluation generated no tokens")
 
 
 def _validate_checkpoint(output, case, steps):

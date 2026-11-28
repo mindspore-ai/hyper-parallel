@@ -22,6 +22,8 @@ import yaml
 
 _OPTIONAL_OVERRIDE_PATHS = frozenset((
     "rollout.vllm.visible_devices", "train.token_log_probs_mode", "train.token_log_probs_chunk_size",
+    "train.accelerator.cpu_offload", "train.accelerator.reference_cpu_offload",
+    "train.accelerator.offload_during_rollout",
 ))
 
 

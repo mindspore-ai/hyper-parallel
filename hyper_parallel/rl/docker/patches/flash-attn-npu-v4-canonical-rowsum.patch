@@ -1,0 +1,39 @@
+--- a/csrc/ascend910/flash_attn_npu_4/online_softmax.hpp
++++ b/csrc/ascend910/flash_attn_npu_4/online_softmax.hpp
+@@ -748,30 +748,10 @@
+     void CalcLocalRowSum(uint32_t sUbOffset, uint32_t rowNumCurLoopRound, uint32_t columnNum, uint32_t columnNumRound,
+         uint32_t rowOffset)
+     {
+-        // *** ll = rowsum(ls32)
+-        if (columnNum == 512) {
+-            RowsumSPECTILE512(
+-                lsUbTensor[sUbOffset],
+-                llUbTensor[rowOffset],
+-                tvUbTensor,
+-                rowNumCurLoopRound,
+-                columnNum,
+-                columnNumRound);
+-        } else if (columnNum == 256) {
+-            RowsumSPECTILE256(
+-                lsUbTensor[sUbOffset],
+-                llUbTensor[rowOffset],
+-                tvUbTensor,
+-                rowNumCurLoopRound,
+-                columnNum,
+-                columnNumRound);
+-        } else {
+-            RowsumTAILTILE(
+-                lsUbTensor[sUbOffset],
+-                llUbTensor[rowOffset],
+-                tvUbTensor,
+-                rowNumCurLoopRound,
+-                columnNum,
+-                columnNumRound);
+-        }
++        // Use the same 64-column reduction order for full and tail KV tiles.
++        // The specialized 256/512 trees associate partial sums differently,
++        // so a causal prefix can change when future masked keys are appended.
++        RowsumTAILTILE(
++            lsUbTensor[sUbOffset], llUbTensor[rowOffset], tvUbTensor,
++            rowNumCurLoopRound, columnNum, columnNumRound);
+     }

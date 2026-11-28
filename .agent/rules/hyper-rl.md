@@ -6,7 +6,6 @@ paths:
   - hyper_parallel/models/qwen3/**
   - tests/ut/rl/**
   - hyper_parallel/rl/tests/st/**
-  - tests/common/rl_st_cases.py
   - docs/rl-*.md
   - .agent/rules/hyper-rl.md
   - .agent/rules/rl/module-map.md
@@ -72,8 +71,9 @@ Read the affected product contract rather than every RL document.
   Create a document only when a stable contract cannot fit an existing owner.
 - For feature or boundary changes, consult [design goals](../../hyper_parallel/rl/docs/design.md), describe the approach,
   interfaces, edge cases, affected files and validation, and obtain approval once before implementing.
-- UT belongs in `tests/ut/rl/`; ST in `hyper_parallel/rl/tests/st/`; shared recipes in `tests/common/rl_st_cases.py`.
-  UT must not depend on the standalone ST directory. `conftest.py` also collects `agentic_ut.py`.
+- UT belongs in `tests/ut/rl/`; ST in `hyper_parallel/rl/tests/st/`, including ST recipes and runner helpers.
+  Product UT must run without the standalone ST directory. Run the ST harness self-checks explicitly from a checkout.
+  `conftest.py` also collects `agentic_ut.py`.
   Follow [testing](testing.md), [UT rules](unit-test.md) and the [UT guide](../skills/add-unit-test/SKILL.md).
   ST launchers must not import Torch/HyperParallel during collection.
 - Run affected tests and report failures or unrun checks. Broaden coverage for shared contracts or unresolved concerns;

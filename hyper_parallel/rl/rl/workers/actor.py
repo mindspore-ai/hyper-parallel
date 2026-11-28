@@ -29,6 +29,7 @@ from rl.distillation.config import DistillationConfig
 from rl.data.contracts import ExperienceBatch
 from rl.workers.input.dp_balance import balance_experience
 from rl.workers.input.batching import equalize_batch_count, plan_token_batches, select_experience_rows
+from rl.workers.adapters.context_parallel import compute_cp_token_log_probs, slice_cp_targets, gather_cp_log_probs
 from rl.workers.adapters.router_replay import RouterReplay
 from rl.weight_sync.sync import synchronized_call
 from rl.utils.monitoring.metrics import (
@@ -138,6 +139,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         sequences: torch.Tensor,
         attention_mask: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
+        *, cp_local: bool = False,
     ) -> torch.Tensor:
         """Compute next-token probabilities, optionally selecting actions on capable models.
 
@@ -145,6 +147,32 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         """
         if tuple(attention_mask.shape) != tuple(sequences.shape):
             raise ValueError("attention_mask must align with sequences")
+        length = sequences.shape[1]
+        multiple = getattr(self.actor_model, "unified_sequence_multiple", 1)
+        padding = (-length) % multiple
+        if padding:
+            sequences = functional.pad(sequences, (0, padding))
+            attention_mask = functional.pad(attention_mask, (0, padding))
+            if action_mask is not None:
+                action_mask = functional.pad(action_mask, (0, padding))
+        cp_mesh = getattr(self.actor_model, "unified_cp_mesh", None)
+        if cp_mesh is not None:
+            result = compute_cp_token_log_probs(self.actor_model, sequences, attention_mask, cp_mesh)
+            if cp_local:
+                return result
+            return gather_cp_log_probs(result, cp_mesh)[:, :length - 1]
+        result = self._model_log_probs(sequences, attention_mask, action_mask)
+        return result[:, :length - 1] if padding else result
+
+    def _model_log_probs(
+        self, sequences: torch.Tensor, attention_mask: torch.Tensor,
+        action_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the model on prepared rows; caller restores original token coordinates."""
+        model_kwargs = {}
+        if getattr(self.actor_model, "unified_sequence_multiple", 1) > 1:
+            # SP embeddings shorten the local sequence; RoPE needs global positions.
+            model_kwargs["position_ids"] = torch.arange(sequences.shape[1], device=sequences.device).unsqueeze(0)
         if getattr(self.actor_model, "supports_token_log_probs", False):
             selected_kwargs = {}
             if action_mask is not None and getattr(self.actor_model, "supports_token_log_probs_mask", False):
@@ -155,6 +183,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 use_cache=False,
                 return_token_log_probs=True,
                 **selected_kwargs,
+                **model_kwargs,
             )
             if (not isinstance(log_probs, torch.Tensor) or log_probs.dtype != torch.float32
                     or tuple(log_probs.shape) != (sequences.shape[0], sequences.shape[1] - 1)):
@@ -164,6 +193,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             input_ids=sequences,
             attention_mask=attention_mask,
             use_cache=False,
+            **model_kwargs,
         )
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         next_token_ids = sequences[:, 1:]
@@ -194,10 +224,12 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         return sequences, attention_mask, kwargs, padded_length
 
     def _experience_log_probs(
-        self, experience: ExperienceBatch, start: int, end: int, *, trim: bool = False,
+        self, experience: ExperienceBatch, start: int, end: int, *, trim: bool = False, cp_local: bool = False,
     ) -> torch.Tensor:
         """Trim selected-output micro-batches while retaining the batch's probability shape."""
         sequences, attention_mask, kwargs, padded_length = self._micro_batch_inputs(experience, start, end, trim=trim)
+        if cp_local and getattr(self.actor_model, "unified_cp_mesh", None) is not None:
+            return self.sequence_log_probs(sequences, attention_mask, cp_local=True, **kwargs)
         log_probs = self.sequence_log_probs(sequences, attention_mask, **kwargs)
         padding = padded_length - sequences.shape[1]
         return functional.pad(log_probs, (0, padding)) if padding else log_probs
@@ -289,13 +321,32 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         reference = experience.reference_log_probs
         optional = {}
         if experience.rollout_is_weights is not None:
-            optional["policy_loss_weights"] = experience.rollout_is_weights[start:end]
+            optional["policy_loss_weights"] = self._local_targets(experience.rollout_is_weights[start:end])
         return self.algorithm.compute_actor_loss(
             current_log_probs=current, old_log_probs=old,
-            reference_log_probs=None if reference is None else reference[start:end],
-            advantages=experience.advantages[start:end], action_mask=experience.loss_action_mask[start:end],
+            reference_log_probs=None if reference is None else self._local_targets(reference[start:end]),
+            advantages=self._local_targets(experience.advantages[start:end]),
+            action_mask=self._local_targets(experience.loss_action_mask[start:end]),
             **optional,
         )
+
+    def _local_targets(self, value: torch.Tensor) -> torch.Tensor:
+        """Keep existing CP1 loss inputs or select this CP rank's aligned targets."""
+        cp_mesh = getattr(self.actor_model, "unified_cp_mesh", None)
+        if cp_mesh is None:
+            return value
+        return slice_cp_targets(value, cp_mesh, self.actor_model.unified_sequence_multiple)
+
+    def _cp_metrics(self, metrics: ActorMicroBatchMetrics) -> ActorMicroBatchMetrics:
+        """Sum local numerators once across CP before the existing logical-DP statistics."""
+        cp_mesh = getattr(self.actor_model, "unified_cp_mesh", None)
+        if cp_mesh is None:
+            return metrics
+        names = ("total_loss_sum", "policy_loss_sum", "kl_loss_sum", "old_policy_kl_sum",
+                 "log_ratio_abs_sum", "clipped_token_count")
+        values = torch.stack([getattr(metrics, name).float() for name in names])
+        dist.all_reduce(values, group=cp_mesh.get_group())
+        return replace(metrics, **dict(zip(names, values.unbind())))
 
     def forward_backward(
         self,
@@ -322,15 +373,18 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 raise ValueError("Sequence loss requires 0 < global_sequences <= global_tokens")
             normalizer = global_sequences
         with self._router_scope(experience, start, end):
-            current_log_probs = self._experience_log_probs(experience, start, end)
+            current_log_probs = self._experience_log_probs(experience, start, end, cp_local=True)
             anchor_log_probs = experience.old_log_probs
             if self.distillation is not None and self.distillation.enabled:
                 anchor_log_probs = experience.rollout_log_probs
-            old_log_probs = anchor_log_probs[start:end].detach()
-            action_mask = experience.loss_action_mask[start:end]
+            old_log_probs = self._local_targets(anchor_log_probs[start:end]).detach()
+            action_mask = self._local_targets(experience.loss_action_mask[start:end])
             output = self._micro_batch_loss(experience, current_log_probs, old_log_probs, start, end)
             total_loss_sum = output.total_loss_sum
-            scaled_loss = total_loss_sum / normalizer * self._dp_size
+            cp_mesh = getattr(self.actor_model, "unified_cp_mesh", None)
+            # HP FSDP averages over DP x CP; each local loss owns distinct CP tokens.
+            loss_domain_size = self._dp_size * (cp_mesh.size() if cp_mesh is not None else 1)
+            scaled_loss = total_loss_sum / normalizer * loss_domain_size
             if self.distillation is not None and self.distillation.enabled:
                 opd_loss = compute_opd_loss(current_log_probs, old_log_probs,
                                             experience.teacher_log_probs[start:end], action_mask, self.distillation)
@@ -342,13 +396,17 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                                       action_mask, experience.teacher_keys[start:end])
             is_finite = self._loss_is_finite(scaled_loss, current_log_probs, action_mask,
                                             synchronize="off_policy_anchor_version" in experience.metadata)
+            if cp_mesh is not None:
+                finite = torch.tensor(int(is_finite), device=current_log_probs.device, dtype=torch.int32)
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=cp_mesh.get_group())
+                is_finite = bool(finite.item())
             if not is_finite:
                 raise RuntimeError(
                     f"Non-finite {self.algorithm.name} loss detected on response slice "
                     f"[{start}:{end}]"
                 )
             scaled_loss.backward()
-        return ActorMicroBatchMetrics(
+        return self._cp_metrics(ActorMicroBatchMetrics(
             total_loss_sum=total_loss_sum.detach(),
             policy_loss_sum=output.policy_loss_sum.detach(),
             kl_loss_sum=output.regularization_loss_sum.detach(),
@@ -358,7 +416,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             ).flatten().sum(dim=0),
             clipped_token_count=output.clipped_token_count.detach(),
             clipped_sequence_count=output.clipped_sequence_count,
-        )
+        ))
 
     def update(self, experience: ExperienceBatch) -> ActorUpdateMetrics:
         """Run policy epochs, optimizer steps, and metric finalization."""

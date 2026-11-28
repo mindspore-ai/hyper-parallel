@@ -124,14 +124,6 @@ Edit local source directly during development; subsequent runs mount the updated
 
 ## 🚀 Quick Start
 
-Full eight-device single-turn GSM8K training defaults to the [50-step recipe and direct launch command](examples/gsm8k/README.md#run-training).
-Both use 6,400 training questions, 500 validation questions, and 128 questions × 8 candidates per step; generation-phase offload and the 0.8/256 inference acceleration settings are enabled by default.
-The latest 8×32 GiB single-turn and Codex runs both completed 50 steps, with strict validation rewards of 94.4% and 93.0%, respectively.
-The historical 8×64 GiB verl result was 91.4%; it predates the sampling fix and used different hardware/runtime, so it cannot establish performance differences under identical configurations.
-See the [GSM8K example](examples/gsm8k/README.md#training-recipes) for training recipes and launch instructions. The pinned 32 GiB verl recipe still lacks full acceptance.
-
-The single-step entry points below are functional checks, each retaining its own device count and short-run budget.
-
 After [environment setup](#installation-and-environment), run either example from the repository root. Replace host paths, use a complete Qwen3-4B checkpoint and tokenizer, and select idle, healthy devices with `npu-smi info`. Run sequentially when sharing devices.
 
 <!-- markdownlint-disable-next-line MD033 -->
@@ -139,21 +131,9 @@ After [environment setup](#installation-and-environment), run either example fro
 
 ### Example 1: Basic Qwen Training
 
-**Qwen3-4B + GSM8K, four-device single-step synchronous GRPO.** The data directory must contain `train.parquet` and `test.parquet`; each row uses `prompt` and `extra_info`, with the answer in `extra_info`. See the [data reader](rl/data/prompts.py) for parsing rules.
-
-```bash
-export HYPER_QWEN3_TP_MODEL_ROOT=/absolute/path/to/Qwen3-4B
-export HYPER_QWEN3_TP_DATA_ROOT=/absolute/path/to/gsm8k
-export HYPER_QWEN3_TP_RESULT_ROOT=/absolute/path/to/results/qwen
-export HYPER_QWEN3_TP_VISIBLE_DEVICES=0,1,2,3
-export HYPER_QWEN3_TP_TRAINER_TP=2
-export HYPER_QWEN3_TP_ROLLOUT_TP=2
-export HYPER_QWEN3_TP_MAX_STEPS=1
-export HYPER_QWEN3_TP_IMPLEMENTATION=native
-export HYPER_QWEN3_TP_WEIGHT_SYNC_STRATEGY=full_gather
-
-./hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_tp_docker.sh colocated
-```
+The [Qwen3-4B GSM8K example](examples/gsm8k/README.md#run-training) provides native and unified eight-device GRPO launch commands. Both use 6,400 training questions, 128 questions × 8 responses per step, and 500 validation questions. At step 50, native scored 94.4% and unified scored 93.0%. See the [measured rewards and timing](examples/gsm8k/README.md#50-step-results) for the two runs.
+An earlier separate Codex run reached 93.0%. The historical 8×64 GiB verl run reached 91.4% on its original runtime. The pinned 32 GiB verl recipe still awaits full acceptance.
+Append `--train.max_steps=1` to either launch command for a one-step check.
 
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="agentic-example"></a>
@@ -342,14 +322,13 @@ Each direction requires complete recipes, learning results, and resource-cost co
 ## System Tests
 
 RL system tests reside in `hyper_parallel/rl/tests/st/` and are temporarily outside the main project's `tests/torch/` gate.
-The six real-NPU scenarios and their original acceptance criteria remain; a passing main-project gate does not prove these scenarios ran.
-Shared recipes remain in `tests/common/rl_st_cases.py` for UT and standalone ST.
+The case recipes, launcher and result checks live alongside the system tests. Run the CPU checks for this harness explicitly from a checkout.
 
 Run these commands from the repository root:
 
 ```bash
 # CPU self-checks: no model training or NPU jobs.
-python -m pytest -q hyper_parallel/rl/tests/st/test_st_runtime.py hyper_parallel/rl/tests/st/test_st_support.py
+python -m pytest -q tests/ut/rl/utils/st_harness_checks.py
 
 # Run real ST explicitly only after resources are ready.
 python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
@@ -420,9 +399,6 @@ If you use HyperParallel-RL, cite the software below and record the commit used 
 See [runtime architecture](docs/architecture.md#rayless-asynchronous-grpo) for the
 single-node Qwen3 dense scope, launch entry, publication and recovery contracts.
 GSM8K, Search and SWE-Smith recipes live in `examples/fully_async/configs/`.
-The core contains five files, with a 1100 physical-line budget checked by
-`python -m pytest hyper_parallel/rl/tests/st/test_async_core_budget.py -q`.
-Shared helpers, examples and tests are counted separately. The synchronous loop remains independent.
 
 ## Colocated Asynchronous GRPO
 

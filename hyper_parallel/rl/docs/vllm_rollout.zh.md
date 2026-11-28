@@ -17,7 +17,6 @@ full_gather 将 GroupedExperts 切片还原为逐专家 checkpoint 权重，通�
 ### MoE R3 路由重放
 
 `train.router_replay.mode: R3` 启用 expert capture 和 Actor replay，默认 `disabled`。
-继续限制为现有 eager/raw-logprob/拓扑组合；不改变 Agent 预算或睡眠级别。
 详细范围见 [MoE 指南](moe_code_agent.zh.md#moe-r3)。
 
 ## Ownership

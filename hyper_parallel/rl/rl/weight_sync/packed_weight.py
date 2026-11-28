@@ -251,22 +251,22 @@ def _unpack_canonical_experts(tensor: Any, experts: list[Mapping[str, Any]]) -> 
         starts, lengths = expert["starts"], expert["shape"]
         name = str(expert["name"])
         _validate_expert_slice(tensor, starts, lengths, name)
-        if (name in names or starts[1] != 0 or lengths[1] != tensor.shape[1]
-                or starts[2] != ends[starts[0]]):
+        if (name in names or starts[2] != 0 or lengths[2] != tensor.shape[2]
+                or starts[1] != ends[starts[0]]):
             raise ValueError("Canonical expert slices must cover storage exactly once with unique names")
         names.add(name)
-        ends[starts[0]] += lengths[2]
+        ends[starts[0]] += lengths[1]
         region = tensor[tuple(slice(start, start + size) for start, size in zip(starts, lengths))]
-        weights.append((name, region.squeeze(0).transpose(0, 1)))
-    if any(end != tensor.shape[2] for end in ends):
+        weights.append((name, region.squeeze(0)))
+    if any(end != tensor.shape[1] for end in ends):
         raise ValueError("Canonical expert slices do not cover storage")
     return weights
 
 
 def _unpack_canonical_rows(tensor: Any, rows: list[Mapping[str, Any]]) -> list[tuple[str, Any]]:
-    """Restore canonical matrices from explicit disjoint physical row ranges."""
-    if tensor.ndim != 2 or not rows:
-        raise ValueError("Canonical row conversion requires a matrix and non-empty ranges")
+    """Restore canonical weight matrices or bias vectors from physical row ranges."""
+    if tensor.ndim not in (1, 2) or not rows:
+        raise ValueError("Canonical row conversion requires a matrix or vector and non-empty ranges")
     grouped = {}
     source_end = 0
     for row in sorted(rows, key=lambda item: int(item["source_start"])):

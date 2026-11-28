@@ -32,6 +32,26 @@ from torch._C._distributed_c10d import ProcessGroup
 from torch.distributed import _functional_collectives
 
 
+def _resolve_functional_collective(operation, *, autograd=True):
+    """Prefer the current API name while retaining older Torch support."""
+    suffix = "_autograd" if autograd else ""
+    collective = getattr(_functional_collectives, f"{operation}_single{suffix}", None)
+    if collective is None:
+        collective = getattr(_functional_collectives, f"{operation}_single", None)
+    if collective is None:
+        collective = getattr(_functional_collectives, f"{operation}_tensor{suffix}", None)
+    if collective is None:
+        raise RuntimeError(f"Torch lacks a functional {operation}{suffix} API")
+    return collective
+
+
+# Resolve before tracing; inference avoids autograd-only ops without Meta kernels.
+_functional_all_gather = _resolve_functional_collective("all_gather")
+_functional_reduce_scatter = _resolve_functional_collective("reduce_scatter")
+_functional_all_gather_forward = _resolve_functional_collective("all_gather", autograd=False)
+_functional_reduce_scatter_forward = _resolve_functional_collective("reduce_scatter", autograd=False)
+
+
 def get_group_local_rank(group: Optional[ProcessGroup] = None) -> int:
     """Return the current rank's index within ``group``, or 0 before init.
 
@@ -402,11 +422,33 @@ def differentiable_all_gather_concat(data: Tensor, group, concat_size: int, conc
             for tensor in dist_func.all_gather(data, group=group)
         ]
         return torch.cat(output, dim=concat_dim)
-    # Torch 2.14 functional collectives provide autograd and tracing-aware waits.
     if not -data.ndim <= concat_dim < data.ndim:
         raise IndexError("All-gather concatenation dimension is out of range")
     concat_dim %= data.ndim
-    return _functional_collectives.all_gather_single(data, concat_dim, group)
+    if hasattr(_functional_collectives, "all_gather_single"):
+        return _functional_collectives.all_gather_single(data, concat_dim, group)
+    # Older Torch needs an explicit autograd API and gather-on-zero reshape.
+    # Functional all-gather only reliably supports gather_dim=0; for other dims we
+    # gather on dim 0 then reshape to avoid _maybe_view_chunk_cat view() bugs
+    # in Dynamo fake tensor tracing.
+    group_size = dist.get_world_size(group)
+    gather = _functional_all_gather if torch.is_grad_enabled() else _functional_all_gather_forward
+    gathered = gather(data, 0, group)
+    if hasattr(gathered, 'wait'):
+        gathered = gathered.wait()
+    if concat_dim == 0:
+        return gathered
+    # Reshape from [group_size * d0, d1, ...] to [d0 * group_size, d1, ...]
+    # by moving the group_size factor from dim 0 to concat_dim.
+    orig_shape = list(data.shape)
+    gathered_shape = [orig_shape[0] * group_size] + orig_shape[1:]
+    gathered = gathered.view(gathered_shape)
+    # Move group_size from dim 0 to concat_dim via unflatten + movedim + flatten
+    unflattened = gathered.unflatten(0, (group_size, orig_shape[0]))
+    moved = torch.movedim(unflattened, 0, concat_dim)
+    result_shape = list(orig_shape)
+    result_shape[concat_dim] *= group_size
+    return moved.reshape(result_shape).contiguous()
 
 
 def differentiable_all_to_all_single(input_tensor: Tensor, input_splits: Sequence[int],
@@ -461,7 +503,17 @@ def differentiable_all_reduce(data: Tensor, op: Union[str, Any], group) -> Tenso
     # Eager: use legacy autograd API. Compile/graph-trace: use functional collectives.
     if not _is_tracing_or_compiling():
         return dist_func.all_reduce(data, op=reduce_op, group=group)
-    return _functional_collectives.all_reduce(data, _reduce_op_to_str(reduce_op), group)
+    # Compile: use functional collective API for torch.compile compatibility.
+    # _functional_collectives.all_reduce expects a string reduceOp and a ProcessGroup.
+    if isinstance(op, str):
+        # Avoid hashing ReduceOp enums while tracing the normal string-op path.
+        op_name = {
+            "sum": "sum", "prod": "product", "max": "max", "min": "min",
+            "all": "min", "avg": "sum", "mean": "avg" if hasattr(dist.ReduceOp, "AVG") else "sum",
+        }.get(op, "sum")
+    else:
+        op_name = _reduce_op_to_str(reduce_op)
+    return _functional_collectives.all_reduce(data, op_name, group)
 
 
 def differentiable_reduce_scatter(data: Tensor, dev_num: int, axis: int,
@@ -482,9 +534,20 @@ def differentiable_reduce_scatter(data: Tensor, dev_num: int, axis: int,
             output_tensor = output_tensor / dev_num
         return output_tensor
 
-    result = _functional_collectives.reduce_scatter_single(data, _reduce_op_to_str(reduce_op), axis, group)
+    if hasattr(_functional_collectives, "reduce_scatter_single"):
+        result = _functional_collectives.reduce_scatter_single(data, _reduce_op_to_str(reduce_op), axis, group)
+        return result / dev_num if isinstance(op, str) and op == "avg" else result
+    # The legacy autograd API supports SUM; string 'avg' uses SUM then divides below.
+    # ReduceOp equality/hash methods are not traceable in older Dynamo versions.
+    supported = op in ("sum", "avg") if isinstance(op, str) else op is dist.ReduceOp.SUM
+    if not supported:
+        raise ValueError("Compiled differentiable reduce-scatter supports only sum or string 'avg'")
+    scatter = _functional_reduce_scatter if torch.is_grad_enabled() else _functional_reduce_scatter_forward
+    result = scatter(data, "sum", axis, group)
+    if hasattr(result, 'wait'):
+        result = result.wait()
     # 'avg' maps to SUM in _OP_MAP, so the division stays manual.
-    if op == 'avg':
+    if isinstance(op, str) and op == 'avg':
         result = result / dev_num
     return result
 

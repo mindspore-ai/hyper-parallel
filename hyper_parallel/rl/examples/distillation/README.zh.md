@@ -64,7 +64,7 @@ RL 的 [materialization 适配](../../rl/workers/engine/materialization.py) 通�
 并可能在较大位置改变 BF16 cos/sin。
 注册在分片与 `to_empty` 前完成，覆盖 checkpoint 加载与随机初始化；重复注册不会改变公共类或其他模型实例。
 无需修改 `hyper_parallel/core` 或 `hyper_parallel/models`。
-相关实例隔离与 HF RoPE 对照测试位于 [RL 内的 materialization 测试](../../tests/ut/test_materialization.py)。
+相关实例隔离与 HF RoPE 对照测试位于 [RL materialization 单测](../../../../tests/ut/rl/trainer/test_materialization.py)。
 蒸馏示例使用 native-vLLM，并独立记录 rollout 与训练端重算概率。旧 bit-exact 门禁已删除；Teacher 概率有效性门禁继续阻止无效更新与发布。
 重放通过不替代训练、发布与 checkpoint 验收，默认使用资源需求更低的单 rank 配方。
 
@@ -151,7 +151,7 @@ Qwen3 与 Qwen3.8 的词表和 token ID 不同，不能通过复制 tokenizer �
 
 ## 验证与恢复
 
-`PYTHONPATH=hyper_parallel/rl python -m pytest -q hyper_parallel/rl/tests/ut/test_materialization.py`
+`PYTHONPATH=hyper_parallel/rl python -m pytest -q tests/ut/rl/trainer/test_materialization.py`
 检查原生 HF 频率、cos/sin、重复 materialization 与实例隔离。
 
 ```bash

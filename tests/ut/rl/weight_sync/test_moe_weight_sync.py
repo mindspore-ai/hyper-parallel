@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 import torch
 
-from rl.weight_sync.model_adapter import ModelWeightAdapter, _native_expert_descriptions
+from rl.weight_sync.model_adapter import ModelWeightAdapter, _native_expert_descriptions, rollout_tensor_descriptions
 from rl.weight_sync import vllm_worker
 from rl.weight_sync.ipc import IPCWeightTransport, PhysicalRolloutWorker
 from rl.weight_sync.packed_weight import PackedWeight, unpack_packed_weights
@@ -42,7 +42,7 @@ class TestMoEWeightSync(unittest.TestCase):
         self.adapter = ModelWeightAdapter(registration)
         self.adapter.bind_source(SimpleNamespace(config=self.config))
         self.name = "model.layers.0.mlp.experts.gate_up_proj"
-        self.value = torch.arange(48, dtype=torch.float32).reshape(2, 3, 8)
+        self.value = torch.arange(48, dtype=torch.float32).reshape(2, 8, 3)
         self.metadata = self.adapter.packed_metadata([
             PackedWeight(self.name, "float32", tuple(self.value.shape), 4).worker_metadata(),
         ])
@@ -53,16 +53,16 @@ class TestMoEWeightSync(unittest.TestCase):
         for expert in range(2):
             for projection, offset in (("gate", 0), ("up", 4)):
                 name = f"model.layers.0.mlp.experts.{expert}.{projection}_proj.weight"
-                torch.testing.assert_close(actual[name], self.value[expert, :, offset:offset + 4].T)
+                torch.testing.assert_close(actual[name], self.value[expert, offset:offset + 4, :])
 
         down_name = "model.layers.0.mlp.experts.down_proj"
-        down = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+        down = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
         metadata = self.adapter.packed_metadata([
             PackedWeight(down_name, "float32", tuple(down.shape), 4).worker_metadata(),
         ])
         weights = dict(unpack_packed_weights(down.view(torch.uint8).flatten(), metadata))
         for expert in range(2):
-            torch.testing.assert_close(weights[f"model.layers.0.mlp.experts.{expert}.down_proj.weight"], down[expert].T)
+            torch.testing.assert_close(weights[f"model.layers.0.mlp.experts.{expert}.down_proj.weight"], down[expert])
 
     def test_invalid_expert_slices_fail(self) -> None:
         """Missing, duplicate and out-of-bounds expert metadata cannot silently load."""
@@ -145,3 +145,18 @@ class TestMoEWeightSync(unittest.TestCase):
         layer = SimpleNamespace(ep_size=2, tp_size=1, tp_rank=0, expert_map=torch.tensor([0, 0]))
         with self.assertRaisesRegex(ValueError, "uniquely"):
             _native_expert_descriptions("model.layers.0.mlp.experts.w13_weight", self.value, layer, self.config)
+
+    def test_nested_native_experts_keep_checkpoint_names(self) -> None:
+        """vLLM 0.30 nests physical storage; the Actor still publishes global HF expert IDs."""
+        prefix = "model.layers.0.mlp.experts"
+        owner_name = f"{prefix}.routed_experts"
+        parallel = SimpleNamespace(ep_size=2, tp_size=1, tp_rank=0)
+        owner = SimpleNamespace(moe_config=SimpleNamespace(moe_parallel_config=parallel),
+                                expert_map=torch.tensor([-1, 0]))
+        model = SimpleNamespace(named_modules=lambda: [(owner_name, owner)], named_parameters=lambda: [
+            (f"{owner_name}.w13_weight", self.value[:1].transpose(1, 2).contiguous()), (f"{owner_name}.w2_weight", torch.zeros(1, 4, 3)),
+        ])
+        config = SimpleNamespace(**vars(self.config), model_type="qwen3_moe", vocab_size=16)
+        descriptions = rollout_tensor_descriptions(model, config, tp_rank=0, tp_size=2)
+        self.assertEqual({item["name"] for item in descriptions},
+                         {f"{prefix}.1.{projection}_proj.weight" for projection in ("gate", "up", "down")})

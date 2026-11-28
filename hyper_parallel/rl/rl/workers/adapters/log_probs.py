@@ -115,5 +115,6 @@ def bind_token_log_probs(model: nn.Module, *, chunk_size: int = 512) -> None:
 
     _commit_forward_rewrite(_ForwardRewriteRequest(
         model, token_log_probs_forward,
-        companion_attrs={"supports_token_log_probs": True, "supports_token_log_probs_mask": True},
+        companion_attrs={"supports_token_log_probs": True, "supports_token_log_probs_mask": True,
+                         "_rl_token_log_probs_forward": token_log_probs_forward},
     ))

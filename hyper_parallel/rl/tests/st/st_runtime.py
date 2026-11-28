@@ -31,17 +31,11 @@ import uuid
 import pytest
 import yaml
 
-from tests.common import rl_st_cases
+from .st_cases import EXAMPLES, Case, prepare_config
 from .st_evidence import validate_phase, validate_sessions
 
-Case = rl_st_cases.Case
-CASES = rl_st_cases.CASES
-AGENT_INSTRUCTIONS = rl_st_cases.AGENT_INSTRUCTIONS
-EXAMPLES = rl_st_cases.EXAMPLES
-prepare_config = rl_st_cases.prepare_config
-
-ROOT = Path(__file__).resolve().parents[4]
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[3]
 BASE_IMAGE = "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64"
 DEFAULT_RESULT_ROOT = ROOT / "hyper_parallel/rl/output"
 

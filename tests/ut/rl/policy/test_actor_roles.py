@@ -92,7 +92,7 @@ def test_actor_runtime_distinguishes_trainable_and_reference_roles() -> None:
     assert built_reference is reference_model
     assert model_builder.kwargs == {
         "distributed_setup": "distributed",
-        "activation_checkpoint": "full",
+        "activation_checkpoint": runtime.activation_checkpoint,
         "peft_config": "peft",
     }
     assert built_optimizer is optimizer

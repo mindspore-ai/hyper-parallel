@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Pure single-node runtime, DP, and TP topology mapping for vLLM rollout."""
+"""Single-node worker ownership and explicit HP-to-vLLM parallel topology."""
 
-__all__ = ["VLLMRolloutTopology", "resolve_vllm_rollout_topology"]
+__all__ = ["VLLMRolloutTopology", "resolve_vllm_rollout_topology",
+           "model_parallel_size", "worker_tensor_parallel_size"]
 
 
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ def _visible_rollout_devices(
 ) -> tuple[str, ...]:
     """Validate and return the rollout's physical device IDs."""
     data_parallel_size, tensor_parallel_size = parallel_sizes
-    rollout_device_count = data_parallel_size * tensor_parallel_size
+    rollout_device_count = data_parallel_size * model_parallel_size(config)
     if deployment == "colocated":
         if "visible_devices" in config:
             raise ValueError(
@@ -74,7 +75,8 @@ def _visible_rollout_devices(
         if rollout_device_count != trainer_world_size:
             raise ValueError(
                 "Colocated rollout devices must match the Trainer world: "
-                f"dp={data_parallel_size}, tp={tensor_parallel_size}, "
+                f"dp={data_parallel_size}, pcp={_parallel_axis(config, 'context_parallel_size')}, "
+                f"tp={tensor_parallel_size}, "
                 f"world_size={trainer_world_size}"
             )
         training_devices = _device_ids(
@@ -93,7 +95,7 @@ def _visible_rollout_devices(
     rollout_devices = _device_ids(config.get("visible_devices"), "rollout.vllm.visible_devices")
     if len(rollout_devices) != rollout_device_count:
         raise ValueError(
-            "Disjoint rollout requires DP x TP devices: "
+            "Disjoint rollout requires DP x PCP x TP devices: "
             f"expected={rollout_device_count}, got={rollout_devices}"
         )
     return rollout_devices
@@ -113,7 +115,7 @@ def resolve_vllm_rollout_topology(
     if deployment not in ("colocated", "disjoint"):
         raise ValueError(f"Unsupported rollout deployment {deployment!r}")
     data_parallel_size, tensor_parallel_size = _parallel_sizes(config)
-    rollout_device_count = data_parallel_size * tensor_parallel_size
+    rollout_device_count = data_parallel_size * model_parallel_size(config)
     default_trainer_world_size = rollout_device_count if deployment == "colocated" else 1
     trainer_rank = int(environment.get("LOCAL_RANK", "0"))
     trainer_world_size = int(
@@ -154,6 +156,31 @@ def resolve_vllm_rollout_topology(
         host=host,
         port=configured_port,
     )
+
+
+def _parallel_axis(config: Mapping[str, object], field: str) -> int:
+    size = config.get(field, 1)
+    if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+        raise ValueError(f"rollout.vllm.{field} must be a positive integer")
+    return size
+
+
+def worker_tensor_parallel_size(config: Mapping[str, object]) -> int:
+    """Keep TP independent of the extra workers used by prefill CP."""
+    if _parallel_axis(config, "pipeline_parallel_size") != 1:
+        raise ValueError("rollout.vllm.pipeline_parallel_size must be 1; PP rollout is not integrated")
+    if _parallel_axis(config, "decode_context_parallel_size") != 1:
+        raise ValueError("rollout.vllm.decode_context_parallel_size must be 1; DCP is not integrated")
+    if _parallel_axis(config, "context_parallel_size") not in (1, 2, 4):
+        raise ValueError("rollout.vllm.context_parallel_size supports PCP1/PCP2/PCP4 only")
+    if _parallel_axis(config, "context_parallel_size") > 1 and config.get("model_implementation") != "unified":
+        raise ValueError("rollout PCP requires model_implementation=unified")
+    return _parallel_axis(config, "tensor_parallel_size")
+
+
+def model_parallel_size(config: Mapping[str, object]) -> int:
+    """Return the supported per-replica worker count."""
+    return worker_tensor_parallel_size(config) * _parallel_axis(config, "context_parallel_size")
 
 
 def _parallel_sizes(config: Mapping[str, object]) -> tuple[int, int]:

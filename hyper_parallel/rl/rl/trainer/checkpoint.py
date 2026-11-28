@@ -22,7 +22,6 @@ import os
 import pickle
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -371,10 +370,8 @@ class RLCheckpointManager:
         self.run_synchronized("checkpoint model save", save_model_state)
         del checkpoint_state
 
-        def save_rank_state(owner_rank: int) -> None:
-            """Persist runtime state only on the synchronized owner rank."""
-            if dist.get_rank() != owner_rank:
-                return
+        def save_rank_state() -> None:
+            """Write this rank's optimizer and runtime state to its own directory."""
             rank_state = {
                 "cpu_rng": torch.get_rng_state(),
                 "device_rng": self.resources.device_handle.get_rng_state(self.resources.device),
@@ -396,13 +393,8 @@ class RLCheckpointManager:
                 use_collectives=False,
             )
 
-        # Pickling optimizer tensors creates full CPU copies. Bound the peak to
-        # one rank's runtime state instead of duplicating every rank concurrently.
-        for owner_rank in range(dist.get_world_size()):
-            self.run_synchronized(
-                f"checkpoint rank-state save rank={owner_rank}",
-                partial(save_rank_state, owner_rank),
-            )
+        # Each rank writes independently. Publish the manifest after all writes succeed.
+        self.run_synchronized("checkpoint rank-state save", save_rank_state)
         self._write_metadata(checkpoint_dir, state)
         self._last_saved_step = step
 

@@ -102,3 +102,27 @@ class TestDifferentiableCollectives(unittest.TestCase):
         torch.testing.assert_close(actual_gather, torch.cat((inputs, inputs), dim=1))
         torch.testing.assert_close(actual_scatter, inputs[:, :2])
         torch.testing.assert_close(actual_reduce, inputs * 2)
+
+    def test_legacy_gather_layout_and_grad_mode(self):
+        """On older Torch, gather rank rows on axis zero and reconstruct the requested axis."""
+        value = torch.arange(6.).reshape(2, 3).requires_grad_()
+
+        def gather_rows(local, axis, group):
+            del group
+            return torch.cat((local, local + 10), dim=axis)
+
+        training, inference = Mock(side_effect=gather_rows), Mock(side_effect=gather_rows)
+        legacy = SimpleNamespace(all_gather_tensor_autograd=training, all_gather_tensor=inference)
+        with patch.object(communication, "_functional_collectives", legacy), \
+                patch.object(communication, "_is_tracing_or_compiling", return_value=True), \
+                patch.object(communication.dist, "get_world_size", return_value=2):
+            # Resolve the legacy API even when the installed Torch provides the new names.
+            with patch.multiple(communication,
+                                _functional_all_gather=communication._resolve_functional_collective("all_gather"),
+                                _functional_all_gather_forward=communication._resolve_functional_collective(
+                                    "all_gather", autograd=False)):
+                for enabled, selected in ((True, training), (False, inference)):
+                    with self.subTest(grad=enabled), torch.set_grad_enabled(enabled):
+                        result = communication.differentiable_all_gather_concat(value, "tp", 2, 1)
+                        selected.assert_called_once_with(value, 0, "tp")
+                        torch.testing.assert_close(result, torch.cat((value, value + 10), dim=1))

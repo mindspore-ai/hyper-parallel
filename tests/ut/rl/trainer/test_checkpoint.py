@@ -624,10 +624,10 @@ def test_resume_rejects_historical_or_unknown_schema(tmp_path, schema):
 
 
 @pytest.mark.parametrize("rank", [0, 1, 3])
-def test_rank_runtime_serialization_has_one_owner_per_synchronized_phase(
+def test_ranks_write_their_own_runtime_in_one_synchronized_phase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank: int,
 ) -> None:
-    """Large optimizer serialization cannot overlap across training ranks."""
+    """Every rank writes once to its own directory in the shared save phase."""
     manager, _ = _manager(tmp_path)
     phases = []
     saves = []
@@ -649,43 +649,36 @@ def test_rank_runtime_serialization_has_one_owner_per_synchronized_phase(
     monkeypatch.setattr(checkpoint_backend, "dcp_save", save)
     manager.save(SimpleNamespace(global_step=1, epoch=0, consumed_samples=8, consumed_tokens=16))
 
-    expected_phases = [f"checkpoint rank-state save rank={owner}" for owner in range(4)]
     observed_phases = [phase for phase in phases if phase.startswith("checkpoint rank-state save")]
-    assert observed_phases == expected_phases, f"Expected {expected_phases}, got {observed_phases}"
+    assert observed_phases == ["checkpoint rank-state save"], f"Unexpected phases: {observed_phases}"
     assert len(saves) == 1, f"Expected one rank-local serialization, got {len(saves)}"
     operation, directory, restored = saves[0]
-    assert operation == expected_phases[rank], f"Expected {expected_phases[rank]}, got {operation}"
+    assert operation == "checkpoint rank-state save", f"Unexpected save phase: {operation}"
     assert directory == manager.directory(1) / f"rank_{rank}", f"Unexpected runtime directory {directory}"
     assert restored["optimizer"] == {"value": "optimizer-live"}, f"Unexpected optimizer {restored}"
     assert restored["scheduler"] == {"value": "scheduler-live"}, f"Unexpected scheduler {restored}"
 
 
-def test_rank_runtime_failure_aborts_before_later_owners_and_completion(
+def test_rank_runtime_failure_prevents_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed owner cannot publish completion or let later ranks serialize."""
+    """An unsuccessful retry must leave no completion marker."""
     manager, _ = _manager(tmp_path)
-    phases = []
-    monkeypatch.setattr(checkpoint_backend.dist, "get_rank", lambda: 2)
+    marker = manager.directory(1) / "checkpoint_complete.json"
+    marker.parent.mkdir()
+    marker.touch()
+    monkeypatch.setattr(checkpoint_backend.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(checkpoint_backend.dist, "get_world_size", lambda: 4)
     monkeypatch.setattr(checkpoint_backend, "SkipDTensorDispatch", MagicMock)
 
-    def synchronize(operation: str, callback: Any) -> None:
-        phases.append(operation)
-        callback()
-
-    def save(_state: dict[str, Any], **kwargs: Any) -> None:
+    def save(state: dict[str, Any], **kwargs: Any) -> None:
+        del state
         if not kwargs["use_collectives"]:
             raise OSError("runtime write failed")
 
-    manager.run_synchronized = synchronize
     monkeypatch.setattr(checkpoint_backend, "dcp_save", save)
     with pytest.raises(OSError, match="runtime write failed"):
         manager.save(SimpleNamespace(global_step=1, epoch=0, consumed_samples=8, consumed_tokens=16))
 
-    expected_phases = [f"checkpoint rank-state save rank={owner}" for owner in range(3)]
-    observed_phases = [phase for phase in phases if phase.startswith("checkpoint rank-state save")]
-    assert observed_phases == expected_phases, f"Expected {expected_phases}, got {observed_phases}"
-    marker = manager.directory(1) / "checkpoint_complete.json"
     assert not marker.exists(), f"Failed save unexpectedly published {marker}"
     assert manager._last_saved_step is None, f"Failed save recorded step {manager._last_saved_step}"
