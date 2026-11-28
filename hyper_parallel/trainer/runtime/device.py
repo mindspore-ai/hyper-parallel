@@ -14,6 +14,8 @@
 
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
 
+# This file keeps its upstream copyright header.
+# pylint: disable=missing-apache-license-header
 """Trainer-side runtime device API.
 
 Split out of the former ``auto_models/components/utils/device.py`` in stage 7
@@ -37,6 +39,8 @@ __all__ = [
     "stream_synchronize",
     "empty_cache",
     "set_device",
+    "simulate_device_runtime",
+    "is_device_runtime_simulated",
     "get_device_rng_state",
     "set_device_rng_state",
     "is_nccl_backend",
@@ -47,10 +51,21 @@ __all__ = [
 ]
 
 import logging
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 
+# Logical-simulation mode: when enabled (by the dry-run tool before it drives
+# real Trainer code over FakeTensors), every device-side effect in this module
+# becomes a no-op so the process never binds an accelerator, initializes its
+# runtime, or appears on device tooling. Pure queries (device type, flags)
+# stay live — simulation intentionally reports the real accelerator topology.
+# The switch is shared with core components (activation swap, optimizer swap,
+# FSDP offload) so they consult the same process-wide simulation state.
+from hyper_parallel.tools.dryrun.simulation import (
+    is_device_runtime_simulated,
+    simulate_device_runtime,
+)
 from hyper_parallel.models.build_options import (
     IS_CUDA_AVAILABLE,
     IS_NPU_AVAILABLE,
@@ -78,12 +93,16 @@ def get_dist_comm_backend() -> str:
 
 
 def synchronize() -> None:
-    """Execute torch synchronize operation."""
+    """Execute the accelerator synchronize operation."""
+    if is_device_runtime_simulated():
+        return
     get_torch_device().synchronize()
 
 
 def stream_synchronize() -> None:
     """Execute device stream synchronize operation."""
+    if is_device_runtime_simulated():
+        return
     if IS_CUDA_AVAILABLE:
         torch.cuda.current_stream().synchronize()
     elif IS_NPU_AVAILABLE:
@@ -93,12 +112,20 @@ def stream_synchronize() -> None:
 
 
 def empty_cache() -> None:
-    """Execute torch empty cache operation."""
+    """Execute the accelerator empty cache operation."""
+    if is_device_runtime_simulated():
+        return
     get_torch_device().empty_cache()
 
 
 def set_device(device: torch.types.Device) -> None:
-    """Execute set device operation."""
+    """Execute set device operation.
+
+    Args:
+        device: Device the process should bind to.
+    """
+    if is_device_runtime_simulated():
+        return
     get_torch_device().set_device(device)
 
 
@@ -129,7 +156,7 @@ def set_device_rng_state(state: Any) -> None:
     set_rng_state(state)
 
 
-def is_nccl_backend(backend: str | None = None) -> bool:
+def is_nccl_backend(backend: Optional[str] = None) -> bool:
     """Check if the distributed communication backend is NCCL."""
     return (backend or get_dist_comm_backend()) == "nccl"
 
@@ -139,7 +166,9 @@ def is_hccl_backend() -> bool:
     return get_dist_comm_backend() == "hccl"
 
 
-def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -> int:
+def get_gpu_compute_capability(
+        device: Optional[Union[torch.types.Device, int]] = None,
+) -> int:
     """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU."""
     if not IS_CUDA_AVAILABLE:
         return 0

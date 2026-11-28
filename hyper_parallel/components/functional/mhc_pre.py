@@ -14,6 +14,7 @@
 # ============================================================================
 """Manifold hyper-connection pre-processing functions."""
 
+import importlib
 from typing import Any, Optional, Tuple
 
 import torch
@@ -93,6 +94,70 @@ class _MhcPre(torch.autograd.Function):
         return tuple(grads)
 
 
+class _CannMhcPre(torch.autograd.Function):
+    """Autograd bridge routing CANN mhc_pre_sinkhorn through the PyTorch dispatcher."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        phi: torch.Tensor,
+        alpha: torch.Tensor,
+        bias: torch.Tensor,
+        num_stream: int,
+        sinkhorn_iters: int,
+        hc_eps: float,
+        norm_eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Invoke the registered CANN mhc_pre_sinkhorn dispatcher op."""
+        # Keep the optional CANN extension out of CPU/non-CANN imports.
+        importlib.import_module("cann_ops_transformer.ops.mhc_pre_sinkhorn")
+
+        hin, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out = (
+            torch.ops.cann_ops_transformer.mhc_pre_sinkhorn(
+                x, phi, alpha, bias, num_stream, sinkhorn_iters, hc_eps, norm_eps, True
+            )
+        )
+        ctx.save_for_backward(
+            x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out, norm_out
+        )
+        ctx.hc_eps = hc_eps
+        return hin, h_post, h_res
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_hin: torch.Tensor,
+        grad_h_post: torch.Tensor,
+        grad_h_res: torch.Tensor,
+    ) -> tuple:
+        """Invoke the registered CANN mhc_pre_sinkhorn_backward dispatcher op."""
+        # Keep the optional CANN extension out of CPU/non-CANN imports.
+        importlib.import_module("cann_ops_transformer.ops.mhc_pre_sinkhorn_backward")
+
+        x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out, norm_out = (
+            ctx.saved_tensors
+        )
+        grad_x, grad_phi, grad_alpha, grad_bias = (
+            torch.ops.cann_ops_transformer.mhc_pre_sinkhorn_backward(
+                grad_hin,
+                grad_h_post,
+                grad_h_res,
+                x,
+                phi,
+                alpha,
+                bias,
+                h_pre,
+                hc_before_norm,
+                inv_rms,
+                sum_out,
+                norm_out,
+                ctx.hc_eps,
+            )
+        )
+        return grad_x, grad_phi, grad_alpha, grad_bias, None, None, None, None
+
+
 def _cann_mhc_pre(
     x: torch.Tensor,
     phi: torch.Tensor,
@@ -110,14 +175,9 @@ def _cann_mhc_pre(
     into the projection as a differentiable ``phi * gamma`` product; autograd
     then keeps the phi and gamma gradients exact.
     """
-    # The package is optional and is needed only for this selected CANN path.
-    from cann_ops_transformer.ops import (  # pylint: disable=import-outside-toplevel
-        mhc_pre_sinkhorn,
-    )
-
     if gamma is not None:
         phi = phi * gamma.reshape(1, -1).to(phi.dtype)
-    hin, h_post, h_res = mhc_pre_sinkhorn(
+    hin, h_post, h_res = _CannMhcPre.apply(
         x, phi, alpha, bias, num_stream, sinkhorn_iters, hc_eps, norm_eps
     )
     # The operator returns the flattened [.., N*N] residual matrix while the

@@ -31,6 +31,8 @@ from torch import Tensor
 from torch._C._distributed_c10d import ProcessGroup
 from torch.distributed import _functional_collectives
 
+from hyper_parallel.tools.dryrun.simulation import simulated_accelerator
+
 
 def _resolve_functional_collective(operation, *, autograd=True):
     """Prefer the current API name while retaining older Torch support."""
@@ -87,6 +89,26 @@ def get_device_handle(device_type: str = "npu"):
     except AttributeError as e:
         raise RuntimeError(f"Failed to resolve device handle: 'torch.{device_type}'.") from e
     return handle
+
+
+def comm_device_type(backend: Optional[str]) -> Optional[str]:
+    """Return the device type a collective backend stages on, if any.
+
+    Collective backends run on accelerator devices; CPU-offload paths stage
+    scalars and buffers on the backend's device before the collective. Under
+    logical simulation the group is a fake backend and the simulated
+    accelerator plays that role, so simulated runs allocate communication
+    buffers where real runs do.
+
+    Args:
+        backend: Collective backend name (``nccl``/``hccl``/``fake``/...).
+
+    Returns:
+        Device type name (``cuda``/``npu``), or ``None`` for backends with no
+        accelerator staging target (``gloo``, ``None``, or a fake backend with
+        no simulated accelerator).
+    """
+    return {"nccl": "cuda", "hccl": "npu", "fake": simulated_accelerator()}.get(backend)
 
 
 def get_world_size() -> int:

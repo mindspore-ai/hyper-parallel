@@ -53,6 +53,24 @@ def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
         dst.copy_(src)
 
 
+def _same_storage_location(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Return whether two tensors start at the same storage location.
+
+    Args:
+        left: First tensor to compare.
+        right: Second tensor to compare.
+
+    Returns:
+        Whether both tensors address the same storage bytes.
+    """
+    if hasattr(left, "fake_mode") or hasattr(right, "fake_mode"):
+        # Dry-run path: FakeTensors share no address, so compare storage objects.
+        return left.untyped_storage() is right.untyped_storage()
+    # Real path: the address includes the storage offset, so views at different
+    # offsets within one storage are told apart.
+    return left.data_ptr() == right.data_ptr()
+
+
 @dataclass
 class ReduceScatterCommCtx:
     """Per-parameter reduce-scatter output and asynchronous work."""
@@ -921,11 +939,10 @@ class HSDPParamV2:
         """Return whether communication storage already aliases the local tensor."""
         if not isinstance(self._sharded_param_data, torch.Tensor):
             return False
-        sharded_data_ptr = self._sharded_param_data.untyped_storage().data_ptr()
+        # Storage identity keeps empty shards and FakeTensors distinct.
         return (
-            # Empty shards may have a zero data pointer and must still be rebuilt.
-            sharded_data_ptr > 0
-            and sharded_data_ptr == local_tensor.untyped_storage().data_ptr()
+            self._sharded_param_data.untyped_storage()
+            is local_tensor.untyped_storage()
         )
 
     def _validate_reset_local_tensor(
@@ -1035,7 +1052,7 @@ class HSDPParamV2:
         local_tensor_data = self.sharded_param._local_tensor.data
         if (
             sharded_param_data.device != local_tensor_data.device
-            or sharded_param_data.data_ptr() != local_tensor_data.data_ptr()
+            or not _same_storage_location(sharded_param_data, local_tensor_data)
         ):
             local_tensor_data.requires_grad_(self.sharded_param.requires_grad)
             # TensorImpl keeps storage_ptr, storage_offset, sizes, strides, dtype and metadatas

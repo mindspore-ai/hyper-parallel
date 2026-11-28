@@ -21,6 +21,7 @@ __all__ = [
     "get_stream_context",
     "get_current_stream",
     "new_event",
+    "record_stream",
     "no_grad",
     "preserve_version_counter",
     "cat",
@@ -33,30 +34,68 @@ __all__ = [
     "register_full_backward_pre_hook",
 ]
 
+from typing import Any
+
 import torch
 from torch import Tensor
 
 from hyper_parallel.core.utils.communication import get_device_handle
+from hyper_parallel.tools.dryrun.simulation import (
+    hold_for_simulated_stream,
+    is_device_runtime_simulated,
+    simulated_device_handle,
+)
+
+
+def _stream_owner():
+    """Return the namespace owning streams and events for this process.
+
+    Under logical simulation the process never binds an accelerator, so stream
+    and event primitives come from the simulated handle: every transfer then
+    completes in host program order, which preserves the storage lifecycle the
+    swap state machine expresses while dropping only device-side overlap.
+    """
+    if is_device_runtime_simulated():
+        return simulated_device_handle()
+    return get_device_handle()
 
 
 def new_stream():
     """Create a new device stream on the current accelerator."""
-    return get_device_handle().Stream()
+    return _stream_owner().Stream()
 
 
 def get_stream_context():
-    """Return the stream context manager (``torch.npu.stream`` / ``torch.cuda.stream``)."""
-    return get_device_handle().stream
+    """Return the device stream context manager (``npu.stream`` / ``cuda.stream``)."""
+    return _stream_owner().stream
 
 
 def get_current_stream():
     """Return the current device stream."""
-    return get_device_handle().current_stream()
+    return _stream_owner().current_stream()
 
 
 def new_event():
     """Create a new device event on the current accelerator."""
-    return get_device_handle().Event()
+    return _stream_owner().Event()
+
+
+def record_stream(tensor: Tensor, stream: Any) -> None:
+    """Reserve ``tensor``'s storage for ``stream`` until its pending work ends.
+
+    Under simulation the reference is held until the next simulated wait —
+    the same point a real caching allocator could first reclaim it — so the
+    logical lifetime of staging buffers is conservative, never shorter than
+    the real one.
+
+    Args:
+        tensor: Tensor whose storage the stream will read.
+        stream: Stream that reads the storage asynchronously.
+    """
+    if is_device_runtime_simulated():
+        hold_for_simulated_stream(tensor)
+        return
+    tensor.record_stream(stream)
 
 
 def no_grad():
@@ -75,12 +114,24 @@ def cat(tensors, dim=0):
 
 
 def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
-    """Allocate an uninitialized tensor shaped like *tensor*."""
+    """Allocate an uninitialized tensor shaped like *tensor*.
+
+    Args:
+        tensor: Tensor whose shape, dtype and layout are matched.
+        dtype: Optional override of the result dtype.
+        device: Optional override of the result device.
+        pin_memory: Request pinned host memory.
+    """
     return torch.empty_like(tensor, dtype=dtype, device=device, pin_memory=pin_memory)
 
 
 def tree_map(fn, tree):
-    """Apply *fn* to every leaf of *tree* and rebuild the same structure."""
+    """Apply *fn* to every leaf of *tree* and rebuild the same structure.
+
+    Args:
+        fn: Callable applied to each leaf.
+        tree: Nested structure of tensors and containers.
+    """
     return torch.utils._pytree.tree_map(fn, tree)  # pylint: disable=W0212
 
 
@@ -90,7 +141,14 @@ def get_element_size(tensor) -> int:
 
 
 def alloc_tensor_buffer(numel: int, dtype, device="cpu", pin_memory: bool = False):
-    """Allocate an uninitialized 1-D tensor buffer."""
+    """Allocate an uninitialized 1-D tensor buffer.
+
+    Args:
+        numel: Number of elements to allocate.
+        dtype: Element type of the buffer.
+        device: Device to allocate on.
+        pin_memory: Request pinned host memory.
+    """
     if pin_memory:
         return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
     return torch.empty(numel, dtype=dtype, device=device)

@@ -17,7 +17,7 @@
 
 import copy
 import functools
-from typing import Any, NamedTuple, Optional, Sequence
+from typing import Any, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 import torch.distributed as dist
@@ -101,7 +101,7 @@ def _calculate_mesh_coordinate_for_rank(
 
 def _infer_tensor_dimension_slice(
     global_size: int,
-    tensor_mapping: int | Sequence[int],
+    tensor_mapping: Union[int, Sequence[int]],
     mesh_shape: Sequence[int],
     mesh_coordinate: Sequence[int],
     uneven_shard_mesh_dims: set[int],
@@ -316,12 +316,17 @@ class Layout:
         return self._process_alias_layout(obj, alias_tensor_map)
 
     def __deepcopy__(self, memo):
-        """Deep copy layout without rebuilding the underlying device mesh."""
+        """Deep copy layout without rebuilding the underlying device mesh.
+
+        ``_mesh`` is shared by identity: a DeviceMesh is process-wide topology
+        (created once, never mutated in place) and deep-copying it would clone
+        its mesh tensor and process-group bookkeeping on every layout copy.
+        """
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
         for k, v in self.__dict__.items():
-            setattr(result, k, copy.deepcopy(v, memo))
+            setattr(result, k, v if k == "_mesh" else copy.deepcopy(v, memo))
         return result
 
     @staticmethod

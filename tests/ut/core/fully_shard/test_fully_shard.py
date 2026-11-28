@@ -29,12 +29,14 @@ from unittest.mock import patch, MagicMock
 import numpy as np
 import torch
 from torch import nn
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.weak import WeakIdKeyDictionary
 
 from hyper_parallel.core.fully_shard.hsdp_param import (
     HSDPParamV2,
     _copy_without_bumping_version,
+    _same_storage_location,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, clear_device_mesh_cache
@@ -456,6 +458,23 @@ class TestHSDPParamV2(unittest.TestCase):
 
         mock_preserve.assert_called_once_with(dst)
         dst.copy_.assert_called_once_with(src)
+
+    def test_same_storage_location_distinguishes_offsets(self):
+        """Views of one storage at different offsets are different locations."""
+        base = torch.empty(8)
+
+        self.assertTrue(_same_storage_location(base, base))
+        self.assertFalse(_same_storage_location(base[0:4], base[4:8]))
+
+    def test_same_storage_location_compares_fake_tensors_by_storage(self):
+        """FakeTensors carry no address, so storage identity decides."""
+        with FakeTensorMode():
+            tensor = torch.empty(4)
+            alias = tensor.view(4)
+            other = torch.empty(4)
+
+        self.assertTrue(_same_storage_location(tensor, alias))
+        self.assertFalse(_same_storage_location(tensor, other))
 
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.dtensor.layout.Layout')

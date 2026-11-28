@@ -91,21 +91,38 @@ class TestPipelinedMhcPost(unittest.TestCase):
                         inputs = [DTensor.from_local(value, mesh, placements) for value in local]
                         kernel = Mock(side_effect=lambda residual, combine, output, post:
                                       _post_formula(output, residual, post, combine))
-                        ops = ModuleType("cann_ops_transformer.ops")
-                        ops.mhc_post = kernel
-                        package = ModuleType("cann_ops_transformer")
-                        package.ops = ops
+
+                        def _post_backward(grad_output, residual, combine, output, post):
+                            with torch.enable_grad():
+                                r_arg = residual.detach().requires_grad_()
+                                c_arg = combine.detach().requires_grad_()
+                                o_arg = output.detach().requires_grad_()
+                                p_arg = post.detach().requires_grad_()
+                                out = _post_formula(o_arg, r_arg, p_arg, c_arg)
+                                return torch.autograd.grad(out, (r_arg, c_arg, o_arg, p_arg), grad_output)
+
+                        cann_ns = SimpleNamespace(
+                            mhc_post=kernel,
+                            mhc_post_backward=Mock(side_effect=_post_backward),
+                        )
+                        fwd_mod = ModuleType("cann_ops_transformer.ops.mhc_post")
+                        bwd_mod = ModuleType("cann_ops_transformer.ops.mhc_post_backward")
 
                         with ExitStack() as stack:
                             if fused:
                                 stack.enter_context(patch.dict(sys.modules, {
-                                    "cann_ops_transformer": package, "cann_ops_transformer.ops": ops,
+                                    "cann_ops_transformer.ops.mhc_post": fwd_mod,
+                                    "cann_ops_transformer.ops.mhc_post_backward": bwd_mod,
                                 }))
+                                stack.enter_context(patch.object(
+                                    torch.ops, "cann_ops_transformer", cann_ns, create=True,
+                                ))
                                 stack.enter_context(patch.object(
                                     torch.Tensor, "device", property(lambda _: SimpleNamespace(type="npu")),
                                 ))
                             first = pipelined_mhc_post(*inputs)
                             second = pipelined_mhc_post(inputs[0], first, inputs[2], inputs[3])
+                            second.to_local().square().sum().backward()
 
                         reference_inputs = [value.clone().requires_grad_() for value in values]
                         reference_first = _post_formula(*reference_inputs)
@@ -118,7 +135,6 @@ class TestPipelinedMhcPost(unittest.TestCase):
                             self.assertEqual(actual.placements, placements)
                             self.assertEqual(actual.shape, expected.shape)
                             torch.testing.assert_close(actual.to_local(), expected[interval])
-                        second.to_local().square().sum().backward()
                         reference_second[interval].square().sum().backward()
                         for value, reference in zip(local, reference_inputs):
                             torch.testing.assert_close(value.grad, reference.grad[interval])

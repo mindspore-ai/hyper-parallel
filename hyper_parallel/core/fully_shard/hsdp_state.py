@@ -35,6 +35,7 @@ from hyper_parallel.core.fully_shard.utils import (
 )
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.param_group import HSDPParamGroup, AllReduceParamGroup
+from hyper_parallel.tools.dryrun.simulation import is_device_runtime_simulated
 
 logger = get_logger("FSDP")
 
@@ -639,6 +640,10 @@ class HSDPStateV2:
 
     def _sync_current_stream_if_needed(self, need_synchronize):
         if need_synchronize:
+            if is_device_runtime_simulated():
+                # Logical simulation: the D2H grad copy completed in program
+                # order; there is no device stream to drain.
+                return
             if self.device.type == "npu":
                 torch.npu.current_stream().synchronize()
             elif self.device.type == "cuda":

@@ -47,15 +47,15 @@ class TestMhcPost(unittest.TestCase):
         h_post = torch.randn(B, S, N)
         h_res = torch.randn(B, S, N, N)
         mixed = torch.randn(B, S, N, C)
-        ops = ModuleType("cann_ops_transformer.ops")
-        ops.mhc_post = Mock(return_value=mixed)
-        package = ModuleType("cann_ops_transformer")
-        package.ops = ops
-        with patch.dict(sys.modules, {"cann_ops_transformer": package, "cann_ops_transformer.ops": ops}), \
+        cann_mod = ModuleType("cann_ops_transformer.ops.mhc_post")
+        cann_ns = Mock()
+        cann_ns.mhc_post = Mock(return_value=mixed)
+        with patch.dict(sys.modules, {"cann_ops_transformer.ops.mhc_post": cann_mod}), \
+                patch.object(torch.ops, "cann_ops_transformer", cann_ns, create=True), \
                 _fake_npu_device():
             result = mhc_post(block_output, residual, h_post, h_res, N)
 
-        args = ops.mhc_post.call_args.args
+        args = cann_ns.mhc_post.call_args.args
         self.assertEqual(args[0].shape, (B, S, N, C))
         self.assertIs(args[1], h_res)
         self.assertIs(args[2], block_output)
