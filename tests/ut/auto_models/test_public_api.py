@@ -203,6 +203,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("max_in_flight_gb", "0.25"),
                 ("offload_budget_gb", "64.0"),
                 ("offload_prefetch_n_layers", "1"),
+                ("dvm", "False"),
             ],
         )
 

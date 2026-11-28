@@ -36,6 +36,7 @@ __all__ = [
     "GradientReduction",
     "PP_SCHEDULES",
     "INDUCTOR_MODES",
+    "INDUCTOR_BACKENDS",
     "DP_MODES",
     "AC_MODES",
     "ACTIVATION_SWAP_MODES",
@@ -62,6 +63,12 @@ PP_SCHEDULES = ("gpipe", "1f1b", "interleaved_1f1b", "vpp")
 #                side-effectful nodes stay eager (see InductorPass)
 #   "full"     - compile the whole joint graph as one Inductor region
 INDUCTOR_MODES = ("off", "regional", "full")
+
+# Inductor backend selection for terminal compilation. ``default`` keeps the
+# running torch/torch_npu device backend; ``dvm`` requires torch_npu's DVM
+# Inductor backend to have been selected via ``TORCHINDUCTOR_NPU_BACKEND=dvm``
+# before torch_npu was imported.
+INDUCTOR_BACKENDS = ("default", "dvm")
 
 # Schedule names that can drive multiple virtual stages per physical rank.
 _INTERLEAVED_SCHEDULES = ("interleaved_1f1b", "vpp")
@@ -247,6 +254,13 @@ class PassConfig:
             compiles each stage's forward/backward subgraph
             independently (both modes); cross-stage fusion is inherently
             impossible because the schedule's P2P sits between the stages.
+        inductor_backend: Inductor backend to use for terminal compilation, one
+            of ``INDUCTOR_BACKENDS``. ``"default"`` keeps the running
+            torch/torch_npu device backend. ``"dvm"`` selects torch_npu's DVM
+            backend and requires ``inductor_mode`` to be ``"regional"`` or
+            ``"full"``, torch >= 2.10, and ``TORCHINDUCTOR_NPU_BACKEND=dvm``
+            set before ``torch_npu`` is imported. Graph mode only declares DVM
+            support for torch 2.10+; older builds keep the default backend.
         inductor_configs: Optional Inductor config overrides passed to the
             compiled regions (keys validated by ``torch._inductor.config``),
             e.g. ``{"reorder_for_peak_memory": True}``. ``"full"`` mode
@@ -324,6 +338,7 @@ class PassConfig:
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
     inductor_mode: str = "off"
+    inductor_backend: str = "default"
     inductor_configs: Optional[Dict[str, Any]] = None
     ac_mode: str = "off"
     ac_layer_count: Optional[int] = None
@@ -540,6 +555,19 @@ class PassConfig:
         # Canonicalize to one spelling so the pass's mode dispatch cannot be
         # defeated by an accepted-but-unnormalized value like "FULL".
         self.inductor_mode = self.inductor_mode.lower()
+        if not isinstance(self.inductor_backend, str) or (
+            self.inductor_backend.lower() not in INDUCTOR_BACKENDS
+        ):
+            raise ValueError(
+                f"inductor_backend must be one of {INDUCTOR_BACKENDS}, "
+                f"got {self.inductor_backend!r}"
+            )
+        self.inductor_backend = self.inductor_backend.lower()
+        if self.inductor_backend == "dvm" and self.inductor_mode == "off":
+            raise ValueError(
+                "inductor_backend='dvm' requires inductor_mode='regional' or "
+                "'full'; DVM is a terminal Inductor backend"
+            )
         if self.inductor_configs is not None and (
             not isinstance(self.inductor_configs, dict)
             or not all(isinstance(key, str) for key in self.inductor_configs)
@@ -744,7 +772,8 @@ def build_pass_config_from_trainer_config(
     The graph-only ``compile.offload_budget_gb`` and
     ``compile.offload_prefetch_n_layers`` knobs are projected too, so Trainer
     YAML can tune the offload budget instead of being pinned to the 64 GiB
-    default.
+    default. ``compile.dvm`` selects the DVM Inductor backend and upgrades the
+    terminal pass to ``regional`` mode; see ``PassConfig.inductor_backend``.
 
     Args:
         config: Trainer topology (e.g. a ``TrainerConfig``); only the
@@ -774,6 +803,11 @@ def build_pass_config_from_trainer_config(
         getattr(config, "activation_checkpoint", None)
     )
 
+    dvm_enabled = getattr(compile_config, "dvm", False)
+    if dvm_enabled is None:
+        dvm_enabled = False
+    if not isinstance(dvm_enabled, bool):
+        raise ValueError(f"compile.dvm must be a bool, got {dvm_enabled!r}")
     return PassConfig(
         enable_overlap=enable_overlap,
         fsdp_enabled=fsdp_enabled,
@@ -788,6 +822,8 @@ def build_pass_config_from_trainer_config(
             compile_config, "fsdp_overlap_grad_reduce", True
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
+        inductor_mode="regional" if dvm_enabled else "off",
+        inductor_backend="dvm" if dvm_enabled else "default",
         ac_mode=ac_mode,
         ac_layer_count=None,
         ac_layer_indices=ac_layer_indices,

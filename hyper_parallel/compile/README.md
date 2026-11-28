@@ -271,6 +271,60 @@ pass_config = PassConfig(
 )
 ```
 
+The terminal pass may also use torch_npu's DVM Inductor backend. DVM graph
+mode is only declared for **torch >= 2.10** and requires
+`TORCHINDUCTOR_NPU_BACKEND=dvm` to be set **before** `torch`, `torch_npu`, or
+`hyper_parallel` are imported:
+
+```bash
+export TORCHINDUCTOR_NPU_BACKEND=dvm
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_dvm   # optional
+```
+
+```python
+pass_config = PassConfig(inductor_mode="regional", inductor_backend="dvm")
+```
+
+```yaml
+compile:
+  enabled: true
+  use_joint_graph: true
+  dvm: true            # projects to inductor_mode="regional" + backend="dvm"
+```
+
+`compile.dvm` is joint-graph only: the trainer rejects it unless
+`compile.enabled` and `compile.use_joint_graph` are both true.
+
+- `regional` is the supported pairing: collectives, the FSDP reshard storage
+  free, and `ao::` offload transfers stay eager region boundaries, so DVM
+  fuses compute runs without absorbing communication scheduling. `full` is
+  accepted but not recommended: it also tags collectives, which DVM usually
+  falls back on.
+- `TORCHINDUCTOR_NPU_BACKEND=dvm` selects the backend at `torch_npu` import
+  time; it cannot be switched per `GraphCompiler` after the process started.
+  `GraphCompiler.compile()` validates the loaded backend before tracing or
+  partitioning so a misconfigured run fails on a retry-safe state.
+- DVM only fuses the operators in its own registry (pointwise, reduce,
+  matmul, casts). Unsupported operators fall back to the regular NPU
+  Inductor/MLIR path; fallback groups need `torch_mlir`, and collectives
+  remain eager in `regional` mode.
+- `standalone_compile` forces `autotune_at_compile_time=True`, but torch_npu
+  registers the DVM import only in the autotune call block, which runs after
+  kernel definitions. HyperParallel hoists `from torch_npu._inductor import dvm`
+  into the autotune defs header so DVM builder decorators can resolve `dvm`.
+  The same scope starts with torch's `AsyncCompile`, which lacks the NPU
+  `import_fx` used by MLIR fallback kernels; HyperParallel rebinds it to
+  torch_npu's `CustomAsyncCompile`. This workaround depends on private
+  torch_npu modules: if they or `CustomAsyncCompile` are missing,
+  HyperParallel logs a warning and leaves that part of the codegen unpatched.
+- On torch 2.7 / 2.9, graph-mode DVM is unavailable because
+  `torch.fx.passes.regional_inductor` does not exist. Use eager DVM instead
+  (`TORCH_NPU_LAZY_FUSION=True`, with `inductor_mode="off"`), or upgrade to
+  torch >= 2.10.
+- Dynamic joint graphs are supported by the same constraints as Inductor
+  compilation; symbolic matmul/reduce shapes are subject to DVM's own
+  per-operator rules and must be validated on the target SoC.
+
 **FsdpOverlapPass** (independent FSDP graph controls):
 
 - `fsdp_allgather_prefetch=True` prefetches tagged parameter all-gathers in
@@ -523,7 +577,9 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   `torch.fx.passes.regional_inductor` (newer than 2.9; the supported 2.6 /
   2.7 / 2.9 builds do not). On older builds the pass logs a warning, leaves
   the graph untouched and records `inductor_compiled="unavailable"` instead of
-  raising. Compiled regions are keyed to the traced static input shapes —
+  raising. This is also why graph-mode DVM is declared only for torch >= 2.10:
+  a requested DVM backend raises on older builds instead of silently using
+  eager fallback. Compiled regions are keyed to the traced static input shapes —
   exactly like stock
   `torch.compile` static tracing; dynamic-shape graphs keep working (Inductor
   compiles the symbolic graph with its own guards), but the combination is

@@ -93,6 +93,7 @@ class TestBuildOptionsValidation(unittest.TestCase):
             (CompileConfig, {"backend": ""}, ValueError, "backend"),
             (CompileConfig, {"options": []}, TypeError, "options"),
             (CompileConfig, {"max_in_flight_gb": -1}, ValueError, "max_in_flight_gb"),
+            (CompileConfig, {"dvm": True}, ValueError, "joint-graph"),
             (FSDP2Config, {"wrapper_class": ["not valid"]}, ValueError, "wrapper_class"),
             (FSDP2Config, {"reshard_after_forward": 1}, TypeError, "reshard_after_forward"),
             (FSDP2MixedPrecisionConfig, {"custom_params": []}, ValueError, "custom_params"),
@@ -106,6 +107,8 @@ class TestBuildOptionsValidation(unittest.TestCase):
         for config, options, error, message in cases:
             with self.subTest(options=options), self.assertRaisesRegex(error, message):
                 config(**options)
+        joint = CompileConfig(enabled=True, use_joint_graph=True, dvm=True)
+        self.assertTrue(joint.dvm)
         with self.assertRaisesRegex(TypeError, "requires a mapping"):
             ModelBuildOptions.from_dict([])
         precision = FSDP2MixedPrecisionConfig(custom_params={"weight": {"param_dtype": "float32"}})
@@ -139,6 +142,7 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("max_in_flight_gb", "0.25"),
                 ("offload_budget_gb", "64.0"),
                 ("offload_prefetch_n_layers", "1"),
+                ("dvm", "False"),
             ],
         )
 
@@ -180,6 +184,8 @@ class TestBuildOptionsFields(unittest.TestCase):
             CompileConfig(enabled=1)
         with self.assertRaisesRegex(TypeError, "compile.use_joint_graph must be a bool"):
             CompileConfig(use_joint_graph=1)
+        with self.assertRaisesRegex(TypeError, "compile.dvm must be a bool"):
+            CompileConfig(dvm=1)
         with self.assertRaisesRegex(ValueError, "compile.mode"):
             CompileConfig(mode="  ")
         with self.assertRaisesRegex(ValueError, "compile.options"):

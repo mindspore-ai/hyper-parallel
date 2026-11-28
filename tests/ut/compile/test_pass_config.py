@@ -208,6 +208,33 @@ class TestPassConfigValidation(unittest.TestCase):
             cfg.validate()
 
 
+class TestPassConfigInductorBackend(unittest.TestCase):
+    """``inductor_backend`` validation and its Inductor-mode pairing."""
+
+    def test_defaults_to_default_backend(self):
+        """Test the default backend leaves terminal compilation opt-in."""
+        cfg = PassConfig()
+        self.assertEqual(cfg.inductor_backend, "default")
+        self.assertEqual(cfg.inductor_mode, "off")
+
+    def test_accepts_and_canonicalizes_dvm(self):
+        """Test the DVM backend is accepted alongside a compiling mode."""
+        for mode in ("regional", "full"):
+            cfg = PassConfig(inductor_mode=mode, inductor_backend="DVM")
+            self.assertEqual(cfg.inductor_backend, "dvm")
+            self.assertEqual(cfg.inductor_mode, mode)
+
+    def test_rejects_unknown_backend(self):
+        """Test an unknown backend spelling raises ValueError."""
+        with self.assertRaisesRegex(ValueError, "inductor_backend"):
+            PassConfig(inductor_mode="regional", inductor_backend="akg")
+
+    def test_dvm_requires_compiling_inductor_mode(self):
+        """Test the DVM backend cannot be paired with ``inductor_mode='off'``."""
+        with self.assertRaisesRegex(ValueError, "inductor_mode"):
+            PassConfig(inductor_backend="dvm")
+
+
 class TestPassConfigTorchFree(unittest.TestCase):
     """The dataclass must not import torch at module top.
 
