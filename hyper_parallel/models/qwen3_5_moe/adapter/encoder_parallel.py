@@ -30,7 +30,7 @@ from hyper_parallel import HSDPModule
 from hyper_parallel.distributed.context_parallel.collectives import ulysses_head_to_seq, ulysses_seq_to_head
 from hyper_parallel.distributed.encoder_parallel.attention import current_encoder_attention_context
 from hyper_parallel.distributed.encoder_parallel.contracts import (
-    EncoderParallelAdapterSpec, EncoderSegment, EncoderWorkItem,
+    EncoderLocalInputs, EncoderParallelAdapterSpec, EncoderSegment, EncoderWorkItem,
 )
 from hyper_parallel.models.replacement import module_replacement
 
@@ -96,7 +96,8 @@ def replace_vision_attention(*, module: nn.Module, module_fqn: str, context: Map
 class QwenVisionBridge:
     """Bind the native patch embedding, vision blocks and spatial merger."""
 
-    input_fields = ("pixel_values", "image_grid_thw")
+    payload_field = "pixel_values"
+    input_fields = (payload_field, "image_grid_thw")
 
     def __init__(self, model: nn.Module) -> None:
         """Bind the native visual subtree without registering duplicate parameters."""
@@ -105,6 +106,12 @@ class QwenVisionBridge:
         self.merge_size = self.vision.spatial_merge_size
         self.image_token_id = model.config.image_token_id
         self.feature_context = ContextVar("qwen_encoder_features", default=None)
+
+    @property
+    def empty_payload_shape(self) -> tuple[int]:
+        """Return the flattened width of one Qwen image patch."""
+        config = self.vision.config
+        return (config.in_channels * config.temporal_patch_size * config.patch_size ** 2,)
 
     @property
     def head_counts(self) -> dict[str, int]:
@@ -161,25 +168,45 @@ class QwenVisionBridge:
         if batch.get("pixel_values_videos") is not None or batch.get("video_grid_thw") is not None:
             raise NotImplementedError("Qwen encoder parallel currently supports images, not videos")
 
-    @staticmethod
-    def _validate_image_payload(pixels: torch.Tensor, grids: torch.Tensor) -> None:
+    def _validate_image_payload(self, pixels: torch.Tensor, grids: torch.Tensor) -> None:
         """Check flattened image patches and integer grid metadata."""
         if not torch.is_tensor(pixels) or not torch.is_tensor(grids) or pixels.ndim != 2:
             raise ValueError("Qwen image tensors must contain flattened patches and grid_thw")
+        if pixels.shape[1:] != self.empty_payload_shape:
+            raise ValueError(f"Qwen pixel_values patches must have shape {self.empty_payload_shape}")
         if grids.ndim != 2 or grids.shape[1] != 3 or grids.dtype not in (torch.int32, torch.int64):
             raise ValueError("image_grid_thw must be an integer [images, 3] tensor")
 
-    def _local_inputs(self, batch: Mapping[str, Any], segments: tuple[EncoderSegment, ...]) -> tuple:
-        """Reuse native HF position formulas and select local patches before embedding."""
+    def pack_payload(self, batch: Mapping[str, Any], segments: tuple[EncoderSegment, ...],
+                     *, device: torch.device | str = "cpu") -> torch.Tensor:
+        """Pack only the requested patches, with zero rows for padding and dummy work."""
+        pixels = batch.get(self.payload_field)
+        dtype = pixels.dtype if pixels is not None else torch.float32
+        count = sum(segment.local_padded_length for segment in segments)
+        packed = torch.zeros((count, *self.empty_payload_shape), dtype=dtype, device=device)
+        for segment in segments:
+            length = segment.local_valid_length
+            if segment.is_dummy or not length:
+                continue
+            if pixels is None:
+                raise ValueError("real image segment requires pixel_values")
+            start = segment.item.payload_start + segment.local_start
+            offset = segment.packed_offset
+            packed[offset:offset + length].copy_(pixels[start:start + length])
+        return packed
+
+    def _local_inputs(self, batch: Mapping[str, Any] | EncoderLocalInputs,
+                      segments: tuple[EncoderSegment, ...]) -> tuple:
+        """Pair the local patches with positional metadata from each image's full grid."""
         helpers = importlib.import_module("transformers.vision_utils")
-        config = self.vision.config
         parameter = next(self.vision.parameters())
-        device, dtype = parameter.device, parameter.dtype
-        patch_width = config.in_channels * config.temporal_patch_size * config.patch_size ** 2
-        patches, indices, weights, positions = [], [], [], []
+        device = parameter.device
+        patches = batch.patches if isinstance(batch, EncoderLocalInputs) else self.pack_payload(
+            batch, segments, device=device,
+        )
+        indices, weights, positions = [], [], []
         for segment in segments:
             length, valid = segment.local_padded_length, segment.local_valid_length
-            patch = torch.zeros(length, patch_width, device=device, dtype=dtype)
             index = torch.zeros(4, length, device=device, dtype=torch.long)
             weight = torch.zeros(4, length, device=device)
             position = torch.zeros(length, 2, device=device, dtype=torch.long)
@@ -189,26 +216,29 @@ class QwenVisionBridge:
                     grid, self.vision.num_grid_per_side, self.merge_size)
                 full_position = helpers.get_vision_position_ids(grid, self.merge_size)
                 start = segment.local_start
-                payload = segment.item.payload_start + start
-                patch[:valid] = batch["pixel_values"][payload:payload + valid].to(dtype)
                 index[:, :valid] = full_index[:, start:start + valid]
                 weight[:, :valid] = full_weight[:, start:start + valid]
                 position[:valid] = full_position[start:start + valid]
-            patches.append(patch)
             indices.append(index)
             weights.append(weight)
             positions.append(position)
-        return torch.cat(patches), torch.cat(indices, 1), torch.cat(weights, 1), torch.cat(positions)
+        patches = patches.to(device=device, dtype=parameter.dtype)
+        return patches, torch.cat(indices, 1), torch.cat(weights, 1), torch.cat(positions)
 
-    def encode_local(self, batch: Mapping[str, Any], segments: tuple[EncoderSegment, ...]) -> torch.Tensor:
+    def encode_local(self, batch: Mapping[str, Any] | EncoderLocalInputs,
+                     segments: tuple[EncoderSegment, ...]) -> torch.Tensor:
         """Run each FSDP visual child once, including ranks with only dummy work."""
         patches, indices, weights, positions = self._local_inputs(batch, segments)
         hidden = self.vision.patch_embed(patches)
         positional = (self.vision.pos_embed(indices) * weights.unsqueeze(-1)).sum(0)
         hidden = hidden + positional.to(hidden.dtype)
-        rotary = self.vision.rotary_pos_emb(positions).reshape(hidden.shape[0], -1)
-        embedding = torch.cat((rotary, rotary), -1)
-        position_embeddings = (embedding.cos(), embedding.sin())
+        rotary = self.vision.rotary_pos_emb
+        if hasattr(rotary, "attention_scaling"):
+            position_embeddings = rotary(hidden, positions)
+        else:
+            angles = rotary(positions).reshape(hidden.shape[0], -1)
+            embedding = torch.cat((angles, angles), -1)
+            position_embeddings = (embedding.cos(), embedding.sin())
         lengths = [0] + [segment.local_padded_length for segment in segments]
         cu_seqlens = torch.tensor(lengths, device=hidden.device, dtype=torch.int32).cumsum(0, dtype=torch.int32)
         for block in self.vision.blocks:
@@ -225,6 +255,8 @@ class QwenVisionBridge:
         """Inject routed image features without replacing the HF decoder forward."""
         if getattr(self.model, "_hp_vlm_cp_enabled", False):
             # The CP forward consumes the same plan but inserts only locally owned image rows.
+            return
+        if getattr(self.model, "_hp_qwen_encoder_forward_installed", False):
             return
         original_forward = self.model.forward
         original_visual = self.vision.forward
@@ -243,10 +275,17 @@ class QwenVisionBridge:
             if "vlm_cp_inputs" in kwargs:
                 return original_forward(*args, **kwargs)
             plan = kwargs.pop("encoder_parallel_plan", None)
+            local_inputs = kwargs.pop("encoder_parallel_inputs", None)
             if plan is None:
                 return original_forward(*args, **kwargs)
-            records, anchor = plan.encode_and_route(kwargs)
+            records, anchor = plan.encode_and_route(kwargs if local_inputs is None else local_inputs)
             features = torch.cat([feature for _, feature in records]) if records else None
+            if features is not None and local_inputs is not None:
+                # Trigger native image insertion while the visual wrapper supplies the routed features.
+                kwargs[self.payload_field] = local_inputs.patches[:0]
+                kwargs["image_grid_thw"] = torch.tensor(
+                    [item.metadata["grid"] for item, _ in records], device=features.device, dtype=torch.long,
+                )
             token = self.feature_context.set(features)
             try:
                 output = original_forward(*args, **kwargs)
@@ -263,6 +302,7 @@ class QwenVisionBridge:
 
         self.vision.forward = visual_forward
         self.model.forward = forward
+        self.model._hp_qwen_encoder_forward_installed = True  # pylint: disable=protected-access
 
 
 def get_encoder_parallel_spec() -> EncoderParallelAdapterSpec:
