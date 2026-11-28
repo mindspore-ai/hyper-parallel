@@ -39,6 +39,7 @@ class CPSparseAttentionSequenceMetadata(SparseAttentionSequenceMetadata):
     """CP kernel segments and optional ranges into the flattened global key bank."""
 
     key_ranges: tuple[tuple[int, int], ...] = ()
+    is_packed: bool = False
 
 
 def _split_packed_prefixes(
@@ -125,6 +126,7 @@ def build_cp_sequence_metadata(
         packed["actual_seq_len"] = actual_seq_len
     queries, keys = resolve_packed_sequence_lengths(packed, total, total)
     compact = cp_size > 1 and queries is not None
+    is_packed = queries is not None
     if queries is None:
         queries = keys = [(row + 1) * global_length for row in range(batch_size)]
     if len(queries) != len(keys):
@@ -143,7 +145,7 @@ def build_cp_sequence_metadata(
         local_key[-1] if key_ranges else (cp_rank + 1) * local_seq_len,
         torch.tensor(local_query, dtype=torch.int32, device=device),
         torch.tensor(local_key, dtype=torch.int32, device=device),
-        key_ranges,
+        key_ranges, is_packed,
     )
 
 
@@ -152,27 +154,38 @@ def _gather_key_banks(
     index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
     metadata: CPSparseAttentionSequenceMetadata,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """Gather the three key banks, then select complete causal prefixes."""
-    index_query, index_key, weights = index_states
+    """Gather each layer's KV and only a Full layer's Indexer key bank.
+
+    Shared layers consume their leader's already-gathered Indexer states and
+    local-query Top-K. Their own main-attention KV must still be exchanged.
+    Every rank follows the same construction-time role and collective order.
+    """
     query, latent_kv, query_rope, key_rope = attention_states
-    tensors = (index_key, latent_kv, key_rope)
+    tensors = (index_states[1], latent_kv, key_rope) if index_states else (latent_kv, key_rope)
     if overlap:
         pending = tuple(context.launch_gather_sequence(tensor, dim=1) for tensor in tensors)
         gathered = tuple(receipt.wait()[0] for receipt in pending)
     else:
         gathered = tuple(context.gather_sequence(tensor, dim=1)[0] for tensor in tensors)
+    indexer_bank_count = 1 if index_states else 0
     if metadata.key_ranges:
         # Repeated prefixes remain in autograd so their key gradients accumulate
         # before the existing gather adjoint reduces them to the source shards.
-        index_key, latent_kv, key_rope = (
+        gathered = (
             torch.cat([tensor.flatten(0, 1)[begin:end] for begin, end in metadata.key_ranges]).unsqueeze(0)
             for tensor in gathered
         )
     else:
-        index_key, latent_kv, key_rope = (
+        gathered = (
             tensor[:, :metadata.kv_prefix_length].contiguous() for tensor in gathered
         )
-    return (index_query, index_key, weights), (query, latent_kv, query_rope, key_rope)
+    if indexer_bank_count:
+        index_key, latent_kv, key_rope = gathered
+        ready_index_states = (index_states[0], index_key, index_states[2])
+    else:
+        latent_kv, key_rope = gathered
+        ready_index_states = ()
+    return ready_index_states, (query, latent_kv, query_rope, key_rope)
 
 
 class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
@@ -213,7 +226,7 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         self, index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
         metadata: CPSparseAttentionSequenceMetadata,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Gather three banks in fixed order and consume their causal prefixes.
+        """Gather owned banks in fixed order and consume their causal prefixes.
 
         All readiness receipts belong to this invocation. The existing gather
         adjoint sums consumers into each source shard, including the zero
@@ -238,6 +251,10 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         Returns:
             The same states with gathered and selected key banks.
         """
+        if inputs.mtp_topk_indices is not None:
+            # The consumer reads the first step's already gathered KV bank and
+            # indices; issuing another sequence gather would break KVShare.
+            return inputs
         index_states, attention_states = self.prepare_key_bank(
             inputs.index_states, inputs.attention_states, inputs.metadata,
         )

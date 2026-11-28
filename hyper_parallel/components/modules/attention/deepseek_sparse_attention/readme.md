@@ -23,15 +23,31 @@ plan_overrides:
         kv_cp_size: 2
         kv_cp_strategy: allgather
         cp_comm_overlap: true
+        dense_warmup: null
 ```
 
-CP 的三个配置参数写在 `replace.implementation` 下：
+启用 MTP 跨 step 共享时，在支持 MTP 的模型配方中单独设置模型 config：
+
+```yaml
+model:
+  config_overrides:
+    index_share_for_mtp_iteration: true
+```
+
+该字段属于模型 config，不属于 attention replacement 的 `implementation` 参数。每个 MTP DSA
+attention 的 config 必须将 `layer_idx` 标记为 MTP 层（`layer_idx >= num_hidden_layers`），MTP 模型
+adapter 需通过 `MultiTokenPrediction` 创建每步 attention 路径一致的 decoder；否则配置会在构建时或
+forward 时失败，不会静默退回共享。通用组件当前不负责把被 DeepSeek-V3.2 adapter 忽略的 MTP checkpoint
+加载回来，也不提供 serving 引擎的 request cache 生命周期。
+
+这些构造选项写在 `replace.implementation` 下：
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `kv_cp_size` | `1` | 上下文并行大小，与 `accelerator.cp_size` 保持一致；1 表示不开启 CP。 |
 | `kv_cp_strategy` | `allgather` | KV 通信策略，当前仅支持 `allgather`。 |
 | `cp_comm_overlap` | `false` | 是否启用异步 KV 收集。 |
+| `dense_warmup` | `null` | `null` 跟随模型的 `dsa_dense_warm_up`；`true`/`false` 固定 dense warm-up 或 sparse 阶段。 |
 
 TP 度和总 CP 度仍写在 `accelerator` 中，改 `accelerator.cp_size` 时须同步改 `kv_cp_size`。
 `*.self_attn` 匹配完整的注意力模块，框架自动选择本地或上下文并行实现；
@@ -54,3 +70,16 @@ CP 按序列维切分输入和输出，不切分参数。例如 TP2 × CP2 时�
 一半 query token，Indexer 仍保留完整的头数。TP1 时所有参数都不做 TP 切分。
 
 表中描述的是计算布局；启用 FSDP 后，参数的存储分片仍由 FSDP 管理。
+
+## V3.2 Indexer Share
+
+V3.2 local/CP member 支持 `dsa_indexer_types`、`dsa_index_topk_freq`、
+`dsa_index_skip_topk_offset` 和 `dsa_index_share_loss`。Shared 层复用前方 Full 层的选择，
+不含自身 Indexer 参数。MTP decoder 通过 `MultiTokenPrediction` 接入时，训练路径支持
+`index_share_for_mtp_iteration: true`：首步发布 Top-K 与 KV，后续 step 复用首步结果并跳过
+Indexer/KV 投影；配置写在 `model.config_overrides`。该实现不包含推理引擎的 request cache、
+speculative rollback/compaction 接入。CP consumer 复用 producer 已收集的 bank，但要求等长非 packed
+输入和 adapter 提供的逐步位置；CP packed/TND 会 fail-fast。边界、配置和状态语义见
+[MTP IndexShare 设计](../../../../../docs/design/dsa_indexer_share.md#11-mtp-indexshare-kvshare-设计)。
+CP 下 Full 收集三路 key bank，Shared 只收集本层 main KV/RoPE key；
+具体配置、边界和验证见 [Indexer Share 设计](../../../../../docs/design/dsa_indexer_share.md)。

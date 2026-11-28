@@ -1,0 +1,29 @@
+# Indexer Share fragment: merge into an existing DeepSeek-V3.2 Trainer YAML.
+# This is not a standalone recipe. Keep the model path, data, optimizer, and
+# topology. Update the existing self_attn override; keep other plan entries.
+# Seed custom attributes in the source config.json first; see design section 2.
+model:
+  config_overrides:
+    dsa_indexer_types: null
+    dsa_index_topk_freq: 3
+    dsa_index_skip_topk_offset: 0
+    dsa_index_share_loss: served
+    dsa_index_share_topk_offload: false
+    dsa_loss_coeff: 0.1
+    dsa_dense_warm_up: false
+    freeze_DSA: false
+    use_cache: false
+
+activation_checkpoint:
+  mode: full
+
+plan_overrides:
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.DeepseekSparseAttention
+        kv_cp_size: 2  # 必须等于 accelerator.cp_size
+        kv_cp_strategy: allgather
+        cp_comm_overlap: true
+        dense_warmup: null         # 跟随模型 config 的 dsa_dense_warm_up

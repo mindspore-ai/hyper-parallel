@@ -33,6 +33,12 @@ from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
 from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
 from hyper_parallel.distributed.module_binding import ParallelBinding
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import (
+    IndexShareContext, IndexShareState, resolve_index_share_plan,
+)
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention.mtp_index_share import (
+    MTPIndexShareContext, MTPIndexShareState,
+)
 
 
 @dataclass(frozen=True)
@@ -81,7 +87,7 @@ class SparseAttentionSequenceMetadata:
 
 def _apply_attention_rope(
     query: torch.Tensor,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
     *,
     interleaved: bool,
@@ -96,6 +102,12 @@ def _apply_attention_rope(
 
     cos, sin = position_embeddings
     rotary_op = apply_rotary_pos_emb_interleave if interleaved else apply_rotary_pos_emb
+    if key is None:
+        # The backend rotates Q and K together. Reuse it for Q without allowing
+        # uninitialized temporary values to enter the kernel.
+        dummy_key = torch.zeros((*query.shape[:2], 1, query.shape[-1]), device=query.device, dtype=query.dtype)
+        query, _ = rotary_op(query, dummy_key, cos, sin, unsqueeze_dim=2)
+        return query, None
     return rotary_op(query, key, cos, sin, unsqueeze_dim=2)
 
 
@@ -189,6 +201,7 @@ class SparseAttentionInputs:
     attention_states: tuple[torch.Tensor, ...]
     metadata: SparseAttentionSequenceMetadata
     use_dense: bool
+    mtp_topk_indices: torch.Tensor | None = None
 
 
 def _dense_flash_attention(
@@ -239,15 +252,21 @@ def _deepseek_v32_dense_attention(
     index_states: tuple[torch.Tensor, ...],
     attention_states: tuple[torch.Tensor, ...],
     sequence_lengths: tuple[torch.Tensor, torch.Tensor],
+    *, aux_loss_coefficient: float | None = None,
 ) -> torch.Tensor:
-    """Run unabsorbed MLA FA and the fused dense indexer KL on local states."""
+    """Run MLA FA and dense Indexer KL with the effective auxiliary-loss scale.
+
+    ``aux_loss_coefficient`` overrides the configured ``dsa_loss_coeff`` for
+    this layer, which Indexer Share uses to divide ``served`` supervision.
+    """
     query, compressed_kv, query_rope, key_rope = attention_states
     projected_kv = module.kv_b_proj(compressed_kv.squeeze(2)).view(
         *compressed_kv.shape[:2], query.shape[2], module.qk_nope_head_dim + module.v_head_dim,
     )
     key, value = projected_kv.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
     key_rope = key_rope.expand(-1, -1, query.shape[2], -1)
-    need_stats = bool(module.training and not module.freeze_dsa and module.dsa_loss_coeff)
+    coefficient = module.dsa_loss_coeff if aux_loss_coefficient is None else aux_loss_coefficient
+    need_stats = bool(module.training and not module.freeze_dsa and coefficient)
     output, maximum, total = _dense_flash_attention(
         module, torch.cat((query, query_rope), dim=-1), torch.cat((key, key_rope), dim=-1),
         value, sequence_lengths, need_stats=need_stats,
@@ -275,7 +294,7 @@ def _deepseek_v32_dense_attention(
             index_query, index_key, weights, teacher_query, teacher_key,
             maximum, total, indexer_stats, scale=module.scaling,
             query_rope=teacher_qrope, key_rope=teacher_krope,
-            query_lengths=query_lengths, key_lengths=key_lengths, loss_coefficient=module.dsa_loss_coeff,
+            query_lengths=query_lengths, key_lengths=key_lengths, loss_coefficient=coefficient,
         )
         output = aux_loss_auto_scale(output, loss)
     return output
@@ -439,6 +458,13 @@ class DeepseekSparseAttentionModule(nn.Module):
         self.dsa_dense_warm_up = bool(
             getattr(module, "dsa_dense_warm_up", getattr(config, "dsa_dense_warm_up", False))
         )
+        self.index_share_for_mtp_iteration = getattr(config, "index_share_for_mtp_iteration", False)
+        if not isinstance(self.index_share_for_mtp_iteration, bool):
+            raise ValueError("index_share_for_mtp_iteration must be a boolean")
+        layer_count = getattr(config, "num_hidden_layers", 0)
+        self.is_mtp_iteration = type(self.layer_idx) is int and self.layer_idx >= layer_count
+        self.mtp_index_share_enabled = self.index_share_for_mtp_iteration and self.is_mtp_iteration
+        self.mtp_index_share_key = ""
         if getattr(module, "param_sink_number", getattr(config, "param_sink_number", 0)) > 0:
             raise ValueError("DeepseekSparseAttention does not support the parameter-sink path")
         if getattr(module, "use_mome", getattr(config, "use_mome", False)):
@@ -480,6 +506,9 @@ class DeepseekSparseAttentionModule(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim, config.hidden_size, bias=bias, **factory_kwargs,
         )
+        self.indexer = None
+        if not self.is_index_leader:
+            return
         self.indexer = nn.Module()
         self.indexer.n_heads, self.indexer.head_dim = self.num_index_heads, self.index_head_dim
         self.indexer.index_topk = self.index_topk
@@ -522,7 +551,9 @@ class DeepseekSparseAttentionModule(nn.Module):
         if module.kv_b_proj.bias is not None:
             raise ValueError("Absorbed KV projection requires a bias-free Linear")
         self.kv_b_proj = module.kv_b_proj
-        self.o_proj, self.indexer = module.o_proj, module.indexer
+        self.o_proj = module.o_proj
+        self.indexer = module.indexer if self.is_index_leader else None
+        self._owns_indexer = self.is_index_leader
 
     def _reuse_local_member(self, module: DeepseekSparseAttentionModule) -> None:
         """Promote a loaded unbound member without re-fusing or reinitializing values."""
@@ -533,12 +564,20 @@ class DeepseekSparseAttentionModule(nn.Module):
             "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim", "qk_head_dim", "index_head_dim",
             "num_index_heads", "index_topk", "scaling", "rotary_interleaved", "index_rotary_interleaved",
             "dsa_loss_coeff", "freeze_dsa", "dsa_dense_warm_up",
+            "index_share_plan", "is_index_leader",
+            "is_mtp_iteration", "index_share_enabled", "_owns_indexer",
+            "index_share_for_mtp_iteration", "mtp_index_share_enabled", "mtp_index_share_key",
             "_q_latent_output_size", "_kv_latent_output_size", "_tp_size", "_tp_group",
         )
         for name in fields:
             setattr(self, name, getattr(module, name))
-        for name in ("linear_qkv", "q_a_layernorm", "kv_a_layernorm", "q_b_proj", "kv_b_proj", "o_proj", "indexer"):
+        for name in ("linear_qkv", "q_a_layernorm", "kv_a_layernorm", "q_b_proj", "kv_b_proj", "o_proj"):
             setattr(self, name, getattr(module, name))
+        self._modules.pop("indexer", None)
+        if module._owns_indexer:
+            self.indexer = module.indexer
+        else:
+            object.__setattr__(self, "indexer", module.indexer)
 
     def __init__(
         self, *, config: Any = None, module: nn.Module | None = None,
@@ -583,6 +622,20 @@ class DeepseekSparseAttentionModule(nn.Module):
                 )
             self._initialize_dimensions(module)
             self._initialize_options(module)
+            self.index_share_plan = resolve_index_share_plan(self.config)
+            if self.index_share_plan.enabled and getattr(self.config, "model_type", None) != "deepseek_v32":
+                raise ValueError("Indexer sharing is supported only for DeepSeek-V3.2")
+            layer_count = getattr(self.config, "num_hidden_layers", 0)
+            self.is_mtp_iteration = type(self.layer_idx) is int and self.layer_idx >= layer_count
+            if self.index_share_plan.enabled and not self.is_mtp_iteration and (
+                type(self.layer_idx) is not int or not 0 <= self.layer_idx < len(self.index_share_plan.leaders)
+            ):
+                raise ValueError("Indexer sharing requires a zero-based global layer_idx within num_hidden_layers")
+            self.index_share_enabled = self.index_share_plan.enabled and not self.is_mtp_iteration
+            self.is_index_leader = (
+                not self.index_share_enabled or self.index_share_plan.leaders[self.layer_idx] == self.layer_idx
+            )
+            self._owns_indexer = self.is_index_leader
             if module is None:
                 self._initialize_config_layers(config)
             else:
@@ -596,10 +649,12 @@ class DeepseekSparseAttentionModule(nn.Module):
             return
         for child in (
             self.linear_qkv, self.q_a_layernorm, self.kv_a_layernorm, self.q_b_proj,
-            self.kv_b_proj, self.o_proj, self.indexer.wq_b, self.indexer.wk,
-            self.indexer.k_norm, self.indexer.weights_proj,
+            self.kv_b_proj, self.o_proj,
         ):
             child.reset_parameters()
+        if self.indexer is not None and self._owns_indexer:
+            for child in self.indexer.children():
+                child.reset_parameters()
 
     def make_transforms(self) -> list[WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""
@@ -676,14 +731,22 @@ class DeepseekSparseAttentionModule(nn.Module):
             raise NotImplementedError("DeepseekSparseAttention does not expose attention weights")
 
     def _project_attention_states(
-        self, hidden_states: torch.Tensor, *, use_dense: bool = False,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        self, hidden_states: torch.Tensor, *, use_dense: bool = False, skip_kv: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, ...]]:
         """Project local states inside the attention/block FSDP boundary."""
         batch_size, seq_length = hidden_states.shape[:-1]
-        q_latent, latent_kv, key_rope = torch.split(
-            self.linear_qkv(hidden_states),
-            (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim), dim=-1,
-        )
+        if skip_kv:
+            bias = self.linear_qkv.bias
+            q_latent = torch.nn.functional.linear(  # pylint: disable=not-callable
+                hidden_states, self.linear_qkv.weight[:self.q_lora_rank],
+                None if bias is None else bias[:self.q_lora_rank],
+            )
+            latent_kv = key_rope = None
+        else:
+            q_latent, latent_kv, key_rope = torch.split(
+                self.linear_qkv(hidden_states),
+                (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim), dim=-1,
+            )
         q_resid = self.q_a_layernorm(q_latent)
         projected = self.q_b_proj(q_resid)
         heads = projected.shape[-1] // self.qk_head_dim
@@ -699,8 +762,9 @@ class DeepseekSparseAttentionModule(nn.Module):
                 batch_size=batch_size, seq_length=seq_length,
                 input_dim=self.qk_nope_head_dim, output_dim=self.kv_lora_rank,
             )
-        latent_kv = self.kv_a_layernorm(latent_kv).view(batch_size, seq_length, 1, self.kv_lora_rank)
-        key_rope = key_rope.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
+        if latent_kv is not None:
+            latent_kv = self.kv_a_layernorm(latent_kv).view(batch_size, seq_length, 1, self.kv_lora_rank)
+            key_rope = key_rope.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
         return q_resid, (query, latent_kv, query_rope, key_rope)
 
     def _project_index_states(
@@ -738,9 +802,11 @@ class DeepseekSparseAttentionModule(nn.Module):
         softmax_stats: tuple[torch.Tensor, torch.Tensor],
         actual_q_len: torch.Tensor,
         actual_kv_len: torch.Tensor,
+        *, aux_loss_coefficient: float | None = None,
     ) -> torch.Tensor:
-        """Attach the sparse attention KL auxiliary loss when training enables it."""
-        if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
+        """Attach Indexer KL using the effective per-layer auxiliary-loss scale."""
+        coefficient = self.dsa_loss_coeff if aux_loss_coefficient is None else aux_loss_coefficient
+        if not (self.training and not self.freeze_dsa and coefficient):
             return attn_output
         query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
@@ -753,7 +819,7 @@ class DeepseekSparseAttentionModule(nn.Module):
         aux_loss = dsa_kl_loss(
             *index_states, query_tnd, key_tnd,
             topk_indices, maximum, total, q_rot_tnd, k_rot_tnd,
-            actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
+            actual_q_len, actual_kv_len, self.scaling, coefficient,
             backend="cann",
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
@@ -778,24 +844,28 @@ class DeepseekSparseAttentionModule(nn.Module):
 
     def prepare_attention(
         self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
-        *, use_dense: bool,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        *, use_dense: bool, reuse_mtp_kv: bool = False,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor | None, ...]]:
         """Run projections and both independent RoPE conventions on local tokens."""
-        q_resid, states = self._project_attention_states(hidden_states, use_dense=use_dense)
+        q_resid, states = self._project_attention_states(
+            hidden_states, use_dense=use_dense, skip_kv=reuse_mtp_kv,
+        )
         query, latent_kv, query_rope, key_rope = states
         query_rope, key_rope = _apply_attention_rope(
             query_rope, key_rope, position_embeddings, interleaved=self.rotary_interleaved,
         )
-        index_states = self._project_index_states(hidden_states, q_resid, position_embeddings)
+        index_states = () if reuse_mtp_kv else (
+            self._project_index_states(hidden_states, q_resid, position_embeddings) if self.is_index_leader else ()
+        )
         return index_states, (query, latent_kv, query_rope, key_rope)
 
     def prepare_attention_inputs(
         self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
-        metadata: SparseAttentionSequenceMetadata, *, use_dense: bool,
+        metadata: SparseAttentionSequenceMetadata, *, use_dense: bool, reuse_mtp_kv: bool = False,
     ) -> SparseAttentionInputs:
         """Prepare local operands while retaining one invocation's resolved mode."""
         index_states, attention_states = self.prepare_attention(
-            hidden_states, position_embeddings, use_dense=use_dense,
+            hidden_states, position_embeddings, use_dense=use_dense, reuse_mtp_kv=reuse_mtp_kv,
         )
         return SparseAttentionInputs(index_states, attention_states, metadata, use_dense)
 
@@ -806,20 +876,77 @@ class DeepseekSparseAttentionModule(nn.Module):
     def run_attention(
         self, index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
         sequence_lengths: tuple[torch.Tensor, torch.Tensor], *, use_dense: bool,
+        index_share_context: IndexShareContext | None = None,
+        mtp_index_share_context: MTPIndexShareContext | None = None,
+        mtp_iteration: int | None = None,
+        mtp_query_positions: torch.Tensor | None = None,
+        mtp_topk_indices: torch.Tensor | None = None,
+        kv_prefix_length: int | None = None,
     ) -> torch.Tensor:
-        """Execute the shared dense/sparse kernel and restore local-head output."""
+        """Run selection once per group and supervise with each served layer's teacher."""
+        aux_loss_coefficient = self.dsa_loss_coeff
+        plan = self.index_share_plan
+        if self.index_share_enabled:
+            if not isinstance(index_share_context, IndexShareContext):
+                raise ValueError("Indexer sharing requires a fresh IndexShareContext for each model forward")
+            leader = plan.leaders[self.layer_idx]
+            if plan.loss_mode == "served":
+                aux_loss_coefficient /= plan.group_size(self.layer_idx)
+            elif not self.is_index_leader:
+                aux_loss_coefficient = 0.0
+            if not self.is_index_leader:
+                state = index_share_context.groups.get(leader)
+                if state is None:
+                    raise ValueError(f"Shared layer {self.layer_idx} requires leader {leader} to run first")
+                if (state.use_dense != use_dense or state.index_topk != self.index_topk
+                        or state.index_states[0].shape[:2] != attention_states[0].shape[:2]
+                        or state.index_states[0].device != attention_states[0].device):
+                    raise ValueError("Shared Indexer requires matching stage, Top-K, batch/sequence and device")
+                index_states, topk = state.index_states, state.topk
+        if mtp_topk_indices is not None:
+            topk = mtp_topk_indices
+            aux_loss_coefficient = 0.0
+        elif self.is_index_leader:
+            if use_dense:
+                topk = None
+            else:
+                topk, *_ = dsa_indexer(
+                    *index_states, *sequence_lengths, self.index_topk, backend="cann",
+                )
+            if self.index_share_enabled:
+                index_share_context.groups[self.layer_idx] = IndexShareState(
+                    index_states, None if topk is None else topk.detach(), use_dense, self.index_topk,
+                )
+            if (self.mtp_index_share_enabled and mtp_index_share_context is not None
+                    and mtp_iteration == 0 and not use_dense):
+                if not isinstance(topk, torch.Tensor):
+                    raise RuntimeError("MTP IndexShare producer did not compute Top-K indices")
+                query_ends, key_ends = sequence_lengths
+                positions = None
+                if mtp_query_positions is not None:
+                    if mtp_query_positions.shape[0] == 1 and attention_states[0].shape[0] > 1:
+                        mtp_query_positions = mtp_query_positions.expand(attention_states[0].shape[0], -1)
+                    positions = tuple(int(value) for value in mtp_query_positions.detach().reshape(-1).cpu().tolist())
+                mtp_index_share_context.publish(
+                    self.mtp_index_share_key,
+                    MTPIndexShareState(
+                        topk.detach(), attention_states[1], attention_states[3], query_ends, key_ends,
+                        positions, kv_prefix_length if kv_prefix_length is not None else int(key_ends[-1]),
+                        self.index_topk,
+                    ),
+                )
         if use_dense:
             return _deepseek_v32_dense_attention(
                 self, index_states, attention_states, sequence_lengths,
+                aux_loss_coefficient=aux_loss_coefficient,
             ).flatten(2)
-        topk, *flattened = dsa_indexer(
-            *index_states, *sequence_lengths, self.index_topk, backend="cann",
-        )
+        flattened = tuple(tensor.flatten(0, 1) for tensor in index_states)
         output, maximum, total = dsa_sparse_attention(
             *attention_states, topk, self.scaling, *sequence_lengths, backend="cann",
         )
         output = self._apply_auxiliary_loss(
             output, tuple(flattened), attention_states, topk, (maximum, total), *sequence_lengths,
+            aux_loss_coefficient=aux_loss_coefficient,
         )
         heads = output.shape[2]
         weight = self.kv_b_proj.weight.view(
@@ -840,21 +967,74 @@ class DeepseekSparseAttentionModule(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None, past_key_values: Any | None = None,
         position_ids: torch.Tensor | None = None,
-        actual_seq_len: torch.Tensor | Sequence[int] | None = None, **kwargs: Any,
+        actual_seq_len: torch.Tensor | Sequence[int] | None = None,
+        index_share_context: IndexShareContext | None = None,
+        mtp_index_share_context: MTPIndexShareContext | None = None,
+        mtp_iteration: int | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         """Run causal or packed sparse attention while retaining the Transformers output ABI."""
         use_dense = self.use_dense_attention()
         position_ids = self.prepare_position_ids(hidden_states, position_ids)
+        if self.index_share_enabled and not isinstance(index_share_context, IndexShareContext):
+            raise ValueError("Indexer sharing requires a fresh IndexShareContext for each model forward")
+        if self.mtp_index_share_enabled:
+            if not isinstance(mtp_index_share_context, MTPIndexShareContext):
+                raise ValueError("MTP IndexShare requires a fresh MTPIndexShareContext for each MTP forward")
+            if isinstance(mtp_iteration, bool) or not isinstance(mtp_iteration, int) or mtp_iteration < 0:
+                raise ValueError("MTP IndexShare requires a nonnegative mtp_iteration")
+            if not self.mtp_index_share_key:
+                raise ValueError("MTP IndexShare attention must be registered by MultiTokenPrediction")
+        if (self.index_share_enabled and self.training and self.dsa_loss_coeff and not self.freeze_dsa
+                and not torch.is_grad_enabled()):
+            raise ValueError("Indexer sharing training requires grad-enabled forward and non-reentrant checkpointing")
         metadata = self.preflight_attention(
             hidden_states, attention_mask, past_key_values, position_ids, actual_seq_len, kwargs,
             use_dense=use_dense,
         )
+        if (self.mtp_index_share_enabled and getattr(self, "_cp_context", None) is not None
+                and getattr(metadata, "is_packed", False)):
+            raise NotImplementedError(
+                "MTP IndexShare with CP currently requires non-packed, equal-length batch rows; "
+                "packed/TND alignment is supported only by the local attention path"
+            )
+        mtp_state = None
+        mtp_topk = None
+        mtp_view = None
+        if self.mtp_index_share_enabled:
+            if getattr(self, "_cp_context", None) is not None and position_ids is None:
+                raise ValueError("MTP IndexShare under CP requires position_ids for every step")
+            if use_dense:
+                mtp_index_share_context.mark_dense(self.mtp_index_share_key)
+            elif mtp_iteration > 0:
+                mtp_state = mtp_index_share_context.consumer_state(self.mtp_index_share_key, mtp_iteration)
+            if mtp_state is not None:
+                mtp_view = mtp_state.view_for_query(
+                    metadata.query_ends, query_positions=position_ids,
+                    query_batch_size=hidden_states.shape[0], query_seq_length=hidden_states.shape[1],
+                    index_topk=self.index_topk,
+                )
+                mtp_topk = mtp_view.topk_indices
         inputs = self.prepare_attention_inputs(
             hidden_states, self.prepare_positions(hidden_states, position_embeddings), metadata, use_dense=use_dense,
+            reuse_mtp_kv=mtp_state is not None,
         )
+        if mtp_state is not None:
+            query, _, query_rope, _ = inputs.attention_states
+            shared_metadata = SparseAttentionSequenceMetadata(
+                mtp_view.kv_prefix_length, metadata.query_ends, mtp_view.key_ends,
+            )
+            inputs = SparseAttentionInputs(
+                (), (query, mtp_view.latent_kv, query_rope, mtp_view.key_rope), shared_metadata,
+                use_dense, mtp_view.topk_indices,
+            )
         inputs = self.exchange_attention(inputs)
         output = self.run_attention(
             inputs.index_states, inputs.attention_states, inputs.metadata.sequence_lengths, use_dense=inputs.use_dense,
+            index_share_context=index_share_context,
+            mtp_index_share_context=mtp_index_share_context, mtp_iteration=mtp_iteration,
+            mtp_query_positions=position_ids, mtp_topk_indices=inputs.mtp_topk_indices,
+            kv_prefix_length=inputs.metadata.kv_prefix_length,
         )
         del inputs
         return self.project_output(output), None

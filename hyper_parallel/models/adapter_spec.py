@@ -57,6 +57,10 @@ class ModelAdapterSpec:
         materialization: provider accepting the constructed model and registering
             deterministic derived buffers or state hooks before sharding and
             ``to_empty()``. This supports unmodified native HF model classes.
+        runtime_setup: provider accepting the constructed model after module
+            replacements and installing model-owned runtime coordination before
+            sharding or activation checkpointing. The generic builder invokes
+            this lifecycle callback; model-specific behavior stays in the adapter.
         context_parallel: provider returning the family's CP wrappers.
         expert_parallel: provider returning the family's EP compute
             factories.
@@ -119,3 +123,4 @@ class ModelAdapterSpec:
     sharding: Optional[Callable[..., Any]] = None
     native_parallel: Optional[Callable[..., Any]] = None
     dit: Optional[Callable[..., Any]] = None
+    runtime_setup: Optional[Callable[..., Any]] = None

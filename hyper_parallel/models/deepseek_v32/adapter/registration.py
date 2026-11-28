@@ -14,6 +14,7 @@
 # ============================================================================
 """Architecture and lazy provider registration for DeepSeek-V3.2."""
 
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import install_indexer_share
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.deepseek_v32.adapter.materialization import register_rotary_materialization
 from hyper_parallel.models.deepseek_v32.adapter.policies.sharding import (
@@ -36,6 +37,7 @@ DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="deepseek_v32",
     replacements=_load_replacements,
     materialization=register_rotary_materialization,
+    runtime_setup=install_indexer_share,
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)
