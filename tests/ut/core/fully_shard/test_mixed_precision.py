@@ -37,16 +37,87 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
         clear_device_mesh_cache()
         self.addCleanup(clear_device_mesh_cache)
 
-    def _shard_model(self, model: nn.Module, policy: MixedPrecisionPolicy, comm_fusion: bool = False) -> None:
+    def _shard_model(self, model: nn.Module, policy: MixedPrecisionPolicy, comm_fusion: bool = False,
+                     *, world_size: int = 2, **shard_options) -> None:
         """Apply FSDP on CPU without a process group or accelerator stream."""
         group = MagicMock(spec=torch.distributed.ProcessGroup)
         group.rank.return_value = 0
-        group.size.return_value = 2
+        group.size.return_value = world_size
         with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0), \
                 patch.object(DeviceMesh, "get_group", return_value=group), \
                 patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh", return_value=torch.device("cpu")):
-            mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("fsdp",), _init_backend=False)
-            fully_shard(model, mesh=mesh, mp_policy=policy, comm_fusion=comm_fusion)
+            mesh = DeviceMesh("cpu", list(range(world_size)), mesh_dim_names=("fsdp",), _init_backend=False)
+            fully_shard(model, mesh=mesh, mp_policy=policy, comm_fusion=comm_fusion, **shard_options)
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor")
+    def test_async_handle_wait_after_shard_update(self, mock_gather):
+        """An outstanding handle installs current values after conversion or an in-place load."""
+        pending = MagicMock()
+
+        def gather(output, local, *, async_op, group):
+            output.copy_(local.repeat(group.size()))
+            return pending if async_op else None
+
+        mock_gather.side_effect = gather
+        for zero_copy in (False, True):
+            for convert in (False, True):
+                with self.subTest(zero_copy=zero_copy, convert=convert):
+                    mock_gather.reset_mock()
+                    pending.reset_mock()
+                    model = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+                    nn.init.zeros_(model.weight)
+                    self._shard_model(model, MixedPrecisionPolicy(), True, comm_fusion_zero_copy=zero_copy)
+                    model.hsdp_scheduler.hsdp_state._init_mp_dtypes()
+                    handle = model.unshard(async_op=True)
+                    dtype = torch.float32 if convert else torch.bfloat16
+                    expected = torch.tensor([[1.0009765625, 2.001953125]], dtype=dtype)
+                    if convert:
+                        model.float()
+                        with torch.no_grad():
+                            model.weight._local_tensor.copy_(expected)
+                    else:
+                        model.load_state_dict({"weight": expected})
+                    pending.wait.assert_called_once_with()
+
+                    handle.wait()
+                    handle.wait()
+                    self.assertEqual(mock_gather.call_count, 2)
+                    torch.testing.assert_close(model.weight, expected.repeat(2, 1), rtol=0, atol=0)
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor")
+    def test_single_shard_refresh_with_and_without_other_buckets(self, mock_gather):
+        """A changed replica refreshes its stable parameter even when the bucket plan is unchanged."""
+
+        def gather(output, local, *, group, **_):
+            output.copy_(local.repeat(group.size()))
+
+        mock_gather.side_effect = gather
+        for world_size in (1, 2):
+            for zero_copy in (False, True):
+                with self.subTest(world_size=world_size, zero_copy=zero_copy):
+                    model = nn.Linear(2, 2, dtype=torch.bfloat16)
+                    self._shard_model(model, MixedPrecisionPolicy(), True, world_size=world_size,
+                                      comm_fusion_zero_copy=zero_copy, replicate_params={model.bias})
+                    state = model.hsdp_scheduler.hsdp_state
+                    state._init_mp_dtypes()
+                    model.unshard()
+                    model.reshard()
+                    expected = torch.tensor([1.0009765625, 2.001953125])
+                    param = next(p for p in state.hsdp_params if p.sharded_param is model.bias)
+                    param.sharded_param._local_tensor = expected.clone()
+                    param.reset_sharded_param()
+                    model.unshard()
+                    torch.testing.assert_close(model.bias, expected, rtol=0, atol=0)
+                    self.assertEqual(model.weight.dtype, torch.bfloat16)
+
+                    # A same-dtype replacement must rebind a replica's zero-copy local view as well.
+                    model.reshard()
+                    replacement = expected + 1
+                    param.sharded_param._local_tensor = replacement
+                    param.reset_sharded_param()
+                    model.unshard()
+                    self.assertEqual(model.bias.data_ptr(), replacement.data_ptr())
+                    torch.testing.assert_close(model.bias, replacement, rtol=0, atol=0)
 
     def test_fields_override_policy_and_preserve_storage_dtype(self) -> None:
         """Feature: Per-field precision precedence.

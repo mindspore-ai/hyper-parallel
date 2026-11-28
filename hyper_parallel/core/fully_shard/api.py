@@ -144,9 +144,11 @@ class HSDPModule:
         """
         if not hasattr(self, "hsdp_scheduler") or self.hsdp_scheduler is None:
             return super()._apply(*args, **kwargs)  # pylint: disable=no-member
+        hsdp_state = self.hsdp_scheduler.hsdp_state
+        if hsdp_state is not None and hsdp_state.param_group is not None:
+            hsdp_state.param_group.discard_pending_all_gathers()
         self.reshard()
         result = super()._apply(*args, **kwargs)  # pylint: disable=no-member
-        hsdp_state = self.hsdp_scheduler.hsdp_state
         if hsdp_state is None:
             return result
         with torch.no_grad():
@@ -283,11 +285,16 @@ class HSDPModule:
             ValueError: When a plain tensor shape matches neither the local
                 shard shape nor the global shape of the target DTensor.
         """
+        self_module = cast(nn.Module, self)
+        for module in self_module.modules():
+            if isinstance(module, HSDPModule) and module.hsdp_scheduler is not None:
+                state = module.hsdp_scheduler.hsdp_state
+                if state is not None and state.param_group is not None:
+                    state.param_group.discard_pending_all_gathers()
         if assign and state_dict and all(
             isinstance(val, DTensor) for val in state_dict.values()
         ):
             return super().load_state_dict(state_dict, strict=strict, assign=True)
-        self_module = cast(nn.Module, self)
 
         target_map: dict[str, Tensor] = {}
         for name, p in parameters_dict(self_module):

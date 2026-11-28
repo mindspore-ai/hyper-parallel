@@ -24,8 +24,11 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Shard
-from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
+from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
+from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
+from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy
 from hyper_parallel.core.fully_shard.param_group import (
     AllGatherMetadata,
     AllGatherResult,
@@ -184,6 +187,20 @@ class TestParamGroupHelpers(unittest.TestCase):
         torch.testing.assert_close(local_input, torch.tensor([1.0, 2.0, 3.0, 4.0]))
         self.assertIs(full_output, output)
 
+    def test_reduce_scatter_batches_padded_dim_zero_gradients(self):
+        """A whole-bucket pack widens BF16 gradients and zero-pads each rank row."""
+        grads = [torch.arange(10, dtype=torch.bfloat16).reshape(5, 2),
+                 torch.arange(3, dtype=torch.bfloat16)]
+        params = [SimpleNamespace(hsdp_placement=Shard(0), padded_sharded_param_size=size)
+                  for size in (torch.Size((3, 2)), torch.Size((2,)))]
+        output = torch.empty(16, dtype=torch.float32)
+        with patch.object(torch, "_chunk_cat", wraps=torch._chunk_cat) as chunk_cat:
+            reduce_scatter_copy_in(params, grads, output, 2)
+        chunk_cat.assert_called_once()
+        expected = torch.tensor([[0, 1, 2, 3, 4, 5, 0, 1],
+                                 [6, 7, 8, 9, 0, 0, 2, 0]], dtype=torch.float32)
+        self.assertTrue(torch.equal(output.view(2, -1), expected))
+
     def test_reduce_scatter_copy_in_supports_mixed_placements(self):
         """Reduce-scatter packing should support mixed shard dimensions."""
         dim0_grad = torch.arange(8, dtype=torch.float32).view(4, 2)
@@ -215,6 +232,61 @@ class TestParamGroupHelpers(unittest.TestCase):
 
 class TestAllGatherBuckets(unittest.TestCase):
     """Cover ordered dtype buckets and all-gather buffer ownership."""
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor")
+    def test_warm_all_gather_after_shard_dtype_reset(self, mock_gather):
+        """A warm bucket reads the replacement shard in its configured communication dtype."""
+
+        def gather(output, local, **_):
+            output.copy_(local.repeat(2))
+
+        mock_gather.side_effect = gather
+        mesh_info = _mesh_info()
+        mesh_info.shard_mesh_dim = 0
+        mesh_info.replicate_mesh_dim = None
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
+            mesh_info.mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("fsdp",), _init_backend=False)
+
+        for zero_copy in (False, True):
+            for policy_dtype in (None, torch.bfloat16):
+                with self.subTest(zero_copy=zero_copy, policy_dtype=policy_dtype):
+                    module = torch.nn.Module()
+                    module.weight = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+                    policy = MixedPrecisionPolicy(param_dtype=policy_dtype)
+                    param = HSDPParamV2(
+                        module.weight, ParamModuleInfo(module, "weight", [], []),
+                        mesh_info, mp_policy=policy, device=torch.device("cpu"),
+                    )
+                    param.init_dtype_attrs(policy)
+                    group = HSDPParamGroup([param], device=param.device, enable_zero_copy=zero_copy)
+                    group.unshard()
+                    group.wait_for_unshard()
+                    self.assertEqual(module.weight.dtype, torch.bfloat16)
+                    param.shard()
+
+                    # Both values lose low bits in BF16, exposing stale communication or unpack buffers.
+                    replacement = torch.tensor([1.0009765625, 2.001953125], dtype=torch.float32)
+                    param.sharded_param._local_tensor = replacement
+                    param.reset_sharded_param()
+                    group.unshard()
+                    group.wait_for_unshard()
+
+                    expected = replacement.to(policy_dtype or torch.float32)
+                    torch.testing.assert_close(mock_gather.call_args.args[1], expected, rtol=0, atol=0)
+                    torch.testing.assert_close(module.weight, expected.repeat(2), rtol=0, atol=0)
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor")
+    def test_dirty_layout_discards_prefetch_before_unshard(self, mock_gather):
+        """A second unshard must retire obsolete work before issuing the new collective."""
+        param = _fake_param([1.0, 2.0])
+        group = HSDPParamGroup([param], device=torch.device("cpu"))
+        group.unshard(async_op=True)
+        param.param_dtype = torch.bfloat16
+        group.gather_layout_dirty = True
+        group.unshard()
+        mock_gather.return_value.wait.assert_called_once_with()
+        self.assertEqual(mock_gather.call_count, 2)
+        self.assertEqual(group.all_gather_buckets[0].all_gather_result.all_gather_output.dtype, torch.bfloat16)
 
     def test_init_all_gather_buckets_groups_by_process_group_and_dtype(self):
         """All-gather buckets should group parameters by process group and dtype."""
@@ -489,6 +561,29 @@ class TestReduceBuckets(unittest.TestCase):
             [shard_group_a, shard_group_b, shard_group_a],
         )
         self.assertIs(param_group.comm_ctx.pre_param_group, param_group)
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
+    def test_final_bucket_applies_existing_grad_without_parking_view(self, mock_reduce_scatter):
+        """An accumulated device grad consumes the final RS view before root cleanup."""
+        param = _fake_param([1.0, 2.0])
+        param.source_shard_info = None
+        param.apply_grad_on_fp32_main_grad = False
+        param.sharded_param.grad = torch.tensor([10.0, 20.0])
+        param.apply_reduced_grad.side_effect = param.sharded_param.grad.add_
+        group = HSDPParamGroup([param], device=torch.device("cpu"))
+        _set_unsharded_grad(param, torch.ones(4))
+
+        def reduce_scatter(**args: torch.Tensor) -> MagicMock:
+            """Emulate the two-rank SUM into the supplied output tensor."""
+            args["output"].copy_(args["input"].view(2, -1).sum(dim=0))
+            return MagicMock()
+
+        mock_reduce_scatter.side_effect = reduce_scatter
+        group.foreach_reducescatter(dist.ReduceOp.SUM)
+        group.wait_reduce_scatter_and_issue_all_reduce()
+        param.apply_reduced_grad.assert_called_once()
+        torch.testing.assert_close(param.sharded_param.grad, torch.tensor([12.0, 22.0]))
+        self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
 
     @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_requires_all_reduce_accumulates_fresh_reduce_outputs(self, mock_reduce_scatter):

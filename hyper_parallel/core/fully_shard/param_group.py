@@ -43,6 +43,7 @@ all-reduce with layer N-1 reduce-scatter.
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import List, Optional
+from weakref import ref
 
 import torch
 import torch.distributed as dist
@@ -142,10 +143,16 @@ class AllGatherBucket:
         if self.flat_param_buffer is None:
             return False
         flat_storage_ptr = self.flat_param_buffer.untyped_storage().data_ptr()
-        return all(
-            hsdp_param._sharded_param_data.untyped_storage().data_ptr() == flat_storage_ptr
-            for hsdp_param in self.hsdp_params
-        )
+        offset = 0
+        for index, param in enumerate(self.hsdp_params):
+            shard = param._sharded_param_data
+            numel = self.metadata.inp_split_sizes[index] if self.metadata is not None else shard.numel()
+            if (shard.untyped_storage().data_ptr() != flat_storage_ptr
+                    or shard.storage_offset() != offset or shard.numel() != numel
+                    or shard.dtype != self.flat_param_buffer.dtype or not shard.is_contiguous()):
+                return False
+            offset += numel
+        return offset == self.flat_param_buffer.numel()
 
     @torch.no_grad()
     def copy_out(self) -> None:
@@ -407,6 +414,21 @@ def reduce_scatter_copy_in(
             f"{len(hsdp_params)} params and {len(unsharded_grads)} grads"
         )
     packed_rows = reduce_scatter_input.view(world_size, -1)
+    # Pack directly into contiguous rank rows; narrow per-parameter output
+    # views otherwise prevent the backend's mixed-dtype ChunkCat fast path.
+    if len(unsharded_grads) > 1 and packed_rows.is_contiguous():
+        dtype = unsharded_grads[0].dtype
+        compatible = all(
+            param.hsdp_placement.dim == 0 and grad.is_contiguous()
+            and grad.dtype == dtype and grad.dim() > 0 and grad.numel() > 0
+            and ((grad.size(0) + world_size - 1) // world_size) * (grad.numel() // grad.size(0))
+            == param.padded_sharded_param_size.numel()
+            for param, grad in zip(hsdp_params, unsharded_grads)
+        )
+        if compatible and packed_rows.size(1) == sum(p.padded_sharded_param_size.numel() for p in hsdp_params):
+            with torch.no_grad():
+                torch._chunk_cat(unsharded_grads, dim=0, num_chunks=world_size, out=packed_rows)
+            return
     column_offset = 0
     with torch.no_grad():
         for hsdp_param, unsharded_grad in zip(hsdp_params, unsharded_grads):
@@ -478,12 +500,54 @@ class HSDPParamGroup:
         self.hsdp_params = hsdp_params
         self.comm_ctx = comm_ctx or ParamGroupCommCtx()
         self.enable_zero_copy = enable_zero_copy
+        self.gather_layout_dirty = True
+        for param in hsdp_params:
+            param._gather_group_ref = ref(self)
         self.gradient_scaling_factor = None
         self.requires_all_reduce = True
         self.all_gather_buckets: list[AllGatherBucket] = []
         self.reduce_scatter_buckets: list[ReduceScatterBucket] = []
         self.all_reduce_buckets: list[AllReduceBucket] = []
         self.reduce_partial_outputs: dict[tuple, torch.Tensor] = {}
+
+    def discard_pending_all_gathers(self) -> None:
+        """Finish reads of old shard storage without publishing the prefetched weights."""
+        for bucket in self.all_gather_buckets:
+            result = bucket.all_gather_result
+            if result is not None:
+                if result.handle is not None:
+                    result.handle.wait()
+                bucket.all_gather_result = None
+                self.gather_layout_dirty = True
+
+    def refresh_all_gather_layout(self) -> None:
+        """Expire stale prefetches and unpack buffers after a shard or dtype change."""
+        if not self.gather_layout_dirty:
+            return
+        self.discard_pending_all_gathers()
+        for param in self.hsdp_params:
+            buffers = param.unsharded_param_buffers
+            if not buffers:
+                continue
+            shard = param._sharded_param_data
+            aliases_shard = param.shard_world_size == 1 and param.param_dtype is None and not param.offload_to_cpu
+            if (buffers[0].dtype != (param.param_dtype or param.orig_dtype)
+                    or buffers[0].numel() != shard.numel() * param.shard_world_size
+                    or (aliases_shard and buffers[0] is not shard)):
+                # The stable Parameter and its backing buffer must be replaced together.
+                if hasattr(param, "_unsharded_param"):
+                    del param._unsharded_param
+                buffers.clear()
+        if self.all_gather_buckets and self._gather_layout != self._current_gather_layout():
+            self.all_gather_buckets.clear()
+        self.gather_layout_dirty = False
+
+    def _current_gather_layout(self):
+        return tuple(
+            (id(p), id(p.mesh_info.shard_process_group), p.param_dtype or p.orig_dtype,
+             p.padded_sharded_param_size, p.hsdp_placement.dim, p.shard_world_size)
+            for p in self.hsdp_params if p.shard_world_size > 1
+        )
 
     def _init_all_gather_buckets(self) -> None:
         """Build ordered all-gather buckets from each parameter's communication facts."""
@@ -504,6 +568,7 @@ class HSDPParamGroup:
                 bucket_groups[bucket_key] = shard_group
             params_by_bucket[bucket_key].append(hsdp_param)
 
+        self._gather_layout = self._current_gather_layout()
         self.all_gather_buckets = []
         for bucket_key, hsdp_params in params_by_bucket.items():
             shard_group = bucket_groups[bucket_key]
@@ -531,6 +596,7 @@ class HSDPParamGroup:
 
     def unshard(self, async_op: bool = False) -> None:
         """Launch fused all-gathers for every communication bucket."""
+        self.refresh_all_gather_layout()
         if self.all_gather_buckets and any(
             bucket.all_gather_result is not None for bucket in self.all_gather_buckets
         ):
@@ -541,6 +607,7 @@ class HSDPParamGroup:
     @torch.no_grad()
     def foreach_all_gather(self, async_op: bool = False) -> None:
         """Initialize ordered buckets and launch their all-gathers."""
+        self.refresh_all_gather_layout()
         if not self.all_gather_buckets:
             self._init_all_gather_buckets()
         for hsdp_param in self.hsdp_params:
@@ -550,8 +617,10 @@ class HSDPParamGroup:
         for all_gather_bucket in self.all_gather_buckets:
             if all_gather_bucket.all_gather_result is not None:
                 continue
-            if self.enable_zero_copy and not all_gather_bucket.is_flat_buffer_valid():
+            use_flat = self.enable_zero_copy and all_gather_bucket.is_flat_buffer_valid()
+            if self.enable_zero_copy and not use_flat:
                 all_gather_bucket.init_flat_param_buffer(self.device)
+                use_flat = all_gather_bucket.is_flat_buffer_valid()
 
             metadata = all_gather_bucket.metadata
             all_gather_output = torch.empty(
@@ -559,7 +628,7 @@ class HSDPParamGroup:
                 dtype=all_gather_bucket.dtype,
                 device=self.device,
             )
-            if self.enable_zero_copy and all_gather_bucket.is_flat_buffer_valid():
+            if use_flat:
                 if all_gather_bucket.flat_param_buffer.dtype == all_gather_bucket.dtype:
                     all_gather_input = all_gather_bucket.flat_param_buffer
                 else:
@@ -590,6 +659,9 @@ class HSDPParamGroup:
 
     def wait_for_unshard(self) -> None:
         """Wait all fused all-gathers and install stable unsharded parameters."""
+        if self.gather_layout_dirty:
+            # A shard may have changed between async unshard() and handle.wait().
+            self.foreach_all_gather(async_op=False)
         for all_gather_bucket in self.all_gather_buckets:
             all_gather_bucket.copy_out()
         for hsdp_param in self.hsdp_params:
@@ -886,11 +958,22 @@ class HSDPParamGroup:
                 reduce_scatter_bucket.layout.param_numels,
                 reduce_scatter_bucket.param_offsets,
             ):
-                hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = reduce_scatter_output.narrow(
+                grad_view = reduce_scatter_output.narrow(
                     0,
                     param_offset,
                     param_numel,
                 )
+                # Consume final device gradients while this bucket is current.
+                # Source-layout reductions and offload are finalized by the root.
+                if (
+                    hsdp_param.source_shard_info is None
+                    and not hsdp_param.offload_to_cpu
+                    and not hsdp_param.apply_grad_on_fp32_main_grad
+                    and hsdp_param.sharded_param.grad is not None
+                ):
+                    hsdp_param.apply_reduced_grad(grad_view)
+                else:
+                    hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = grad_view
         self.reduce_scatter_buckets = []
         # Step3: luanch async allreduce buckets
         self._issue_all_reduce_buckets(self.all_reduce_buckets, async_op)

@@ -21,7 +21,7 @@ import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from hyper_parallel.core.fully_shard.api import HSDPModule
-from hyper_parallel.core.fully_shard.param_group import AllGatherBucket
+from hyper_parallel.core.fully_shard.param_group import AllGatherBucket, HSDPParamGroup
 
 
 class ConvertedLinear(HSDPModule, torch.nn.Linear):
@@ -36,8 +36,10 @@ class ConvertedLinear(HSDPModule, torch.nn.Linear):
             shard_group=None, shard_rank=0, shard_world_size=1,
             dtype=self.weight.dtype, metadata=None, flat_param_buffer=self.weight.detach(),
         )
+        group = HSDPParamGroup([], device=torch.device("cpu"))
+        group.all_gather_buckets = [self.bucket]
         self.hsdp_scheduler = SimpleNamespace(hsdp_state=SimpleNamespace(
-            hsdp_params=[], param_group=SimpleNamespace(all_gather_buckets=[self.bucket]),
+            hsdp_params=[], param_group=group,
         ))
 
     def reshard(self) -> None:
