@@ -23,7 +23,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.sparse_flash_mla import (
     supports_fused_attention_inputs, sparse_flash_mla,
 )

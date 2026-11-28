@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
+import math
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-import math
 from typing import Any, Literal
-import warnings
 
 import torch
 from torch import Tensor, nn
@@ -28,7 +28,8 @@ from torch.nn import functional as F
 from transformers.activations import SiLUActivation
 
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
-from hyper_parallel.components.functional import grouped_matmul, swiglu as npu_swiglu
+from hyper_parallel.components.functional import grouped_matmul
+from hyper_parallel.components.functional import swiglu as npu_swiglu
 from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
 from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
 from hyper_parallel.components.modules.mlp import swiglu_activation
@@ -64,6 +65,7 @@ class GroupedExpertsConfig:
         activation: Optional gate/up activation supplied by the model; defaults to SwiGLU.
         top_k: Static routing width required by fused executors; optional for ordinary GMM.
         swiglu_limit: Positive pre-SiLU clamp in FP32; None disables it, as do nonpositive values with a warning.
+        activation_dtype: SwiGLU precision when no clamp or custom activation is configured.
     """
 
     num_experts: int
@@ -75,6 +77,7 @@ class GroupedExpertsConfig:
     activation: Callable[[Tensor, Tensor], Tensor] | None = None
     top_k: int | None = None
     swiglu_limit: float | None = None
+    activation_dtype: Literal["input", "float32"] = "input"
 
     def __post_init__(self) -> None:
         if self.num_layers is None:
@@ -89,6 +92,8 @@ class GroupedExpertsConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.routing_weight_mode not in ("output", "before_fc2"):
             raise ValueError("routing_weight_mode must be output or before_fc2")
+        if self.activation_dtype not in ("input", "float32"):
+            raise ValueError("activation_dtype must be input or float32")
         top_k_type = type(self.top_k)
         if self.top_k is not None and (top_k_type is not int or not 1 <= self.top_k <= self.num_experts):
             raise ValueError("top_k must be a positive integer no greater than num_experts")
@@ -198,6 +203,7 @@ class GroupedExpertsModule(nn.Module):
         self, *, config: GroupedExpertsConfig | None = None, module: nn.Module | None = None,
         module_fqn: str = "", context: Mapping[str, Any] | None = None,
         activation: Callable[[Tensor, Tensor], Tensor] | None = None,
+        activation_dtype: str = "input", swiglu_limit: float | None = None,
     ) -> None:
         """Create global parameters or adopt an unsharded expert source.
 
@@ -209,6 +215,8 @@ class GroupedExpertsModule(nn.Module):
                 supplies global num_layers for FC2 initialization. Standalone source adoption
                 requires an explicit context['num_layers'] when the source has no canonical config.
             activation: Model-owned gate/up activation for a packed source.
+            activation_dtype: SwiGLU precision when adopting a packed source without a canonical config.
+            swiglu_limit: Explicit clamp for a packed source without a canonical config; None reads the source.
 
         Note:
             Fresh construction keeps nn.Module's default training=True. Source
@@ -223,13 +231,15 @@ class GroupedExpertsModule(nn.Module):
                 configs = tuple((context or {}).get("module_configs", ())) or (source_config,)
                 parameters = _packed_parameters(module, module_fqn, configs, activation)
                 experts, hidden, intermediate = _packed_dimensions(module, module_fqn, parameters, configs)
+                if swiglu_limit is None and activation is None:
+                    swiglu_limit = _match_expert_config_value((module, *configs), "swiglu_limit")
                 source_config = GroupedExpertsConfig(
                     experts, hidden, intermediate, routing_weight_mode="output", activation=activation,
+                    activation_dtype=activation_dtype,
                     num_layers=(context or {}).get("num_layers"),
                     init_method_std=_match_expert_config_value(configs, "init_method_std", 0.02),
                     top_k=_match_expert_config_value((module, *configs), "top_k"),
-                    swiglu_limit=(_match_expert_config_value((module, *configs), "swiglu_limit")
-                                  if activation is None else None),
+                    swiglu_limit=swiglu_limit,
                 )
             self.config = source_config
             self.gate_up_proj = module.gate_up_proj
@@ -246,6 +256,18 @@ class GroupedExpertsModule(nn.Module):
             self.down_proj = nn.Parameter(torch.empty(config.num_experts, config.hidden_size,
                                                       config.intermediate_size))
             self.reset_parameters()
+
+    @property
+    def limit(self) -> float:
+        """Expose the resolved source clamp to model-owned expert composition."""
+        return self.config.swiglu_limit or 0.0
+
+    def apply_activation(self, gate: Tensor, up: Tensor, dtype: torch.dtype) -> Tensor:
+        """Apply the custom activation or configured SwiGLU to the first projection."""
+        if self.config.activation is not None:
+            return self.config.activation(gate, up).to(dtype)
+        precision = "float32" if self.config.swiglu_limit is not None else self.config.activation_dtype
+        return swiglu_activation(gate, up, activation_dtype=precision, limit=self.config.swiglu_limit or 0.0).to(dtype)
 
     def reset_parameters(self) -> None:
         """Initialize both projections normally, using Megatron's depth scaling for FC2."""
@@ -383,14 +405,9 @@ class GroupedExpertsModule(nn.Module):
         # Empty ranks avoid unsupported empty GMM calls while retaining gradients to both weights.
         fc1 = (grouped_matmul(hidden, gate_up, group_list=group_list)  # pylint: disable=not-callable
                if hidden.shape[0] else hidden @ gate_up[0])
-        activation = self.config.activation
-        if self.config.swiglu_limit is not None:
-            gate, up = fc1.chunk(2, dim=-1)
-            activated = swiglu_activation(
-                gate, up, limit=self.config.swiglu_limit, activation_dtype="float32",
-            ).to(hidden.dtype)
-        elif activation is not None:
-            activated = activation(*fc1.chunk(2, dim=-1)).to(hidden.dtype)
+        if (self.config.swiglu_limit is not None or self.config.activation is not None
+                or self.config.activation_dtype != "input"):
+            activated = self.apply_activation(*fc1.chunk(2, dim=-1), hidden.dtype)
         else:
             activated = npu_swiglu(fc1)  # pylint: disable=not-callable
         if self.config.routing_weight_mode == "before_fc2":

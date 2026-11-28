@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 
-from hyper_parallel.components.losses.moe_aux_loss import sequence_load_balancing_loss
+from hyper_parallel.components.losses.aux_loss import sequence_load_balancing_loss
 from hyper_parallel.components.modules.moe.moe_utils import (
     accumulate_router_load as accumulate_expert_load,
     update_router_bias,

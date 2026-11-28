@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | Gate | [moe/router.py](router.py) | logits、learned TopK、fix-router；返回 logits/weights/实际 IDs |
 | 训练状态 | [GateModule](router.py) | 可选 aux-loss、选择 bias、mask/sequence metadata、并行资源绑定 |
-| sequence aux-loss | [losses/moe_aux_loss.py](../../losses/moe_aux_loss.py) | 不依赖具体模型的 sequence balancing 公式 |
+| sequence aux-loss | [losses/aux_loss.py](../../losses/aux_loss.py) | 不依赖具体模型的 sequence balancing 公式 |
 | 负载与更新 | [moe_utils.py](moe_utils.py) | backward 计数、跨组同步、step bias 更新 |
 | step 调度 | [MoEMonitorCallback](../../../trainer/callbacks/moe_monitor_callback.py) | 遍历模型并在 optimizer step 后更新 |
 | 共享专家 | [shared_expert.py](shared_expert.py)、[shared_expert_overlap.py](shared_expert_overlap.py) | 共享计算与普通 EP dispatch 的组合 |
@@ -177,7 +177,7 @@ self.gate = Gate(config=routing_config, context={'module_configs': (model_config
 独立训练循环（`router` / `experts` 已构造并按需绑定）：
 
 ```python
-from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
 
 optimizer.zero_grad()
@@ -281,7 +281,7 @@ Gate 通过 `bind_parallel` 绑定并行信息。
 | `sync_and_update_expert_bias` | router、既有统计 group → 更新并清零 | optimizer step 后汇总唯一统计轴，调用 router 的更新方法 |
 
 `routing_scores`、TopK 选择、`balanced_expert_indices` 统一放在 `router.py`；序列辅助损失在
-`components/losses/moe_aux_loss.py`；监控与 optimizer hook 在 `trainer/callbacks/moe_monitor_callback.py`。
+`components/losses/aux_loss.py`；监控与 optimizer hook 在 `trainer/callbacks/moe_monitor_callback.py`。
 工具文件不负责专家计算、dispatch/combine，也不重复规约已经覆盖的 EP group。
 
 ## 集合通信 MoonEP

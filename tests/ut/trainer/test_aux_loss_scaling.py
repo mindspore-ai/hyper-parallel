@@ -24,7 +24,7 @@ from unittest.mock import Mock
 import torch
 from torch import nn
 
-from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_auto_scale
 from hyper_parallel.trainer.base import BaseTrainer
 
 

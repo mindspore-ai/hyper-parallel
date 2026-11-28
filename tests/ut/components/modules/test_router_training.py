@@ -22,8 +22,9 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from examples.torch.module_family.config import GateConfig
-from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
-from hyper_parallel.components.losses.moe_aux_loss import sequence_load_balancing_loss
+from hyper_parallel.components.losses.aux_loss import (
+    aux_loss_scale_context, bind_aux_loss_scale, sequence_load_balancing_loss,
+)
 from hyper_parallel.components.modules import Gate
 from hyper_parallel.components.modules.moe.router import Gate as CanonicalGate
 from hyper_parallel.components.modules.moe.router import balanced_expert_indices

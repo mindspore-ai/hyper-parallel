@@ -75,7 +75,7 @@ from hyper_parallel.trainer.runtime.distributed import (
 from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
-from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from hyper_parallel.components.ops import ops
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel

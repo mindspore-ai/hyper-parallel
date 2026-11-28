@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional
 
-from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard

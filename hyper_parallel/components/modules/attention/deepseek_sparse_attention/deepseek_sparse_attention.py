@@ -27,7 +27,7 @@ from torch import nn
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
-from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.losses.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
 from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
 from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
