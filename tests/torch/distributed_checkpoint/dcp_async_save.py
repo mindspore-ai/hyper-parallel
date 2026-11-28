@@ -15,12 +15,11 @@
 """DCP async_save + load API tests (fully_shard + multi-parameter model)."""
 # pylint: disable=C0413
 import os
-
-
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -29,6 +28,8 @@ import torch_npu  # pylint: disable=W0611
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.distributed_checkpoint import async_save, load as dcp_load
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata
+from hyper_parallel.core.distributed_checkpoint.planner import SavePlan
+from hyper_parallel.core.distributed_checkpoint.standard_planner import CachedSaveResult, StandardSavePlanner
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
@@ -49,6 +50,25 @@ _MP = MixedPrecisionPolicy(
     output_dtype=torch.float32,
     cast_forward_inputs=True,
 )
+
+
+class _TracingSavePlanner(StandardSavePlanner):
+    """Record cache events in shared memory so the caller sees the persist child's trace."""
+
+    def __init__(self, events: torch.Tensor) -> None:
+        super().__init__()
+        self._events = events
+
+    def get_cached(self) -> Optional[CachedSaveResult]:
+        """Count a miss at index zero or a hit at index one."""
+        cached = super().get_cached()
+        self._events[int(cached is not None)].add_(1)
+        return cached
+
+    def cache_result(self, final_plan: SavePlan, metadata: Metadata) -> None:
+        """Count plan writes at index two."""
+        super().cache_result(final_plan, metadata)
+        self._events[2].add_(1)
 
 
 class FsdpAsyncDemoNet(nn.Module):
@@ -138,7 +158,9 @@ def _fresh_ckpt_dir(rank: int, tag: str) -> Path:
     return ckpt_dir
 
 
-def _run_async_save_load(tag: str, use_collectives: bool, use_gloo: bool) -> None:
+def _run_async_save_load(
+    tag: str, use_collectives: bool, use_gloo: bool, planner: Optional[StandardSavePlanner],
+) -> Metadata:
     """Async-save a fully_shard model, mutate it, then load the checkpoint back and compare.
 
     Args:
@@ -146,11 +168,13 @@ def _run_async_save_load(tag: str, use_collectives: bool, use_gloo: bool) -> Non
         use_collectives (bool): Whether the persist child coordinates with the other ranks.
         use_gloo (bool): Whether that coordination runs on a gloo group the child reinitialises
             (the alternative is exchanging plans and write results through the storage).
+        planner: Optional planner for tracing the cache across child processes.
+
+    Returns:
+        The save metadata returned by the persist child.
     """
-    init_dist()
     rank = dist.get_rank()
     world = dist.get_world_size()
-    assert world == 4, f"expect world_size=4, got {world}"
 
     model = _build_sharded_demo_model(world)
     save_data = {"model_state_dict": model.state_dict()}
@@ -161,6 +185,7 @@ def _run_async_save_load(tag: str, use_collectives: bool, use_gloo: bool) -> Non
     resp = async_save(
         save_data,
         checkpoint_id=ckpt_dir,
+        planner=planner,
         use_collectives=use_collectives,
         use_gloo=use_gloo,
         callback=lambda: callback_calls.append(1),
@@ -189,44 +214,35 @@ def _run_async_save_load(tag: str, use_collectives: bool, use_gloo: bool) -> Non
     dist.barrier()
     if rank == 0:
         shutil.rmtree(ckpt_dir, ignore_errors=True)
+    dist.barrier()
+    return persist_meta
 
 
-def test_dcp_async_save_load():
-    """
-    Feature: ``async_save`` without cross-rank coordination (``use_collectives=False``).
-    Description: Async-save a ``fully_shard`` model whose tensors are overwritten as soon as
-        the call returns, then load the checkpoint into a fresh model.
-    Expectation: Run success, the checkpoint holds the staged values and the callback ran once.
-    """
-    _run_async_save_load("no_comm", use_collectives=False, use_gloo=False)
+@pytest.mark.parametrize("transport, use_collectives, use_gloo, saves", [
+    pytest.param("local", False, False, 1, id="local"),
+    pytest.param("storage", True, False, 2, id="storage-cold-and-warm"),
+    pytest.param("gloo", True, True, 1, id="gloo"),
+])
+def test_dcp_async_save_and_restore(
+    transport: str, use_collectives: bool, use_gloo: bool, saves: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check staged data, completion and callbacks for each transport on four NPU ranks."""
+    init_dist()
+    world_size = dist.get_world_size()
+    assert world_size == 4, f"Expected four ranks for async save, got {world_size}"
 
-
-def test_dcp_async_save_load_with_storage_comm():
-    """
-    Feature: ``async_save`` coordinating through the storage (``use_collectives=True``).
-    Description: Same scenario, but the persist child exchanges local plans and write results
-        with the other ranks as files instead of over a process group.
-    Expectation: Run success, the checkpoint holds the staged values and the callback ran once.
-    """
-    _run_async_save_load("storage_comm", use_collectives=True, use_gloo=False)
-
-
-def test_dcp_async_save_load_with_gloo_comm():
-    """
-    Feature: ``async_save`` coordinating over gloo (``use_gloo=True``).
-    Description: Same scenario, but the persist child reinitialises a gloo process group from
-        MASTER_ADDR / MASTER_PORT and runs the plan collectives on it.
-    Expectation: Run success, the checkpoint holds the staged values and the callback ran once.
-    """
-    _run_async_save_load("gloo_comm", use_collectives=True, use_gloo=True)
-
-
-def test_dcp_async_save_twice_reuses_the_plan_cache():
-    """
-    Feature: back-to-back ``async_save`` calls.
-    Description: Persist the same model twice; the child hands its plan cache back to the
-        parent through the result queue, so the second save starts from a warm cache.
-    Expectation: Run success, both saves return Metadata and the second checkpoint loads back.
-    """
-    _run_async_save_load("twice_first", use_collectives=True, use_gloo=False)
-    _run_async_save_load("twice_second", use_collectives=True, use_gloo=False)
+    # Each transport must build a plan once. Only the second storage save sees a warm plan.
+    monkeypatch.setattr(StandardSavePlanner, "cached_save_result", {})
+    events = torch.zeros(3, dtype=torch.int64).share_memory_() if saves > 1 else None
+    planner = _TracingSavePlanner(events) if events is not None else None
+    for index in range(saves):
+        metadata = _run_async_save_load(f"{transport}_{index}", use_collectives, use_gloo, planner)
+        if use_collectives:
+            cache = StandardSavePlanner.cached_save_result
+            assert len(cache) == 1, f"[{transport}] expected one save plan returned to the parent, got {len(cache)}"
+            cached = next(iter(cache.values()))
+            assert cached.metadata == metadata, f"[{transport}] the returned save metadata differs from the cached plan"
+        if events is not None:
+            actual = events.tolist()
+            expected = [1, index, 1]
+            assert actual == expected, f"[{transport}] cache misses, hits, writes: got {actual}, expected {expected}"

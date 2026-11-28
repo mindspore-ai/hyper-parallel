@@ -14,6 +14,7 @@
 # ============================================================================
 """Activation Swap memory comparison: None vs Swap"""
 import copy
+import statistics
 import time
 from typing import Optional
 import pytest
@@ -113,7 +114,7 @@ def test_act_swap_memory_comparison():
     tol = 1e-5
     for step in range(train_steps):
         base_val = base_losses[step]
-        for mode in ["swap", "swap_with_policy"]:
+        for mode in ["swap", "swap_with_policy", "group_swap"]:
             val = results[mode]["losses"][step]
             diff = abs(val - base_val)
             assert diff < tol, (
@@ -515,6 +516,7 @@ def _run_cpu_pool_swap_step(
     inputs = [torch.randn(128, 1024).npu().requires_grad_() for _ in range(warmup_steps + steps)]
     losses = []
     step_times_ms = []
+    warm_pool_bytes = 0
 
     for step, step_input in enumerate(inputs):
         torch.npu.synchronize()
@@ -524,9 +526,15 @@ def _run_cpu_pool_swap_step(
         loss.backward()
         optimizer.step()
         torch.npu.synchronize()
+        if cpu_pool is not None and step == warmup_steps - 1:
+            warm_pool_bytes = cpu_pool.total_allocated
         if step >= warmup_steps:
             step_times_ms.append((time.perf_counter() - start) * 1000)
             losses.append(loss.item())
+            if cpu_pool is not None and warmup_steps:
+                assert cpu_pool.total_allocated == warm_pool_bytes > 0, (
+                    f"Step {step}: pool changed from {warm_pool_bytes} to {cpu_pool.total_allocated} bytes"
+                )
 
     del inputs, loss, optimizer, model
     torch.npu.empty_cache()
@@ -539,8 +547,8 @@ def test_act_swap_tensor_cpu_pool_performance():
     Description: Use swap_wrapper with a MUST_SWAP per-tensor policy, warm both paths,
                  then compare identical activation-swap steps with and without pool reuse.
                  Synchronize NPU work at both timing boundaries.
-    Expectation: Every loss pair aligns within 1e-5, the explicit pool is populated,
-                 and its average measured step time is shorter than the non-pool path.
+    Expectation: Every loss pair aligns within 1e-5, the explicit pool reuses its warm
+                 allocation, and the pooled median stays within 1.25x of the non-pool path.
     """
     steps = 10
     cpu_pool = PinnedMemoryPool(max_host_bytes=256 * 1024**2)
@@ -553,7 +561,7 @@ def test_act_swap_tensor_cpu_pool_performance():
     assert len(without_pool_step_times) == steps
     assert len(with_pool_step_times) == steps
     assert all(step_time > 0 for step_time in without_pool_step_times + with_pool_step_times)
-    assert cpu_pool.total_allocated > 0, "Expected swap_wrapper to allocate from the explicit CPU pool."
+    assert 0 < cpu_pool.total_allocated <= cpu_pool.max_host_bytes, "Expected allocation within the CPU pool budget"
 
     for step, (without_pool_loss, with_pool_loss) in enumerate(zip(without_pool_losses, with_pool_losses)):
         loss_diff = abs(with_pool_loss - without_pool_loss)
@@ -564,13 +572,21 @@ def test_act_swap_tensor_cpu_pool_performance():
 
     without_pool_avg_ms = sum(without_pool_step_times) / steps
     with_pool_avg_ms = sum(with_pool_step_times) / steps
+    without_pool_median_ms = statistics.median(without_pool_step_times)
+    with_pool_median_ms = statistics.median(with_pool_step_times)
     print(
         "Per-tensor activation swap CPU pool comparison passed: "
         f"without_cpu_pool_step_ms={[round(value, 3) for value in without_pool_step_times]}, "
         f"with_cpu_pool_step_ms={[round(value, 3) for value in with_pool_step_times]}, "
         f"without_cpu_pool_avg_ms={without_pool_avg_ms:.3f}, "
         f"with_cpu_pool_avg_ms={with_pool_avg_ms:.3f}, "
+        f"without_cpu_pool_median_ms={without_pool_median_ms:.3f}, "
+        f"with_cpu_pool_median_ms={with_pool_median_ms:.3f}, "
         f"pool_allocated_bytes={cpu_pool.total_allocated}"
+    )
+    # Use an allowance for host scheduling and device copy variability on gate runners.
+    assert 0 < without_pool_median_ms < float("inf") and 0 < with_pool_median_ms <= 1.25 * without_pool_median_ms, (
+        f"Pooled median {with_pool_median_ms:.3f} ms exceeded 1.25x of {without_pool_median_ms:.3f} ms"
     )
 
 

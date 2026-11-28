@@ -23,23 +23,9 @@ _VPP_SCHEDULE = str(Path(__file__).resolve().parent / "vpp_schedule.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
-def test_vpp_schedule_group1():
-    """
-    Feature: parallel run case in pipeline_parallel
-    Description:
-        Runs ``test_vpp`` / ``run_parallel``. Before the VPP schedule, each **PP domain**
-        (two ranks per domain when world size is 4) builds its own ``DeviceMesh``,
-        calls ``manual_seed(parallel_seed, domain_mesh)`` with **different seeds per domain**,
-        then runs ``torch.randn_like`` on a **sharded** ``DTensor`` on that mesh.
-
-        ``simple_mlp.MLP`` still includes ``Dropout(p=0)`` for a no-op random-style module in the
-        main network without affecting ``allclose`` vs standalone.
-
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_VPP_SCHEDULE, "test_vpp", 12346, 4)
-    ])
+def test_vpp_schedule_group1() -> None:
+    """Check per-domain RNG, outputs and gradients for both VPP warmup shapes on four ranks."""
+    parallel_run([TorchCase(_VPP_SCHEDULE, "test_vpp_npu_warmup_shapes", num_proc=4)])
 
 
 @arg_mark(
@@ -97,29 +83,11 @@ def test_vpp_schedule_group1_gloo():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
-def test_vpp_schedule_deep_warmup():
-    """
-    Feature: Interleaved 1F1B deep-warmup (vpp=2, M=3*PP) correctness.
-    Description: Launch ``test_vpp_deep_warmup`` on 4 ranks (pp=4, vpp=2,
-        micro_batch_num=12). Regression test for the zero-width DATA_LOAD
-        splice: when per-FWD DATA_LOAD slots widen each rank's schedule columns
-        by its warmup depth, the last rank's BWD_RECV lands after the BWD that
-        consumes it (garbage grads, then irecv(None)).
-    Expectation: Worker exits 0 on every rank; losses and weights match the
-        standalone reference.
-    """
-    parallel_run([
-        TorchCase(_VPP_SCHEDULE, "test_vpp_deep_warmup", 12348, 4)
-    ])
-
-
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_vpp_schedule_deep_warmup_gloo():
     """
     Feature: Interleaved 1F1B deep-warmup (vpp=2, M=3*PP) correctness on gloo.
-    Description: The ``test_vpp_deep_warmup`` worker on 4 CPU/gloo ranks — same
-        regression shape as :func:`test_vpp_schedule_deep_warmup`.
+    Description: The ``test_vpp_deep_warmup`` worker on 4 CPU/gloo ranks.
     Expectation: Worker exits 0 on every rank; losses and weights match the
         standalone reference.
     """

@@ -280,33 +280,53 @@ def test_memory_lifecycle() -> None:
         assert max(result[3]) - min(result[3]) < min_gap, "allocated bytes grew across completed steps"
 
 
+def test_checkpoint_exclude_numerics_and_rng() -> None:
+    """Check excluded operator precision and autocast RNG parity in one NPU worker."""
+    test_operator_numerics()
+    test_rng_autocast()
+
+
+def _time_checkpoint_step(block: _Block, input_data: torch.Tensor, *, reentrant: bool) -> tuple[float, float, float]:
+    """Measure forward submission, full submission and synchronized step time in milliseconds."""
+    value = input_data.clone().requires_grad_()
+    block.weight.grad = None
+    torch.npu.synchronize()
+    start = time.perf_counter()
+    loss = checkpoint(block, value, use_reentrant=reentrant)
+    forward_host = time.perf_counter()
+    loss.backward()
+    submitted = time.perf_counter()
+    torch.npu.synchronize()
+    completed = time.perf_counter()
+    return (forward_host - start) * 1000, (submitted - start) * 1000, (completed - start) * 1000
+
+
 def test_timing_observation() -> None:
-    """Report forward/step host submissions and synchronized steps, without speed assertions."""
+    """Bound warmed reentrant timings against the equivalent non-reentrant step."""
     _require_npu()
     torch.manual_seed(189)
     for operator in ("mm", "gmm", "fa"):
-        reference = _Block(operator, pointwise_layers=24)
-        weight = reference.weight.detach().clone()
+        blocks = {reentrant: _Block(operator, pointwise_layers=24) for reentrant in (False, True)}
+        with torch.no_grad():
+            blocks[True].weight.copy_(blocks[False].weight)
         input_data = _input(operator).detach()
-        for mode in ("nonreentrant", "reentrant"):
-            block = _Block(operator, pointwise_layers=24)
-            with torch.no_grad():
-                block.weight.copy_(weight)
-            samples = []
-            for step in range(7):
-                value = input_data.clone().requires_grad_()
-                block.weight.grad = None
-                torch.npu.synchronize()
-                start = time.perf_counter()
-                loss = checkpoint(block, value, use_reentrant=mode == "reentrant")
-                forward_host = time.perf_counter()
-                loss.backward()
-                submitted = time.perf_counter()
-                torch.npu.synchronize()
-                completed = time.perf_counter()
+        samples = {False: [], True: []}
+        for step in range(7):
+            order = (False, True) if step % 2 == 0 else (True, False)
+            for reentrant in order:
+                timing = _time_checkpoint_step(blocks[reentrant], input_data, reentrant=reentrant)
                 if step >= 2:
-                    samples.append(((forward_host - start) * 1000, (submitted - start) * 1000,
-                                    (completed - start) * 1000))
-            medians = [statistics.median(sample[index] for sample in samples) for index in range(3)]
-            print(f"{operator}/{mode}: forward_host_ms={medians[0]:.3f} "
-                  f"full_host_ms={medians[1]:.3f} sync_step_ms={medians[2]:.3f}")
+                    samples[reentrant].append(timing)
+        for reentrant, block in blocks.items():
+            assert block.excluded.calls == 7, f"{operator}/{reentrant} ran {block.excluded.calls} excluded calls"
+        for label, reference, actual in zip(
+            ("forward_host_ms", "full_host_ms", "sync_step_ms"),
+            map(statistics.median, zip(*samples[False], strict=True)),
+            map(statistics.median, zip(*samples[True], strict=True)),
+            strict=True,
+        ):
+            print(f"{operator}/{label}: nonreentrant={reference:.3f} reentrant={actual:.3f}")
+            # Use paired medians and allow headroom for shared gate host scheduling jitter.
+            assert 0 < reference < float("inf") and 0 < actual <= 1.25 * reference, (
+                f"{operator}/{label}: reentrant {actual:.3f} ms, nonreentrant {reference:.3f} ms (limit 1.25x)"
+            )

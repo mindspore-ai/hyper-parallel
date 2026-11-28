@@ -33,22 +33,22 @@ arrived out of another stage's broadcast, fails the comparison rather than passi
 buffer that happened to be zero.
 """
 # pylint: disable=C0413
-import os
-
-
 import shutil
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, Union
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.distributed_checkpoint import load, save
 from hyper_parallel.core.distributed_checkpoint.broadcast import _MAX_BROADCASTS_IN_FLIGHT
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.distributed_checkpoint.standard_planner import StandardSavePlanner
+from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
@@ -134,16 +134,16 @@ _LAYERS_PER_STAGE = 2 * _MAX_BROADCASTS_IN_FLIGHT
 _BATCH_SETTINGS = (0, 6 * 1024 * 1024)
 
 
-def _setup(seed: int) -> tuple[Any, int]:
-    """Initialize the backend and return the torch process group plus this rank."""
+def _setup(seed: int) -> int:
+    """Initialize the backend and return this rank."""
     init_backend(_DEVICE_TYPE)
     torch.manual_seed(seed)
     world_size = dist.get_world_size()
     assert world_size == _WORLD_SIZE, f"expect world_size={_WORLD_SIZE}, got {world_size}"
-    return dist, dist.get_rank()
+    return dist.get_rank()
 
 
-def _fresh_checkpoint_dir(dist_pg: Any, rank: int, name: str) -> Path:
+def _fresh_checkpoint_dir(rank: int, name: str) -> Path:
     """Return an empty checkpoint directory, agreed on by every rank."""
     checkpoint_path = Path(f"./{name}")
     if rank == 0 and checkpoint_path.exists():
@@ -313,14 +313,14 @@ def _run_pp_load(
     stage split is covered both with the small shards gathered into one broadcast and with
     each going on its own.
     """
-    dist_pg, rank = _setup(seed)
+    rank = _setup(seed)
     mesh = init_device_mesh(
         device_type=_DEVICE_TYPE, mesh_shape=shape.mesh_shape,
         mesh_dim_names=shape.mesh_dim_names,
     )
     stage_mesh = mesh[shape.stage_dims]
     pp_rank = mesh.get_local_rank("pp")
-    checkpoint_path = _fresh_checkpoint_dir(dist_pg, rank, checkpoint_name)
+    checkpoint_path = _fresh_checkpoint_dir(rank, checkpoint_name)
 
     saved = _build_state(specs, shape, stage_mesh, rank, pp_rank, poisoned=False)
     _assert_stages_differ(specs, saved, pp_rank, rank)
@@ -479,3 +479,21 @@ def test_dcp_load_pp4_tied_parameter_skips_the_middle_stages() -> None:
         specs=_tied_specs(_PP4, (0, 3)),
         seed=61,
     )
+
+
+@pytest.mark.parametrize("check", [
+    pytest.param(test_dcp_load_pp_stages_hold_different_parameters, id="pp2-stage-local"),
+    pytest.param(test_dcp_load_pp_stage_without_replicated_shards, id="pp2-no-replicas"),
+    pytest.param(test_dcp_load_pp_stages_interleave_in_the_shard_order, id="pp2-interleaved"),
+    pytest.param(test_dcp_load_pp_tied_parameter_spans_both_stages, id="pp2-world-group"),
+    pytest.param(test_dcp_load_pp4_stages_hold_different_parameters, id="pp4-stage-local"),
+    pytest.param(test_dcp_load_pp4_tied_parameter_skips_the_middle_stages, id="pp4-distant-tie"),
+])
+def test_dcp_load_pipeline_stage_matrix(check: Callable[[], None], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Share rank startup while each scenario starts with fresh stage groups and plans."""
+    # The planner keys on state-dict names, which can repeat across the PP2 and PP4 cases.
+    monkeypatch.setattr(StandardSavePlanner, "cached_save_result", {})
+    # Keep the rendezvous group, but rebuild the per-stage groups for every scenario.
+    clear_device_mesh_cache()
+    check()
+    dist.barrier()
