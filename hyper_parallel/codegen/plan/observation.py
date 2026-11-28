@@ -16,7 +16,11 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field, fields
+from functools import lru_cache
+import inspect
+import textwrap
 from typing import Any
 
 from hyper_parallel.codegen.inline.component_source import observe_wrapper_source
@@ -124,6 +128,17 @@ def _observe_nested_components(plan: Any, model: Any) -> list[dict[str, str]]:
     root_module = type(model).__module__
     components: dict[tuple[str, str], dict[str, str]] = {}
     for boundary_fqn in (getattr(plan, "modules", {}) or {}):
+        parts = boundary_fqn.split(".")
+        for index in range(1, len(parts) + 1):
+            ancestor_fqn = ".".join(parts[:index])
+            ancestor_type = type(model.get_submodule(ancestor_fqn))
+            parent = model if index == 1 else model.get_submodule(".".join(parts[:index - 1]))
+            if (ancestor_type.__module__ == root_module
+                    and parts[index - 1] in _auto_model_attributes(type(parent))):
+                identity = f"{root_module}:{ancestor_type.__qualname__}"
+                components[(ancestor_fqn, identity)] = {
+                    "fqn": ancestor_fqn, "type": identity, "owner_module": root_module,
+                }
         owner_module = type(model.get_submodule(boundary_fqn)).__module__
         if (
             owner_module == root_module
@@ -132,7 +147,6 @@ def _observe_nested_components(plan: Any, model: Any) -> list[dict[str, str]]:
         ):
             continue
         candidates = []
-        parts = boundary_fqn.split(".")
         for index in range(1, len(parts) + 1):
             ancestor_fqn = ".".join(parts[:index])
             ancestor_type = type(model.get_submodule(ancestor_fqn))
@@ -148,6 +162,25 @@ def _observe_nested_components(plan: Any, model: Any) -> list[dict[str, str]]:
             "owner_module": owner_module,
         }
     return [components[key] for key in sorted(components)]
+
+
+@lru_cache(maxsize=None)
+def _auto_model_attributes(parent_type: type) -> frozenset[str]:
+    """Read concrete child slots constructed through the native AutoModel registry."""
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(parent_type.__init__)))
+    except (OSError, TypeError):
+        return frozenset()
+    result = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.value, ast.Call):
+            continue
+        target, factory = node.targets[0], node.value.func
+        if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"
+                and isinstance(factory, ast.Attribute) and factory.attr == "from_config"
+                and isinstance(factory.value, ast.Name) and factory.value.id == "AutoModel"):
+            result.add(target.attr)
+    return frozenset(result)
 
 
 __all__ = ["EmissionPlanObservation", "observe_emission_plan"]

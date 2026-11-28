@@ -155,6 +155,9 @@ def observe_wrapper_source(
     source_bindings = _installed_closure_bindings(function, node.name)
     target_names, original_names = _bound_capture_names(captures, target, original_forward)
     bindings, literals = _closure_bindings(function, captures, companions)
+    initializers, state_imports = _companion_initializers(
+        function, captures, bindings, target_names, original_names, literals,
+    )
     cp_scalars = _native_cp_scalars(function, captures, bindings)
     if cp_scalars:
         offset = 1 if ast.get_docstring(node) is not None else 0
@@ -176,9 +179,11 @@ def observe_wrapper_source(
     globals_used = _referenced_global_names("\n".join((*source_bindings.values(), ast.unparse(node)))) - set(captures)
     owner = function.__globals__["__name__"]
     imports = [(owner, name) for name in sorted(globals_used & function.__globals__.keys())]
+    imports.extend(state_imports)
     if "_get_cp_submesh" in body:
         imports.append(("hyper_parallel.distributed._builder.applier", "_get_cp_submesh"))
     return {"body": body, "imports": imports, "bindings": tuple(source_bindings.values()),
+            "initializers": initializers,
             "definition": _wrapper_definition(node, body, getattr(forward, "__self__", None) is target)}
 
 
@@ -221,6 +226,55 @@ def _bound_capture_names(captures: dict[str, Any], target: Any, original: Any) -
                 if getattr(value, "__self__", None) is target
                 and getattr(value, "__func__", None) is getattr(original, "__func__", None)]
     return targets, forwards
+
+
+def _companion_initializers(
+    function: Any, captures: dict[str, Any], bindings: dict[str, str],
+    target_names: list[str], original_names: list[str], literals: dict[str, Any],
+) -> tuple[tuple[str, ...], list[tuple[str, str]]]:
+    """Rebuild explicitly published state from its native constructor, never from the live object."""
+    qualname = _function_source_qualname(function)
+    owner = function.__globals__.get(qualname.partition(".<locals>.")[0])
+    if not inspect.isfunction(owner):
+        return (), []
+    tree = ast.parse(textwrap.dedent(inspect.getsource(owner.__code__))).body[0]
+    assignments = {node.targets[0].id: node.value for node in tree.body if isinstance(node, ast.Assign)
+                   and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)}
+    target_names = list(target_names)
+    for name in original_names:
+        value = assignments.get(name)
+        if isinstance(value, ast.Attribute) and value.attr == "forward" and isinstance(value.value, ast.Name):
+            if not any(isinstance(node, ast.Name) and node.id == value.value.id and isinstance(node.ctx, ast.Store)
+                       for node in ast.walk(tree)):
+                target_names.append(value.value.id)
+    initializers, imports = [], []
+    for name, attr in bindings.items():
+        value = assignments.get(name)
+        if attr is None or not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name):
+            continue
+        constructor = function.__globals__.get(value.func.id)
+        if constructor is not type(captures[name]) or not _assigned_once(tree, name):
+            continue
+        arguments = []
+        for argument in (*value.args, *(keyword.value for keyword in value.keywords)):
+            if isinstance(argument, ast.Name) and argument.id in target_names:
+                arguments.append("self")
+            elif isinstance(argument, ast.Name) and argument.id in literals:
+                arguments.append(repr(literals[argument.id]))
+            else:
+                try:
+                    arguments.append(repr(ast.literal_eval(argument)))
+                except (ValueError, TypeError) as exc:
+                    raise RuntimeError(f"codegen cannot rebuild companion {name!r} from a dynamic argument") from exc
+        positional = arguments[:len(value.args)]
+        keywords = [f"{keyword.arg}={text}" if keyword.arg else f"**{text}"
+                    for keyword, text in zip(value.keywords, arguments[len(value.args):])]
+        module, symbol = constructor.__module__, constructor.__name__
+        if getattr(importlib.import_module(module), symbol, None) is not constructor:
+            raise RuntimeError(f"codegen companion constructor {constructor!r} is not importable")
+        initializers.append(f"self.{attr} = {symbol}({', '.join((*positional, *keywords))})")
+        imports.append((module, symbol))
+    return tuple(dict.fromkeys(initializers)), imports
 
 
 def _native_companion_bindings(function: Any) -> tuple[dict[str, str], set[str]]:

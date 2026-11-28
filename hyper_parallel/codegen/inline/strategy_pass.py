@@ -58,7 +58,7 @@ def build_strategy_patches(
     """
     patch_set = InlinePatchSet()
     imported: set[str] = set()
-    subclassed: dict[str, str] = {}
+    subclassed: dict[str, tuple[str, tuple[str, ...]]] = {}
     for rule in rules:
         target = rule.inner_wrapper_target
         if target is None:
@@ -85,7 +85,7 @@ def _materialize_cp_forward(
     target: str,
     model_type: str | None,
     boundary_classes: Mapping[str, str] | None,
-    subclassed: dict[str, str],
+    subclassed: dict[str, tuple[str, tuple[str, ...]]],
 ) -> None:
     """Materialize CP dispatch in the original host class exactly once."""
     host_classes = ({rule.observed_wrapper["host_class"]} if rule.observed_wrapper is not None
@@ -93,17 +93,19 @@ def _materialize_cp_forward(
     if not host_classes:
         raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
     for host_class in sorted(host_classes):
+        definition = (spec.definition or spec.subclass_shell, spec.initializers)
         if host_class in subclassed:
-            if subclassed[host_class] != (spec.definition or spec.subclass_shell):
+            if subclassed[host_class] != definition:
                 raise RuntimeError(f"codegen: conflicting CP bindings for source class {host_class!r}")
             continue
-        subclassed[host_class] = spec.definition or spec.subclass_shell
+        subclassed[host_class] = definition
         patch_set.forward_extracts.append(
             ForwardExtractPatch(
                 class_name=host_class,
                 method_name=spec.method_name,
                 body=spec.subclass_shell,
                 definition=spec.definition,
+                initializers=spec.initializers,
             )
         )
 
@@ -129,6 +131,7 @@ def _rule_strategy(
         return StrategySpec(
             kind=CP_ATTENTION_KIND, subclass_shell=rule.observed_wrapper["body"],
             definition=rule.observed_wrapper.get("definition"),
+            initializers=tuple(rule.observed_wrapper.get("initializers", ())),
             imports=tuple(ImportPatch(module, (name,)) for module, name in rule.observed_wrapper["imports"]),
             snippets=tuple(ModuleSnippetPatch(source) for source in rule.observed_wrapper.get("bindings", ())),
         )

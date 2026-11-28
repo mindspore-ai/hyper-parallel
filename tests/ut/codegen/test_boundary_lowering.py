@@ -2084,7 +2084,7 @@ def test_explicit_replacements_preserve_partial_layers_aliases_and_initializatio
 
 def test_shared_replacement_groups_survive_existing_snapshot_projection(monkeypatch):
     """Retain native alias groups when equal replacement rules are coalesced."""
-    monkeypatch.setattr(replacement_pass, "replacement_spec", lambda *_args, **_kwargs: ReplacementSpec(
+    monkeypatch.setattr(replacement_pass, "replacement_spec_for_observation", lambda *_args, **_kwargs: ReplacementSpec(
         old_ctor="Original", new_ctor="Wrapped", imports=(), mode="wrap_source", defer_to_fqns=True))
     rules = collect_source_observations(SimpleNamespace(module_overrides=[
         {"fqns": ["model.layers.0", "model.alias"], "factory": "demo.Wrapped"},

@@ -84,6 +84,7 @@ class ForwardExtractPatch:
     method_name: str
     body: str
     definition: str | None = None
+    initializers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,7 @@ class StrategySpec:
     subclass_shell: str | None = None
     definition: str | None = None
     snippets: tuple[ModuleSnippetPatch, ...] = ()
+    initializers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Require a complete method patch or an imports-only declaration."""

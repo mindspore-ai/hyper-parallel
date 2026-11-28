@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+from dataclasses import replace
 from functools import lru_cache
 import inspect
 import textwrap
@@ -59,6 +60,7 @@ from hyper_parallel.codegen.inline.ir import (
     ImportPatch,
     ModuleSnippetPatch,
     ReplacementSpec,
+    SourceObservation,
     StrategySpec,
 )
 from hyper_parallel.codegen.inline.recognition import (
@@ -123,21 +125,16 @@ def _family_key(model_type: str | None, target: str | None) -> str | None:
 
 
 def _factory_function(target: str, model_type: str | None):
-    """Resolve a YAML replacement ``_target_`` to the family's real factory.
-
-    Returns ``None`` when the target is not a factory exported by this family's
-    replacements provider — a target the framework cannot structurally resolve.
-    """
-    module = _family_provider(model_type, "replacements")
-    if module is None:
+    """Resolve the recorded native factory without re-executing its provider."""
+    del model_type
+    module_name, _, name = target.replace(":", ".", 1).rpartition(".")
+    if not module_name or not name:
         return None
-    prefix = module.__name__ + "."
-    if not target.startswith(prefix):
+    try:
+        factory = getattr(importlib.import_module(module_name), name, None)
+    except ImportError:
         return None
-    name = target[len(prefix):]
-    if "." in name:
-        return None
-    return getattr(module, name, None)
+    return factory if getattr(factory, "_hp_module_replacement", False) else None
 
 
 #: Generic components are valid direct targets without a decorator. Model-owned
@@ -512,6 +509,20 @@ __all__ = [
 ]
 
 
+def replacement_spec_for_observation(
+    rule: SourceObservation, model_type: str | None = None,
+) -> ReplacementSpec | None:
+    """Resolve the same native observation for coverage checks and rendering."""
+    if rule.construction is not None:
+        return observed_constructor_spec(rule)
+    spec = replacement_spec_for(rule.replace_target, model_type, module_type=rule.module_type)
+    if spec is None:
+        return None
+    arguments = {item.split("=", 1)[0]: item for item in spec.keyword_args}
+    arguments.update({item.split("=", 1)[0]: item for item in rule.construction_kwargs})
+    return replace(spec, keyword_args=tuple(arguments.values()))
+
+
 def observed_constructor_spec(rule: Any) -> ReplacementSpec | None:
     """Use the native-selected class and its existing construction contracts."""
     module_name, name = rule.construction["implementation"].replace(":", ".", 1).rsplit(".", 1)
@@ -526,12 +537,39 @@ def observed_constructor_spec(rule: Any) -> ReplacementSpec | None:
             arguments.append(f"{key}={value}")
     mode = _observed_constructor_mode(component, parameters)
     if mode == "wrap_source" and "module" not in parameters:
-        return replacement_spec_for(rule.replace_target, module_type=rule.module_type)
+        return (replacement_spec_for(rule.replace_target, module_type=rule.module_type)
+                or _observed_factory_spec(rule, component))
     imports, snippets = _observed_component_source(component)
     return ReplacementSpec(
         old_ctor=class_name_of(rule.module_type), new_ctor=name,
         imports=imports, mode=mode,
         keyword_args=tuple(arguments), remove_class=False, snippets=snippets,
+    )
+
+
+def _observed_factory_spec(rule: SourceObservation, component: type) -> ReplacementSpec | None:
+    """Keep a proven native classmethod construction instead of guessing an initializer."""
+    factory = _factory_function(rule.replace_target, None) if rule.replace_target else None
+    if not inspect.isfunction(factory):
+        return None
+    tree = ast.parse(textwrap.dedent(inspect.getsource(factory)))
+    returns = [node.value for node in ast.walk(tree) if isinstance(node, ast.Return)]
+    if len(returns) != 1 or not isinstance(returns[0], ast.Call):
+        return None
+    callee = returns[0].func
+    if (not isinstance(callee, ast.Attribute) or not isinstance(callee.value, ast.Name)
+            or factory.__globals__.get(callee.value.id) is not component):
+        return None
+    # No live build context is retained in a snapshot. An unused protocol
+    # argument can be supplied, but a context-dependent factory stays unsupported.
+    if any(isinstance(node, ast.Name) and node.id == "context" and isinstance(node.ctx, ast.Load)
+           for node in ast.walk(tree)):
+        return None
+    return ReplacementSpec(
+        old_ctor=class_name_of(rule.module_type), new_ctor=factory.__name__, mode="wrap_source",
+        imports=(ImportPatch(factory.__module__, (factory.__name__,)),),
+        keyword_args=("module_fqn=''", "context={}", *rule.construction_kwargs),
+        remove_class=False, defer_to_fqns=True,
     )
 
 

@@ -52,6 +52,46 @@ class DeepseekV3Model:
 """
 
 
+class _ObservedBoundary:
+    """Represent a component-owned boundary after native replacement."""
+
+    __module__ = "hyper_parallel.components.fixture"
+
+
+class _ObservedTower:
+    """Keep the enclosing model's source owner after replacing a child."""
+
+    def __init__(self):
+        self.block = _ObservedBoundary()
+
+
+class _AutoFactory:
+    """Stand in for the native registry without modifying Transformers globals."""
+
+    @staticmethod
+    def from_config(_config: object) -> _ObservedTower:
+        """Construct the native tower selected by the fixture registry."""
+        return _ObservedTower()
+
+
+AutoModel = _AutoFactory
+
+
+class _ObservedHost:
+    """Use both concrete and registry construction in the same source file."""
+
+    def __init__(self, config):
+        self.direct = _ObservedTower()
+        self.dynamic = AutoModel.from_config(config)
+
+    def get_submodule(self, path: str) -> object:
+        """Resolve a recorded module path without Torch or process groups."""
+        module = self
+        for name in path.split("."):
+            module = getattr(module, name)
+        return module
+
+
 class TestSourceComposition(unittest.TestCase):
     """Validate one-file composition for a nested AutoModel text tower."""
 
@@ -172,6 +212,48 @@ class TestSourceComposition(unittest.TestCase):
             "type": "transformers.models.deepseek_v3.modeling_deepseek_v3:DeepseekV3Model",
             "owner_module": "transformers.models.deepseek_v3.modeling_deepseek_v3",
         }])
+
+    def test_same_source_factory_is_observed_below_a_replaced_boundary(self):
+        """Component ownership must not hide the native registry-built parent."""
+        model = _ObservedHost(object())
+        plan = SimpleNamespace(modules={
+            "direct.block": SimpleNamespace(), "dynamic.block": SimpleNamespace(),
+        })
+
+        frozen = observe_emission_plan(plan, model).to_dict()
+
+        self.assertEqual(frozen["nested_components"], [{
+            "fqn": "dynamic", "type": f"{__name__}:_ObservedTower", "owner_module": __name__,
+        }])
+
+    @patch("hyper_parallel.codegen.source.composition._read_module_source")
+    def test_same_source_towers_use_emitted_classes_without_duplicate_source(self, mock_read):
+        """Instantiated child methods come from the artifact, not the global registry."""
+        source = (
+            "class TextTower:\n"
+            "    def __init__(self, config):\n        self.config = config\n"
+            "class VisionTower(TextTower):\n    pass\n"
+            "class Host:\n"
+            "    def __init__(self, config):\n"
+            "        self.language = AutoModel.from_config(config)\n"
+            "        self.visual = AutoModel.from_config(config)\n"
+        )
+        meta = SimpleNamespace(source={"module_name": "fixture.modeling"}, nested_components=[
+            {"fqn": name, "type": f"fixture.modeling:{kind}"}
+            for name, kind in (("language", "TextTower"), ("visual", "VisionTower"))
+        ])
+        registry = SimpleNamespace(from_config=lambda _config: self.fail("native registry was executed"))
+
+        rendered = compose_nested_model_sources(source, meta)
+        namespace = {"AutoModel": registry}
+        exec(compile(rendered, "<emitted-towers>", "exec"), namespace)  # pylint: disable=exec-used
+        model = namespace["Host"](object())
+
+        self.assertIs(type(model.language), namespace["TextTower"])
+        self.assertIs(type(model.visual), namespace["VisionTower"])
+        self.assertEqual(rendered.count("class TextTower:"), 1)
+        self.assertEqual(model.language.__init__.__func__.__code__.co_filename, "<emitted-towers>")
+        mock_read.assert_not_called()
 
 
 if __name__ == "__main__":

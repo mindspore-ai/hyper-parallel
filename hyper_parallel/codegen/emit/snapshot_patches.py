@@ -34,11 +34,17 @@ def emission_patches_from_snapshot_payload(
         payload: Serialized native observations and selected strategy records.
     """
     applications = payload["replacements"]["applications"]
+    factories = {
+        item["rule_id"]: import_target_path(item["replacement_target"])
+        for item in payload["replacements"].get("declarations", ())
+        if item.get("replacement_target")
+    }
     replacements = [
         {
             "module_fqn": item["primary_fqn"],
             "source_type": item["source_type"],
             "replacement_type": item["replacement_type"],
+            **({"factory": factories[item["rule_id"]]} if item.get("rule_id") in factories else {}),
             **({"factory": item["family_request"]["factory"],
                 "factory_kwargs": {**item["family_request"]["kwargs"],
                                    "context": item["family_request"]["context"]}}
