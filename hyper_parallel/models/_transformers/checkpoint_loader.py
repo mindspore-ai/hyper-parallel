@@ -47,6 +47,7 @@ from hyper_parallel.components.checkpoint.load_groups import (
     local_target_tensor,
 )
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
+from hyper_parallel.core.distributed_checkpoint.metadata import CHUNK_INFO
 from hyper_parallel.models.registry import resolve_model_adapter
 
 # PEP 604 unions (``str | Path``, ``int | None``) are valid on this interpreter, but the checker
@@ -65,9 +66,10 @@ class CheckpointManager:
     to restore the released tensor names and layouts.
     """
 
-    def __init__(self, model: nn.Module) -> None:
-        """Bind the manager to one finalized model."""
+    def __init__(self, model: nn.Module, compiler: Any = None) -> None:
+        """Bind the manager to one finalized model and its optional graph compiler."""
         self.model = model
+        self.compiler = compiler
 
     def save_pretrained(
         self,
@@ -157,9 +159,17 @@ class CheckpointManager:
     def _gather_full_state_dict(self, *, keep_state_dict: bool) -> dict[str, Any]:
         """Gather sharded model tensors into a full CPU state dictionary."""
 
+        if self.compiler is not None:
+            if getattr(self.compiler, "is_compiled", False):
+                attach = getattr(self.compiler, "attach_shard_metadata", None)
+            else:
+                attach = getattr(self.compiler, "attach_source_shard_metadata", None)
+            if callable(attach):
+                attach()
         state_dict = self.model.state_dict(keep_vars=True)
         gathered = {}
         for name, value in state_dict.items():
+            chunk_info = getattr(value, CHUNK_INFO, None)
             if isinstance(value, DTensor):
                 value = value.full_tensor()
             elif isinstance(value, torch.Tensor):
@@ -168,6 +178,12 @@ class CheckpointManager:
                     value = DTensor.from_local_with_layout(value.detach(), layout).full_tensor()
                 else:
                     value = value.detach()
+            if (
+                chunk_info is not None
+                and isinstance(value, torch.Tensor)
+                and tuple(value.shape) != tuple(chunk_info.global_shape)
+            ):
+                value = value[tuple(slice(0, size) for size in chunk_info.global_shape)]
             if keep_state_dict:
                 gathered[name] = value.cpu() if isinstance(value, torch.Tensor) else value
         return gathered

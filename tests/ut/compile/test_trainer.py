@@ -136,8 +136,8 @@ class TestGraphTrainerCompile(unittest.TestCase):
         # A very large loss guarantees an un-clipped gradient of norm > 1.
         with torch.no_grad():
             model.weight.mul_(10.0)
-        # Reset the graph so the next step recomputes a huge loss.
-        tr._compiler._joint_graph = None
+        # The compiled graph feeds live weights each step, so this second step
+        # recomputes the loss without re-tracing (compile is one-shot).
         tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
         grad_norm = float(model.weight.grad.norm())
         self.assertGreater(grad_norm, 1.0)

@@ -531,8 +531,8 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   `GraphCompiler` (independent of Inductor).
 - **Compilation is not idempotent**: the partitioning passes mutate the live
   model in place, so `GraphCompiler.compile` may only be called once — a
-  second call silently re-traces the already-partitioned model and yields an
-  incorrect graph (it does not raise; guard the call site yourself).
+  second call raises instead of silently re-tracing the already-partitioned
+  model.
 - **Requires torch with a patched autograd engine** for joint-graph capture.
   On stock torch the backward half is annotated structurally instead (see
   `_annotate_autograd_backward` in `tracer/graph_tracer.py`).

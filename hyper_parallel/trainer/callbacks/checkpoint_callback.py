@@ -33,11 +33,11 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
-from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.high_availability.group_registry import is_recovery_reboot
+from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
 )
@@ -177,7 +177,9 @@ class CheckpointerCallback(Callback):
             extra_state_per_rank=self._save_extra_state_per_rank,
         )
         self._hf_checkpoint_manager = (
-            CheckpointManager(trainer.model) if self._save_hf_weights else None
+            CheckpointManager(trainer.model, getattr(trainer, "graph_compiler", None))
+            if self._save_hf_weights
+            else None
         )
 
     # ------------------------------------------------------------------
@@ -215,6 +217,13 @@ class CheckpointerCallback(Callback):
             return
         if not is_recovery_reboot():
             self._load_checkpoint()
+        if self._restore_optimizer:
+            compiler = getattr(self.trainer, "graph_compiler", None)
+            if compiler is not None and not compiler.is_compiled:
+                optimizers = _as_list(self.trainer.optimizer)
+                compiler.add_post_compile_hook(
+                    lambda: compiler.reshard_optimizer_state(optimizers)
+                )
         self._initial_checkpoint_processed = True
 
     def on_step_end(  # pylint: disable=arguments-differ
@@ -294,8 +303,12 @@ class CheckpointerCallback(Callback):
 
     def _model_state_dict(self) -> Dict[str, Any]:
         """Return the model state to persist, trainable-only under PEFT."""
+        from hyper_parallel.compile.checkpoint_metadata import (  # pylint: disable=C0415
+            annotate_model_state_dict
+        )
         model = self.trainer.model
         state_dict = model.state_dict()
+        annotate_model_state_dict(self.trainer, state_dict)
         external = get_model_external_state(model)
         if external is not None:
             missing = set(external.parameters) - set(state_dict)
@@ -409,10 +422,14 @@ class CheckpointerCallback(Callback):
         )
 
         checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
+        from hyper_parallel.compile.checkpoint_metadata import (  # pylint: disable=C0415
+            annotate_optimizer_state_dict
+        )
         optimizers = _as_list(self.trainer.optimizer) if self._save_optimizer else []
         if self._save_optimizer:
-            checkpoint_state["optimizer"] = _unwrap_single(
-                [optimizer.state_dict() for optimizer in optimizers]
+            checkpoint_state["optimizer"] = annotate_optimizer_state_dict(
+                self.trainer,
+                _unwrap_single([optimizer.state_dict() for optimizer in optimizers]),
             )
         if self._save_train_state:
             checkpoint_state["extra_state"] = self._collect_extra_state(state)
@@ -671,9 +688,13 @@ class CheckpointerCallback(Callback):
                 )
 
         checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
+        from hyper_parallel.compile.checkpoint_metadata import (  # pylint: disable=C0415
+            annotate_optimizer_state_dict
+        )
         if optimizers:
-            checkpoint_state["optimizer"] = _unwrap_single(
-                [optimizer.state_dict() for optimizer in optimizers]
+            checkpoint_state["optimizer"] = annotate_optimizer_state_dict(
+                self.trainer,
+                _unwrap_single([optimizer.state_dict() for optimizer in optimizers]),
             )
         return checkpoint_state, optimizers
 

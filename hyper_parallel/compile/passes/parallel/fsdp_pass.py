@@ -459,6 +459,9 @@ class FSDPPass(GraphPass):
         graph_module.fsdp_sharded_param_names = frozenset(
             node.meta["param_name"] for node in param_nodes
         )
+        graph_module.fsdp_padded_params = {
+            name: (info.n, info.n_pad) for name, info in self._padded_params.items()
+        }
 
         _LOG.info(
             "Identified %d sharded (incl. %d pad-sharded) + %d replicated DP "
