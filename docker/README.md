@@ -49,7 +49,7 @@ python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))
 | --- | --- |
 | `Dockerfile.hyper-parallel-npu` | General HyperParallel NPU image, defaulting to the PyTorch 2.9 backend |
 | `Dockerfile.models-npu-a3` | Ascend A3 / Ubuntu 22.04 / Python 3.11 training image with dependencies for high-performance fused operators |
-| `Dockerfile.torch` | PyTorch backend image installing `hyper_parallel[torch29]` |
+| `Dockerfile.torch` | PyTorch backend image installing `hyper_parallel[torch-npu-2-9]` |
 | `build_hyper-parallel_npu.sh` | Simplified build script that runs an import smoke test after building |
 | `run_hyper-parallel.sh` | Ascend NPU container launch script |
 
@@ -71,15 +71,13 @@ Build the PyTorch environment:
 
 ```bash
 DOCKERFILE=docker/Dockerfile.torch \
-HP_EXTRA=torch29 \
+HP_EXTRA=torch-npu-2-10 \
 bash docker/build_hyper-parallel_npu.sh hyper-parallel:torch
 ```
 
-`HP_EXTRA` corresponds to the extras in `docs/installation.md`:
-
-```text
-torch26 | torch27 | torch29 | torch | all
-```
+The build runs `uv sync --locked` in the base image's Python environment. Set `HP_EXTRA` to `torch-npu-2-9` for
+PyTorch 2.9 (the default), or select `torch-npu-2-10`, `torch-npu-2-11`, `torch-npu-2-12`, `torch-npu-2-13`
+or `torch-npu-2-14` for PyTorch 2.10 through 2.14. Each NPU extra installs CPU builds of PyTorch and torchvision, the matching archived TorchNPU wheel, and HyperMulticore.
 
 ## Start Containers
 
@@ -109,11 +107,14 @@ bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
   python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
-## Optional HyperMulticore
+## Activate HyperMulticore
 
-HyperMulticore is installed separately in training images that use MegaMoE, MegaGate or MegaMHC.
-Install a matching wheel and activate `hyper_multicore_set_env.bash` before starting training.
-The Dockerfiles do not build multicore operators.
+Before running MegaMoE, MegaGate or MegaMHC, activate CANN and the installed operators in the training shell.
+
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+source "$(command -v hyper_multicore_set_env.bash)"
+```
 
 ## Verification
 

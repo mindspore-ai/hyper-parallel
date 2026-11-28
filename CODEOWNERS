@@ -52,7 +52,11 @@
 /.jenkins/ @yangzhenzhang02
 /docs/ @yangzhenzhang02 @gemini524
 /requirements.txt  @yangzhenzhang02
-/setup.py  @yangzhenzhang02
+
+# Python packaging and dependency management.
+/pyproject.toml @liuchongming74
+/uv.lock @liuchongming74
+/setup.py @liuchongming74
 
 /tests/torch/multicore/ @davidhe91 @Probiotics5333
 

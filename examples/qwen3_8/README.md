@@ -60,8 +60,7 @@ python3 -m pip install -e . --no-deps
 ```
 
 `requirements.txt` 固定了 PyTorch 2.9.0、torch-npu 2.9.0.post6、Triton-Ascend 3.2.2、
-Transformers 5.13.0 等 Python 依赖。`pip install -e . --no-deps` 安装当前仓库，避免根目录可选
-`[torch]` extra 的不同 PyTorch 版本覆盖本示例的版本组合。融合算子源码已在
+Transformers 5.13.0 等 Python 依赖。`pip install -e . --no-deps` 以可编辑模式安装当前仓库，沿用本示例固定的版本组合。融合算子源码已在
 [`components/functional/_triton/gated_delta_net`](../../hyper_parallel/components/functional/_triton/gated_delta_net)；不需要另装 FLA、
 AscendC GDN 扩展或 `causal-conv1d`。Triton-Ascend 与普通 Triton 共用 `triton` 包路径，安装后不要再
 单独升级普通 Triton；相关说明见[官方安装指南](https://github.com/triton-lang/triton-ascend/blob/main/docs/en/installation_guide.md)。
