@@ -20,7 +20,10 @@ from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotar
 from hyper_parallel.models.qwen3_5.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
-from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import get_fsdp_execution_order
+from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import (
+    build_vision_sharding,
+    get_fsdp_execution_order,
+)
 from hyper_parallel.models.registry import register_model_adapter
 
 
@@ -50,20 +53,12 @@ def _load_vlm_loss():
     return vlm_chunk_loss
 
 
-def _load_encoder_parallel():
-    """Reuse the shared Qwen visual ownership contract through a lazy provider."""
-    from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import (  # pylint: disable=C0415
-        get_encoder_parallel_spec,
-    )
-    return get_encoder_parallel_spec()
-
-
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
     materialization=register_rotary_materialization,
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
     loss=_load_vlm_loss,
-    encoder_parallel=_load_encoder_parallel,
+    sharding=build_vision_sharding,
     fsdp_execution_order=get_fsdp_execution_order,
     replacements=_load_replacements,
     context_parallel=_load_context_parallel,
