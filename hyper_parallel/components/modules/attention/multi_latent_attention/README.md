@@ -39,6 +39,17 @@ plan_overrides:
 例如 CP4 下，省略 U 为 U4，U=1 为 AG4，U=2 为 U2×AG2。
 strategy 选择通信表示，U 选择并行拓扑；虽然默认策略名含 ulysses，也可通过 U 选择 AG/混合。
 
+## 源参数与数学配置
+
+默认保留融合 down 投影、原有 CP 通信和反向调度。已有独立 down 投影可设置
+`fuse_latent_qkv: false`，保留其参数对象和 checkpoint 名称；不能在已构造的 family 上临时切换表示。
+`q_lora_rank: null` 使用直接 Q 投影，目前要求 TP1，CP 时还要求 `overlap: false`。
+
+`use_fused_norm: null` 保留来源 Norm；显式布尔值选择公共 RMSNorm 实现。
+`use_fused_rotary_pos_emb` 默认 true，eager 和 fused 均复用公共 RoPE；`use_nope: true` 显式关闭旋转。
+`key_expansion_layout` 默认 bsnd；只有需要保留来源 BNSD 广播反向归约顺序时才选 bnsd。
+布局数学等价不保证 BF16 梯度逐位相同。这些选项不改变 CP 的 token/head 所有权。
+
 ## Latent CP 与前反向掩盖
 
 `expanded_ulysses` 先展开 Q/K/V 再通信；`latent_kv_head` 传输压缩 KV 和共享 K 位置通道，

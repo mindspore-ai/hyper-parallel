@@ -15,6 +15,7 @@
 """CPU adapter contracts and real HF replacement/checkpoint coverage for MLA CP."""
 
 from copy import deepcopy
+from functools import partial
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,13 +51,15 @@ from hyper_parallel.components.modules.attention.multi_latent_attention.cp_mla_b
 from hyper_parallel.components.modules.attention.gated_multi_latent_attention.cp_gated_mla_backward_overlap import (
     GatedMLAInputState, GatedMLAOutputProjectionState,
 )
-from hyper_parallel.models.kimi_k3.adapter.mla import KimiMultiLatentAttention
 from hyper_parallel.models.module_build import build_module_context, prepare_model_components
 from hyper_parallel.trainer.config.resolver import resolve_config
 from hyper_parallel.trainer.config.parallelism import normalize_distributed_setup_overrides
 from tests.common.mla_cp_utils import (
     TestCPMesh, make_cp_mla, make_mla, make_deepseek_model, replace_and_load_mla,
 )
+
+
+KimiMultiLatentAttention = partial(GatedMultiLatentAttention, source_contract="tensor")
 
 
 def _reference_attention(module, query, key, value, attention_mask=None, **kwargs):
@@ -398,6 +401,96 @@ class TestMLAContextParallel(unittest.TestCase):
 
 class TestMLAModel(unittest.TestCase):
     """Exercise real decoder objects and the family-specific fused latent rules."""
+
+    def test_key_expansion_preserves_source_gradient_layout(self) -> None:
+        """Feature: Source shared-K broadcast order.
+
+        Description: Compare both K assembly layouts with independent BF16 slice/concat references.
+        Expectation: Values, strides and shared-key reduction gradients match the selected source order.
+        """
+        with torch.random.fork_rng():
+            torch.manual_seed(17)
+            for layout in ("bsnd", "bnsd"):
+                content = torch.randn(2, 7, 4, 3, dtype=torch.bfloat16, requires_grad=True)
+                shared = torch.randn(2, 7, 5, dtype=torch.bfloat16, requires_grad=True)
+                left = content.detach().clone().requires_grad_()
+                right = shared.detach().clone().requires_grad_()
+                if layout == "bsnd":
+                    expected = torch.cat((left, right.unsqueeze(2).expand(2, 7, 4, 5)), dim=-1)
+                else:
+                    expected = torch.empty(2, 4, 7, 8, dtype=torch.bfloat16)
+                    expected[..., :3] = left.transpose(1, 2)
+                    expected[..., 3:] = right[:, None].expand(2, 4, 7, 5)
+                    expected = expected.transpose(1, 2)
+                actual = MultiLatentAttentionModule.assemble_key(content, shared, layout=layout)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                self.assertEqual(actual.stride(), expected.stride())
+                gradient = torch.randn_like(expected)
+                reference = torch.autograd.grad(expected, (left, right), gradient)
+                grads = torch.autograd.grad(actual, (content, shared), gradient)
+                for value, target in zip(grads, reference):
+                    torch.testing.assert_close(value, target, atol=0, rtol=0)
+
+    def test_split_and_direct_query_source_contracts(self) -> None:
+        """Feature: Preserve independent down projections and direct queries.
+
+        Description: Adopt split parameters, compare fused projections, and construct CP/meta members.
+        Expectation: Forward and all gradients agree; unsupported direct-Q schedules fail before binding.
+        """
+        for direct_query in (False, True):
+            config = deepcopy(make_deepseek_model().config)
+            if direct_query:
+                config.q_lora_rank = None
+            source = MultiLatentAttention(config=config, fuse_latent_qkv=False, use_fused_norm=False)
+            source.attention_interface = _reference_attention
+            split = MultiLatentAttention(module=source, fuse_latent_qkv=False)
+            self.assertIs(split.attention_interface, _reference_attention)
+            for name, parameter in source.named_parameters():
+                self.assertIs(split.get_parameter(name), parameter)
+            fused = MultiLatentAttention(config=config, use_fused_norm=False)
+            state = dict(source.state_dict())
+            query_name = "q_proj" if direct_query else "q_a_proj"
+            for suffix in ("weight", "bias"):
+                if query_name + "." + suffix in state:
+                    state["linear_qkv." + suffix] = torch.cat((
+                        state.pop(query_name + "." + suffix), state.pop("kv_a_proj_with_mqa." + suffix)))
+            fused.load_state_dict(state)
+            hidden = torch.randn(2, 5, config.hidden_size, requires_grad=True)
+            other = hidden.detach().clone().requires_grad_()
+            for module in (source, fused):
+                module.attention_interface = _reference_attention
+            expected = source(hidden, position_embeddings=None)[0]
+            actual = fused(other, position_embeddings=None, cache=None)[0]
+            gradient = torch.randn_like(actual)
+            expected.backward(gradient)
+            actual.backward(gradient)
+            torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(other.grad, hidden.grad, atol=1e-6, rtol=1e-5)
+            grads = {name: parameter.grad for name, parameter in source.named_parameters()}
+            for suffix in ("weight", "bias"):
+                if query_name + "." + suffix in grads:
+                    grads["linear_qkv." + suffix] = torch.cat((
+                        grads.pop(query_name + "." + suffix), grads.pop("kv_a_proj_with_mqa." + suffix)))
+            for name, parameter in fused.named_parameters():
+                torch.testing.assert_close(parameter.grad, grads[name], atol=2e-6, rtol=2e-5)
+            for strategy in ("expanded_ulysses", "latent_kv_head"):
+                cp = MultiLatentAttention(module=source, fuse_latent_qkv=False,
+                                          context={"cp_size": 2}, strategy=strategy)
+                self.assertEqual(cp.cp_plan.dimensions.q_rank, source._q_latent_output_size)
+            with torch.device("meta"):
+                meta = MultiLatentAttention(config=config, fuse_latent_qkv=False)
+            self.assertTrue(all(parameter.is_meta for parameter in meta.parameters()))
+            if direct_query:
+                with self.assertRaisesRegex(NotImplementedError, "overlap=False"):
+                    MultiLatentAttention(config=config, context={"cp_size": 2}, overlap=True)
+                with self.assertRaisesRegex(NotImplementedError, "TP1"):
+                    MultiLatentAttention(config=config, context={"tp_size": 2})
+
+        source = MultiLatentAttention(config=make_deepseek_model().config, fuse_latent_qkv=False)
+        source.kv_a_layernorm = source.q_a_layernorm
+        split = MultiLatentAttention(module=source, fuse_latent_qkv=False)
+        self.assertIs(split.kv_a_layernorm, source.q_a_layernorm)
+        self.assertIs(split.q_a_layernorm, split.kv_a_layernorm)
 
     def test_gated_unfused_source_checkpoint_roundtrip(self) -> None:
         """Preserve inherited projection converters for an unfused HF gated NoPE source."""

@@ -168,7 +168,7 @@ plan_overrides:
     replace:
       kind: method
       implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.qwen3_5_linear_attention_decoder_wrapper
+        _target_: hyper_parallel.distributed.context_parallel.wrappers.packed_linear_decoder_wrapper
 ```
 
 只匹配线性 decoder，不能无区别替换 full-attention decoder。Kimi/Qwen 的 runtime input adapter
@@ -199,7 +199,7 @@ flowchart TD
 - `components/modules/attention/linear_attention_utils/`：`layer_adapter.py` 负责来源参数与输入适配，`parallel_layout.py` 负责公共 TP/SP token 边界，各算法族声明参数的 head 归属，`cp_convolution.py` 包含 Q/K/V halo 打包、相邻 rank 交换及本地卷积调度。`sequence_layout.py` 集中文档区间、状态槽位、局部文档执行和 chunk 索引；它只依赖 Torch 与标准库，供 functional、模块族及模型 runtime 共同使用。
 - `components/functional/`：每个算法使用公共数学入口、Triton、Ascend C 三个文件。公共入口包含 eager 及简单状态 apply，Triton 文件包含本地阶段和 summary/merge 前端，原始 kernels 保留在 `_triton/`。本地卷积独立；这些文件不持有通信组、不执行跨卡通信。
 - `distributed/context_parallel/collectives.py`：保留公共 Tensor 交换原语；因果卷积专用的邻居选择归 `linear_attention_utils/cp_convolution.py`。
-- `models/qwen3_5/adapter/linear_attention_decoder.py`：将本次调用的文档边界透传给 Qwen 线性注意力 decoder 内的 GDN，不负责数据打包或算法后端选择。
+- `distributed/context_parallel/wrappers.py`：将本次调用的文档边界透传给 Qwen 线性注意力 decoder 内的 GDN，不负责数据打包或算法后端选择。
 
 构造模块时只记录逻辑选项；绑定时借用 CP mesh、创建已有协议对象与子组。每次前向的 H、M、G、
 收发 buffer 和 autograd cache 属于该调用，不挂到共享协议对象上。RD 的 reset 剪枝、无消费者
@@ -257,6 +257,6 @@ GDN 当前仍只支持纯 Ulysses 或 Triton P2P，不由公共目录自动获�
 ### Qwen 完整文本模型的 packed mask
 
 完整 Qwen 文本模型还需避免 HF 根据本地 CP 输入重复构造 attention mask。
-选择所有 GDN/gated-GQA 模块族后，为文本模型安装 `qwen3_5_packed_model_wrapper`，
+选择所有 GDN/gated-GQA 模块族后，为文本模型安装 `packed_linear_model_wrapper`，
 让下游根据全局文档边界处理因果关系与文档隔离。配置和限制见
 [TND CP 指南](linear_attention_tnd_cp.md#qwen-完整文本模型的-packed-mask)。

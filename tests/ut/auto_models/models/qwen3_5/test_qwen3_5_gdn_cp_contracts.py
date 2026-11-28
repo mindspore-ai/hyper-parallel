@@ -16,13 +16,9 @@
 # pylint: disable=wrong-import-position
 
 import os
-import tempfile
 import unittest
 from copy import deepcopy
-from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
@@ -34,24 +30,14 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeAtten
 from hyper_parallel.components.functional.gated_delta_net import (
     torch_chunk_gated_delta_rule,
 )
-from hyper_parallel.distributed._builder.forward_rewriter import (
-    _ForwardRewriteRequest,
-)
-from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.recipe_spec import (
-    CP,
     INNER_WRAPPER,
-    ModuleShardingSpec,
 )
-from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.models.qwen3_5.adapter import linear_attention_decoder as adapter_context_parallel
+from hyper_parallel.distributed.context_parallel import wrappers as adapter_context_parallel
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.components.modules import GatedGroupedQueryAttention
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementRequest
-from hyper_parallel.trainer.config import entries_to_plan_overrides
-from hyper_parallel.trainer.config.parser import parse_training_args
-from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 from tests.common.mark_utils import arg_mark
 
 
@@ -79,7 +65,7 @@ class TestQwen35GdnCpContracts(unittest.TestCase):
                       mask: Any, **kwargs: Any) -> tuple:
             """CPU kernel oracle; projections, gate, Norm and RoPE remain production code."""
             del module
-            output = torch.nn.functional.scaled_dot_product_attention(
+            output = torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=not-callable
                 query, key, value, attn_mask=mask, scale=kwargs["scaling"], enable_gqa=True)
             return output.transpose(1, 2), None
 
@@ -104,13 +90,14 @@ class TestQwen35GdnCpContracts(unittest.TestCase):
                 candidate = model.self_attn
                 self.assertIs(candidate.q_norm.weight, original_norm)
                 self.assertIsInstance(model.linear_attn, nn.Identity)
-                # Preparation declares conversion; checkpoint loading applies it later.
+                # Loaded source projections are adopted with the same declared checkpoint conversion.
                 state = reference.state_dict()
                 converted = dict(state)
                 for transform in candidate.make_transforms():
                     converted.update(transform.operations[0].convert(
                         state, transform.source_patterns, transform.target_patterns))
-                candidate.load_state_dict({name: converted[name] for name in candidate.state_dict()})
+                for name, parameter in candidate.named_parameters():
+                    torch.testing.assert_close(parameter, converted[name], atol=0, rtol=0)
                 candidate.attention_interface = attention
                 inputs = torch.randn(2, 7, 32, requires_grad=True)
                 parallel_inputs = inputs.detach().clone().requires_grad_()
@@ -152,7 +139,7 @@ class TestQwen35GdnCpContracts(unittest.TestCase):
         self.assertIs(top_spec.context_parallel(), text_spec.context_parallel())
         self.assertIsNotNone(get_model_adapter("Qwen3_5ForCausalLM"))
         for name in (
-            "qwen3_5_linear_attention_decoder_wrapper",
+            "packed_linear_decoder_wrapper",
         ):
             wrapper = getattr(adapter_context_parallel, name)
             self.assertEqual(wrapper._injection_meta.kind, INNER_WRAPPER)

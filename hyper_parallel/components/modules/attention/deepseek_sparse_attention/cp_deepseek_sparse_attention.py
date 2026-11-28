@@ -202,12 +202,13 @@ class CPDeepseekSparseAttentionModule(DeepseekSparseAttentionModule):
         context = binding.cp_context
         if context is None or context.size <= 1:
             raise ValueError("DeepSeek sparse-attention CP member requires an active CPContext")
-        if self.kv_cp_size != context.size:
+        if self.kv_cp_size is not None and self.kv_cp_size != context.size:
             raise ValueError("kv_cp_size must equal the bound CPContext size")
         if self._cp_context is not None and self._cp_context.mesh is not context.mesh:
             raise ValueError("DeepSeek sparse-attention CP member already belongs to another mesh")
         super().bind_parallel(binding)
         self._cp_context = context
+        self.kv_cp_size = context.size
 
     def prepare_key_bank(
         self, index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],

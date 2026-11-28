@@ -27,6 +27,11 @@ plan_overrides:
 strategy、ulysses_degree、overlap 和 kv_exchange 的选择及默认值见 [MLA 配置](../multi_latent_attention/README.md#yaml-配置)。
 CP1 使用 local 成员，仍执行 gate；overlap 开关只改变调度，不决定是否有 gate。
 
+K3 的 Tensor 返回协议使用同一个公共入口，在 implementation 中设置 `source_contract: tensor`；
+默认 tuple 协议仍返回 `(output, attention_weights)`。tensor 协议接受 K3 的 mask、position_ids、cache
+参数顺序，NoPE 忽略位置编码，CP 仍拒绝实际 cache。旧的 `models.kimi_k3.adapter.mla` 入口已移除。
+需要保留独立 down 参数时再设置 `fuse_latent_qkv: false`，不必新增 K3 专用 CP wrapper。
+
 ## 文件职责
 
 | 文件 | 作用 |

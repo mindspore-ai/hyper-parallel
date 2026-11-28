@@ -16,6 +16,8 @@
 # These per-case imports keep optional model implementations behind the CPU fixtures.
 # pylint: disable=wrong-import-position,import-outside-toplevel
 
+from __future__ import annotations
+
 from functools import partial
 import importlib.util
 import inspect
@@ -228,17 +230,23 @@ class TestGQAFamilyContracts(unittest.TestCase):
         # CPU contract tests replace the NPU boundary while preserving the production fused selection.
         norm_module = importlib.import_module("hyper_parallel.components.modules.common.rms_norm")
 
-        def norm_kernel(inputs, weight, eps, cast_order):
+        def norm_kernel(inputs: torch.Tensor, weight: torch.Tensor, eps: float,
+                        cast_order: str) -> torch.Tensor:
+            """Normalize test operands without an accelerator kernel."""
             del cast_order
             return torch.nn.functional.rms_norm(inputs, (inputs.shape[-1],), weight, eps)
 
-        def attention(module, query, key, value, mask, **kwargs):
+        def attention(module: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                      mask: torch.Tensor | None, **kwargs: Any) -> tuple[torch.Tensor, None]:
+            """Return dense reference attention in the production BSND layout."""
             del module
-            result = torch.nn.functional.scaled_dot_product_attention(
+            result = torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=not-callable
                 query, key, value, attn_mask=mask, scale=kwargs["scaling"], enable_gqa=True)
             return result.transpose(1, 2), None
 
-        def positioned(tensor, norm, positions):
+        def positioned(tensor: torch.Tensor, norm: nn.Module | None,
+                       positions: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            """Apply partial RoPE using independent mathematical operations."""
             tensor = norm(tensor) if norm is not None else tensor
             rotary, tail = tensor.split((2, tensor.shape[-1] - 2), dim=-1)
             cos, sin = (part.unsqueeze(2) for part in positions)
@@ -263,13 +271,16 @@ class TestGQAFamilyContracts(unittest.TestCase):
                     source.o_proj = nn.Linear(4 * source.config.v_head_dim, 16, bias=False)
                     source.q_norm = nn.RMSNorm(4, eps=1e-5) if use_norm else None
                     source.k_norm = nn.RMSNorm(4, eps=1e-5) if use_norm else None
-                    converters = factory(module=source, **arguments).make_transforms()
+                    adopted = factory(module=source, **arguments)
+                    converters = adopted.make_transforms()
                     candidate = factory(config=source.config, **arguments)
                     self.assertEqual(candidate.make_transforms(), [])
                     state = dict(source.state_dict())
                     for transform in converters:
                         state.update(transform.operations[0].convert(
                             state, transform.source_patterns, transform.target_patterns))
+                    for name, parameter in adopted.named_parameters():
+                        torch.testing.assert_close(parameter, state[name], atol=0, rtol=0)
                     candidate.load_state_dict({name: state[name] for name in candidate.state_dict()})
                     candidate.attention_interface = attention
                     inputs = torch.randn(2, 7, 16, requires_grad=True)
@@ -431,7 +442,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
                     cp_context=SimpleNamespace(size=4),
                     ulysses_context=SimpleNamespace(launch_sequence_to_head=launch),
                     query_context=SimpleNamespace(launch_gather_sequence=gather),
-                    project_query=lambda _hidden, _positions: project("q"),
+                    project_query_state=lambda _hidden, _positions: (project("q"), "gate"),
                     project_key=lambda _hidden, _positions: project("k"),
                     project_value=lambda _hidden: project("v"),
                     split_projection=split_projection, q_norm=None, k_norm=None,
@@ -446,7 +457,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
                 self.assertFalse(any(event[0].startswith("wait") for event in events))
                 self.assertFalse(any(event[0] == "launch_ag" for event in events))
                 actual = CPGroupedQueryAttentionModule.exchange_attention(member, prepared)
-                self.assertEqual(actual, ("q", "k", "v", "gate" if fused else None))
+                self.assertEqual(actual, ("q", "k", "v", "gate"))
                 self.assertLess(events.index(("launch_u", "q")), events.index(("project", "k")))
                 if fused:
                     self.assertEqual(events.count(("project", "qkv")), 1)
@@ -581,6 +592,8 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
         from transformers import Qwen3Config, Qwen3Model, Qwen3MoeConfig, Qwen3MoeModel
         from hyper_parallel.models._transformers.packed_attention import register_npu_packed_attention
         for config_type, model_type in ((Qwen3Config, Qwen3Model), (Qwen3MoeConfig, Qwen3MoeModel)):
+            # Transformers generates config keyword parameters dynamically.
+            # pylint: disable-next=unexpected-keyword-arg
             config = config_type(hidden_size=32, intermediate_size=64, num_hidden_layers=1,
                                  num_attention_heads=4, num_key_value_heads=2, head_dim=8, vocab_size=16,
                                  moe_intermediate_size=32, num_experts=4, num_experts_per_tok=2)

@@ -27,7 +27,7 @@ from hyper_parallel.components.losses.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.sparse_flash_mla import (
     supports_fused_attention_inputs, sparse_flash_mla,
 )
-from hyper_parallel.components.modules.common.rms_norm import RMSNorm
+from hyper_parallel.components.modules.common.rms_norm import RMSNorm, RMSNormModule
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from .compressor import CSA2Compressor
 from .document_layout import SharedCompressedPackedSequence
@@ -262,7 +262,7 @@ def reference_sparse_attention(
     return torch.matmul(probabilities[..., :-1].to(key_value.dtype), key_value).transpose(1, 2)
 
 
-def _build_parameters(config: Any, layer_idx: int) -> nn.Module:
+def _build_parameters(config: Any, layer_idx: int, norm_cast_order: str | None = None) -> nn.Module:
     """Create the canonical V4.1 parameter tree without importing the model."""
     # Transformers provides V4 parameter classes; CSA2 owns the V4.1 math below.
     # Preserve their construction order so seeded initialization stays compatible.
@@ -294,6 +294,10 @@ def _build_parameters(config: Any, layer_idx: int) -> nn.Module:
             config=config, compress_ratio=module.compress_ratio, layer_idx=layer_idx, apply_rope=_apply_v41_rope,
         )
 
+    if norm_cast_order is not None:
+        for child in module.modules():
+            if isinstance(child, RMSNormModule):
+                child.rms_norm_cast_order = norm_cast_order
     return module
 
 
@@ -308,14 +312,19 @@ class CompressedSparseAttention2Module(nn.Module):
             layer_idx: int = 0,
             replace_indexer: bool = True,
             use_fused_ops: bool = False,
+            norm_cast_order: str | None = None,
     ) -> None:
         """Create from config or adopt a source module without replacing its parameters."""
         if (module is None) == (config is None):
             raise ValueError("CSA2 requires exactly one of config or module")
         if not isinstance(use_fused_ops, bool):
             raise ValueError("use_fused_ops must be a bool")
+        if norm_cast_order not in (None, "before_weight", "after_weight"):
+            raise ValueError("norm_cast_order must be before_weight, after_weight or None")
         if module is None:
-            module = _build_parameters(config, layer_idx)
+            module = _build_parameters(config, layer_idx, norm_cast_order)
+        else:
+            self._validate_source_norm(module, norm_cast_order)
         super().__init__()
         for name, child in module._modules.items():  # pylint: disable=protected-access
             self.add_module(name, child)
@@ -323,13 +332,7 @@ class CompressedSparseAttention2Module(nn.Module):
             self.register_parameter(name, parameter)
         for name, buffer in module._buffers.items():  # pylint: disable=protected-access
             self.register_buffer(name, buffer, persistent=name not in module._non_persistent_buffers_set)
-        indexer = getattr(self, "indexer", None)
-        if (
-                replace_indexer
-                and indexer is not None
-                and not isinstance(indexer, CSA2Indexer)
-        ):
-            self.indexer = CSA2Indexer(indexer, apply_rope=_apply_v41_rope)
+        self._adopt_indexer(replace_indexer, use_fused_ops)
         self.config = module.config
         self.layer_idx = module.layer_idx
         self.num_heads = module.num_heads
@@ -350,6 +353,35 @@ class CompressedSparseAttention2Module(nn.Module):
             self.indexer.use_fused = use_fused_ops
         # Children are adopted by identity; preserve their individual training modes.
         self.training = module.training
+
+    @staticmethod
+    def _validate_source_norm(module: nn.Module, norm_cast_order: str | None) -> None:
+        """Adopting loaded parameters must preserve the source normalization rounding policy."""
+        if norm_cast_order is not None and any(
+                (isinstance(child, RMSNormModule) and child.rms_norm_cast_order != norm_cast_order)
+                or (type(child).__name__ == "DeepseekV4RMSNorm"
+                    and type(child).__module__.startswith("transformers.models.deepseek_v4.")
+                    and norm_cast_order != "after_weight")
+                for child in module.modules()):
+            raise ValueError("Changing CSA2 source norm policy requires config construction and state loading")
+
+    def _adopt_indexer(self, replace_indexer: bool, use_fused_ops: bool) -> None:
+        """Adopt the source Indexer while preserving its fusion and parallel-selection policy."""
+        indexer = getattr(self, "indexer", None)
+        if (not replace_indexer and indexer is not None
+                and getattr(indexer, "use_fused", False) != use_fused_ops):
+            raise ValueError("Changing CSA2 Indexer fusion requires replace_indexer=True")
+        if (
+                replace_indexer
+                and indexer is not None
+                and (not isinstance(indexer, CSA2Indexer) or indexer.use_fused != use_fused_ops)
+        ):
+            # Reject parallel Indexer subclasses whose policy is outside this source contract.
+            if isinstance(indexer, CSA2Indexer) and type(indexer) is not CSA2Indexer:  # pylint: disable=unidiomatic-typecheck
+                raise ValueError("CSA2 cannot change the fusion policy of a parallel Indexer source")
+            self.indexer = CSA2Indexer(indexer, apply_rope=_apply_v41_rope)
+            if getattr(indexer, "_selection_region", None) is not None:
+                self.indexer.enable_selection_exclude()
 
     def head_reducer(self) -> Callable | None:
         """Keep local head sums; parallel members provide the complete-head reduction."""

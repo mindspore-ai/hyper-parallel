@@ -31,9 +31,9 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 import torch
 from torch import nn
 
+from hyper_parallel.distributed.context_parallel.attention import build_cp_attention_mask
 from hyper_parallel.models.kimi_k26.adapter.distributed.context_parallel import (
     bind_context_parallel,
-    build_cp_attention_mask,
 )
 
 

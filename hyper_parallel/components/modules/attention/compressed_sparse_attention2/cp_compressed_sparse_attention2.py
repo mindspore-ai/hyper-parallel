@@ -256,7 +256,7 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
     cp_context = None
 
     def __init__(self, module: torch.nn.Module | None = None, *, config: Any = None, layer_idx: int = 0,
-                 replace_indexer: bool = True, use_fused_ops: bool = False,
+                 replace_indexer: bool = True, use_fused_ops: bool = False, norm_cast_order: str | None = None,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
                  indexer_balance_block_size: int | None = None, indexer_zigzag_min_length: int | None = None) -> None:
         """Adopt mathematical children and choose CP stages without creating parameters."""
@@ -267,7 +267,7 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
         super().__init__(module, config=config, layer_idx=layer_idx,
-                         replace_indexer=replace_indexer, use_fused_ops=use_fused_ops)
+                         replace_indexer=replace_indexer, use_fused_ops=use_fused_ops, norm_cast_order=norm_cast_order)
         self.indexer_load_balance = indexer_load_balance
         self.main_kv_comm = main_kv_comm
         self.indexer_balance_block_size = indexer_balance_block_size

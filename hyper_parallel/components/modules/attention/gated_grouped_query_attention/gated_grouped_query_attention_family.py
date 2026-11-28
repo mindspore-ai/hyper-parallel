@@ -35,16 +35,19 @@ from .gated_grouped_query_attention import GatedGroupedQueryAttentionModule
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     overlap: bool = False, ulysses_degree: int | None = None,
+    fuse_qkv: bool = True, use_fused_ops: bool = True,
 ) -> nn.Module:
     """Build gated math; shared layout binding handles TP/SP."""
     del module_fqn, context, overlap, ulysses_degree
-    return GatedGroupedQueryAttentionModule(config=config, module=module)
+    return GatedGroupedQueryAttentionModule(config=config, module=module, fuse_qkv=fuse_qkv,
+                                            use_fused_ops=use_fused_ops)
 
 
 @module_replacement
 def GatedGroupedQueryAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, overlap: bool = False, ulysses_degree: int | None = None,
+    fuse_qkv: bool = True, use_fused_ops: bool = True,
 ) -> nn.Module:
     """Build mandatory gated GQA; CP topology selects the class, overlap only selects scheduling.
 
@@ -54,6 +57,8 @@ def GatedGroupedQueryAttention(  # pylint: disable=invalid-name
         module_fqn: Source module path supplied by replacement.
         context: Logical parallel configuration, independent of concrete process groups.
         mesh: Existing job mesh, borrowed by the shared execution binder.
+        fuse_qkv: Pack Q/gate, K and V together; False preserves independent source matrices.
+        use_fused_ops: Use fused NPU normalization and rotary kernels.
         overlap: Submit ready Q/K/V transfers before independent projection stages.
         ulysses_degree: Head-parallel CP factor; 1 selects KV AG, None selects pure Ulysses.
 
@@ -61,7 +66,8 @@ def GatedGroupedQueryAttention(  # pylint: disable=invalid-name
         The local or CP member with fixed parameter names and family provenance.
     """
     return build_family(GatedGroupedQueryAttention, config=config, module=module, module_fqn=module_fqn,
-                        context=context, mesh=mesh, overlap=overlap, ulysses_degree=ulysses_degree)
+                        context=context, mesh=mesh, overlap=overlap, ulysses_degree=ulysses_degree,
+                        fuse_qkv=fuse_qkv, use_fused_ops=use_fused_ops)
 
 
 register_module_family(ModuleFamily(

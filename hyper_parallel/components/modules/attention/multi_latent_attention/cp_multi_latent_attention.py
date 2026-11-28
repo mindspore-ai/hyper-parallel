@@ -375,7 +375,10 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
                  module_fqn: str = "", context: Any = None,
                  strategy: str = "expanded_ulysses", overlap: bool = False,
                  ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
-                 rotary_fn: Callable | None = None, attention_interface: Callable | None = None) -> None:
+                 rotary_fn: Callable | None = None, attention_interface: Callable | None = None,
+                 fuse_latent_qkv: bool = True, use_fused_norm: bool | None = None,
+                 use_fused_rotary_pos_emb: bool = True, key_expansion_layout: str = "bsnd",
+                 use_nope: bool | None = None) -> None:
         """Choose CP ownership before parameter sharding and FSDP construction.
 
         Args:
@@ -394,15 +397,19 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         for name, callback in (("rotary_fn", rotary_fn), ("attention_interface", attention_interface)):
             if callback is not None and not callable(callback):
                 raise TypeError(f"{name} must be callable")
-        super().__init__(module=module, config=config)
+        norm_options = self._source_math_options(
+            use_fused_norm, use_fused_rotary_pos_emb, key_expansion_layout, use_nope)
+        super().__init__(module=module, config=config, fuse_latent_qkv=fuse_latent_qkv, **norm_options)
         self.rotary_fn = rotary_fn
         if attention_interface is not None:
             self.attention_interface = attention_interface
         if self.attention_dropout != 0 or self.sliding_window is not None:
             raise ValueError("MLA CP requires zero dropout and no implicit sliding window")
-        if type(self.q_b_proj) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
+        if self.q_b_proj is None and (overlap or (context or {}).get("tp_size", 1) > 1):
+            raise NotImplementedError("Direct-query MLA CP requires TP1 and overlap=False")
+        if self.q_b_proj is not None and type(self.q_b_proj) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
             raise ValueError("MLA CP requires a plain Linear query up-projection")
-        dimensions = MLADimensions(self.config.num_attention_heads, self.q_lora_rank, self.kv_lora_rank,
+        dimensions = MLADimensions(self.config.num_attention_heads, self._q_latent_output_size, self.kv_lora_rank,
                                    self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim)
         cp_degree = (context or {}).get("cp_size", 1)
         self.cp_plan = MLACPPlan(dimensions, cp_degree, strategy=strategy, tp_degree=(context or {}).get("tp_size", 1),
@@ -418,6 +425,22 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         """Keep the existing managed dO/wgrad scheduling boundary."""
         if self.cp_plan.overlap and self.cp_plan.tp_degree == 1 and self.cp_plan.ulysses_degree > 1:
             self.o_proj = CPMLAOutputLinear(self.o_proj)
+
+    @staticmethod
+    def _source_math_options(use_fused_norm, use_fused_rotary_pos_emb, key_expansion_layout, use_nope):
+        """Forward explicit math choices without injecting options into the gated NoPE member."""
+        if not isinstance(use_fused_rotary_pos_emb, bool):
+            raise TypeError("use_fused_rotary_pos_emb must be bool")
+        if key_expansion_layout not in ("bsnd", "bnsd"):
+            raise ValueError("key_expansion_layout must be bsnd or bnsd")
+        norm_options = {} if use_fused_norm is None else {"use_fused_norm": use_fused_norm}
+        if key_expansion_layout != "bsnd":
+            norm_options["key_expansion_layout"] = key_expansion_layout
+        if use_nope is not None:
+            norm_options["use_nope"] = use_nope
+        if not use_fused_rotary_pos_emb:
+            norm_options["use_fused_rotary_pos_emb"] = False
+        return norm_options
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
         """Declare operand/output stages; framework TP still owns its outer ports."""
@@ -709,7 +732,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         key_nope, value = self.project_key_value_parts(state.kv_latent, heads=self.cp_plan.local_heads)
         # Keep K assembly inside V's communication window.
         key_nope = launch_input(value, key_nope, input_a2a.value)
-        key = self.assemble_key(key_nope, key_rope)
+        key = self.assemble_key(key_nope, key_rope, layout=self.key_expansion_layout)
         # K is complete; Q projection and its model-defined rotation can cover it.
         query_latent = launch_input(key, state.query_latent, input_a2a.key)
         query = self.project_query(

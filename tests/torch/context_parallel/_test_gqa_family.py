@@ -16,6 +16,7 @@
 
 from copy import deepcopy
 from datetime import timedelta
+from typing import Any
 import os
 
 import torch
@@ -40,7 +41,7 @@ class _AttentionModel(nn.Module):
         self.self_attn = attention
         self.config = attention.config
 
-    def forward(self, hidden_states, **kwargs):
+    def forward(self, hidden_states: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Return the attention output for gradient comparison."""
         return self.self_attn(hidden_states, **kwargs)[0]
 
@@ -112,6 +113,8 @@ def _case(mesh, factory, degree, packed, device, *, tp=1, sp=False, padding=Fals
     gated = factory is GatedGroupedQueryAttention
     config_type = Qwen3_5TextConfig if gated else Qwen3Config
     attention_type = Qwen3_5Attention if gated else Qwen3Attention
+    # Transformers generates config keyword parameters dynamically.
+    # pylint: disable-next=unexpected-keyword-arg
     config = config_type(hidden_size=128, intermediate_size=256, num_hidden_layers=1,
                          num_attention_heads=8, num_key_value_heads=4, head_dim=16, attention_bias=True)
     for overlap in (False, True):
@@ -175,6 +178,7 @@ def test_gqa_family_npu():
         for factory, degree, packed, fused in (
             (GroupedQueryAttention, 4, False, True), (GroupedQueryAttention, 1, True, True),
             (GroupedQueryAttention, 2, True, False), (GatedGroupedQueryAttention, 4, True, True),
+            (GatedGroupedQueryAttention, 2, True, False),
         ):
             _case(mesh, factory, degree, packed, device, fuse_qkv=fused)
         _case(mesh, GroupedQueryAttention, 1, False, device, padding=True)
