@@ -16,7 +16,7 @@
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.qwen3_5.adapter.checkpoint import export_text_checkpoint
-from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
+from hyper_parallel.models.qwen3_5.adapter.materialization import prepare_model_materialization
 from hyper_parallel.models.qwen3_5.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
@@ -59,7 +59,7 @@ def _load_encoder_parallel():
 
 
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
-    materialization=register_rotary_materialization,
+    materialization=prepare_model_materialization,
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
     loss=_load_vlm_loss,
@@ -72,7 +72,7 @@ QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
 
 QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     checkpoint_export=export_text_checkpoint,
-    materialization=register_rotary_materialization,
+    materialization=prepare_model_materialization,
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
     loss=_load_loss,

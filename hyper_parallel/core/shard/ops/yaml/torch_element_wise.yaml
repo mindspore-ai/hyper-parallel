@@ -58,6 +58,9 @@ sin:
 log:
   dist_op_name: _torch_log_dist_op
 
+log_:
+  dist_op_name: _torch_log__dist_op
+
 neg:
   dist_op_name: _torch_neg_dist_op
 

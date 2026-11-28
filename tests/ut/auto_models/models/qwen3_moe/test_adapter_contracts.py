@@ -29,6 +29,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from hyper_parallel.components import modules as component_modules
 from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
 from hyper_parallel.distributed.recipe_spec import (
     LOCAL_COMPUTE,
@@ -387,6 +388,66 @@ class TestGQAFamilyContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported parameter layout"):
             validate_parallel_module(module, protocol, local_spec, local_context)
 
+    def test_ulysses_minimal_kv_replication_preserves_attention_gradients(self):
+        """Feature: Replicate only the KV heads needed by equal Ulysses head shards.
+        Description: Mock transport after sequence collection, including MQA and non-power-of-two heads.
+        Expectation: GQA/gated sync/overlap retain head mapping, minimal payloads and summed dK/dV.
+        """
+        def attention(tensors):
+            query, key, value = (tensor.transpose(1, 2) for tensor in tensors)
+            repeats = query.shape[1] // key.shape[1]
+            key, value = (tensor.repeat_interleave(repeats, dim=1) for tensor in (key, value))
+            scores = (query @ key.transpose(-1, -2)) * query.shape[-1] ** -0.5
+            future = torch.ones(query.shape[-2], key.shape[-2], dtype=torch.bool).triu(1)
+            return (scores.masked_fill(future, float("-inf")).softmax(-1) @ value).transpose(1, 2)
+
+        degree = 4
+        for factory in (component_modules.GroupedQueryAttention, component_modules.GatedGroupedQueryAttention):
+            for overlap in (False, True):
+                for query_heads, kv_heads, sent_kv_heads in ((16, 4, 4), (16, 2, 4), (16, 1, 4), (12, 6, 12)):
+                    with self.subTest(factory=factory.__name__, overlap=overlap, kv_heads=kv_heads):
+                        config = SimpleNamespace(hidden_size=16, num_attention_heads=query_heads,
+                                                 num_key_value_heads=kv_heads, head_dim=4)
+                        module = factory(config=config, context={"cp_size": degree}, overlap=overlap)
+                        generator = torch.Generator().manual_seed(951)
+                        inputs = [torch.randn(2, 5, heads, 4, dtype=torch.float64, generator=generator,
+                                              requires_grad=True) for heads in (query_heads, kv_heads, kv_heads)]
+                        reference_inputs = [tensor.detach().clone().requires_grad_() for tensor in inputs]
+                        expected = attention(reference_inputs)
+                        outputs = []
+                        for rank in range(degree):
+                            sent_heads = []
+
+                            def transfer(tensor, destination=rank, record=sent_heads.append):
+                                # Mock the head partition of A2A using an already assembled sequence.
+                                record(tensor.shape[2])
+                                return tensor.chunk(degree, dim=2)[destination]
+
+                            def launch(tensor, transfer_fn=transfer):
+                                output = transfer_fn(tensor)
+                                return SimpleNamespace(wait=lambda: output)
+
+                            transport = SimpleNamespace(sequence_to_head=transfer, launch_sequence_to_head=launch)
+                            module.bind_parallel(SimpleNamespace(cp_context=SimpleNamespace(
+                                size=degree, split=lambda _, current=transport: (current, None))))
+                            operands = []
+                            for index, tensor in enumerate(inputs):
+                                output, pending = module._transfer_input(tensor, is_query=index == 0)
+                                operands.append(output if pending is None else pending.wait())
+                            self.assertEqual(sent_heads, [query_heads, sent_kv_heads, sent_kv_heads])
+                            if sent_kv_heads == kv_heads:
+                                self.assertEqual(module.kv_head_repeats, 1)
+                            outputs.append(attention(operands))
+                        actual = torch.cat(outputs, dim=2)
+                        torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
+                        target = torch.randn(expected.shape, dtype=expected.dtype, generator=generator)
+                        actual_grads = torch.autograd.grad((actual * target).sum(), inputs)
+                        expected_grads = torch.autograd.grad((expected * target).sum(), reference_inputs)
+                        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+                            torch.testing.assert_close(actual_grad, expected_grad, atol=1e-12, rtol=1e-12)
+        with self.assertRaisesRegex(ValueError, "TP-local Q heads"):
+            component_modules.GroupedQueryAttention(module=self._source(), context={"cp_size": 8})
+
     def test_hybrid_gathers_start_before_waiting_for_other_branches(self):
         """Feature: Preserve the existing hybrid CP overlap window.
         Description: Record prepare/exchange events for fused and independent projections.
@@ -427,7 +488,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
             with self.subTest(fused=fused):
                 events.clear()
                 member = SimpleNamespace(
-                    overlap=True, fuse_qkv=fused, ulysses_degree=2, all_gather_degree=2,
+                    overlap=True, fuse_qkv=fused, ulysses_degree=2, all_gather_degree=2, kv_head_repeats=1,
                     cp_context=SimpleNamespace(size=4),
                     ulysses_context=SimpleNamespace(launch_sequence_to_head=launch),
                     query_context=SimpleNamespace(launch_gather_sequence=gather),

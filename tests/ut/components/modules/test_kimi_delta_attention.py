@@ -65,6 +65,7 @@ def _make_inputs(
     num_k_heads: int = 2,
     num_v_heads: int = 4,
     sequence_length: int = 17,
+    dt_bias_mean: float = -4.0,
 ):
     """Build stable grouped-value KDA inputs with all gradients enabled."""
     torch.manual_seed(seed)
@@ -83,12 +84,12 @@ def _make_inputs(
         for name, shape in shapes.items()
     }
     tensors["dt_bias"] = (
-        torch.randn(shapes["dt_bias"], dtype=torch.float32) * 0.2 - 4.0
+        torch.randn(shapes["dt_bias"], dtype=torch.float32) * 0.2 + dt_bias_mean
     ).requires_grad_(True)
     return tensors
 
 
-def _run_and_grad(function, tensors):
+def _run_and_grad(function, tensors, chunk_size=8):
     """Run one KDA implementation and differentiate output plus final state."""
     output, final_state = function(
         tensors["query"],
@@ -104,7 +105,7 @@ def _run_and_grad(function, tensors):
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         lower_bound=-5.0,
-        **({"chunk_size": 8} if function is torch_chunk_kda else {}),
+        **({"chunk_size": chunk_size} if function is torch_chunk_kda else {}),
     )
     torch.manual_seed(23)
     output_grad = torch.randn(
@@ -185,20 +186,24 @@ def test_kimi_gate_is_lower_bounded_and_differentiable():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize(
-    "seed,num_k_heads,num_v_heads",
-    ((0, 2, 2), (11, 2, 4), (29, 1, 4)),
+    "seed,num_k_heads,num_v_heads,sequence_length,chunk_size,dt_bias_mean",
+    ((0, 2, 2, 17, 8, -4.0), (11, 2, 4, 17, 8, -4.0), (29, 1, 4, 17, 8, -4.0),
+     (0, 2, 2, 128, 64, 0.0), (11, 2, 4, 129, 64, 0.0), (29, 1, 4, 65, 64, 2.0)),
 )
 def test_chunk_kda_matches_recurrent_output_state_and_all_gradients(
     seed,
     num_k_heads,
     num_v_heads,
+    sequence_length,
+    chunk_size,
+    dt_bias_mean,
 ):
     """Feature: Chunked KDA recurrence.
 
-    Description: Compare chunk and token recurrences with a nonzero final-state gradient.
-    Expectation: Outputs, final state and all input gradients agree.
+    Description: Compare token recurrence with short chunks and strong decay in padded/unpadded chunk64.
+    Expectation: Outputs, final state and all gradients remain finite and agree.
     """
-    recurrent_inputs = _make_inputs(seed, num_k_heads, num_v_heads)
+    recurrent_inputs = _make_inputs(seed, num_k_heads, num_v_heads, sequence_length, dt_bias_mean)
     chunk_inputs = {
         name: tensor.detach().clone().requires_grad_(True)
         for name, tensor in recurrent_inputs.items()
@@ -211,6 +216,7 @@ def test_chunk_kda_matches_recurrent_output_state_and_all_gradients(
     actual_output, actual_state, actual_grads = _run_and_grad(
         torch_chunk_kda,
         chunk_inputs,
+        chunk_size=chunk_size,
     )
 
     torch.testing.assert_close(actual_output, expected_output, atol=2e-5, rtol=2e-5)
@@ -300,13 +306,14 @@ def _run_cp4_state_summary(summary_inputs, common_kwargs):
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
-def test_kda_state_summary_cp4_matches_output_state_and_gradients():
+@pytest.mark.parametrize("sequence_length,chunk_size,dt_bias_mean", ((64, 8, -4.0), (256, 64, 0.0)))
+def test_kda_state_summary_cp4_matches_output_state_and_gradients(sequence_length, chunk_size, dt_bias_mean):
     """Feature: KDA affine state composition.
 
     Description: Compose four local summaries and compare with the full-sequence recurrence.
     Expectation: Output, final state and gradients match the full-sequence reference.
     """
-    reference_inputs = _make_inputs(sequence_length=64)
+    reference_inputs = _make_inputs(sequence_length=sequence_length, dt_bias_mean=dt_bias_mean)
     summary_inputs = {
         name: tensor.detach().clone().requires_grad_(True)
         for name, tensor in reference_inputs.items()
@@ -316,10 +323,10 @@ def test_kda_state_summary_cp4_matches_output_state_and_gradients():
         "use_gate_in_kernel": True,
         "use_beta_sigmoid_in_kernel": True,
         "lower_bound": -5.0,
-        "chunk_size": 8,
+        "chunk_size": chunk_size,
     }
 
-    expected_output, expected_state = torch_chunk_kda(
+    expected_output, expected_state = torch_recurrent_kda(
         reference_inputs["query"],
         reference_inputs["key"],
         reference_inputs["value"],
@@ -329,7 +336,7 @@ def test_kda_state_summary_cp4_matches_output_state_and_gradients():
         dt_bias=reference_inputs["dt_bias"],
         initial_state=reference_inputs["initial_state"],
         output_final_state=True,
-        **common_kwargs,
+        **{name: value for name, value in common_kwargs.items() if name != "chunk_size"},
     )
 
     actual_output, actual_state, composed_state = _run_cp4_state_summary(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Rebuild Qwen dense and MoE rotary buffers after empty materialization."""
+"""Preserve Qwen dense and MoE initialization through empty materialization."""
 
 import torch
 from torch import nn
@@ -24,13 +24,31 @@ _TEXT_ROTARY_CLASSES = {"Qwen3_5TextRotaryEmbedding", "Qwen3_5MoeTextRotaryEmbed
 _VISION_ROTARY_CLASSES = {"Qwen3_5VisionRotaryEmbedding", "Qwen3_5MoeVisionRotaryEmbedding"}
 
 
+def prepare_model_materialization(model: nn.Module) -> None:
+    """Retain native parameter policies and config-derived rotary buffers.
+
+    Args:
+        model: Qwen model to prepare before parameter materialization.
+    """
+    # Registry discovery must not import optional HF vision/model dependencies.
+    from hyper_parallel.models.qwen3_5.adapter.initialization import (  # pylint: disable=import-outside-toplevel
+        register_native_initialization,
+    )
+    register_native_initialization(model)
+    register_rotary_materialization(model)
+
+
 def register_rotary_materialization(model: nn.Module) -> None:
-    """Retain native CPU RoPE initialization outside storage replaced by to_empty."""
+    """Retain native CPU RoPE initialization outside storage replaced by to_empty.
+
+    Args:
+        model: Qwen model whose config-derived rotary buffers must be rebuilt.
+    """
     for module in model.modules():
         class_name = type(module).__name__
         with torch.device("cpu"):
             if class_name in _TEXT_ROTARY_CLASSES:
-                reference = type(module)(module.config, device="cpu")
+                reference = type(module)(module.config)
             elif class_name in _VISION_ROTARY_CLASSES:
                 reference = type(module)(module.dim, module.theta)
             else:

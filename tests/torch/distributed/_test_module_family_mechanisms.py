@@ -22,13 +22,22 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.random import manual_seed
+from hyper_parallel.components.modules import (
+    DeepseekSparseAttention, GatedDeltaNet, GatedGroupedQueryAttention, GatedMultiLatentAttention,
+    GroupedQueryAttention, KimiDeltaAttention, MultiLatentAttention, OffsetRMSNorm,
+)
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.components.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
@@ -38,7 +47,12 @@ from hyper_parallel.distributed.context_parallel.cp_context import CPContext
 from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.models.build_options import FSDP2Config
-from hyper_parallel.models.module_build import build_module_context, prepare_model_components
+from hyper_parallel.models._transformers.model_builder import _initialize_model_weights, _move_model_to_device
+from hyper_parallel.models._transformers import model_builder
+from hyper_parallel.models.module_build import (
+    attach_build_context, build_module_context, prepare_model_components, resolve_effective_model_spec,
+)
+from hyper_parallel.models.replacement import ModuleReplacementRequest
 from tests.common.module_family_fixtures import LinearConfig, LinearFamily, register_linear_family
 from tests.common.parallel_module_fixtures import (
     AttentionConfig, LocalAttention, MODEL_SPEC, create_attention_model,
@@ -332,5 +346,143 @@ def test_family_cp_fsdp_dcp_npu() -> None:
         _check_expert_transport("npu")
         _check_direct_cp_model(mesh, "npu", True)
         _check_ep_fsdp_model()
+    finally:
+        dist.destroy_process_group()
+
+
+class _AttentionInitializationModel(nn.Module):
+    """Retain a native projection policy and inspect its final local parameter shards."""
+
+    def __init__(self, attention: nn.Module) -> None:
+        super().__init__()
+        self.attention = attention
+        self.native_values = {}
+
+    @torch.no_grad()
+    def initialize_weights(self) -> None:
+        """Use the model's distribution and capture final parameter values for comparison."""
+        for child in self.modules():
+            if isinstance(child, (nn.Linear, nn.Conv1d)):
+                nn.init.normal_(child.weight, std=.017)
+                if child.bias is not None:
+                    nn.init.zeros_(child.bias)
+        self.native_values = {name: value.to_local().detach().clone() for name, value in self.named_parameters()}
+
+
+def test_attention_meta_initialization_cp_fsdp_npu() -> None:
+    """Feature: Attention defaults and native initialization on actual CP/FSDP shards.
+    Description: Promote local meta members to CP2, bind layouts, shard and initialize storage on two NPUs.
+    Expectation: All shards are finite and exactly preserve the native policy, including recurrence states.
+    """
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device("npu", torch.npu.current_device())
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        mesh = MeshContext(dp_size=1, cp_size=2, dp_shard_size=2, sequence_parallel=False)
+        mesh.build_meshs("npu", dist.get_world_size())
+        config = SimpleNamespace(
+            hidden_size=32, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+            q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4, v_head_dim=8,
+            attention_bias=True, qk_norm=True, rms_norm_eps=1e-6, index_head_dim=8,
+            index_n_heads=2, index_topk=1024, num_heads=4, head_k_dim=4, head_v_dim=8,
+            linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=4, linear_value_head_dim=8,
+        )
+        cases = ((GroupedQueryAttention, {}), (GroupedQueryAttention, {"fuse_qkv": False}),
+                 (GatedGroupedQueryAttention, {}), (MultiLatentAttention, {}), (GatedMultiLatentAttention, {}),
+                 (GatedDeltaNet, {"ulysses_degree": None}), (KimiDeltaAttention, {"ulysses_degree": None}),
+                 (DeepseekSparseAttention, {"kv_cp_size": 2}))
+        context = build_module_context(DistributedSetup(mesh_context=mesh), device=device, dtype=torch.float32)
+        for factory, options in cases:
+            with torch.device("meta"):
+                model = _AttentionInitializationModel(factory(config=config, **options))
+            model, _ = prepare_model_components(model, context)
+            plan = ShardingPlanner(derive=False).plan(model, mesh.device_mesh, cp_size=2, sequence_parallel=False)
+            model, source = apply_sharding_plan(model, plan, mesh)
+            fsdp = FSDP2Config(dp_shard_size=2, wrapper_class=[type(model.attention).__name__])
+            model = FSDP2Manager(fsdp, mesh).parallelize(model, source)
+            model = _move_model_to_device(model, True, device)
+            manual_seed(421, mesh.device_mesh)
+            _initialize_model_weights(model)
+            local_numel, global_numel = 0, 0
+            for name, parameter in model.named_parameters():
+                value = parameter.to_local()
+                local_numel += value.numel()
+                global_numel += parameter.numel()
+                assert torch.isfinite(value).all(), name
+                torch.testing.assert_close(value, model.native_values[name], rtol=0, atol=0, msg=name)
+            assert local_numel < global_numel
+    finally:
+        dist.destroy_process_group()
+
+
+def _poison_materialized_parameters(model, is_meta_device, device):
+    """Make any missed random initialization fail deterministically on its local shard."""
+    model = _move_model_to_device(model, is_meta_device, device)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.to_local().fill_(float("nan"))
+    return model
+
+
+def test_qwen35_native_initialization_cp_fsdp_npu() -> None:
+    """Feature: Real Qwen dense/MoE model initialization after CP2 and FSDP2.
+    Description: Poison every materialized shard and run native HF initialization after source replacement.
+    Expectation: Norms, router and all parameters initialize; distributed A_log matches native HF exactly.
+    """
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device("npu", torch.npu.current_device())
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        mesh = MeshContext(dp_size=1, cp_size=2, dp_shard_size=2, sequence_parallel=False)
+        mesh.build_meshs("npu", dist.get_world_size())
+        for model_type, config_type in ((Qwen3_5ForCausalLM, Qwen3_5TextConfig),
+                                        (Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig)):
+            config = config_type.from_dict({
+                "vocab_size": 64, "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1,
+                "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+                "layer_types": ["linear_attention"], "initializer_range": 0.017,
+                "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+                "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+                "moe_intermediate_size": 32, "shared_expert_intermediate_size": 32,
+                "num_experts": 4, "num_experts_per_tok": 2,
+            })
+            reference = model_type(config).to(device)
+            with torch.device("meta"):
+                model = model_type(config)
+            context = dict(build_module_context(DistributedSetup(mesh_context=mesh), device=device,
+                           model_spec=resolve_effective_model_spec(config), config=config))
+            context["module_replacement_requests"] = (
+                ModuleReplacementRequest(match=("model.layers.*.linear_attn",), target=GatedDeltaNet,
+                                         kwargs={"ulysses_degree": None}),
+                ModuleReplacementRequest(match=("model.layers.*.input_layernorm",
+                                                "model.layers.*.post_attention_layernorm", "model.norm"),
+                                         target=OffsetRMSNorm),
+            )
+            attach_build_context(model, context)
+            fsdp = FSDP2Config(dp_shard_size=2,
+                              wrapper_class=[model_type.__name__.replace("ForCausalLM", "DecoderLayer")])
+            manual_seed(421, mesh.device_mesh)
+            with patch.object(model_builder, "_move_model_to_device", _poison_materialized_parameters):
+                model = model_builder.apply_model_infrastructure(
+                    model, mesh=mesh, sharding_planner=ShardingPlanner(derive=False),
+                    fsdp2_manager=FSDP2Manager(fsdp, mesh), is_meta_device=True, is_hf_model=True, device=device)
+            local_numel = 0
+            for name, parameter in model.named_parameters():
+                value = parameter.to_local()
+                local_numel += value.numel()
+                assert torch.isfinite(value).all(), name
+                if name.endswith("dt_bias"):
+                    torch.testing.assert_close(value, torch.ones_like(value), rtol=0, atol=0)
+                elif "layernorm" in name or name == "model.norm.weight":
+                    torch.testing.assert_close(value, torch.zeros_like(value), rtol=0, atol=0)
+            assert local_numel < sum(parameter.numel() for parameter in model.parameters())
+            assert not model.is_custom_code()
+            expected = reference.model.layers[0].linear_attn
+            actual = model.model.layers[0].linear_attn
+            torch.npu.manual_seed(35)
+            reference.model._init_weights(expected)
+            torch.npu.manual_seed(35)
+            model.model._init_weights(actual)
+            torch.testing.assert_close(actual.A_log.full_tensor(), expected.A_log, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
