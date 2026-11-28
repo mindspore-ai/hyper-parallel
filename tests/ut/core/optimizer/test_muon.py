@@ -16,7 +16,7 @@
 """Unit tests for the Muon optimizer."""
 
 from typing import Tuple, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -29,7 +29,11 @@ from hyper_parallel.core.optimizer.muon import (
     _NS_LEGACY_COEFFS,
     zeropower_via_newtonschulz5,
 )
-from hyper_parallel.core.optimizer.muon_shard import build_param_shard_metadata_for_group
+from hyper_parallel.core.optimizer.muon_shard import (
+    build_pad_ns_inputs,
+    build_param_shard_metadata_for_group,
+    fused_allgather_dtensor_params,
+)
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
 from hyper_parallel.core.optimizer.sharding_category import CommDomainKey, HSDPCommGroup, ParamLayoutSpec, ParamRecord
 
@@ -251,6 +255,126 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+def test_muon_overlap_spreads_local_batches_by_default() -> None:
+    """Split five local batches across one shard batch's gather and broadcast windows."""
+    local_params = [torch.nn.Parameter(torch.ones(2, cols)) for cols in range(2, 7)]
+    for param in local_params:
+        param.grad = torch.ones_like(param)
+    shard_param = torch.nn.Parameter(torch.ones(2, 2))
+    optimizer = Muon([shard_param, *local_params], overlap_shard_comm=True)
+    shard_group = MagicMock()
+    assignment = MagicMock(owned_params=[shard_param], shard_pgs=(shard_group,), is_shard=True,
+                           is_replicated=False)
+    optimizer._hsdp_assignment_batches = {  # pylint: disable=protected-access
+        0: {"batch_groups": [{"sub_batches": [assignment]}], "no_comm": local_params},
+    }
+    calls = MagicMock()
+
+    def run_shard_collectives(*_args, overlap_work, **_kwargs):
+        """Run the callback once during gather and once during broadcast."""
+        calls.gather()
+        overlap_work()
+        calls.broadcast()
+        overlap_work()
+        calls.apply()
+
+    with patch("hyper_parallel.core.optimizer.muon.dist.get_world_size", return_value=2), \
+            patch.object(optimizer, "_shard_pipeline_key", return_value=(torch.device("cpu"), (shard_group,), ())), \
+            patch.object(optimizer, "_process_shard_params", side_effect=run_shard_collectives), \
+            patch.object(optimizer, "_process_unshard_params", side_effect=lambda *_: calls.local()):
+        optimizer.step()
+
+    expected = [call.gather(), call.local(), call.local(), call.broadcast(),
+                call.local(), call.local(), call.local(), call.apply()]
+    assert calls.mock_calls == expected, f"expected {expected}, got {calls.mock_calls}"
+
+
+@pytest.mark.parametrize("local_error", [False, True])
+def test_muon_async_gather_waits_after_local_work(local_error: bool) -> None:
+    """Feature: Run independent Muon work during an asynchronous gather.
+
+    Description: Mock a gather whose output only becomes readable when its work is waited on.
+    Expectation: Local work runs before the wait, including when local work raises.
+    """
+    calls = MagicMock()
+    if local_error:
+        calls.local_work.side_effect = RuntimeError("local work failed")
+    group = MagicMock()
+    layout = ParamLayoutSpec(tensor_ndim=2, shard_axes=((0, 0),), replicate_mesh_dims=())
+    local = torch.arange(1, 3, dtype=torch.bfloat16).view(1, 2)
+
+    def gather(output, packed, *, group, async_op):
+        """Expose gathered data only when the caller waits for the handle."""
+        calls.launch(group, async_op)
+        calls.wait.side_effect = lambda: output.copy_(packed.repeat(2))
+        return calls
+
+    with patch("hyper_parallel.core.optimizer.muon_shard.dist") as dist:
+        dist.get_world_size.return_value = 2
+        dist.all_gather_into_tensor.side_effect = gather
+        if local_error:
+            with pytest.raises(RuntimeError, match="local work failed"):
+                fused_allgather_dtensor_params([local], [group], layout, while_gathering=calls.local_work)
+        else:
+            result, = fused_allgather_dtensor_params([local], [group], layout, while_gathering=calls.local_work)
+            torch.testing.assert_close(result, local.repeat(2, 1), rtol=0, atol=0)
+
+    expected = [call.launch(group, True), call.local_work(), call.wait()]
+    assert calls.mock_calls == expected, f"expected {expected}, got {calls.mock_calls}"
+
+
+def test_muon_pad_ns_inputs_uses_fallback_only_without_real_inputs() -> None:
+    """Feature: Match the communication dtype when a rank has no valid gradient.
+
+    Description: Construct padding for float32 parameters with and without a real NS input.
+    Expectation: An explicit fallback controls empty input batches; real inputs take precedence.
+    """
+    first = torch.nn.Parameter(torch.ones(2, 2))
+    second = torch.nn.Parameter(torch.ones(2, 2))
+    inputs = build_pad_ns_inputs([first], {}, fallback_dtype=torch.bfloat16)
+    torch.testing.assert_close(inputs[0], torch.zeros((2, 2), dtype=torch.bfloat16))
+
+    reference = torch.ones((2, 2), dtype=torch.float64)
+    inputs = build_pad_ns_inputs([first, second], {first: reference}, fallback_dtype=torch.bfloat16)
+    torch.testing.assert_close(inputs[1], torch.zeros_like(reference))
+
+
+def test_muon_gather_reuses_owner_slot_with_column_shards() -> None:
+    """Feature: Reusable pipeline storage for owner NS inputs.
+
+    Description: Gather column shards with padding and unpack only the owner's matrix into reusable storage.
+    Expectation: Reused storage contains the next gather and never aliases the raw gather buffer.
+    """
+    layout = ParamLayoutSpec(tensor_ndim=2, shard_axes=((0, 1),), replicate_mesh_dims=())
+    group = MagicMock()
+    local = torch.arange(6, dtype=torch.bfloat16).view(3, 2)
+    gather_buffers, owner_buffers = {}, {}
+
+    def gather(output, packed, *, group):  # pylint: disable=unused-argument
+        """Return a copy of the local shard for each rank."""
+        output.copy_(packed.repeat(2))
+
+    with patch("hyper_parallel.core.optimizer.muon_shard.dist") as dist:
+        dist.get_world_size.return_value = 2
+        dist.all_gather_into_tensor.side_effect = gather
+        first, skipped = fused_allgather_dtensor_params(
+            [local, local], [group], layout,
+            buffer_cache=gather_buffers, keep_indices={0}, owner_buffer_cache=owner_buffers,
+        )
+        torch.testing.assert_close(first, local.repeat(1, 2), rtol=0, atol=0)
+        assert skipped is None, f"Unowned input should be empty, got {skipped}"
+        second, = fused_allgather_dtensor_params(
+            [local + 1], [group], layout,
+            buffer_cache=gather_buffers, keep_indices={0}, owner_buffer_cache=owner_buffers,
+        )
+
+    torch.testing.assert_close(second, (local + 1).repeat(1, 2), rtol=0, atol=0)
+    assert first.data_ptr() == second.data_ptr(), f"Owner buffer was replaced: {first.data_ptr()}, {second.data_ptr()}"
+    assert all(tmp.data_ptr() != second.data_ptr() for tmp in gather_buffers.values()), (
+        f"Owner buffer {second.data_ptr()} aliases a raw gather buffer"
+    )
 
 
 @pytest.mark.parametrize("mode", ["legacy", "vanilla"])
