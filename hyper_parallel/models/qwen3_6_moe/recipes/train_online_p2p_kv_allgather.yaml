@@ -126,12 +126,10 @@ dataloader:
     _target_: hyper_parallel.models.qwen3_5.cp_batch.GDNCPDataCollator
     chunk_size: 64
   get_batch:
-    _target_: hyper_parallel.data.batching.TextParallelBatch
+    _target_: hyper_parallel.models.qwen3_5.cp_batch.GDNCPParallelBatch
     source_type: online
-    attention_mode: compressed
-    runtime_input_adapter:
-      _target_: hyper_parallel.models.qwen3_5.adapter.data.runtime.Qwen35PackedRuntime
-    # One conversation still comes from GDNCPDataCollator; lengths avoid an S*S mask.
+    attention_mode: dense
+    # Independent padded batch rows; CP attention builds causal visibility without an S*S mask.
   sampler_type: cyclic
   data_rearrange_map: null
   data_sharding: false

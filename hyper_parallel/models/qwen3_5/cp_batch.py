@@ -12,20 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Single-conversation batches for GDN P2P plus attention KV all-gather CP."""
+"""Unpacked batches for GDN P2P plus attention KV all-gather CP."""
 
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from hyper_parallel.data.batching.build_collate_fn import TextPackingCollator
+import torch
+import torch.nn.functional as F
+
+from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.batching.get_batch import TextParallelBatch
 
 
 class GDNCPDataCollator:
-    """Right-pad one conversation so every CP shard contains whole GDN chunks.
+    """Right-pad independent batch rows to whole GDN chunks on every CP rank.
 
-    Independent conversations cannot be packed: attention masking alone does
-    not reset the GDN recurrent state or its causal convolution history.
+    Independent conversations stay in separate rows: attention masking alone
+    does not reset the GDN recurrent state or its causal convolution history.
     Padding labels are ignored, and future padding cannot affect real tokens.
     """
 
@@ -37,31 +40,39 @@ class GDNCPDataCollator:
             raise ValueError("cp_size and chunk_size must be positive")
         if tp_size != 1:
             raise NotImplementedError("The GDN P2P batch path currently requires tp_size=1")
-        self.collator = TextPackingCollator(alignment_size=cp_size * chunk_size)
+        self.alignment_size = cp_size * chunk_size
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        """Collate exactly one nonempty conversation, including its ignored tail."""
-        if len(model_samples) != 1:
-            raise ValueError("GDN P2P requires micro_batch_size=1; packed independent samples are unsupported")
-        sample = model_samples[0]
-        if sample["input_ids"].ndim != 1 or sample["input_ids"].numel() == 0:
-            raise ValueError("GDN P2P requires nonempty one-dimensional input_ids")
-        if sample["labels"].shape != sample["input_ids"].shape:
-            raise ValueError("GDN P2P requires aligned input_ids and pre-shifted labels")
-        batch = self.collator(model_samples)
-        # Tail padding belongs to the same causal stream, not a new sequence.
-        # Keeping one boundary also avoids resetting RoPE positions in the tail.
-        batch["cu_seq_lens"] = batch["cu_seq_lens"][[0, -1]]
+        """Keep conversations in separate rows, with ignored right-padding labels."""
+        if not model_samples:
+            raise ValueError("GDN P2P requires at least one conversation")
+        for sample in model_samples:
+            if sample["input_ids"].ndim != 1 or sample["input_ids"].numel() == 0:
+                raise ValueError("GDN P2P requires nonempty one-dimensional input_ids")
+            if sample["labels"].shape != sample["input_ids"].shape:
+                raise ValueError("GDN P2P requires aligned input_ids and pre-shifted labels")
+        length = max(sample["input_ids"].numel() for sample in model_samples)
+        length += (-length) % self.alignment_size
+        batch = {
+            name: torch.stack([
+                F.pad(sample[name], (0, length - sample[name].numel()), value=pad_value)
+                for sample in model_samples
+            ])
+            for name, pad_value in (("input_ids", 0), ("labels", IGNORE_INDEX))
+        }
+        # These boundaries describe physical batch rows for TextParallelBatch;
+        # they are not forwarded to the model as packed-sequence metadata.
+        batch["cu_seq_lens"] = torch.arange(len(model_samples) + 1, dtype=torch.int32) * length
         return batch
 
 
 class GDNCPParallelBatch(TextParallelBatch):
     """Use contiguous token shards and delegate causal masking to the CP wrapper.
 
-    This pairs with GDNCPDataCollator and sdpa_hf. A mask dictionary bypasses
-    HF's local-length mask construction: sdpa_hf constructs the global-offset
-    causal mask after gathering K/V. GDN needs no padding mask for a single
-    right-padded causal stream. Neither path supports cached decoding here.
+    This pairs with GDNCPDataCollator. A mask dictionary bypasses HF's
+    local-length mask construction; the CP attention implementation owns
+    global-offset causal attention. Each row has an independent GDN state.
+    Right padding cannot affect real tokens in these causal streams.
     """
 
     def _build_runtime_inputs(self, parallel_batch: Mapping[str, Any]) -> dict[str, Any]:
@@ -70,8 +81,11 @@ class GDNCPParallelBatch(TextParallelBatch):
             raise ValueError("GDN P2P batches require dense full causal attention without sliding_window")
         if self.parallel_context.tp_world_size != 1:
             raise NotImplementedError("GDN P2P batches currently require tp_size=1")
-        if parallel_batch["input_ids"].shape[0] != 1 or parallel_batch["cu_seq_lens"].numel() != 2:
-            raise ValueError("GDN P2P batches require one conversation; use GDNCPDataCollator")
-        if parallel_batch["input_ids"].shape[1] % 64:
+        batch_size, local_length = parallel_batch["input_ids"].shape
+        global_length = local_length * self.parallel_context.cp_world_size
+        boundaries = parallel_batch["cu_seq_lens"].tolist()
+        if boundaries != list(range(0, (batch_size + 1) * global_length, global_length)):
+            raise ValueError("GDN P2P batches require one conversation per row; use GDNCPDataCollator")
+        if local_length % 64:
             raise ValueError("GDN Triton CP requires local sequence length divisible by 64")
         return {"attention_mask": {"full_attention": None, "linear_attention": None}}
