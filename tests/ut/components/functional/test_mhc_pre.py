@@ -57,7 +57,7 @@ class TestMhcPre(unittest.TestCase):
         self.assertIs(post, h_post)
         self.assertEqual(residual.shape, (B, S, N, N))
         self.assertEqual(streams.shape, (B, S, N * C))
-        args = ops.mhc_pre_sinkhorn.call_args.args
+        args = getattr(ops, "mhc_pre_sinkhorn").call_args.args
         self.assertEqual(args[0].shape, (B, S, N, C))
         self.assertEqual(args[1].dtype, torch.float32)
         self.assertEqual(args[4:], (N, 20, 1e-6, 1e-6))
@@ -80,15 +80,15 @@ class TestMhcPre(unittest.TestCase):
         with patch.dict(sys.modules, {"cann_ops_transformer": package, "cann_ops_transformer.ops": ops}):
             mhc_pre(x, phi, torch.randn(3), torch.randn(N * N + 2 * N), N, gamma=gamma)
 
-        folded = ops.mhc_pre_sinkhorn.call_args.args[1]
+        folded = getattr(ops, "mhc_pre_sinkhorn").call_args.args[1]
         torch.testing.assert_close(folded, phi * gamma.reshape(1, -1))
 
     def test_omni_backend_is_deprecated(self):
         """
         Feature: Legacy omni MHC pre backend.
         Description: Invoke mhc_pre with backend='omni'.
-        Expectation: Log a deprecation warning and run the legacy pre and
-            Sinkhorn operator pair through torch.ops.custom.
+        Expectation: Log a deprecation warning, run the legacy pre operator,
+            and forward its mixing logits to the Sinkhorn interface.
         """
         x = torch.randn(B, S, N * C)
         hin = torch.randn(B, S, C)
@@ -98,16 +98,13 @@ class TestMhcPre(unittest.TestCase):
         h_mix = torch.randn(B, S, N * N + 2 * N)
         h_pre = torch.randn(B, S, N)
         sink_out = torch.randn(B, S, N, N)
-        norm_out = torch.randn(B, S, N, N)
-        sum_out = torch.randn(B, S, N, N)
         omni = ModuleType("omni_training_custom_ops")
         custom = Mock()
         custom.npu_manifold_constrained_hyper_connection_pre = Mock(
             return_value=(hin, h_post, comb, inv_rms, h_mix, h_pre))
-        custom.npu_sinkhorn = Mock(return_value=(sink_out, norm_out, sum_out))
         with patch.dict(sys.modules, {"omni_training_custom_ops": omni}), \
                 patch.object(torch.ops, "custom", custom, create=True), \
-                patch("hyper_parallel.components.functional.sinkhorn.omni_training_custom_ops", omni), \
+                patch("hyper_parallel.components.functional.mhc_pre.sinkhorn", return_value=sink_out) as normalize, \
                 patch("hyper_parallel.components.functional.mhc_pre.logger") as fake_logger:
             block_input, post, residual, streams = mhc_pre(
                 x, torch.randn(N * N + 2 * N, N * C), torch.randn(3), torch.randn(N * N + 2 * N), N,
@@ -120,7 +117,7 @@ class TestMhcPre(unittest.TestCase):
         self.assertEqual(post.shape, (B, S, N))
         self.assertEqual(residual.shape, (B, S, N, N))
         self.assertEqual(streams.shape, (B, S, N * C))
-        custom.npu_sinkhorn.assert_called_once()
+        normalize.assert_called_once_with(comb, 20, 1e-6)
 
     def test_rejects_unknown_backend(self):
         """

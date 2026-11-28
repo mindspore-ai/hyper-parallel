@@ -31,8 +31,9 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
+from hyper_parallel.components.functional.swiglu import local_swiglu
 from hyper_parallel.components.modules.mlp.swiglu_mlp import (
-    SwiGLUMLPModule, _validate_mlp_config, local_swiglu, _activation_settings,
+    SwiGLUMLPModule, _validate_mlp_config, _activation_settings,
 )
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 
@@ -374,8 +375,6 @@ class SharedExpertModule(nn.Module):
             Activated intermediate [..., intermediate_size], retaining source dtype policy.
         """
         if self._preserve_source_layout:
-            if self.swiglu_limit <= 0 and self.activation_dtype == "input" and hasattr(self, "act_fn"):
-                return self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
             intermediate = torch.cat((self.gate_proj(hidden_states), self.up_proj(hidden_states)), dim=-1)
             return self.activation_func(intermediate).to(hidden_states.dtype)
         intermediate, bias = self.linear_fc1(hidden_states)

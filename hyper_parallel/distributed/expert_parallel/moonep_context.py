@@ -23,6 +23,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from hyper_parallel.components.ops import moe_token_permute
+
 from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
 from hyper_parallel.distributed.expert_parallel.moonep_planner import compile_plan, select_allocation
 
@@ -95,16 +97,12 @@ class MoonEPContext(EPContext):
             self._run_overlap("fc1", hidden, weights)
         counts, receive_order = plan["counts"], plan["receive_order"]
         if hidden.shape[0] and hidden.device.type == "npu":
-            # torch_npu is optional for CPU import and planning tests.
-            from hyper_parallel.components.functional.moe_token_permute import (  # pylint: disable=C0415
-                moe_token_permute,
-            )
-
             rows = torch.arange(counts.numel(), device=counts.device).repeat_interleave(
                 counts, output_size=hidden.shape[0],
             )
             ids = torch.empty_like(rows).scatter_(0, receive_order, rows)
-            hidden, inverse = moe_token_permute(hidden.contiguous(), ids.to(torch.int32).unsqueeze(-1))
+            hidden, _, inverse = moe_token_permute(hidden.contiguous(), ids.unsqueeze(-1))
+            inverse = inverse.to(torch.int32)
         else:
             hidden = hidden.index_select(0, receive_order)
             inverse = torch.empty_like(receive_order, dtype=torch.int32).scatter_(

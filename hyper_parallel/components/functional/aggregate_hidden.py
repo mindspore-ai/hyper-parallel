@@ -14,48 +14,40 @@
 # ============================================================================
 """Masked hidden-state aggregation function."""
 
-from typing import Any, Tuple
-
 import torch
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 
+from hyper_parallel.components import ops
 
-class _AggregateHidden(torch.autograd.Function):
-    """Autograd bridge for the aggregate-hidden custom operator."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        input_tensor: torch.Tensor,
-        weight: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the aggregate-hidden forward operator."""
-        ctx.save_for_backward(input_tensor, weight, mask)
-        return torch.ops.custom.npu_aggregate_hidden(input_tensor, weight, mask=mask)
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, None]:
-        """Run the aggregate-hidden backward operator."""
-        input_tensor, weight, mask = ctx.saved_tensors
-        grad_input, grad_weight = torch.ops.custom.npu_aggregate_hidden_grad(
-            grad_output.contiguous(),
-            input_tensor,
-            weight,
-            mask=mask,
-        )
-        return grad_input, grad_weight, None
+__all__ = ["aggregate_hidden"]
 
 
 def aggregate_hidden(input_tensor: torch.Tensor, weight: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Aggregate masked hidden states with the NPU custom operator.
+    """Aggregate each hidden channel over a causal window and mask output positions.
+
+    For a window of size K, the output is::
+
+        output[t, b, h] = mask[b, t] * sum(
+            weight[k, h] * input_tensor[t - K + 1 + k, b, h]
+            for k in range(K)
+        )
+
+    Input positions before the sequence start contribute zero. The last filter
+    tap multiplies the current token. The mask gates outputs only: a masked
+    token can still contribute to later unmasked outputs. Channels are filtered
+    independently, without adding a bias or a residual connection.
 
     Args:
-        input_tensor: Hidden states in ``[sequence, batch, hidden]`` layout.
-        weight: Depthwise aggregation weights in ``[window, hidden]`` layout.
-        mask: Boolean validity mask in ``[batch, sequence]`` layout.
+        input_tensor: Floating hidden states of shape [sequence, batch, hidden].
+        weight: Filter taps of shape [window, hidden], with a positive window
+            size and the same dtype and device as input_tensor.
+        mask: Boolean output mask of shape [batch, sequence] on the input device.
 
     Returns:
-        Aggregated hidden states.
+        Aggregated hidden states with the input shape, dtype and device. False
+        mask positions are zero. Empty sequences or batches return empty states
+        while retaining gradient connections to the input and filter weights.
+
+    Raises:
+        ValueError: Input shapes, dtypes or devices do not match this contract.
     """
-    return _AggregateHidden.apply(input_tensor, weight, mask)
+    return ops.aggregate_hidden(input_tensor, weight, mask)

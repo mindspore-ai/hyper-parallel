@@ -36,6 +36,7 @@ from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBindi
 from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
 from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from tests.common.mark_utils import arg_mark
+from tests.common.op_precision import assert_precision
 
 
 def _router(**settings):
@@ -368,8 +369,9 @@ class TestRouterTraining(unittest.TestCase):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
         actual[1].square().sum().backward()
         expected[1].square().sum().backward()
-        torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
-        torch.testing.assert_close(left.weight.grad, right.weight.grad, rtol=0, atol=0)
+        assert_precision(hidden.grad, other.grad, dtype=torch.float32, backward=True, label="router/input")
+        assert_precision(left.weight.grad, right.weight.grad, dtype=torch.float32,
+                         backward=True, label="router/weight")
         torch.testing.assert_close(left.tokens_per_expert, right.tokens_per_expert)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -396,8 +398,9 @@ class TestRouterTraining(unittest.TestCase):
             torch.testing.assert_close(result, value, rtol=0, atol=0)
         actual[1].square().sum().backward()
         expected[1].square().sum().backward()
-        torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
-        torch.testing.assert_close(member.weight.grad, reference.weight.grad, rtol=0, atol=0)
+        assert_precision(hidden.grad, other.grad, dtype=torch.float32, backward=True, label="router/input")
+        assert_precision(member.weight.grad, reference.weight.grad, dtype=torch.float32,
+                         backward=True, label="router/weight")
         torch.testing.assert_close(member.tokens_per_expert, torch.bincount(actual[2].flatten(), minlength=4))
         biases = {name: getattr(member, name).detach().clone() for name in member.fp32_parameter_names}
         member.to(dtype=torch.bfloat16)

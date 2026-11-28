@@ -23,40 +23,161 @@ import torch
 
 from hyper_parallel.components.functional.dsa_indexer import dsa_indexer as fused_packed_indexer
 from hyper_parallel.components.functional.lightning_indexer import (
-    lightning_indexer, sort_key_indices, validate_indexer_tensors,
+    lightning_indexer,
+    sort_key_indices,
+    validate_indexer_tensors,
 )
 
 from .._dependency import load_cann, require_package, require_symbol
 from .._dsa_layout import DsaQueryLayout, ReduceSum, packed_segments
+from ..factory import _select_for_call
 from ..registry import OpRegistry
 from ..spec import OpSpec
 
 
 class DsaIndexerFn(Protocol):
-    """Produce sorted causal TopK key IDs with -1 marking unused slots."""
+    """Select causal compressed keys using the DeepSeek indexer score.
+
+    Compute weighted head sums of ReLU query-key dot products, apply logical
+    document and causal visibility, then retain TopK keys sorted by key ID.
+    Unused result slots contain -1. Optional reduce_sum combines partial head
+    scores before selection. Discrete key selection has no gradient.
+    """
 
     def __call__(
         self, x: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor, *,
         layout: DsaQueryLayout, sparse_count: int, query_chunk_size: int = 256,
         reduce_sum: ReduceSum | None = None,
     ) -> torch.Tensor:
-        """Return int32 key IDs for each query."""
+        """Return int32 key IDs for each query.
+
+        Args:
+            x: Indexer queries [batch, query_length, heads, head_dim].
+            key: Compressed indexer keys [batch, key_length, head_dim].
+            merge_weight: Per-query indexer head weights [batch, query_length, heads].
+            layout: Logical document geometry and compressed-key visibility bounds.
+            sparse_count: Requested number of selected keys per query.
+            query_chunk_size: Query rows processed together by the native reference.
+            reduce_sum: Optional callback combining partial scores before selection.
+
+        Returns:
+            Sorted int32 compressed-key IDs [batch, query_length, min(sparse_count, key_length)],
+            padded with -1 for unavailable visible keys.
+        """
 
 
-DSA_INDEXER = OpSpec[DsaIndexerFn](config_key="dsa_indexer", variant="compressed_causal_topk")
+def dsa_indexer(
+    x: torch.Tensor,
+    key: torch.Tensor,
+    merge_weight: torch.Tensor,
+    *,
+    layout: DsaQueryLayout,
+    sparse_count: int,
+    query_chunk_size: int = 256,
+    reduce_sum: ReduceSum | None = None,
+) -> torch.Tensor:
+    """Select causal compressed keys and return sorted int32 IDs.
+
+    Args:
+        x: Indexer queries [batch, query_length, heads, head_dim].
+        key: Compressed indexer keys [batch, key_length, head_dim].
+        merge_weight: Per-query indexer head weights [batch, query_length, heads].
+        layout: Logical document geometry and compressed-key visibility bounds.
+        sparse_count: Requested number of selected keys per query.
+        query_chunk_size: Query rows processed together by the native reference.
+        reduce_sum: Optional callback combining partial scores before selection.
+
+    Returns:
+        Sorted int32 compressed-key IDs [batch, query_length, min(sparse_count, key_length)],
+            padded with -1 for unavailable visible keys.
+
+    Notes:
+        Select causal compressed keys using the DeepSeek indexer score.
+
+        Compute weighted head sums of ReLU query-key dot products, apply logical
+        document and causal visibility, then retain TopK keys sorted by key ID.
+        Unused result slots contain -1. Optional reduce_sum combines partial head
+        scores before selection. Discrete key selection has no gradient.
+    """
+    implementation = _select_for_call(DSA_INDEXER, device=x.device)
+    return implementation(
+        x,
+        key,
+        merge_weight,
+        layout=layout,
+        sparse_count=sparse_count,
+        query_chunk_size=query_chunk_size,
+        reduce_sum=reduce_sum,
+    )
+
+
+DSA_INDEXER = OpSpec[DsaIndexerFn](config_key='dsa_indexer', variant='compressed_causal_topk')
 
 
 class PackedDsaIndexerFn(Protocol):
-    """Select document-local key IDs and retain the flattened indexer states."""
+    """Select document-local keys from packed, right-aligned causal indexer scores.
+
+    For each packed document, form weighted sums of ReLU head-wise dot
+    products and select TopK visible keys. Indices use document-local key
+    coordinates with -1 padding; the score-ranked order need not be key-sorted.
+    Return the flattened input states alongside the discrete selection.
+    """
 
     def __call__(
         self, x: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
         query_ends: torch.Tensor, key_ends: torch.Tensor, sparse_count: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return right-aligned causal TopK with -1 padding, followed by TND states and TN weights."""
+        """Return right-aligned causal TopK with -1 padding, followed by TND states and TN weights.
+
+        Args:
+            x: Indexer queries in BSND layout before flattening batch and sequence.
+            key: Indexer keys in BSND layout, with a singleton key-head axis.
+            weights: Indexer head weights before flattening batch and sequence.
+            query_ends: Cumulative query document ends after flattening.
+            key_ends: Cumulative key document ends for the same documents.
+            sparse_count: Requested number of keys per query.
+
+        Returns:
+            A tuple of int32 IDs [total_queries, 1, sparse_count], flattened TND queries, TND keys and TN
+            head weights.
+        """
 
 
-DSA_PACKED_INDEXER = OpSpec[PackedDsaIndexerFn](config_key="dsa_indexer", variant="packed_causal_topk")
+DSA_PACKED_INDEXER = OpSpec[PackedDsaIndexerFn](config_key='dsa_indexer', variant='packed_causal_topk')
+
+
+def dsa_indexer_packed(
+    x: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    query_ends: torch.Tensor,
+    key_ends: torch.Tensor,
+    sparse_count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return right-aligned causal TopK with -1 padding, followed by TND states and TN weights.
+
+    Args:
+        x: Indexer queries in BSND layout before flattening batch and sequence.
+        key: Indexer keys in BSND layout, with a singleton key-head axis.
+        weights: Indexer head weights before flattening batch and sequence.
+        query_ends: Cumulative query document ends after flattening.
+        key_ends: Cumulative key document ends for the same documents.
+        sparse_count: Requested number of keys per query.
+
+    Returns:
+        A tuple of int32 IDs [total_queries, 1, sparse_count], flattened TND queries, TND keys and TN
+        head weights.
+
+    Notes:
+        Select document-local keys from packed, right-aligned causal indexer scores.
+
+        For each packed document, form weighted sums of ReLU head-wise dot
+        products and select TopK visible keys. Indices use document-local key
+        coordinates with -1 padding; the score-ranked order need not be key-sorted.
+        Return the flattened input states alongside the discrete selection.
+    """
+    operation = _select_for_call(DSA_PACKED_INDEXER, device=x.device)
+    return operation(x, key, weights, query_ends, key_ends, sparse_count)
 
 
 def _native_packed_indexer(
@@ -160,7 +281,7 @@ def native_dsa_indexer(
     return torch.cat(selected_chunks, dim=1)
 
 
-def indexer_native_only(x: torch.Tensor, layout: DsaQueryLayout, reduce_sum: ReduceSum | None) -> str | None:
+def _indexer_input_error(x: torch.Tensor, layout: DsaQueryLayout, reduce_sum: ReduceSum | None) -> str | None:
     """Explain why the LI V2 candidate cannot represent this call."""
     if (x.dtype != torch.bfloat16 or x.shape[-1] != 128 or layout.segments is None or reduce_sum is not None):
         return "LI V2 requires BF16 D=128, document segments and no TP score reduction"
@@ -173,6 +294,9 @@ def _cann_indexer(
     layout: DsaQueryLayout, sparse_count: int, query_chunk_size: int = 256,
     reduce_sum: ReduceSum | None = None,
 ) -> torch.Tensor:
+    reason = _indexer_input_error(x, layout, reduce_sum)
+    if reason is not None:
+        raise ValueError(reason)
     del reduce_sum
     _validate_indexer_inputs(x, key, merge_weight, layout, query_chunk_size)
     validate_indexer_tensors(x, key, merge_weight)

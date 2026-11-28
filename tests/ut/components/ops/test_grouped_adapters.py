@@ -14,14 +14,14 @@
 # ============================================================================
 """CPU contracts for grouped-kernel argument conversion and adapter autograd."""
 
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from hyper_parallel.components.ops.impl import grouped_matmul, grouped_swiglu
+from tests.common.op_precision import assert_precision
 from tests.common.op_precision_suite import precision_cases
 
 
@@ -51,38 +51,39 @@ def _evaluate(operation, args):
 class TestGroupedAdapters(unittest.TestCase):
     """Validate layout, offsets, empty experts and routing gradients around kernel calls."""
 
-    def _check_swiglu(self, operation) -> None:
+    def _check_swiglu(self, operation, dtype=torch.float32) -> None:
         """Compare adapter results and every VJP with the independent expert oracle."""
-        for case in precision_cases("grouped_swiglu", torch.float32):
+        for case in precision_cases("grouped_swiglu", dtype):
             with self.subTest(case=case.name):
                 expected, expected_grads = _evaluate(case.reference, case.args)
                 actual, actual_grads = _evaluate(operation, case.args)
-                torch.testing.assert_close(actual, expected)
+                assert_precision(actual, expected, dtype=dtype)
                 for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-                    torch.testing.assert_close(actual_grad, expected_grad)
+                    assert_precision(actual_grad, expected_grad, dtype=dtype, backward=True)
 
     def test_cuda_grouped_swiglu_offsets_and_gradients(self) -> None:
         """CUDA adapters use cumulative int32 counts and preserve all expert gradients."""
-        with patch.object(torch, "_grouped_mm", side_effect=_cuda_grouped_mm, create=True):
-            self._check_swiglu(grouped_swiglu._load_cuda())  # pylint: disable=protected-access
+        with patch.object(torch, "_grouped_mm", side_effect=_cuda_grouped_mm, create=True), patch.object(
+            torch.cuda, "get_device_capability", return_value=(8, 0),
+        ):
+            self._check_swiglu(grouped_swiglu._load_cuda(), torch.bfloat16)  # pylint: disable=protected-access
 
     def test_npu_grouped_swiglu_offsets_and_gradients(self) -> None:
         """NPU adapters preserve transpose views, routing weights and empty-expert VJPs."""
-        module_name = "hyper_parallel.components.functional.grouped_matmul"
-        module = ModuleType(module_name)
-        module.grouped_matmul = _npu_grouped_mm
         extension = SimpleNamespace(npu_grouped_matmul=_npu_grouped_mm)
-        with patch.dict(sys.modules, {module_name: module}), patch.object(
+        with patch.object(grouped_swiglu, "npu_grouped_matmul", side_effect=_npu_grouped_mm), patch.object(
             grouped_swiglu, "require_package", return_value=extension,
         ):
             self._check_swiglu(grouped_swiglu._load_npu())  # pylint: disable=protected-access
 
     def test_cuda_grouped_matmul_offset_encoding(self) -> None:
         """The grouped GEMM adapter converts incoming int64 ends to CUDA int32 ends."""
-        x = torch.arange(6.0).reshape(3, 2)
-        weights = torch.arange(12.0).reshape(2, 2, 3)
+        x = torch.arange(6.0, dtype=torch.bfloat16).reshape(3, 2)
+        weights = torch.arange(12.0, dtype=torch.bfloat16).reshape(2, 2, 3)
         ends = torch.tensor([1, 3])
-        with patch.object(torch, "_grouped_mm", side_effect=_cuda_grouped_mm, create=True):
+        with patch.object(torch, "_grouped_mm", side_effect=_cuda_grouped_mm, create=True), patch.object(
+            torch.cuda, "get_device_capability", return_value=(8, 0),
+        ):
             operation = grouped_matmul._load_cuda()  # pylint: disable=protected-access
             actual = operation(x, weights, ends)
         torch.testing.assert_close(actual, torch.cat((x[:1] @ weights[0], x[1:] @ weights[1])))

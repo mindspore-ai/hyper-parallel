@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from functools import lru_cache
 from math import isfinite, prod, sqrt
 from typing import Any
 
@@ -26,6 +25,7 @@ from torch.nn import functional as F
 
 from hyper_parallel.components.checkpoint.weight_conversion import ConversionOps, WeightConverter, WeightRenaming
 from hyper_parallel.components.losses.aux_loss import aux_loss_auto_scale, sequence_load_balancing_loss
+from hyper_parallel.components.ops import moe_router
 from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
 from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
 from hyper_parallel.components.modules.moe.moe_utils import (
@@ -464,14 +464,6 @@ class GateModule(nn.Module):
             self.tokens_per_expert.zero_()
 
 
-@lru_cache(maxsize=None)
-def _plan_for_device(device: torch.device) -> Any:
-    # HyperMulticore is optional and its runtime is needed only for native NPU calls.
-    from hyper_multicore.modules.mega_gate.plan import build_mega_gate_plan  # pylint: disable=import-outside-toplevel
-
-    return build_mega_gate_plan(device)
-
-
 class MegaGateModule(GateModule):
     """Extend the ordinary gate with correction biases and a fused NPU route.
 
@@ -557,13 +549,10 @@ class MegaGateModule(GateModule):
 
     def _native_forward(self, hidden_states: torch.Tensor,
                         image_mask: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
-        # Only the fused execution path requires the optional native package.
-        from hyper_multicore.modules.mega_gate.function import mega_gate  # pylint: disable=import-outside-toplevel
-
-        return mega_gate(hidden_states, self.weight, self.bias, _plan_for_device(hidden_states.device),
-                         vision_bias=self.bias_vl if image_mask is not None else None,
-                         image_mask=None if image_mask is None else image_mask.view(-1),
-                         top_k=self.top_k, routed_scaling_factor=self.routed_scaling_factor)
+        return moe_router(
+            hidden_states, self.weight, self.bias, self.bias_vl if image_mask is not None else None,
+            image_mask, self.top_k, self.scoring_func, self.routed_scaling_factor,
+        )
 
     # The fused NPU API takes a modality mask in the second argument.
     def forward(self, hidden_states: torch.Tensor,  # pylint: disable=arguments-renamed
@@ -590,12 +579,6 @@ class MegaGateModule(GateModule):
             if (image_mask.shape != hidden_states.shape[:-1] or image_mask.dtype != torch.bool
                     or image_mask.device != hidden_states.device):
                 raise ValueError("image_mask must be BOOL [batch, sequence] on the hidden_states device")
-        if self.scoring_func != "sqrtsoftplus" or hidden_states.device.type != "npu" or hidden_states.numel() == 0:
-            return self._torch_forward(hidden_states, image_mask, token_mask=token_mask,
-                                       sequence_ids=sequence_ids, num_sequences=num_sequences,
-                                       sequence_partition_groups=sequence_partition_groups)
-        if image_mask is not None and not image_mask.is_contiguous():
-            raise ValueError("image_mask must be contiguous for native MegaGate")
         logits, weights, indices = self._native_forward(hidden_states, image_mask)
         weights, indices = self._finish_routing(
             hidden_states, logits, weights, indices, token_mask, sequence_ids,

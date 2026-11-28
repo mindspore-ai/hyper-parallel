@@ -20,6 +20,7 @@ import unittest
 import torch
 
 from hyper_parallel.components import ops as operators
+from hyper_parallel.components.functional.mome import mome
 from hyper_parallel.components.modules.attention.linear_attention_utils.sequence_layout import PackedSequenceInfo
 from tests.common.op_precision import check_case
 from tests.common.op_precision_suite import FAMILY_BUILDERS, precision_cases
@@ -51,7 +52,7 @@ class TestNativeContracts(unittest.TestCase):
             ("grouped_matmul", operators.grouped_matmul, (tensor(3, 2), tensor(2, 2, 3), torch.tensor([1, 3]))),
             ("grouped_swiglu", operators.grouped_swiglu,
              (tensor(3, 2), tensor(2, 3, 2), tensor(2, 2, 3), tensor(2, 3, 2), torch.tensor([1, 2]), tensor(3))),
-            ("mome", operators.mome, (tensor(1, 3, 2), torch.tensor([[True, False, True]]),
+            ("mome", mome, (tensor(1, 3, 2), torch.tensor([[True, False, True]]),
                                       tensor(2, 1, 2), tensor(2))),
         ]
         for family, operation, args in cases:
@@ -102,7 +103,7 @@ class TestNativeContracts(unittest.TestCase):
         x = torch.ones(1, 4, 2, requires_grad=True)
         weight = torch.ones(2, 1, 3, requires_grad=True)
         bias = torch.ones(2, requires_grad=True)
-        output = operators.mome(x, torch.zeros(1, 4, dtype=torch.bool), weight, bias)
+        output = mome(x, torch.zeros(1, 4, dtype=torch.bool), weight, bias)
         torch.testing.assert_close(output, x, atol=0, rtol=0)
         output.sum().backward()
         for parameter in (weight, bias):
@@ -131,8 +132,8 @@ class TestNativeContracts(unittest.TestCase):
         states = torch.arange(12.0).reshape(3, 4).requires_grad_()
         indices = torch.tensor([[2, 0], [1, 2], [0, 1]])
         weights = torch.full((3, 2), 0.5, requires_grad=True)
-        permuted, _, positions = operators.moe_token_reorder(states, indices)
-        restored = operators.moe_token_restore(permuted, positions, weights)
+        permuted, _, positions = operators.moe_token_permute(states, indices)
+        restored = operators.moe_token_unpermute(permuted, positions, weights)
         torch.testing.assert_close(restored, states, atol=0, rtol=0)
         restored.sum().backward()
         torch.testing.assert_close(states.grad, torch.ones_like(states), atol=0, rtol=0)

@@ -20,7 +20,6 @@ from unittest.mock import patch
 
 import torch
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeTopKRouter
-from hyper_multicore.modules.mega_gate import MegaGate as SourceMegaGate
 
 from examples.torch.module_family.config import GateConfig
 from hyper_parallel.components.modules.moe.router import Gate, GateModule, MegaGateModule
@@ -65,7 +64,6 @@ class TestGate(unittest.TestCase):
         mega = Gate(config=config, implementation="mega")
         self.assertIsInstance(mega, GateModule)
         self.assertEqual(MegaGateModule.__bases__, (GateModule,))
-        self.assertNotIsInstance(mega, SourceMegaGate)
         self.assertFalse(getattr(type(mega), "_hp_module_replacement", False))
         mega.weight.data.copy_(local.weight)
         values = torch.randn(2, 3, 8)
@@ -128,19 +126,13 @@ class TestGate(unittest.TestCase):
         values = torch.randn(2, 3, 8)
         mask = torch.tensor([[True, False, True], [False, True, False]])
         expected = member(values, mask)
-        with patch("hyper_parallel.components.modules.moe.router._plan_for_device") as plan:
-            with patch("hyper_multicore.modules.mega_gate.function.mega_gate", return_value=expected) as native:
-                actual = member._native_forward(values, mask)  # pylint: disable=protected-access
+        with patch("hyper_parallel.components.modules.moe.router.moe_router", return_value=expected) as selected:
+            actual = member._native_forward(values, mask)  # pylint: disable=protected-access
         self.assertIs(actual, expected)
-        args, options = native.call_args
-        self.assertIs(args[0], values)
-        self.assertIs(args[1], member.weight)
-        self.assertIs(args[2], member.bias)
-        self.assertIs(args[3], plan.return_value)
-        self.assertIs(options["vision_bias"], member.bias_vl)
-        torch.testing.assert_close(options["image_mask"], mask.flatten())
-        self.assertEqual(options["top_k"], member.top_k)
-        self.assertEqual(options["routed_scaling_factor"], member.routed_scaling_factor)
+        args = selected.call_args.args
+        for value, parameter in zip(args[:5], (values, member.weight, member.bias, member.bias_vl, mask)):
+            self.assertIs(value, parameter)
+        self.assertEqual(args[5:], (member.top_k, member.scoring_func, member.routed_scaling_factor))
         self.assertEqual(tuple(member.children()), ())
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")

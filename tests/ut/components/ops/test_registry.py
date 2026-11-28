@@ -41,22 +41,34 @@ class TestRegistryValidation(unittest.TestCase):
 
     def test_family_registration_rejects_invalid_contract_sets(self) -> None:
         """Reject duplicate families, duplicate variants, empty sets and mismatched keys."""
-        cases = (("activation", (self.spec,)), ("other", ()), ("other", (self.spec,)),
-                 ("activation", (self.spec, self.spec)), (" ", (OpSpec(config_key="other"),)))
+        cases = (
+            ("activation", (self.spec,)),
+            ("other", ()),
+            ("other", (self.spec,)),
+            ("activation", (self.spec, self.spec)),
+            (" ", (OpSpec(config_key="other"),)),
+        )
         for key, specs in cases:
             with self.subTest(key=key, specs=specs), self.assertRaisesRegex(ValueError, "Invalid or duplicate"):
                 self.registry.register_family(key, specs=specs)
 
     def test_implementation_registration_rejects_invalid_metadata(self) -> None:
         """A loader, compatibility predicate, name and device set must all be valid."""
-        cases = ({"name": "auto"}, {"name": ""}, {"devices": ()}, {"devices": ("cpu", "cpu")},
-                 {"devices": ("xla",)}, {"load": None}, {"check_compatibility": False}, {"name": "native"})
+        cases = (
+            {"name": "auto"},
+            {"name": ""},
+            {"devices": ()},
+            {"devices": ("cpu", "cpu")},
+            {"devices": ("xla",)},
+            {"load": None},
+            {"name": "native"},
+        )
         for invalid in cases:
             settings = {"name": "alternative", "devices": ("cpu",), "load": lambda: torch.neg, **invalid}
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.registry.register_impl(self.spec, **settings)
         self.registry.seal()
-        self.assertIs(self.registry.resolve(self.spec, "native", torch.ones(1))[1], torch.square)
+        self.assertIs(self.registry.resolve(self.spec, "native", torch.device("cpu"))[1], torch.square)
 
     def test_foreign_contract_is_rejected(self) -> None:
         """Equal-valued contracts from another catalog cannot be registered or resolved."""
@@ -64,7 +76,7 @@ class TestRegistryValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unregistered operator contract"):
             self.registry.register_impl(other, name="other", devices=("cpu",), load=lambda: torch.neg)
         with self.assertRaisesRegex(ValueError, "Unregistered operator contract"):
-            self.registry.resolve(other, "native", torch.ones(1))
+            self.registry.resolve(other, "native", torch.device("cpu"))
 
     def test_auto_order_rejects_unknown_or_duplicate_candidates(self) -> None:
         """Candidate lists refer to unique registered implementations on a valid device."""
@@ -87,28 +99,21 @@ class TestRegistryValidation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "registry is sealed"):
             self.registry.register_family("other", specs=(OpSpec(config_key="other"),))
 
-    def test_resolution_reports_per_call_constraints(self) -> None:
-        """Blocked candidates and native-only requirements report their specific rejection."""
+    def test_auto_order_and_explicit_selection_use_only_contract_and_device(self) -> None:
+        """Resolve by registration and configured order without receiving input tensors."""
         self.registry.register_impl(self.spec, name="fused", devices=("cpu",), load=lambda: torch.neg)
         self.registry.set_auto_order(self.spec, device="cpu", candidates=("fused", "native"))
         self.registry.seal()
-        x = torch.ones(1)
-        for kwargs in ({"native_only": "packed input"}, {"blocked_backends": (("fused", "requires dense"),)}):
-            with self.subTest(kwargs=kwargs):
-                self.assertEqual(self.registry.resolve(self.spec, "auto", x, **kwargs)[0], "native")
-        for name, kwargs, reason in (
-            ("fused", {"native_only": "packed input"}, "packed input"),
-            ("fused", {"blocked_backends": (("fused", "requires dense"),)}, "requires dense"),
-            ("unknown", {}, "not registered for this contract and device"),
-        ):
-            with self.subTest(name=name, reason=reason), self.assertRaisesRegex(RuntimeError, reason):
-                self.registry.resolve(self.spec, name, x, **kwargs)
+        self.assertEqual(self.registry.resolve(self.spec, "auto", torch.device("cpu"))[0], "fused")
+        self.assertEqual(self.registry.resolve(self.spec, "native", torch.device("cpu"))[0], "native")
+        with self.assertRaisesRegex(RuntimeError, "not registered for this contract and device"):
+            self.registry.resolve(self.spec, "fused", torch.device("cuda", 1))
 
     def test_empty_auto_order_and_noncallable_loader_result(self) -> None:
         """Empty auto policies and broken loaders must fail without reporting a selection."""
         self.registry.register_impl(self.spec, name="broken", devices=("cpu",), load=lambda: None)
         self.registry.seal()
         with self.assertRaisesRegex(RuntimeError, "no auto candidates registered"):
-            self.registry.resolve(self.spec, "auto", torch.ones(1))
+            self.registry.resolve(self.spec, "auto", torch.device("cpu"))
         with self.assertRaisesRegex(TypeError, "did not return a callable"):
-            self.registry.resolve(self.spec, "broken", torch.ones(1))
+            self.registry.resolve(self.spec, "broken", torch.device("cpu"))

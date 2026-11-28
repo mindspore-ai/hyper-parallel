@@ -14,6 +14,7 @@
 # ============================================================================
 """Default backend orders for the built-in operator catalog."""
 
+from .impl.aggregate_hidden import AGGREGATE_HIDDEN
 from .impl.attention import (
     GROUPED_QUERY_ATTENTION, MULTI_LATENT_ATTENTION, MULTI_LATENT_ATTENTION_WITH_STATS, VISION_ATTENTION,
 )
@@ -27,10 +28,10 @@ from .impl.grouped_swiglu import GROUPED_SWIGLU
 from .impl.kda import KDA
 from .impl.mhc_post import MHC_POST
 from .impl.moe_router import MOE_ROUTER
-from .impl.moe_token_reorder import MOE_TOKEN_REORDER, MOE_TOKEN_RESTORE
-from .impl.mome import MOME
+from .impl.moe_token_permute import MOE_TOKEN_PERMUTE
+from .impl.moe_token_unpermute import MOE_TOKEN_UNPERMUTE
 from .impl.rms_norm import RMS_NORM, RMS_NORM_FP32_AFFINE
-from .impl.rope import ROPE, ROPE_INTERLEAVED
+from .impl.rope import ROPE, ROPE_INTERLEAVED, ROPE_INTERLEAVED_SINGLE
 from .impl.sinkhorn import SINKHORN
 from .impl.swiglu import SWIGLU, SWIGLU_CLAMPED
 from .registry import OpRegistry
@@ -60,10 +61,10 @@ def apply_auto_policy(registry: OpRegistry) -> None:
         for device in ("cuda", "cpu"):
             registry.set_auto_order(spec, device=device, candidates=("sdpa", "native"))
     for spec, fused in (
-        (MOME, "omni"),
-        (ROPE, "torch_npu"), (ROPE_INTERLEAVED, "torch_npu"),
+        (AGGREGATE_HIDDEN, "omni"),
+        (ROPE, "torch_npu"), (ROPE_INTERLEAVED, "torch_npu"), (ROPE_INTERLEAVED_SINGLE, "torch_npu"),
         (SINKHORN, "omni"), (MOE_ROUTER, "megagate"),
-        (MOE_TOKEN_REORDER, "torch_npu"), (MOE_TOKEN_RESTORE, "torch_npu"),
+        (MOE_TOKEN_PERMUTE, "torch_npu"), (MOE_TOKEN_UNPERMUTE, "torch_npu"),
         (DSA_COMPRESSED_BANKS, "cann"), (DSA_INDEXER, "cann"), (DSA_INDEXER_KL, "cann"),
         (DSA_PACKED_INDEXER, "cann"), (DSA_ABSORBED, "cann"), (DSA_ABSORBED_SINK, "omni"),
         (DSA_PACKED_KL, "cann"), (DSA_DENSE_KL, "cann"),

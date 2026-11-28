@@ -24,6 +24,7 @@ import torch
 from torch import Tensor, nn
 from torch.distributed import _functional_collectives
 
+from hyper_parallel.components.ops import moe_token_permute, moe_token_unpermute
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all, ep_all_to_all_async, ep_exchange_counts, ep_split_sizes,
 )
@@ -200,15 +201,9 @@ class EPContext:
             raise ValueError("recv_inverse must have dtype int32 and one index per received slot")
         if recv_inverse.device != values.device:
             raise ValueError("slot outputs and recv_inverse must be on the same device")
-        if values.shape[0] and values.device.type == "npu":
-            # Keep the optional torch_npu dependency inside the NPU path.
-            from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=C0415
-                moe_token_unpermute,
-            )
-
-            values = moe_token_unpermute(values.contiguous(), recv_inverse)
-        elif values.shape[0]:
-            values = values.index_select(0, recv_inverse)
+        if values.shape[0]:
+            probabilities = values.new_ones((values.shape[0], 1))
+            values = moe_token_unpermute(values.contiguous(), recv_inverse.long(), probabilities)
         asynchronous = self._overlap_ready("fc2")
         returned = self._exchange(values, recv_splits, send_splits, async_op=asynchronous)
         if asynchronous:
@@ -264,19 +259,8 @@ class EPContext:
         if not hidden.shape[0]:
             return hidden, local_counts, weights, send, receive, local_ids.to(torch.int32)
 
-        if hidden.device.type == "npu":
-            # Keep the optional torch_npu dependency inside the NPU path.
-            from hyper_parallel.components.functional.moe_token_permute import (  # pylint: disable=C0415
-                moe_token_permute,
-            )
-
-            # One expert per received slot keeps this a one-to-one rearrangement.
-            hidden, recv_inverse = moe_token_permute(hidden.contiguous(), local_ids.to(torch.int32).view(-1, 1))
-        else:
-            order = local_ids.argsort(stable=True)
-            hidden = hidden.index_select(0, order)
-            rows = torch.arange(order.numel(), dtype=torch.int32, device=order.device)
-            recv_inverse = torch.empty_like(rows).scatter_(0, order, rows)
+        hidden, _, recv_inverse = moe_token_permute(hidden.contiguous(), local_ids.view(-1, 1))
+        recv_inverse = recv_inverse.to(torch.int32)
         if weights is not None:
             weights = torch.empty_like(weights).scatter_(0, recv_inverse.to(torch.int64), weights)
         return hidden, local_counts, weights, send, receive, recv_inverse

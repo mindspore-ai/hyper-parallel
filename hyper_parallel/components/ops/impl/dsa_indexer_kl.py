@@ -25,18 +25,28 @@ import torch
 from hyper_parallel.components.functional.dsa_dense import dsa_dense_indexer_kl_loss, dsa_dense_indexer_lse
 from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss as fused_packed_kl
 from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad import (
-    gather_selected_keys, sparse_lightning_indexer_kl_loss, validate_fused_kl_inputs,
+    gather_selected_keys,
+    sparse_lightning_indexer_kl_loss,
+    validate_fused_kl_inputs,
 )
 
 from .._dependency import load_cann, require_package, require_symbol
 from .._dsa_layout import DsaQueryLayout, ReduceSum, packed_segments, selected_packed_keys, selected_packed_scores
+from ..factory import _select_for_call
 from ..registry import OpRegistry
 from ..spec import OpSpec
-from .dsa_indexer import indexer_native_only
+from .dsa_indexer import _indexer_input_error
 
 
 class DsaIndexerKlFn(Protocol):
-    """Return a scalar KL loss, differentiating only the student."""
+    """Distill the compressed attention teacher into the indexer using scalar KL.
+
+    Compute teacher probabilities from selected compressed attention keys and
+    sink normalization, and compare them with the indexer distribution. Teacher
+    states and selections are detached. Only student queries, index keys and
+    merge weights receive gradients. loss_coeff scales the local query loss;
+    query_chunk_size bounds native intermediate score storage.
+    """
 
     def __call__(
         self, x: torch.Tensor, index_key: torch.Tensor, merge_weight: torch.Tensor,
@@ -44,14 +54,99 @@ class DsaIndexerKlFn(Protocol):
         sinks: torch.Tensor, *, attention_scale: float, loss_coeff: float, query_chunk_size: int = 256,
         reduce_sum: ReduceSum | None = None, layout: DsaQueryLayout | None = None,
     ) -> torch.Tensor:
-        """Return the coefficient-scaled loss across all local query rows."""
+        """Return the coefficient-scaled loss across all local query rows.
+
+        Args:
+            x: Student indexer queries [batch, query_length, heads, head_dim].
+            index_key: Student compressed indexer key bank.
+            merge_weight: Student per-query indexer head weights.
+            attention_query: Teacher queries [batch, heads, query_length, head_dim]; detached.
+            compressed_key: Teacher compressed key bank; no gradient is propagated.
+            topk_indices: Selected compressed-key IDs, with -1 padding.
+            sinks: Teacher sink logits; no gradient is propagated.
+            attention_scale: Multiplier for teacher query-key scores.
+            loss_coeff: Loss multiplier; zero disables the KL contribution.
+            query_chunk_size: Query rows per native score chunk.
+            reduce_sum: Optional callback combining partial student scores.
+            layout: Optional logical document and compressed-key visibility metadata.
+
+        Returns:
+            A scalar coefficient-scaled KL loss with gradients only on the three student inputs.
+        """
 
 
-DSA_INDEXER_KL = OpSpec[DsaIndexerKlFn](config_key="dsa_indexer_kl", variant="compressed_teacher")
+def dsa_indexer_kl(
+    x: torch.Tensor,
+    index_key: torch.Tensor,
+    merge_weight: torch.Tensor,
+    attention_query: torch.Tensor,
+    compressed_key: torch.Tensor,
+    topk_indices: torch.Tensor,
+    sinks: torch.Tensor,
+    *,
+    attention_scale: float,
+    loss_coeff: float,
+    query_chunk_size: int = 256,
+    reduce_sum: ReduceSum | None = None,
+    layout: DsaQueryLayout | None = None,
+) -> torch.Tensor:
+    """Compute the scalar Indexer KL loss, with gradients restricted to the student.
+
+    Args:
+        x: Student indexer queries [batch, query_length, heads, head_dim].
+        index_key: Student compressed indexer key bank.
+        merge_weight: Student per-query indexer head weights.
+        attention_query: Teacher queries [batch, heads, query_length, head_dim]; detached.
+        compressed_key: Teacher compressed key bank; no gradient is propagated.
+        topk_indices: Selected compressed-key IDs, with -1 padding.
+        sinks: Teacher sink logits; no gradient is propagated.
+        attention_scale: Multiplier for teacher query-key scores.
+        loss_coeff: Loss multiplier; zero disables the KL contribution.
+        query_chunk_size: Query rows per native score chunk.
+        reduce_sum: Optional callback combining partial student scores.
+        layout: Optional logical document and compressed-key visibility metadata.
+
+    Returns:
+        A scalar coefficient-scaled KL loss with gradients only on the three student inputs.
+
+    Notes:
+        Distill the compressed attention teacher into the indexer using scalar KL.
+
+        Compute teacher probabilities from selected compressed attention keys and
+        sink normalization, and compare them with the indexer distribution. Teacher
+        states and selections are detached. Only student queries, index keys and
+        merge weights receive gradients. loss_coeff scales the local query loss;
+        query_chunk_size bounds native intermediate score storage.
+    """
+    implementation = _select_for_call(DSA_INDEXER_KL, device=x.device)
+    return implementation(
+        x,
+        index_key,
+        merge_weight,
+        attention_query,
+        compressed_key,
+        topk_indices,
+        sinks,
+        attention_scale=attention_scale,
+        loss_coeff=loss_coeff,
+        query_chunk_size=query_chunk_size,
+        reduce_sum=reduce_sum,
+        layout=layout,
+    )
+
+
+DSA_INDEXER_KL = OpSpec[DsaIndexerKlFn](config_key='dsa_indexer_kl', variant='compressed_teacher')
 
 
 class PackedDsaKlFn(Protocol):
-    """Distill the packed sparse attention distribution into the DSA indexer."""
+    """Distill packed sparse attention into the indexer on selected keys.
+
+    Form a detached teacher from latent and rotary scores on valid causal
+    TopK keys, average its probabilities across query-head groups, and compare
+    with weighted ReLU indexer scores. Sum KL over tokens, divide by the total
+    student token count, and multiply by loss_coeff. Native recomputes teacher
+    probabilities rather than consuming the supplied fused softmax statistics.
+    """
 
     def __call__(
         self, x: torch.Tensor, index_key: torch.Tensor, merge_weight: torch.Tensor,
@@ -59,24 +154,198 @@ class PackedDsaKlFn(Protocol):
         softmax_max: torch.Tensor, softmax_sum: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
         query_ends: torch.Tensor, key_ends: torch.Tensor, scale: float, loss_coeff: float,
     ) -> torch.Tensor:
-        """Return a token-mean KL loss with gradients on the three student inputs only."""
+        """Return a token-mean KL loss with gradients on the three student inputs only.
+
+        Args:
+            x: Flattened student queries in TND layout.
+            index_key: Flattened student keys in TND layout.
+            merge_weight: Flattened student head weights in TN layout.
+            query: Detached teacher latent queries in TND layout.
+            key: Detached teacher latent keys in TND layout.
+            topk_indices: Document-local TopK IDs with -1 padding.
+            softmax_max: Teacher sparse maxima [kv_heads, tokens, groups], supplied for fused kernels.
+            softmax_sum: Teacher sparse exponential sums, matching softmax_max.
+            query_rope: Detached teacher rotary queries in TND layout.
+            key_rope: Detached teacher rotary keys in TND layout.
+            query_ends: Cumulative packed query document ends.
+            key_ends: Cumulative packed key document ends.
+            scale: Teacher query-key score multiplier.
+            loss_coeff: Multiplier for the token-mean loss.
+
+        Returns:
+            Scalar FP32 KL loss with gradients on x, index_key and merge_weight only.
+        """
 
 
-DSA_PACKED_KL = OpSpec[PackedDsaKlFn](config_key="dsa_indexer_kl", variant="packed_sparse_teacher")
+DSA_PACKED_KL = OpSpec[PackedDsaKlFn](config_key='dsa_indexer_kl', variant='packed_sparse_teacher')
 
 
 class DenseDsaKlFn(Protocol):
-    """Distill unabsorbed MLA into the indexer over each packed document."""
+    """Distill dense unabsorbed MLA into the indexer within each packed document.
+
+    Build the detached causal teacher from latent plus rotary query-key scores
+    and average its probabilities across heads. Compare with the weighted ReLU
+    indexer distribution over visible keys. Return token-mean KL times
+    loss_coeff. Native recomputes teacher probabilities; supplied max/sum
+    statistics serve the fused kernel interface.
+    """
 
     def __call__(
         self, x: torch.Tensor, index_key: torch.Tensor, weights: torch.Tensor, query: torch.Tensor, key: torch.Tensor,
         maximum: torch.Tensor, total: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
         query_ends: torch.Tensor, key_ends: torch.Tensor, *, scale: float, loss_coeff: float,
     ) -> torch.Tensor:
-        """Return the token-mean KL and differentiate the indexer inputs only."""
+        """Return the token-mean KL and differentiate the indexer inputs only.
+
+        Args:
+            x: Flattened student queries in TND layout.
+            index_key: Flattened student keys in TND layout.
+            weights: Flattened student head weights in TN layout.
+            query: Detached unabsorbed teacher queries in TND layout.
+            key: Detached teacher keys in TND layout.
+            maximum: Teacher softmax maxima [heads, tokens, 1], for fused kernels.
+            total: Teacher shifted exponential sums matching maximum.
+            query_rope: Detached teacher rotary queries in TND layout.
+            key_rope: Detached teacher rotary keys in TND layout.
+            query_ends: Cumulative packed query document ends.
+            key_ends: Cumulative packed key document ends.
+            scale: Teacher query-key score multiplier.
+            loss_coeff: Multiplier for the token-mean loss.
+
+        Returns:
+            Scalar FP32 KL loss with gradients on x, index_key and weights only.
+        """
 
 
-DSA_DENSE_KL = OpSpec[DenseDsaKlFn](config_key="dsa_indexer_kl", variant="packed_dense_teacher")
+DSA_DENSE_KL = OpSpec[DenseDsaKlFn](config_key='dsa_indexer_kl', variant='packed_dense_teacher')
+
+
+def dsa_indexer_kl_packed(
+    x: torch.Tensor,
+    index_key: torch.Tensor,
+    merge_weight: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_max: torch.Tensor,
+    softmax_sum: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    query_ends: torch.Tensor,
+    key_ends: torch.Tensor,
+    scale: float,
+    loss_coeff: float,
+) -> torch.Tensor:
+    """Return a token-mean KL loss with gradients on the three student inputs only.
+
+    Args:
+        x: Flattened student queries in TND layout.
+        index_key: Flattened student keys in TND layout.
+        merge_weight: Flattened student head weights in TN layout.
+        query: Detached teacher latent queries in TND layout.
+        key: Detached teacher latent keys in TND layout.
+        topk_indices: Document-local TopK IDs with -1 padding.
+        softmax_max: Teacher sparse maxima [kv_heads, tokens, groups], supplied for fused kernels.
+        softmax_sum: Teacher sparse exponential sums, matching softmax_max.
+        query_rope: Detached teacher rotary queries in TND layout.
+        key_rope: Detached teacher rotary keys in TND layout.
+        query_ends: Cumulative packed query document ends.
+        key_ends: Cumulative packed key document ends.
+        scale: Teacher query-key score multiplier.
+        loss_coeff: Multiplier for the token-mean loss.
+
+    Returns:
+        Scalar FP32 KL loss with gradients on x, index_key and merge_weight only.
+
+    Notes:
+        Distill packed sparse attention into the indexer on selected keys.
+
+        Form a detached teacher from latent and rotary scores on valid causal
+        TopK keys, average its probabilities across query-head groups, and compare
+        with weighted ReLU indexer scores. Sum KL over tokens, divide by the total
+        student token count, and multiply by loss_coeff. Native recomputes teacher
+        probabilities rather than consuming the supplied fused softmax statistics.
+    """
+    operation = _select_for_call(DSA_PACKED_KL, device=x.device)
+    return operation(
+        x,
+        index_key,
+        merge_weight,
+        query,
+        key,
+        topk_indices,
+        softmax_max,
+        softmax_sum,
+        query_rope,
+        key_rope,
+        query_ends,
+        key_ends,
+        scale,
+        loss_coeff,
+    )
+
+
+def dsa_indexer_kl_dense(
+    x: torch.Tensor,
+    index_key: torch.Tensor,
+    weights: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    maximum: torch.Tensor,
+    total: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    query_ends: torch.Tensor,
+    key_ends: torch.Tensor,
+    *,
+    scale: float,
+    loss_coeff: float,
+) -> torch.Tensor:
+    """Return the token-mean KL and differentiate the indexer inputs only.
+
+    Args:
+        x: Flattened student queries in TND layout.
+        index_key: Flattened student keys in TND layout.
+        weights: Flattened student head weights in TN layout.
+        query: Detached unabsorbed teacher queries in TND layout.
+        key: Detached teacher keys in TND layout.
+        maximum: Teacher softmax maxima [heads, tokens, 1], for fused kernels.
+        total: Teacher shifted exponential sums matching maximum.
+        query_rope: Detached teacher rotary queries in TND layout.
+        key_rope: Detached teacher rotary keys in TND layout.
+        query_ends: Cumulative packed query document ends.
+        key_ends: Cumulative packed key document ends.
+        scale: Teacher query-key score multiplier.
+        loss_coeff: Multiplier for the token-mean loss.
+
+    Returns:
+        Scalar FP32 KL loss with gradients on x, index_key and weights only.
+
+    Notes:
+        Distill dense unabsorbed MLA into the indexer within each packed document.
+
+        Build the detached causal teacher from latent plus rotary query-key scores
+        and average its probabilities across heads. Compare with the weighted ReLU
+        indexer distribution over visible keys. Return token-mean KL times
+        loss_coeff. Native recomputes teacher probabilities; supplied max/sum
+        statistics serve the fused kernel interface.
+    """
+    operation = _select_for_call(DSA_DENSE_KL, device=x.device)
+    return operation(
+        x,
+        index_key,
+        weights,
+        query,
+        key,
+        maximum,
+        total,
+        query_rope,
+        key_rope,
+        query_ends,
+        key_ends,
+        scale=scale,
+        loss_coeff=loss_coeff,
+    )
 
 
 def _native_dense_kl(
@@ -315,12 +584,12 @@ def _mask_compressed_keys(
     return indices.masked_fill(outside, -1)
 
 
-def indexer_kl_native_only(
+def _indexer_kl_input_error(
     x: torch.Tensor, index_key: torch.Tensor, topk_indices: torch.Tensor,
     layout: DsaQueryLayout | None, reduce_sum: ReduceSum | None,
 ) -> str | None:
     """Explain why the CANN KL candidate cannot represent this call."""
-    if layout is None or indexer_native_only(x, layout, reduce_sum) is not None:
+    if layout is None or _indexer_input_error(x, layout, reduce_sum) is not None:
         return "fused KL requires BF16 D=128, ordinary TopK512, document segments and no TP reduction"
     if x.shape[2] not in (8, 16, 32, 64) or not min(512, index_key.shape[1]) <= topk_indices.shape[-1] <= 512:
         return "fused KL requires supported head counts and ordinary TopK512 indices"
@@ -334,6 +603,9 @@ def _cann_kl(
     reduce_sum: ReduceSum | None = None, layout: DsaQueryLayout | None = None,
 ) -> torch.Tensor:
     """Validate compressed selections and invoke the fused CANN KL adapter."""
+    reason = _indexer_kl_input_error(x, index_key, topk_indices, layout, reduce_sum)
+    if reason is not None:
+        raise ValueError(reason)
     del reduce_sum
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""NPU MoE token permutation function."""
+"""Legacy two-result token permutation adapted to configured operators."""
 
 import torch
-import torch_npu
+from hyper_parallel.components.ops import moe_token_permute as selected_permute
 
 
 def moe_token_permute(
@@ -29,7 +29,8 @@ def moe_token_permute(
         indices: Selected expert indices with shape ``[num_tokens, top_k]``.
 
     Returns:
-        A tuple containing expert-major tokens and the sorting indices needed
+        A tuple containing expert-major tokens and the int32 inverse slot positions needed
         by :func:`moe_token_unpermute`.
     """
-    return torch_npu.npu_moe_token_permute(tokens, indices)
+    states, _, positions = selected_permute(tokens, indices)
+    return states, positions.to(torch.int32)

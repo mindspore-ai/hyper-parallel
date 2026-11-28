@@ -24,6 +24,7 @@ from unittest.mock import Mock, patch
 import torch
 
 import hyper_parallel
+from hyper_parallel.components.ops.impl.grouped_matmul import npu_grouped_matmul
 
 
 def _grouped_kernel(x, weight, *, group_list, group_type, **kwargs):
@@ -56,12 +57,14 @@ class TestGroupedMatmul(unittest.TestCase):
         backend = ModuleType("torch_npu")
         self.kernel = Mock(side_effect=_grouped_kernel)
         backend.npu_grouped_matmul = self.kernel
-        grouped = _load_functional("grouped_matmul", backend)
+        patcher = patch("hyper_parallel.components.ops.impl.grouped_matmul.require_package", return_value=backend)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         swiglu = _load_functional("npu_grouped_swiglu", backend)
         with patch.dict(sys.modules, {"torch_npu": backend}):
             packed = swiglu._get_npu_grouped_matmul()
         self.bridges = {
-            "grouped": lambda inputs, weight, groups: grouped.grouped_matmul(inputs, weight, group_list=groups),
+            "grouped": lambda inputs, weight, groups: npu_grouped_matmul(inputs, weight, group_list=groups),
             "swiglu": packed.apply,
         }
 

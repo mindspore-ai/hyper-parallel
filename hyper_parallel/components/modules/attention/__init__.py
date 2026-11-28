@@ -14,10 +14,24 @@
 # ============================================================================
 """Attention families with explicit mathematical and parallel members."""
 
-from hyper_parallel.components.modules.attention.deepseek_sparse_attention import (
-    CPDeepseekSparseAttentionModule, DeepseekSparseAttention, DeepseekSparseAttentionModule,
-)
+import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.modules.attention.deepseek_sparse_attention import (
+        CPDeepseekSparseAttentionModule, DeepseekSparseAttention, DeepseekSparseAttentionModule,
+    )
 
 __all__ = [
     "DeepseekSparseAttention", "DeepseekSparseAttentionModule", "CPDeepseekSparseAttentionModule",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Keep sequence-layout imports independent of attention family registration."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f"{__name__}.deepseek_sparse_attention")
+    value = getattr(module, name)
+    globals()[name] = value
+    return value

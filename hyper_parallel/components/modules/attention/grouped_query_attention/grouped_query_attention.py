@@ -26,7 +26,8 @@ from torch import nn
 
 from hyper_parallel.components.checkpoint import InterleaveQKV
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
-from hyper_parallel.components.functional import apply_rotary_pos_emb_single, npu_fusion_attention_forward
+from hyper_parallel.components.functional import npu_fusion_attention_forward
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_bsnd
 from hyper_parallel.components.modules.common.rms_norm import RMSNorm
 
 
@@ -50,29 +51,7 @@ def _projections_can_fuse(projections: tuple[nn.Linear, ...]) -> bool:
 
 def apply_gqa_position(tensor: torch.Tensor, positions: Any, interleaved: bool) -> torch.Tensor:
     """Rotate one BSND branch, retaining the source half-band/interleaved convention."""
-    if positions is None:
-        return tensor
-    cos, sin = positions
-    if cos.ndim == 2:
-        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
-    rotary_dim = cos.shape[-1]
-    if rotary_dim > tensor.shape[-1] or rotary_dim % 2:
-        raise ValueError("GQA rotary dimension must be even and fit the head dimension")
-    # Keep partial-width half-layout rotation on its established eager path.
-    if not interleaved and rotary_dim < tensor.shape[-1]:
-        rotary, tail = tensor.split((rotary_dim, tensor.shape[-1] - rotary_dim), dim=-1)
-        return torch.cat((rotary * cos.unsqueeze(2) + rotate_half(rotary) * sin.unsqueeze(2), tail), dim=-1)
-    if interleaved:
-        cos, sin = (part[..., :rotary_dim // 2].repeat_interleave(2, dim=-1) for part in (cos, sin))
-    cos, sin = (part.expand(tensor.shape[0], -1, -1).transpose(0, 1) for part in (cos, sin))
-    result = apply_rotary_pos_emb_single(tensor.transpose(0, 1), cos, sin,
-                                       rotary_interleaved=interleaved, use_fused_rotary_pos_emb=True)
-    result = result.transpose(0, 1)
-    if interleaved:
-        rotary, tail = result.split((rotary_dim, result.shape[-1] - rotary_dim), dim=-1)
-        rotary = rotary.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
-        result = torch.cat((rotary, tail), dim=-1) if tail.shape[-1] else rotary
-    return result
+    return apply_rotary_pos_emb_bsnd(tensor, positions, interleaved=interleaved)
 
 
 @dataclass(frozen=True)

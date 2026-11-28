@@ -176,7 +176,7 @@ class TestRMSNormFamily(unittest.TestCase):
         torch.testing.assert_close(restored.weight, member.weight)
 
     def test_native_and_npu_members_preserve_parameter_representation(self):
-        """Two concrete implementations share Parameters and checkpoints without importing OpSelect."""
+        """Legacy members share Parameters and checkpoints while using OpSelect."""
         pairs = ((RMSNorm, NativeRMSNormModule, RMSNormModule),
                  (OffsetRMSNorm, NativeOffsetRMSNormModule, OffsetRMSNormModule))
         for factory, native_type, npu_type in pairs:
@@ -195,8 +195,7 @@ class TestRMSNormFamily(unittest.TestCase):
                 self.assertEqual(tuple(native.state_dict()), tuple(fused.state_dict()))
                 values = torch.randn(2, 8)
                 torch.testing.assert_close(native(values), adopted(values))
-                with self.assertRaisesRegex(ValueError, "NPU tensors"):
-                    fused(values)
+                torch.testing.assert_close(fused(values), native(values))
                 for backend in ("auto", "torch_npu", "cann", "unknown"):
                     with self.subTest(use_fused_ops=backend), self.assertRaises((TypeError, ValueError)):
                         factory(config=RMSNormConfig(8), use_fused_ops=backend)

@@ -30,6 +30,7 @@ from hyper_parallel.components.ops.catalog import builtin_registry
 from hyper_parallel.components.ops._dependency import require_package
 from hyper_parallel.components.ops.registry import ImplementationUnavailable
 from tests.common.op_precision import PrecisionCase, check_case
+from tests.common.op_precision_experts import mome_cases
 from tests.common.op_precision_suite import (
     FAMILY_BUILDERS, backend_precision_dtypes, precision_cases, registered_backends,
 )
@@ -70,16 +71,12 @@ def _device(device_type: str) -> str:
     return f"{device_type}:{index}"
 
 
-def _require_implementation(family, variant, backend, device_type, sample):
+def _require_implementation(family, variant, backend, device_type):
     # The inventory audit intentionally uses registry metadata; no public
     # introspection or dependency-probe API is needed by application code.
     """Check hardware compatibility and load the explicitly requested backend."""
     spec = builtin_registry._families[family][variant]  # pylint: disable=protected-access
     implementation = builtin_registry._implementations[(spec, backend, device_type)]  # pylint: disable=protected-access
-    if implementation.check_compatibility is not None:
-        reason = implementation.check_compatibility(sample)
-        if reason is not None:
-            pytest.skip(f"{family}.{variant}/{backend}: {reason}")
     try:
         for package in _OPTIONAL_PACKAGES.get(backend, ()):
             require_package(package)
@@ -108,8 +105,7 @@ def _precision_matrix():
 def test_backend_precision(case: PrecisionCase, backend: str, device_type: str) -> None:
     """Require actual selection and compare every output and argument/parameter VJP."""
     device = _device(device_type)
-    first_tensor = next(arg for arg in case.args if isinstance(arg, torch.Tensor))
-    _require_implementation(case.family, case.variant, backend, device_type, first_tensor.to(device))
+    _require_implementation(case.family, case.variant, backend, device_type)
     check_case(case, backend=backend, device=device)
 
 
@@ -124,3 +120,20 @@ def _native_matrix():
 def test_native_precision(case: PrecisionCase) -> None:
     """Validate all native contracts against independent oracles on the NPU."""
     check_case(case, device=_device("npu"))
+
+
+def _mome_matrix():
+    """Exercise functional composition without registering another operator family."""
+    for backend in ("native", "omni"):
+        dtypes = (torch.float32, torch.float16, torch.bfloat16) if backend == "native" else (torch.bfloat16,)
+        for dtype in dtypes:
+            for case in mome_cases(dtype, hardware=True):
+                yield pytest.param(case, backend, id=f"mome/{backend}/{dtype}/{case.name}")
+
+
+@pytest.mark.parametrize("case,backend", list(_mome_matrix()))
+def test_mome_composition_precision(case: PrecisionCase, backend: str) -> None:
+    """Validate MOME outputs and VJPs through the configured aggregate-hidden backend."""
+    device = _device("npu")
+    _require_implementation(case.family, case.variant, backend, "npu")
+    check_case(case, backend=backend, device=device)

@@ -32,7 +32,6 @@ class ImplementationUnavailable(RuntimeError):
 @dataclass(frozen=True)
 class _Implementation:
     load: Callable[[], Any]
-    check_compatibility: Callable[[torch.Tensor], str | None] | None
 
 
 class OpRegistry:
@@ -56,7 +55,7 @@ class OpRegistry:
             raise ValueError(f"Unregistered operator contract {spec.config_key}.{spec.variant}")
 
     def register_family(self, config_key: str, *, specs: tuple[OpSpec[Any], ...]) -> None:
-        """Register a family and all of its distinct callable contracts."""
+        """Register an operator family and its typed backend contracts."""
         self._require_mutable()
         variants = {spec.variant: spec for spec in specs}
         if (
@@ -78,7 +77,6 @@ class OpRegistry:
         name: str,
         devices: tuple[DeviceType, ...],
         load: Callable[[], Fn],
-        check_compatibility: Callable[[torch.Tensor], str | None] | None = None,
     ) -> None:
         """Register a lazy implementation for the given contract and devices."""
         self._require_mutable()
@@ -87,21 +85,25 @@ class OpRegistry:
             raise ValueError(f"Invalid operator implementation name {name!r}")
         if not devices or len(set(devices)) != len(devices) or set(devices) - {"cpu", "cuda", "npu"}:
             raise ValueError(f"Invalid operator devices {devices!r} for {spec.config_key}.{name}")
-        if not callable(load) or (check_compatibility is not None and not callable(check_compatibility)):
-            raise ValueError(f"Invalid operator loader or compatibility check for {spec.config_key}.{name}")
+        if not callable(load):
+            raise ValueError(f"Invalid operator loader for {spec.config_key}.{name}")
         keys = [(spec, name, device_type) for device_type in devices]
         if any(key in self._implementations for key in keys):
             raise ValueError(f"Overlapping operator registration for {spec.config_key}.{spec.variant}:{name}")
-        implementation = _Implementation(load, check_compatibility)
+        implementation = _Implementation(load)
         self._implementations.update({key: implementation for key in keys})
         # String keys let Dynamo resolve implementations without hashing OpSpec dataclasses.
-        self._implementations_by_name.update({
-            (spec.config_key, spec.variant, name, device): implementation for device in devices
-        })
+        self._implementations_by_name.update(
+            {(spec.config_key, spec.variant, name, device): implementation for device in devices}
+        )
         self._names[spec.config_key].add(name)
 
     def set_auto_order(
-        self, spec: OpSpec[Any], *, device: DeviceType, candidates: tuple[str, ...],
+        self,
+        spec: OpSpec[Any],
+        *,
+        device: DeviceType,
+        candidates: tuple[str, ...],
     ) -> None:
         """Declare an ordered list of registered candidates for one device."""
         self._require_mutable()
@@ -134,31 +136,21 @@ class OpRegistry:
                 raise ValueError(f"Invalid ops.{key} value {name!r}, expected one of {allowed}")
 
     def resolve(
-        self, spec: OpSpec[Fn], selection: str, x: torch.Tensor, *, native_only: str | None = None,
-        blocked_backends: tuple[tuple[str, str], ...] = (),
+        self,
+        spec: OpSpec[Fn],
+        selection: str,
+        device: torch.device,
     ) -> tuple[str, Fn]:
         """Return the selected name and callable, or explain candidate rejection."""
         self._require_spec(spec)
-        device_type = x.device.type
+        device_type = device.type
         names = self._auto.get((spec, device_type), ()) if selection == "auto" else (selection,)
         reasons = []
-        blocked = dict(blocked_backends)
         for name in names:
-            if native_only is not None and name != "native":
-                reasons.append(f"{name}: {native_only}")
-                continue
-            if name in blocked:
-                reasons.append(f"{name}: {blocked[name]}")
-                continue
             impl = self._implementations_by_name.get((spec.config_key, spec.variant, name, device_type))
             if impl is None:
                 reasons.append(f"{name}: not registered for this contract and device")
                 continue
-            if impl.check_compatibility is not None:
-                reason = impl.check_compatibility(x)
-                if reason is not None:
-                    reasons.append(f"{name}: {reason}")
-                    continue
             try:
                 selected = impl.load()
             except ImplementationUnavailable as exc:
@@ -170,5 +162,9 @@ class OpRegistry:
         detail = ", ".join(reasons) or "no auto candidates registered"
         raise RuntimeError(
             f"Cannot select ops.{spec.config_key}={selection!r} "
-            f"for variant {spec.variant!r} on {x.device}: {detail}"
+            f"for variant {spec.variant!r} on {device}: {detail}"
         )
+
+
+# The selector and family modules share this instance without importing the catalog.
+builtin_registry = OpRegistry()

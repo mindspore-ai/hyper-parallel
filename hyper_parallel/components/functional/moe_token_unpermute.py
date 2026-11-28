@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""NPU MoE token unpermutation function."""
+"""Legacy token restoration adapted to configured operators."""
 
 from typing import Optional
 
 import torch
-import torch_npu
+from hyper_parallel.components.ops import moe_token_unpermute as selected_unpermute
 
 
 def moe_token_unpermute(
@@ -29,10 +29,12 @@ def moe_token_unpermute(
 
     Args:
         permuted_tokens: Expert outputs in expert-major order.
-        sorted_indices: Sorting indices returned by :func:`moe_token_permute`.
-        probs: Optional routing probabilities applied while restoring tokens.
+        sorted_indices: Inverse slot positions returned by :func:`moe_token_permute`.
+        probs: Routing probabilities [tokens, top_k]. None treats each slot as a token (top-k=1).
 
     Returns:
         Restored token-major output with repeated token routes accumulated.
     """
-    return torch_npu.npu_moe_token_unpermute(permuted_tokens, sorted_indices, probs)
+    if probs is None:
+        probs = permuted_tokens.new_ones((sorted_indices.numel(), 1))
+    return selected_unpermute(permuted_tokens, sorted_indices.to(torch.int64), probs)

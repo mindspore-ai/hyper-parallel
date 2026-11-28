@@ -22,13 +22,16 @@ from typing import Any
 
 # This package provides PyTorch-specific high-performance modules.
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
+)
+
+from hyper_parallel.components.functional.swiglu import (
+    local_swiglu, swiglu_activation, _resolve_activation_dtype,
 )
 
 
@@ -43,56 +46,6 @@ def _validate_mlp_config(config: Any) -> None:
     limit = getattr(config, "swiglu_limit", 0.0)
     if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not isfinite(limit):
         raise ValueError("swiglu_limit must be finite; nonpositive values disable clamping")
-
-
-def swiglu_activation(gate: torch.Tensor, up: torch.Tensor, *, limit: float = 0.0,
-                       activation_dtype: str = "input") -> torch.Tensor:
-    """Apply declared separate-projection activation math without changing its return dtype.
-
-    FP32 activation remains FP32 even when clamp is disabled. The projection
-    owner decides when to cast back before its down projection.
-
-    Args:
-        gate: Gate projection activations.
-        up: Matching up-projection activations.
-        limit: Positive clamp bound; nonpositive values disable clamping.
-        activation_dtype: Compute in the input dtype or float32.
-    """
-    if activation_dtype not in ("input", "float32"):
-        raise ValueError("activation_dtype must be input or float32")
-    if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not isfinite(limit):
-        raise ValueError("SwiGLU limit must be finite")
-    if activation_dtype == "float32":
-        gate, up = gate.float(), up.float()
-    if limit > 0:
-        gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-    return F.silu(gate) * up
-
-
-def _resolve_activation_dtype(activation_dtype: str | None, limit: float) -> str:
-    """Resolve the shared input/FP32 activation policy without changing projection dtype."""
-    if activation_dtype is None:
-        activation_dtype = "float32" if limit > 0 else "input"
-    if activation_dtype not in ("input", "float32"):
-        raise ValueError("activation_dtype must be input or float32")
-    return activation_dtype
-
-
-def local_swiglu(x: torch.Tensor, *, limit: float = 0.0, activation_dtype: str | None = None) -> torch.Tensor:
-    """Apply packed SwiGLU, retaining the historical FP32 clamp default.
-
-    Args:
-        x: Packed gate/up activations ending in twice the intermediate width.
-        limit: Positive clamp bound; nonpositive values disable clamping.
-        activation_dtype: Explicit compute dtype policy or the clamp-dependent default.
-    """
-    activation_dtype = _resolve_activation_dtype(activation_dtype, limit)
-    if x.device.type == "npu" and limit <= 0 and activation_dtype == "input":
-        # Optional NPU operators are required only by NPU execution.
-        from hyper_parallel.components.functional import swiglu  # pylint: disable=C0415
-        return swiglu(x)
-    gate, up = x.chunk(2, dim=-1)
-    return swiglu_activation(gate, up, limit=limit, activation_dtype=activation_dtype).to(x.dtype)
 
 
 def _activation_settings(source: Any, *, limit: float | None = None,

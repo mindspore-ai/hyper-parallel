@@ -15,8 +15,10 @@
 """mHC family construction, state and portable execution regression."""
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4UnweightedRMSNorm
 
 from examples.torch.module_family.config import MHCPreConfig, MHCPostConfig, PipelinedMhcConfig
 from hyper_parallel.components.modules import (
@@ -26,15 +28,23 @@ from hyper_parallel.components.modules import (
 from hyper_parallel.models.module_build import prepare_model_components
 from hyper_parallel.models.replacement import ModuleReplacementSpec
 from hyper_parallel.components.modules.module_family import FamilyShardingContext
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed._builder.family_layout import collect_owned_layouts, validate_owned_layouts
+from tests.common.mark_utils import arg_mark
 
 
 class TestMHCFamily(unittest.TestCase):
     """Verify the three distinct component contracts."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_model_owned_config(self):
-        """Independent model configs retain direct and source construction validation."""
+        """
+        Feature: mHC construction.
+        Description: Independent configs validate direct and adopted construction.
+        Expectation: All factories retain model-owned settings and reject invalid settings.
+        """
         settings = {"num_stream": 4, "hidden_size": 16, "sinkhorn_iters": 3,
                     "hc_eps": 1e-6, "norm_eps": 1e-6, "use_gamma": True}
         for factory in (MHCPre, MHCPost, PipelinedMhc):
@@ -49,8 +59,13 @@ class TestMHCFamily(unittest.TestCase):
         with self.assertRaises(ValueError):
             MHCPre(config=SimpleNamespace(**{**settings, "hc_eps": float("nan")}))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_build_source_and_prepare(self):
-        """Source installation reuses parameters, buffers and frozen state."""
+        """
+        Feature: mHC replacement.
+        Description: Prepare frozen source modules through each public family.
+        Expectation: Parameters retain identity and frozen state across repeated preparation.
+        """
         for factory, config in (
             (MHCPre, MHCPreConfig(4, 16, use_gamma=True)),
             (MHCPost, MHCPostConfig(4)),
@@ -73,8 +88,13 @@ class TestMHCFamily(unittest.TestCase):
                 self.assertEqual(get_family_build_info(model[0]).origin, "replacement")
                 prepare_model_components(model, context)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_reset_and_checkpoint(self):
-        """Meta construction resets owned parameters and restores direct state."""
+        """
+        Feature: mHC materialization.
+        Description: Materialize meta members, reset parameters, and reload their state.
+        Expectation: All parameters are finite and checkpoint values restore exactly.
+        """
         for factory, config in (
             (MHCPre, MHCPreConfig(4, 16)),
             (MHCPre, MHCPreConfig(4, 16, use_gamma=True)),
@@ -91,8 +111,13 @@ class TestMHCFamily(unittest.TestCase):
                     self.assertTrue(torch.isfinite(parameter).all())
                     torch.testing.assert_close(parameter, restored.state_dict()[name])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_coefficients_and_post_backward(self):
-        """Portable coefficient/post composition preserves gradients and checkpoint state."""
+        """
+        Feature: mHC precision.
+        Description: Compare portable coefficient and post composition with independent stream math.
+        Expectation: Outputs and gradients agree and checkpoint state remains compatible.
+        """
         member = PipelinedMhc(config=PipelinedMhcConfig(4, 16, sinkhorn_iters=3))
         reference = PipelinedMhc(config=PipelinedMhcConfig(4, 16, sinkhorn_iters=3))
         reference.load_state_dict(member.state_dict())
@@ -118,8 +143,59 @@ class TestMHCFamily(unittest.TestCase):
         self.assertIsNotNone(output.grad)
         self.assertIsNotNone(residual.grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_adopted_unweighted_norm_materialization(self) -> None:
+        """
+        Feature: mHC source materialization.
+        Description: Adopt the HF unweighted norm and materialize its meta coefficient owner.
+        Expectation: Initialization and backward succeed without requiring a norm reset hook.
+        """
+        with torch.device("meta"):
+            source = PipelinedMhc(config=PipelinedMhcConfig(4, 16, sinkhorn_iters=3))
+            source.input_norm = DeepseekV4UnweightedRMSNorm(eps=1e-6)
+            member = PipelinedMhc(module=source)
+        self.assertIs(member.input_norm, source.input_norm)
+        member.to_empty(device="cpu")
+        member.reset_parameters()
+        self.assertEqual(set(member.state_dict()), {"fn", "base", "scale"})
+        for parameter in member.parameters():
+            self.assertTrue(torch.isfinite(parameter).all())
+        hidden = torch.randn(2, 3, 4, 16, requires_grad=True)
+        outputs = member(hidden)
+        sum(value.square().sum() for value in outputs).backward()
+        self.assertTrue(torch.isfinite(hidden.grad).all())
+        for parameter in member.parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_reset_distributed_scale(self) -> None:
+        """
+        Feature: mHC distributed initialization.
+        Description: Reset an actual DTensor scale on a CPU mesh with mocked rank lookup.
+        Expectation: The scale retains its DTensor placement and all local values become 0.01.
+        """
+        member = PipelinedMhc(config=PipelinedMhcConfig(4, 16))
+        with (
+            patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0),
+            patch.dict("hyper_parallel.core.dtensor.device_mesh._DEVICE_MESH_MAP", {}, clear=True),
+            patch.dict("hyper_parallel.core.dtensor.dtensor._LAYOUT_CACHE", {}, clear=True),
+        ):
+            mesh = DeviceMesh("cpu", [0], mesh_dim_names=("mhc_reset",), _init_backend=False)
+            scale = DTensor.from_local(torch.empty(3), mesh, (Replicate(),))
+            member.scale = torch.nn.Parameter(scale)
+            member.reset_parameters()
+        self.assertIsInstance(member.scale, DTensor)
+        self.assertEqual(member.scale.placements, (Replicate(),))
+        torch.testing.assert_close(member.scale.to_local(), torch.full((3,), 0.01))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_config(self):
-        """Reject non-finite epsilons and ambiguous construction sources."""
+        """
+        Feature: mHC input validation.
+        Description: Construct families with invalid dimensions, epsilon, or ambiguous sources.
+        Expectation: Each invalid configuration raises ValueError.
+        """
         for values in ((0, 16), (True, 16), (4, 0)):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 MHCPreConfig(*values)

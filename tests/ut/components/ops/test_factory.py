@@ -16,8 +16,11 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import unittest
 from importlib import import_module
+from inspect import signature
 from pkgutil import iter_modules
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -27,6 +30,7 @@ from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from hyper_parallel.components import ops as public_ops
 from hyper_parallel.components.ops import impl, ops, swiglu
 from hyper_parallel.components.ops.catalog import builtin_registry
 from hyper_parallel.components.ops import factory
@@ -40,12 +44,14 @@ def _missing() -> None:
     raise ImplementationUnavailable("optional kernel is missing")
 
 
-def _identity(x: torch.Tensor) -> torch.Tensor:
+def _identity(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    del dim
     return x
 
 
-def _requires_bfloat16(x: torch.Tensor) -> str | None:
-    return None if x.dtype == torch.bfloat16 else "requires BF16 input"
+def _square(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    del dim
+    return x.square()
 
 
 class _CheckpointedActivation(nn.Module):
@@ -68,6 +74,39 @@ class TestBuiltinFamilyFiles(unittest.TestCase):
                 self.assertEqual(keys, {module.name})
                 builtin_registry.validate_selections({module.name: "auto"})
 
+    def test_every_variant_has_an_explicit_public_function(self) -> None:
+        """Source functions expose real signatures and document every registered variant."""
+        self.assertNotIn("__getattr__", vars(public_ops))
+        self.assertEqual(len(public_ops.__all__), len(set(public_ops.__all__)))
+        for module in iter_modules(impl.__path__):
+            namespace = vars(import_module(f"{impl.__name__}.{module.name}"))
+            contracts = {name: value for name, value in namespace.items() if isinstance(value, OpSpec)}
+            covered = set()
+            for name in public_ops.__all__:
+                function = getattr(public_ops, name)
+                if not inspect.isfunction(function) or function.__module__ != namespace["__name__"]:
+                    continue
+                with self.subTest(function=name):
+                    self.assertIs(function, namespace[name])
+                    parameters = signature(function).parameters
+                    self.assertNotIn("self", parameters)
+                    self.assertNotIn("select", parameters)
+                    self.assertNotIn("backend", parameters)
+                    self.assertTrue(
+                        all(value.annotation is not inspect.Parameter.empty for value in parameters.values())
+                    )
+                    self.assertIsNot(signature(function).return_annotation, inspect.Signature.empty)
+                    tree = ast.parse(inspect.getsource(function))
+                    references = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} & contracts.keys()
+                    covered.update(contracts[key] for key in references)
+                    if references:
+                        documentation = inspect.getdoc(function)
+                        for section in ("Args:", "Returns:", "Notes:"):
+                            self.assertIn(section, documentation)
+            self.assertEqual(covered, set(contracts.values()))
+        self.assertEqual(next(iter(signature(public_ops.aggregate_hidden).parameters)), "input_tensor")
+        self.assertEqual(next(iter(signature(public_ops.grouped_query_attention).parameters)), "module")
+
 
 class TestBackendSelection(unittest.TestCase):
     """Exercise configuration replacement through imported operator functions."""
@@ -77,14 +116,10 @@ class TestBackendSelection(unittest.TestCase):
         self.registry = OpRegistry()
         self.registry.register_family("swiglu", specs=(SWIGLU,))
         self.registry.register_impl(SWIGLU, name="identity", devices=("cpu", "cuda"), load=lambda: _identity)
-        self.registry.register_impl(SWIGLU, name="square", devices=("cpu", "cuda"), load=lambda: torch.square)
-        self.registry.register_impl(
-            SWIGLU, name="bf16_square", devices=("cpu", "cuda"), load=lambda: torch.square,
-            check_compatibility=_requires_bfloat16,
-        )
+        self.registry.register_impl(SWIGLU, name="square", devices=("cpu", "cuda"), load=lambda: _square)
         self.registry.register_impl(SWIGLU, name="missing", devices=("cpu",), load=_missing)
         for device in ("cpu", "cuda"):
-            candidates = ("missing", "bf16_square", "identity") if device == "cpu" else ("bf16_square", "identity")
+            candidates = ("missing", "identity") if device == "cpu" else ("identity",)
             self.registry.set_auto_order(SWIGLU, device=device, candidates=candidates)
         self.registry.seal()
         previous = ops.get_backends()
@@ -157,21 +192,41 @@ class TestBackendSelection(unittest.TestCase):
         model(x).sum().backward()
         torch.testing.assert_close(x.grad, 2 * x)
 
-    def test_selection_uses_actual_device_and_input_dtype(self) -> None:
-        """Reuse a choice only for matching input devices and dtypes."""
-        fp32 = torch.full((2,), 3.0)
-        bf16 = fp32.to(torch.bfloat16)
-        for device in (torch.device("cpu"), torch.device("cuda", 0), torch.device("cuda", 1)):
-            with self.subTest(device=device), patch.object(
-                torch.Tensor, "device", property(lambda _x, selected_device=device: selected_device),
-            ):
-                torch.testing.assert_close(swiglu(fp32), fp32)
-                torch.testing.assert_close(swiglu(bf16), bf16.square())
-                torch.testing.assert_close(swiglu(fp32), fp32)
-        self.assertCountEqual(ops.used_backends(), (
-            ("swiglu", "standard", "identity"),
-            ("swiglu", "standard", "bf16_square"),
-        ))
+    def test_device_key_reuses_choices_across_dtypes_and_shapes(self) -> None:
+        """Only execution device separates cache entries; dtype, shape and position do not."""
+        def scaled(scale: float, values: torch.Tensor, device: torch.device) -> torch.Tensor:
+            operation = factory._select_for_call(SWIGLU, device=device)  # pylint: disable=protected-access
+            return operation(values) * scale
+
+        with patch.object(self.registry, "resolve", wraps=self.registry.resolve) as resolve:
+            for device in (torch.device("cpu"), torch.device("cuda", 0), torch.device("cuda", 1)):
+                for shape, dtype in (((2,), torch.float32), ((3, 4), torch.bfloat16), ((), torch.float64)):
+                    values = torch.ones(shape, dtype=dtype)
+                    torch.testing.assert_close(scaled(2.0, values, device), values * 2)
+            self.assertEqual(resolve.call_count, 3)
+        self.assertEqual(ops.used_backends(), (("swiglu", "standard", "identity"),))
+
+    def test_selected_implementation_errors_do_not_trigger_fallback(self) -> None:
+        """Input validation remains active on cache hits and cannot change backend."""
+        def positive_only(values: torch.Tensor) -> torch.Tensor:
+            if values.ndim == 0:
+                raise ValueError("scalar tensors are unsupported")
+            return values
+
+        self.registry = OpRegistry()
+        self.registry.register_family("swiglu", specs=(SWIGLU,))
+        self.registry.register_impl(SWIGLU, name="limited", devices=("cpu",), load=lambda: positive_only)
+        self.registry.register_impl(SWIGLU, name="native", devices=("cpu",), load=lambda: torch.neg)
+        self.registry.set_auto_order(SWIGLU, device="cpu", candidates=("limited", "native"))
+        self.registry.seal()
+        with patch.object(factory, "builtin_registry", self.registry):
+            ops.set_backends({})
+            operation = factory._select_for_call(SWIGLU, device=torch.device("cpu"))  # pylint: disable=protected-access
+            torch.testing.assert_close(operation(torch.ones(2)), torch.ones(2))
+            operation = factory._select_for_call(SWIGLU, device=torch.device("cpu"))  # pylint: disable=protected-access
+            with self.assertRaisesRegex(ValueError, "scalar tensors"):
+                operation(torch.ones(()))
+        self.assertEqual(ops.used_backends(), (("swiglu", "standard", "limited"),))
 
     def test_compiled_calls_observe_configuration_changes(self) -> None:
         """A full graph captures the selected callable and guards its configuration."""

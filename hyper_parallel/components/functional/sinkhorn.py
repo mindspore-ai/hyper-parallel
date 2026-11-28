@@ -14,49 +14,14 @@
 # ============================================================================
 """Sinkhorn normalization functions used by manifold hyper-connections."""
 
-from typing import Any, Tuple
-
 import torch
 
-try:
-    import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
-except ImportError:
-    omni_training_custom_ops = None
-
-
-class _Sinkhorn(torch.autograd.Function):
-    """Autograd bridge for the NPU Sinkhorn custom operator."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        h_res: torch.Tensor,
-        sinkhorn_iters: int = 20,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        """Run the NPU Sinkhorn forward operator."""
-        if omni_training_custom_ops is None:
-            raise ImportError("NPU Sinkhorn requires omni_training_custom_ops")
-        output, norm_out, sum_out = torch.ops.custom.npu_sinkhorn(
-            h_res,
-            out_flag=1,
-            eps=eps,
-            num_iters=sinkhorn_iters,
-        )
-        ctx.save_for_backward(norm_out, sum_out)
-        return output
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None, None]:
-        """Run the NPU Sinkhorn backward operator."""
-        norm_out, sum_out = ctx.saved_tensors
-        grad_h_res = torch.ops.custom.npu_sinkhorn_grad(grad_output, norm_out, sum_out)
-        grads = [grad_h_res, None, None]
-        return tuple(grads)
+from hyper_parallel.components.ops import sinkhorn as selected_sinkhorn
+from hyper_parallel.components.ops.impl.sinkhorn import native_sinkhorn
 
 
 def sinkhorn(h_res: torch.Tensor, sinkhorn_iters: int = 20, eps: float = 1e-6) -> torch.Tensor:
-    """Normalize a square mixing matrix with the NPU Sinkhorn operator.
+    """Normalize a square mixing matrix through the configured OpSelect backend.
 
     Args:
         h_res: Residual mixing matrix.
@@ -66,7 +31,7 @@ def sinkhorn(h_res: torch.Tensor, sinkhorn_iters: int = 20, eps: float = 1e-6) -
     Returns:
         The normalized residual mixing matrix.
     """
-    return _Sinkhorn.apply(h_res, sinkhorn_iters, eps)
+    return selected_sinkhorn(h_res, sinkhorn_iters, eps)
 
 
 def sinkhorn_knopps(h_res: torch.Tensor, sinkhorn_iters: int = 20, eps: float = 1e-6) -> torch.Tensor:
@@ -80,12 +45,4 @@ def sinkhorn_knopps(h_res: torch.Tensor, sinkhorn_iters: int = 20, eps: float = 
     Returns:
         The normalized residual mixing matrix.
     """
-    h_res = h_res.softmax(-1) + eps
-    col_sum = h_res.sum(-2, keepdim=True)
-    h_res = h_res / (col_sum + eps)
-    for _ in range(sinkhorn_iters - 1):
-        row_sum = h_res.sum(-1, keepdim=True)
-        h_res = h_res / (row_sum + eps)
-        col_sum = h_res.sum(-2, keepdim=True)
-        h_res = h_res / (col_sum + eps)
-    return h_res
+    return native_sinkhorn(h_res, sinkhorn_iters, eps)

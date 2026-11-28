@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""NPU-accelerated Transformers-compatible rotary position embeddings."""
+"""Transformers-compatible rotary position embeddings and legacy single-tensor helpers."""
 
 from __future__ import annotations
 
 import numpy as np
 import torch
-import torch_npu
+
+from hyper_parallel.components.ops import rope, rope_interleaved, rope_interleaved_single
+from hyper_parallel.components.ops._dependency import require_package
 
 
 def apply_rotary_pos_emb(
@@ -28,7 +30,7 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply NPU RoPE using the Transformers ``apply_rotary_pos_emb`` contract.
+    """Apply selected RoPE using the Transformers ``apply_rotary_pos_emb`` contract.
 
     Args:
         q: Query tensor.
@@ -42,61 +44,13 @@ def apply_rotary_pos_emb(
         Rotated query and key tensors with the same shapes as the inputs.
 
     Raises:
-        ValueError: If the rotary dimension does not cover the complete Q/K
-            head dimension supported by the NPU operator interface.
+        ValueError: If the frequency dimensions differ, are odd, or exceed
+            the Q/K head dimensions.
     """
     if cos.ndim == 2:
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    if cos.shape[0] == 1 and q.shape[0] > 1:
-        cos = cos.expand(q.shape[0], -1, -1)
-        sin = sin.expand(q.shape[0], -1, -1)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    if rotary_dim != q.shape[-1] or rotary_dim != k.shape[-1]:
-        raise ValueError(
-            "NPU RoPE requires the rotary dimension to equal the Q/K head dimension"
-        )
-    q_embed = torch_npu.npu_rotary_mul(q.clone(), cos, sin, rotary_mode="half")
-    k_embed = torch_npu.npu_rotary_mul(k.clone(), cos, sin, rotary_mode="half")
-    return q_embed, k_embed
-
-
-def _apply_interleaved_rope(
-    tensor: torch.Tensor,
-    pass_through: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int,
-) -> torch.Tensor:
-    """Apply interleaved RoPE and append dimensions that bypass rotation."""
-    sequence_first = (
-        tensor.permute(2, 0, 1, 3)
-        if unsqueeze_dim == 1
-        else tensor.permute(1, 0, 2, 3)
-    )
-    seq_length, batch_size, num_heads, head_dim = sequence_first.shape
-    if batch_size > 1 and seq_length > 1:
-        rotated = torch_npu.npu_rotary_mul(
-            sequence_first.reshape(batch_size * seq_length, 1, num_heads, head_dim),
-            cos.reshape(batch_size * seq_length, 1, 1, head_dim),
-            sin.reshape(batch_size * seq_length, 1, 1, head_dim),
-            rotary_mode="interleave",
-        ).reshape(seq_length, batch_size, num_heads, head_dim)
-    else:
-        rotated = torch_npu.npu_rotary_mul(
-            sequence_first.clone(),
-            cos.unsqueeze(-2),
-            sin.unsqueeze(-2),
-            rotary_mode="interleave",
-        )
-    rotated = rotated.permute(1, 2, 0, 3)
-    # Transpose pairs instead of strided slices to avoid scattered writes in backward.
-    rotated = rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
-    if unsqueeze_dim == 2:
-        rotated = rotated.transpose(1, 2)
-    return torch.cat((rotated, pass_through), dim=-1) if pass_through.shape[-1] else rotated
+        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+    cos, sin = cos.unsqueeze(unsqueeze_dim), sin.unsqueeze(unsqueeze_dim)
+    return rope(q, cos, sin), rope(k, cos, sin)
 
 
 def apply_rotary_pos_emb_interleave(
@@ -107,7 +61,7 @@ def apply_rotary_pos_emb_interleave(
     position_ids: torch.Tensor | None = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply NPU RoPE using Transformers' interleaved RoPE contract.
+    """Apply selected RoPE using Transformers' interleaved RoPE contract.
 
     Args:
         q: Interleaved-pair query tensor.
@@ -126,33 +80,37 @@ def apply_rotary_pos_emb_interleave(
             by the NPU interleave kernel.
     """
     del position_ids
-    if unsqueeze_dim not in (1, 2):
-        raise ValueError("NPU interleaved RoPE supports unsqueeze_dim 1 or 2")
+    return rope_interleaved(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+
+def apply_rotary_pos_emb_bsnd(
+    tensor: torch.Tensor,
+    positions: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    interleaved: bool = False,
+) -> torch.Tensor:
+    """Rotate one BSND tensor, preserving its tail and canonical output layout.
+
+    Interleaved input pairs become split real/imaginary half-bands. Half-layout
+    inputs retain their layout. Frequencies are rounded to the input dtype before
+    rotation; a missing position pair leaves the tensor unchanged.
+
+    Args:
+        tensor: States [batch, sequence, heads, hidden].
+        positions: Cosine/sine tables [sequence, rotary_dim] or [batch, sequence, rotary_dim].
+        interleaved: Whether the input prefix stores adjacent real/imaginary pairs.
+
+    Returns:
+        Rotated states with the input shape and untouched nonrotary tail.
+    """
+    if positions is None:
+        return tensor
+    cos, sin = (part.to(tensor.dtype) for part in positions)
     if cos.ndim == 2:
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    rotary_dim = cos.shape[-1]
-    if rotary_dim % 2:
-        raise ValueError("interleaved RoPE requires an even rotary dimension")
-    if rotary_dim > q.shape[-1] or rotary_dim > k.shape[-1]:
-        raise ValueError("RoPE frequencies cannot exceed the Q/K head dimension")
-    q_rot, q_pass = q.split((rotary_dim, q.shape[-1] - rotary_dim), dim=-1)
-    k_rot, k_pass = k.split((rotary_dim, k.shape[-1] - rotary_dim), dim=-1)
-
-    # Transformers supplies cat(freqs, freqs). The NPU interleave mode expects
-    # each frequency next to the corresponding real/imaginary input pair.
-    cos = cos[..., : rotary_dim // 2].repeat_interleave(2, dim=-1)
-    sin = sin[..., : rotary_dim // 2].repeat_interleave(2, dim=-1)
-    if cos.shape[0] == 1 and q.shape[0] > 1:
-        cos = cos.expand(q.shape[0], -1, -1)
-        sin = sin.expand(q.shape[0], -1, -1)
-    cos = cos.transpose(0, 1)
-    sin = sin.transpose(0, 1)
-
-    return (
-        _apply_interleaved_rope(q_rot, q_pass, cos, sin, unsqueeze_dim),
-        _apply_interleaved_rope(k_rot, k_pass, cos, sin, unsqueeze_dim),
-    )
+        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+    if interleaved:
+        return rope_interleaved_single(tensor, cos, sin, unsqueeze_dim=2)
+    return rope(tensor, cos.unsqueeze(2), sin.unsqueeze(2))
 
 
 def _rotate_half(
@@ -221,6 +179,7 @@ def apply_rotary_pos_emb_single(
         sin = sin.unsqueeze(-2)
 
     if use_fused_rotary_pos_emb and t.device.type != "cpu":
+        torch_npu = require_package("torch_npu")
         rotary_mode = "interleave" if rotary_interleaved else "half"
         sequence_length, batch_size, num_heads, head_dim = t.shape
         if rotary_interleaved and batch_size > 1 and sequence_length > 1:
@@ -270,6 +229,7 @@ def apply_rotary_pos_emb_single_freqs(
     sin_ = torch.sin(freqs).to(t.dtype)
 
     rotary_mode = "interleave" if rotary_interleaved else "half"
+    torch_npu = require_package("torch_npu")
     t = torch_npu.npu_rotary_mul(t.clone(), cos_, sin_, rotary_mode=rotary_mode)
 
     if t_pass is not None:

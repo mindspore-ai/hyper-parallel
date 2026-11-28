@@ -19,6 +19,10 @@ model:
     _target_: hyper_parallel.models._transformers.packed_attention.register_npu_packed_attention
   force_hf: true
 
+# Operator backends are resolved by each worker. For native precision diagnosis,
+# set rms_norm, swiglu, grouped_matmul, moe_token_permute and moe_token_unpermute to native here.
+ops: {}
+
 training:
   train_iters: 3
   train_samples: null

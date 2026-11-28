@@ -27,10 +27,10 @@ import torch
 from torch import nn
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 
-from hyper_parallel.components import functional
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
 from hyper_parallel.components.modules.common.rms_norm import RMSNorm
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_bsnd
 
 
 
@@ -75,24 +75,7 @@ def apply_mla_rope(
         Rotated BSND features. Interleaved inputs become the half-band order consumed by MLA.
         No extra contiguous conversion is imposed on the caller's layout.
     """
-    if position_embeddings is None:
-        return tensor
-    cos, sin = (part.to(tensor.dtype) for part in position_embeddings)
-    if cos.ndim == 2:
-        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
-    if interleaved:
-        cos, sin = (part[..., :tensor.shape[-1] // 2].repeat_interleave(2, dim=-1)
-                    for part in (cos, sin))
-    cos, sin = (part.expand(tensor.shape[0], -1, -1).transpose(0, 1) for part in (cos, sin))
-    rotated = functional.apply_rotary_pos_emb_single(
-        tensor.transpose(0, 1), cos, sin,
-        rotary_interleaved=interleaved, use_fused_rotary_pos_emb=True,
-    )
-    if interleaved:
-        # V3 consumes real/imaginary half-bands; the kernel returns adjacent pairs.
-        rotated = rotated.permute(1, 2, 0, 3)
-        return rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2).transpose(1, 2)
-    return rotated.transpose(0, 1)
+    return apply_rotary_pos_emb_bsnd(tensor, position_embeddings, interleaved=interleaved)
 
 
 @dataclass(frozen=True)
@@ -317,10 +300,11 @@ class MultiLatentAttentionModule(nn.Module):
     @staticmethod
     def _config_scaling(config: Any, default: float) -> float:
         """Keep the source-compatible YaRN factor and explicit scaling override."""
-        rope = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
-        if rope.get("rope_type", rope.get("type", "default")) != "default" and rope.get("mscale_all_dim", 0):
-            factor = rope["factor"]
-            mscale = 1.0 if factor <= 1 else 0.1 * rope["mscale_all_dim"] * math.log(factor) + 1.0
+        rope_settings = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+        if (rope_settings.get("rope_type", rope_settings.get("type", "default")) != "default"
+                and rope_settings.get("mscale_all_dim", 0)):
+            factor = rope_settings["factor"]
+            mscale = 1.0 if factor <= 1 else 0.1 * rope_settings["mscale_all_dim"] * math.log(factor) + 1.0
             default *= mscale * mscale
         return getattr(config, "scaling", default)
 

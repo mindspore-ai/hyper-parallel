@@ -22,7 +22,7 @@ import torch
 
 from hyper_parallel.components import ops as operators
 from tests.common.op_precision import PrecisionCase
-from tests.common.op_precision_cases import Inputs
+from tests.common.op_precision_inputs import Inputs
 
 
 def _compressed_bounds(layout, query, token):
