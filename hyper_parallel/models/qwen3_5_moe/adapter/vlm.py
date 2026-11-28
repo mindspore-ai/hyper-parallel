@@ -152,6 +152,7 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
         return output
 
     model.forward = forward
+    model._hp_qwen_vlm_bridge = bridge  # pylint: disable=protected-access
     # Exercise the shared internal integration contract; no public equivalent exists.
     model._hp_vlm_cp_enabled = cp_enabled  # pylint: disable=protected-access
     model._hp_qwen_vlm_forward_installed = True  # pylint: disable=protected-access

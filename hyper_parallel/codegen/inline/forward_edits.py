@@ -42,6 +42,15 @@ def forward_extract_edits(
         cls = index.find_class(patch.class_name)
         if cls is None:
             continue
+        if patch.initializers:
+            initializer = cls.methods.get("__init__")
+            if initializer is None or initializer.body_end is None:
+                raise RuntimeError(f"codegen cannot initialize observed state for {patch.class_name!r}")
+            statements = textwrap.indent("\n".join(patch.initializers), "        ") + "\n"
+            line_end = source_text.find("\n", initializer.body_end - 1)
+            offset = line_end + 1 if line_end >= 0 else len(source_text)
+            prefix = "" if source_text[:offset].endswith("\n") else "\n"
+            edits.append(TextEdit(offset, offset, prefix + statements))
         if patch.definition is not None:
             edits.append(_definition_edit(source_text, cls, patch))
             continue
@@ -67,7 +76,9 @@ def _definition_edit(source_text: str, cls: ClassInfo, patch: ForwardExtractPatc
     func = cls.methods.get(patch.method_name)
     if func is None:
         return TextEdit(cls.end_offset, cls.end_offset, "\n" + definition)
-    if "self._forward_impl(" in patch.definition:
+    if any(isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+           and node.value.id == "self" and node.attr == "_forward_impl"
+           for node in ast.walk(ast.parse(patch.definition))):
         impl = _build_forward_impl_edit(source_text, func)
         if impl is None or "_forward_impl" in cls.methods:
             raise RuntimeError("codegen cannot preserve the original method for the observed wrapper")

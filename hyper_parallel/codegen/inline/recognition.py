@@ -725,6 +725,8 @@ def _nested_forward_body(
                 return ast.copy_location(ast.Name(id=variadic[node.id], ctx=node.ctx), node)
             if node.id == target_name:
                 return ast.copy_location(ast.Name(id="self", ctx=node.ctx), node)
+            if node.id == original_forward and node.id in captured and isinstance(node.ctx, ast.Load):
+                return ast.copy_location(ast.parse("self._forward_impl", mode="eval").body, node)
             if literals is not None and node.id in captured and node.id in literals:
                 return ast.copy_location(ast.parse(repr(literals[node.id]), mode="eval").body, node)
             if runtime_cp and node.id == "cp_mesh" and node.id in captured and node.id not in companion_attrs:
@@ -743,17 +745,6 @@ def _nested_forward_body(
                 ),
                 node,
             )
-
-        def visit_Call(self, node: ast.Call) -> ast.AST:  # pylint: disable=invalid-name
-            """Rewrite a call after recursively resolving its arguments."""
-            node = self.generic_visit(node)
-            if isinstance(node.func, ast.Name) and node.func.id == original_forward:
-                node.func = ast.Attribute(
-                    value=ast.Name(id="self", ctx=ast.Load()),
-                    attr="_forward_impl",
-                    ctx=ast.Load(),
-                )
-            return node
 
     body = forward.body[1:] if ast.get_docstring(forward) is not None else forward.body
     lowered = [ClosureBindings().visit(ast.fix_missing_locations(node)) for node in body]

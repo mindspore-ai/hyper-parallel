@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from dataclasses import replace
 from typing import Any
 
 from hyper_parallel.codegen.inline.ir import (
@@ -29,7 +28,7 @@ from hyper_parallel.codegen.inline.ir import (
     ModuleSnippetPatch,
 )
 from hyper_parallel.codegen.inline.framework_spec import (
-    observed_constructor_spec, replacement_spec_for as replacement_spec,
+    replacement_spec_for_observation,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,7 +69,7 @@ def build_replacement_patches(
         target = rule.replace_target
         if target is None:
             continue
-        spec = _rule_replacement_spec(rule, target, model_type)
+        spec = replacement_spec_for_observation(rule, model_type)
         if spec is None:
             continue
         key = (target, rule.module_type, spec.keyword_args)
@@ -127,18 +126,6 @@ def _scope_attrs(rule: SourceObservation) -> tuple[str, ...]:
     """
 
     return tuple(sorted({fqn.rsplit(".", 1)[-1] for fqn in rule.match if fqn}))
-
-
-def _rule_replacement_spec(rule: SourceObservation, target: str, model_type: str | None) -> Any:
-    """Keep observed constructors separate from legacy declaration-only rules."""
-    if rule.construction is not None:
-        return observed_constructor_spec(rule)
-    spec = replacement_spec(target, model_type, module_type=rule.module_type)
-    if spec is None:
-        return None
-    arguments = {item.split("=", 1)[0]: item for item in spec.keyword_args}
-    arguments.update({item.split("=", 1)[0]: item for item in rule.construction_kwargs})
-    return replace(spec, keyword_args=tuple(arguments.values()))
 
 
 def _requires_deferred_scope(spec: Any, source_fqns: set[str], attrs: tuple[str, ...],

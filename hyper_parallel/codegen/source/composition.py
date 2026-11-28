@@ -43,7 +43,9 @@ def compose_nested_model_sources(source_text: str, meta: Any) -> str:
     if not components:
         return source_text
     rendered = source_text
-    included_modules: set[str] = set()
+    source = getattr(meta, "source", None)
+    module_name = source.get("module_name") if isinstance(source, dict) else getattr(source, "module_name", None)
+    included_modules: set[str] = {module_name} if module_name else set()
     for component in components:
         identity = component.get("type")
         if not isinstance(identity, str) or ":" not in identity:
