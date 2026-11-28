@@ -15,6 +15,7 @@
 """Independent sink attention and explicit fused-operator selection checks."""
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from torch import nn
 from hyper_parallel.core.dtensor.placement_types import Shard
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
+from hyper_parallel.distributed.context_parallel.batch_plan import CPBatchPlanConfig, prepare_cp_batch
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.components.modules import CompressedSparseAttention2
 from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
@@ -42,6 +44,7 @@ from hyper_parallel.components.modules.attention.compressed_sparse_attention2.co
     reference_sparse_attention,
 )
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import index_key_plan
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
 
@@ -81,6 +84,63 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         self.key = torch.ones(1, 2, 128)
         self.weights = torch.ones(1, 2, 8)
         self.indices = torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32)
+
+    def test_index_key_transport_reaches_family_and_shared_consumers(self):
+        """The CP member owns dispatch and rejects incompatible shared bank layouts."""
+        binding = ParallelBinding(MeshBinding(SimpleNamespace(tp_size=1)),
+                                  cp_context=SimpleNamespace(size=2, rank=0))
+        for transport in ("all_gather", "all_to_all_v"):
+            with self.subTest(transport=transport):
+                module = CompressedSparseAttention2(module=_source(True), context={"cp_size": 2},
+                                                     index_k_comm=transport)
+                module.bind_parallel(binding)
+                self.assertEqual(module.indexer.index_k_comm, transport)
+                plan = module.indexer._resolve_key_plan((3, 5), None, None)
+                self.assertEqual(plan is not None, transport == "all_to_all_v")
+                module.indexer.owns_key = False
+                self.assertEqual(module.indexer._resolve_key_plan((3, 5), plan, None), plan)
+                if plan is not None:
+                    module.indexer.index_k_comm = "all_gather"
+                    with self.assertRaisesRegex(ValueError, "Full/Reindex"):
+                        module.indexer._resolve_key_plan((3, 5), plan, None)
+                    module.indexer.index_k_comm = transport
+                    module.indexer.owns_key = True
+                    module.indexer.is_candidate_source = True
+                    with self.assertRaisesRegex(NotImplementedError, "ordinary causal selection"):
+                        module.indexer._resolve_key_plan((3, 5), None, None)
+        with self.assertRaisesRegex(ValueError, "index_k_comm"):
+            CompressedSparseAttention2(module=_source(), index_k_comm="invalid")
+        with self.assertRaisesRegex(ValueError, "indexer_paged_k requires"):
+            CompressedSparseAttention2(module=_source(), indexer_paged_k=True)
+        for size in (1, 2):
+            paged = CompressedSparseAttention2(module=_source(True), context={"cp_size": size},
+                                              use_fused_ops=True, indexer_paged_k=True)
+            self.assertTrue(paged.indexer.paged_key)
+
+    def test_compact_index_key_aligns_kl_with_either_main_bank_layout(self):
+        """Index K compaction must preserve teacher/student IDs with main AG or A2AV."""
+        module = CompressedSparseAttention2(module=_source(index_source=True))
+        plan = index_key_plan((3, 5), 2, 1, 1, "greedy", 2)
+        main = torch.arange(8 * 128, dtype=torch.float32).view(1, 8, 128)
+        compact = main[:, plan.global_positions(main.device)].clone().requires_grad_()
+        selected = torch.tensor([[[3, -1], [7, 4]]], dtype=torch.int32)
+        output = attention.CSA2IndexerOutput(
+            selected, compact.detach(), None, self.query, self.weights,
+            plan, plan.owner_view(compact), plan.owner_range[0],
+        )
+        segments = ((0, 2, 3, 8, 3),)
+        expected_segments = ((0, 2, 0, 5, 3),)
+        for offset in (0, 3):
+            with self.subTest(main_key_offset=offset):
+                with patch.object(attention_impl, "shared_compressed_indexer_kl_loss",
+                                  return_value=torch.zeros(())) as loss:
+                    module._apply_indexer_loss(output, self.query, main[:, offset:], segments, offset)
+                args, kwargs = loss.call_args
+                torch.testing.assert_close(args[1], main[:, 3:], rtol=0, atol=0)
+                torch.testing.assert_close(args[4], main[:, 3:], rtol=0, atol=0)
+                torch.testing.assert_close(args[5], torch.tensor([[[0, -1], [4, 1]]], dtype=torch.int32))
+                self.assertEqual(kwargs["query_segments"], expected_segments)
+                self.assertTrue(args[1].requires_grad)
 
     def test_indexer_requires_native_when_explicitly_selected(self):
         """Unsupported CPU inputs cannot silently satisfy native mode."""
@@ -464,6 +524,31 @@ class TestCSA2Family(unittest.TestCase):
                     self.assertTrue(selected.indexer.q_b_proj.training)
                     self.assertFalse(selected.sinks.requires_grad)
                     self.assertNotIn("calibration", selected.state_dict())
+
+    def test_prepared_plan_is_bound_to_call_and_validates_document_and_transport(self):
+        """Keep two live micro-batch plans independent and reject stale metadata."""
+        module = CompressedSparseAttention2(module=_source(True), context={"cp_size": 2},
+                                            index_k_comm="all_to_all_v")
+        module.bind_parallel(ParallelBinding(MeshBinding(SimpleNamespace(tp_size=1)),
+                                             cp_context=SimpleNamespace(size=2, rank=1)))
+        config = CPBatchPlanConfig(2, 1, ratios=(1,), windows=(128,), index_k_comm="all_to_all_v")
+        documents = []
+        for lengths in ((3, 5), (1, 7)):
+            packed = SharedCompressedPackedSequence(torch.tensor([0, lengths[0], 8]), 4, 4, 8)
+            document = module.prepare_document_inputs(torch.zeros(1, 4, 2), torch.arange(4).unsqueeze(0), packed)
+            plan = prepare_cp_batch(lengths, config)
+            bound = module.attach_batch_plan(document, plan)
+            self.assertIsNone(document.batch_plan)
+            self.assertIs(bound.batch_plan, plan)
+            self.assertIs(module.indexer_runtime_options(bound, attention_impl.SharedCompressedAttentionState())[
+                "prepared_batch"], plan)
+            documents.append(bound)
+        self.assertEqual(documents[0].batch_plan.lengths, (3, 5))
+        with self.assertRaisesRegex(ValueError, "document lengths"):
+            module.attach_batch_plan(documents[1], documents[0].batch_plan)
+        mismatched = prepare_cp_batch((3, 5), replace(config, index_k_comm="all_gather"))
+        with self.assertRaisesRegex(ValueError, "configuration differs"):
+            module.attach_batch_plan(documents[0], mismatched)
 
     def test_complete_layout_and_invalid_override(self):
         """Every parameter is owned; invalid TP/CP placement overrides are rejected."""

@@ -43,11 +43,25 @@ plan_overrides:
         _target_: hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
         use_fused_ops: true
         main_kv_comm: all_to_all_v
+        index_k_comm: all_to_all_v
+        indexer_paged_k: true
         indexer_load_balance: greedy
         indexer_balance_block_size: 2048
 ```
 
-`main_kv_comm` accepts `all_gather` (default) and document-prefix `all_to_all_v`. SWA raw KV uses the existing document-aware halo A2AV path. Index K uses the existing gather path. `indexer_load_balance` accepts `none`, `zigzag`, `greedy` and `hybrid`. Greedy/hybrid accept `indexer_balance_block_size`; hybrid also requires `indexer_zigzag_min_length`. These options preserve the current task planning, low-rank `qr` transport and owner-side KL semantics.
+`main_kv_comm` and `index_k_comm` independently accept `all_gather` (default) and
+document-prefix `all_to_all_v`. SWA raw KV uses the document-aware halo A2AV path.
+Index K dispatch covers both worker selection and original-owner KL demand;
+only the latter contributes gradients. Full/Reindex consumers must use matching
+dispatch settings. `indexer_paged_k` defaults to false and enables LI V2 shared
+physical pages for repeated logical prefixes, independently of transport. It
+requires fused selection and a native LI V2 with `PA_BBND` support.
+
+`indexer_load_balance` accepts `none`, `zigzag`, `greedy` and `hybrid`.
+Greedy/hybrid accept `indexer_balance_block_size`; hybrid also requires
+`indexer_zigzag_min_length`. These options preserve low-rank `qr` transport and
+owner-side KL semantics. See the [CP guide](../../../../../docs/guide/deepseek_v41_indexer_cp.md)
+for complete configuration, immutable batch plans and optional CPU prefetch.
 
 For a family target, remove the old `*.self_attn.forward` replacement and `tp_divide_attrs: [num_groups]` rules. The family layout and CP stage binding own these responsibilities; the former model-owned attention wrapper is no longer an importable entry.
 
@@ -197,4 +211,10 @@ Execution uses class-defined stages rather than assigning a CP wrapper to `forwa
 Old checked-in codegen output is removed with the obsolete wrapper; generate a fresh
 bundle from the current training YAML instead of importing the old artifact.
 
-The native operator adapters, teacher formula, Q chunk size and candidate-pool restrictions retain their existing behavior. CP row addresses are derived from the CP rank and local sequence length; RoPE position IDs may reset within a document and are not used as communication addresses. Packed local/global bounds are still validated. This refactor does not add fused TP, paged Index K or new communication scheduling policies.
+The teacher formula, Q chunk size and candidate-pool restrictions retain their
+existing behavior. CP row addresses are derived from the CP rank and local
+sequence length; RoPE position IDs may reset within a document and are not used
+as communication addresses. Packed local/global bounds are still validated.
+An optional `cp_batch_plan` is validated and carried by the current call, never
+stored as mutable module state. Index K dispatch, shared-page selection and AG
+de-padding do not change the existing collective submission order or add fused TP.

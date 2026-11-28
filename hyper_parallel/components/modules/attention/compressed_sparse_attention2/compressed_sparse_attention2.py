@@ -82,6 +82,8 @@ class SharedCompressedAttentionState:
     topk_indices_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     candidate_blocks_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     compressed_kv_offsets: dict[int, int] = field(default_factory=dict)
+    index_key_plans: dict[int, Any] = field(default_factory=dict)
+    owner_index_keys: dict[int, torch.Tensor] = field(default_factory=dict)
 
     @staticmethod
     def _require(
@@ -115,11 +117,20 @@ class SharedCompressedAttentionState:
             consumer_layer,
         )
 
-    def publish_index_key(self, source_layer: int, value: torch.Tensor) -> bool:
+    def publish_index_key(self, source_layer: int, value: torch.Tensor, plan: Any = None,
+                          owner_key: torch.Tensor | None = None) -> bool:
         """Publish the Full Indexer's shared key tensor."""
         if is_recomputing():
             return False
         self.index_key_by_source[source_layer] = value
+        if plan is None:
+            self.index_key_plans.pop(source_layer, None)
+        else:
+            self.index_key_plans[source_layer] = plan
+        if owner_key is None:
+            self.owner_index_keys.pop(source_layer, None)
+        else:
+            self.owner_index_keys[source_layer] = owner_key
         return True
 
     def require_index_key(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
@@ -181,6 +192,7 @@ class CSA2DocumentInputs:
     causal_upper: torch.Tensor | None
     raw_document_starts: tuple
     global_key_length: int
+    batch_plan: Any = None
 
 
 @dataclass
@@ -308,12 +320,17 @@ class CompressedSparseAttention2Module(nn.Module):
             layer_idx: int = 0,
             replace_indexer: bool = True,
             use_fused_ops: bool = False,
+            indexer_paged_k: bool = False,
     ) -> None:
         """Create from config or adopt a source module without replacing its parameters."""
         if (module is None) == (config is None):
             raise ValueError("CSA2 requires exactly one of config or module")
         if not isinstance(use_fused_ops, bool):
             raise ValueError("use_fused_ops must be a bool")
+        if not isinstance(indexer_paged_k, bool):
+            raise ValueError("indexer_paged_k must be a bool")
+        if indexer_paged_k and not use_fused_ops:
+            raise ValueError("indexer_paged_k requires use_fused_ops=True")
         if module is None:
             module = _build_parameters(config, layer_idx)
         super().__init__()
@@ -348,6 +365,7 @@ class CompressedSparseAttention2Module(nn.Module):
         self.use_fused_ops = use_fused_ops
         if self.is_index_source:
             self.indexer.use_fused = use_fused_ops
+            self.indexer.paged_key = indexer_paged_k
         # Children are adopted by identity; preserve their individual training modes.
         self.training = module.training
 
@@ -529,6 +547,18 @@ class CompressedSparseAttention2Module(nn.Module):
         del shared_state
         return prepared
 
+    def attach_batch_plan(self, document: CSA2DocumentInputs, plan: Any) -> CSA2DocumentInputs:
+        """Reject CP metadata on local members instead of silently ignoring it."""
+        if plan is not None:
+            raise ValueError("cp_batch_plan requires an active CP member")
+        return document
+
+    def indexer_runtime_options(self, document: CSA2DocumentInputs,
+                                shared_state: SharedCompressedAttentionState) -> dict:
+        """Local selection needs no communication plan or owner-bank override."""
+        del document, shared_state
+        return {}
+
     def _run_indexer(
             self,
             hidden_states: torch.Tensor,
@@ -573,9 +603,12 @@ class CompressedSparseAttention2Module(nn.Module):
             key_position_embeddings=key_position_embeddings,
             document_lengths=document_lengths,
             causal_upper=document.causal_upper,
+            **self.indexer_runtime_options(document, shared_state),
         )
         if self.indexer.owns_key:
-            shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
+            shared_state.publish_index_key(
+                self.layer_idx, indexer_output.index_key, indexer_output.key_plan, indexer_output.owner_index_key,
+            )
         shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
         if indexer_output.candidate_blocks is not None:
             shared_state.publish_candidate_blocks(
@@ -630,7 +663,15 @@ class CompressedSparseAttention2Module(nn.Module):
             # KL uses the original owner's queries. A view aligns its student K
             # with the compact teacher bank while preserving global Index K gradients.
             index_key = indexer_output.index_key
-            if main_key_offset or compressed_kv.shape[1] != index_key.shape[1]:
+            if indexer_output.owner_index_key is not None:
+                index_key = indexer_output.owner_index_key
+                owner_start = indexer_output.owner_key_offset
+                offset = owner_start - main_key_offset
+                if offset < 0 or offset + index_key.shape[1] > compressed_kv.shape[1]:
+                    raise ValueError("Main KV bank does not cover the original owner's KL prefix")
+                compressed_kv = compressed_kv.narrow(1, offset, index_key.shape[1])
+                main_key_offset = owner_start
+            elif main_key_offset or compressed_kv.shape[1] != index_key.shape[1]:
                 index_key = index_key[:, main_key_offset:main_key_offset+compressed_kv.shape[1]]
             selected = indexer_output.topk_indices
             if main_key_offset:
@@ -725,6 +766,7 @@ class CompressedSparseAttention2Module(nn.Module):
             hidden_states, attention_mask, past_key_values, kwargs,
         )
         document = self.prepare_document_inputs(hidden_states, position_ids, packed)
+        document = self.attach_batch_plan(document, kwargs.get("cp_batch_plan"))
         prepared = self.prepare_attention_inputs(hidden_states, position_embeddings, shared, document)
         inputs = self.exchange_attention(prepared, shared)
         del prepared

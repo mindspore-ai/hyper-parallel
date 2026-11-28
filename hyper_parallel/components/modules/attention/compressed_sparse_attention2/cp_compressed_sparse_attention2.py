@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
@@ -27,6 +27,8 @@ import torch.distributed._functional_collectives as funcol
 from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
+from hyper_parallel.distributed.context_parallel.batch_plan import CPBatchPlan
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import IndexKeyPlan, index_key_plan
 from hyper_parallel.distributed.context_parallel.compressed_document import (
     document_compression_plan, launch_compressed_bank,
 )
@@ -42,7 +44,7 @@ from .compressed_sparse_attention2 import (
 )
 from .compressor import CSA2Compressor
 from .document_layout import SharedCompressedPackedSequence
-from .indexer import CSA2Indexer, CSA2IndexerOutput
+from .indexer import CSA2Indexer, CSA2IndexerOutput, compressed_causal_topk
 
 
 def _reduce_scores(tensor: torch.Tensor, *, group: Any) -> torch.Tensor:
@@ -126,6 +128,7 @@ class _CPIndexer(CSA2Indexer):
 
     cp_context = None
     balance_mode = "none"
+    index_k_comm = "all_gather"
     balance_block_size = None
     zigzag_min_length = None
     _input_region = None
@@ -133,17 +136,35 @@ class _CPIndexer(CSA2Indexer):
     _wait_region = None
 
     def prepare_key(self, latent: torch.Tensor | None, cos: torch.Tensor, sin: torch.Tensor,
-                    index_key: torch.Tensor | None, block_plan: Any, key_position_embeddings: tuple | None) -> Any:
+                    index_key: torch.Tensor | None, block_plan: Any, key_position_embeddings: tuple | None,
+                    key_plan: IndexKeyPlan | None = None) -> Any:
         """Submit Full-layer K; Reindex reuses the already differentiable shared bank."""
         key = self._project_index_key(latent, cos, sin, index_key, key_position_embeddings)
         if not self.owns_key:
             return key
+        if key_plan is not None:
+            return async_sequence_dispatch(key, 1, key_plan.dispatch, self.cp_context.mesh.get_group(),
+                                           gradient=key_plan.gradient)
         launch = partial(_launch_bank, context=self.cp_context)
         return launch(key, 1) if block_plan is None else launch_compressed_bank(key, block_plan.counts, launch)
 
     def exchange_key(self, prepared: Any) -> torch.Tensor:
         """Wait only when the local/worker selection consumes Index K."""
         return prepared if isinstance(prepared, torch.Tensor) else prepared.wait()
+
+    def _resolve_key_plan(self, lengths: tuple, source_plan: IndexKeyPlan | None,
+                          prepared_batch: CPBatchPlan | None) -> IndexKeyPlan | None:
+        """Require a single physical bank layout across Full/Reindex consumers."""
+        plan = None
+        if self.index_k_comm == "all_to_all_v":
+            if self.is_candidate_source or self.uses_candidates:
+                raise NotImplementedError("Index K prefix dispatch requires ordinary causal selection")
+            plan = (prepared_batch.for_ratio(self.compress_ratio).index_key if prepared_batch is not None else
+                    index_key_plan(lengths, self.cp_context.size, self.cp_context.rank, self.compress_ratio,
+                                   self.balance_mode, self.balance_block_size, self.zigzag_min_length))
+        if not self.owns_key and plan != source_plan:
+            raise ValueError("Full/Reindex consumers must share compression and Index K dispatch settings")
+        return plan
 
     def forward(
             self, hidden_states: torch.Tensor, query_residual: torch.Tensor, latent: torch.Tensor | None,
@@ -153,10 +174,14 @@ class _CPIndexer(CSA2Indexer):
             minimum_key_indices: torch.Tensor | None = None, query_segments: tuple | None = None,
             document_lengths: tuple[int, ...] = (), prepare_attention: Callable | None = None,
             block_plan: Any = None, key_position_embeddings: tuple | None = None,
-            causal_upper: torch.Tensor | None = None,
+            causal_upper: torch.Tensor | None = None, source_key_plan: IndexKeyPlan | None = None,
+            owner_index_key: torch.Tensor | None = None, prepared_batch: CPBatchPlan | None = None,
     ) -> CSA2IndexerOutput:
-        """Reuse local math or dispatch only the discrete selection workload."""
-        if self.balance_mode == "none":
+        """Keep owner learning separate from detached worker selection storage."""
+        key_plan = self._resolve_key_plan(document_lengths, source_key_plan, prepared_batch)
+        if not self.owns_key and key_plan is not None and owner_index_key is None:
+            raise ValueError("Reindex prefix dispatch requires the Full layer's owner KL key")
+        if self.balance_mode == "none" and key_plan is None:
             return super().forward(
                 hidden_states, query_residual, latent, compress_position_embeddings,
                 index_key=index_key, candidate_blocks=candidate_blocks, reduce_sum=reduce_sum,
@@ -165,26 +190,65 @@ class _CPIndexer(CSA2Indexer):
                 prepare_attention=prepare_attention, block_plan=block_plan,
                 key_position_embeddings=key_position_embeddings, causal_upper=causal_upper,
             )
-        if reduce_sum is not None or self.is_candidate_source or self.uses_candidates:
+        if self.is_candidate_source or self.uses_candidates or (self.balance_mode != "none" and reduce_sum is not None):
             raise NotImplementedError("Indexer overlap requires ordinary causal selection and TP=1")
         cos, sin = compress_position_embeddings
-        weights = self.weights_proj(hidden_states.detach())
-        weights = weights * (self.head_dim**-0.5 * self.global_num_heads**-0.5)
-        launch = self._launch_selection if self._input_region is None else self._input_region
-        wave = launch(query_residual, weights, (cos, sin), document_lengths)
-        prepared_key = self.prepare_key(latent, cos, sin, index_key, block_plan, key_position_embeddings)
+        wave = None
+        if self.balance_mode != "none":
+            weights = self.weights_proj(hidden_states.detach())
+            weights = weights * (self.head_dim**-0.5 * self.global_num_heads**-0.5)
+            launch = self._launch_selection if self._input_region is None else self._input_region
+            wave = launch(query_residual, weights, (cos, sin), document_lengths, prepared_batch)
+        prepared_key = self.prepare_key(latent, cos, sin, index_key, block_plan, key_position_embeddings, key_plan)
         if prepare_attention is not None:
             prepare_attention()
-        prepared = self._prepare_dispatched(wave)
-        key = self.exchange_key(prepared_key)
-        select = self._select_dispatched if self._result_region is None else self._result_region
-        result = select(prepared, key)
-        del prepared
-        query = self._project_index_query(query_residual, cos, sin)
+        prepared = self._prepare_dispatched(wave) if wave is not None else None
+        if wave is None:
+            query = self._project_index_query(query_residual, cos, sin)
+            weights = self.weights_proj(hidden_states.detach())
+            weights = weights * (self.head_dim**-0.5 * self.global_num_heads**-0.5)
+        if key_plan is not None and self.owns_key:
+            key, owner_index_key = prepared_key.wait_with_gradient()
+        else:
+            key = self.exchange_key(prepared_key)
+        if wave is None:
+            selected, candidates = self._run_selection(
+                query, key, weights, candidate_blocks, query_offset, reduce_sum,
+                minimum_key_indices, query_segments, causal_upper, key_plan=key_plan,
+            )
+        else:
+            select = self._select_dispatched if self._result_region is None else self._result_region
+            result = select(prepared, key, key_plan)
+            del prepared
+            query = self._project_index_query(query_residual, cos, sin)
+            finish = self._finish_selection if self._wait_region is None else self._wait_region
+            selected, candidates = finish(result), None
         if weights.shape[-1] != query.shape[2]:
             raise ValueError("Indexer query and merge weights must have matching head counts")
-        finish = self._finish_selection if self._wait_region is None else self._wait_region
-        return CSA2IndexerOutput(finish(result), key, None, query, weights)
+        return CSA2IndexerOutput(selected, key, candidates, query, weights, key_plan, owner_index_key,
+                                 0 if key_plan is None else key_plan.owner_range[0])
+
+    def _select_indices(
+            self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
+            candidate_blocks: torch.Tensor | None, query_offset: int,
+            reduce_sum: Callable | None, minimum_key_indices: torch.Tensor | None,
+            query_segments: tuple | None, causal_upper: torch.Tensor | None = None,
+            *, key_plan: IndexKeyPlan | None = None,
+    ) -> tuple:
+        """Translate compact bank addresses only inside the CP selection stage."""
+        if key_plan is None:
+            return super()._select_indices(query, key, merge_weight, candidate_blocks, query_offset,
+                                           reduce_sum, minimum_key_indices, query_segments, causal_upper)
+        selected = compressed_causal_topk(
+            query, key, merge_weight, compress_ratio=self.compress_ratio, sparse_count=self.index_topk,
+            query_offset=query_offset, query_chunk_size=self.query_chunk_size, reduce_sum=reduce_sum,
+            query_segments=key_plan.map_segments(query_segments), use_fused=self.use_fused,
+            paged_key=self.paged_key, global_key_length=key_plan.global_length,
+            key_global_positions=None if self.use_fused else key_plan.global_positions(key.device),
+        )
+        if self.use_fused:
+            selected = key_plan.global_indices(selected, query_segments)
+        return selected, None
 
     def enable_selection_exclude(self) -> None:
         """Reuse input/selection/result transfers instead of waiting on consumed handles."""
@@ -194,10 +258,13 @@ class _CPIndexer(CSA2Indexer):
         object.__setattr__(self, "_wait_region", checkpoint_exclude_wrapper(self._finish_selection))
 
     @torch.no_grad()
-    def _launch_selection(self, qr: torch.Tensor, weights: torch.Tensor, embeddings: tuple, lengths: tuple) -> Any:
+    def _launch_selection(self, qr: torch.Tensor, weights: torch.Tensor, embeddings: tuple, lengths: tuple,
+                          prepared_batch: CPBatchPlan | None = None) -> Any:
         """Use the existing task planner and dtype-preserving input transport."""
         return launch_indexer_inputs(qr, weights, embeddings, lengths, self.compress_ratio, self.balance_mode,
-                                     self.cp_context.mesh.get_group(), self.balance_block_size, self.zigzag_min_length)
+                                     self.cp_context.mesh.get_group(), self.balance_block_size, self.zigzag_min_length,
+                                     prepared_route=(None if prepared_batch is None else
+                                                     prepared_batch.for_ratio(self.compress_ratio).worker_route))
 
     @torch.no_grad()
     def _prepare_dispatched(self, wave: Any) -> tuple | None:
@@ -211,10 +278,11 @@ class _CPIndexer(CSA2Indexer):
         return query, weights, wave
 
     @torch.no_grad()
-    def _select_dispatched(self, prepared: tuple, key: torch.Tensor) -> Any:
+    def _select_dispatched(self, prepared: tuple, key: torch.Tensor, key_plan: IndexKeyPlan | None = None) -> Any:
         """Consume worker Q once and launch the inverse ID transfer."""
         query, weights, wave = prepared
-        selected = self._select_indices(query, key, weights, None, 0, None, None, wave.route.segments)[0]
+        selected = self._select_indices(query, key, weights, None, 0, None, None, wave.route.segments,
+                                        key_plan=key_plan)[0]
         return wave.launch_result(selected[0])
 
     @staticmethod
@@ -258,7 +326,8 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
     def __init__(self, module: torch.nn.Module | None = None, *, config: Any = None, layer_idx: int = 0,
                  replace_indexer: bool = True, use_fused_ops: bool = False,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
-                 indexer_balance_block_size: int | None = None, indexer_zigzag_min_length: int | None = None) -> None:
+                 indexer_balance_block_size: int | None = None, indexer_zigzag_min_length: int | None = None,
+                 index_k_comm: str = "all_gather", indexer_paged_k: bool = False) -> None:
         """Adopt mathematical children and choose CP stages without creating parameters."""
         indexer_balance_block_size = resolve_indexer_balance_block_size(
             indexer_load_balance, indexer_balance_block_size,
@@ -266,15 +335,19 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
         validate_indexer_hybrid_threshold(indexer_load_balance, indexer_zigzag_min_length)
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
+        if index_k_comm not in ("all_gather", "all_to_all_v"):
+            raise ValueError("index_k_comm must be all_gather or all_to_all_v")
         super().__init__(module, config=config, layer_idx=layer_idx,
-                         replace_indexer=replace_indexer, use_fused_ops=use_fused_ops)
+                         replace_indexer=replace_indexer, use_fused_ops=use_fused_ops, indexer_paged_k=indexer_paged_k)
         self.indexer_load_balance = indexer_load_balance
         self.main_kv_comm = main_kv_comm
+        self.index_k_comm = index_k_comm
         self.indexer_balance_block_size = indexer_balance_block_size
         self.indexer_zigzag_min_length = indexer_zigzag_min_length
         if self.is_index_source:
             self.indexer = _CPIndexer(self.indexer, apply_rope=_apply_v41_rope)
             self.indexer.balance_mode = indexer_load_balance
+            self.indexer.index_k_comm = index_k_comm
             self.indexer.balance_block_size = indexer_balance_block_size
             self.indexer.zigzag_min_length = indexer_zigzag_min_length
         if self.is_kv_source and isinstance(getattr(self, "compressor", None), CSA2Compressor):
@@ -300,6 +373,32 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
         offset = self.cp_context.rank * sequence_length
         return offset, sequence_length * self.cp_context.size
 
+    def attach_batch_plan(self, document: CSA2DocumentInputs, plan: Any) -> CSA2DocumentInputs:
+        """Bind an immutable batch snapshot to this call, never to module state."""
+        if plan is None:
+            return document
+        if not isinstance(plan, CPBatchPlan):
+            raise TypeError("cp_batch_plan must be CPBatchPlan")
+        boundaries = ((0, document.global_length) if document.packed is None
+                      else document.packed.document_boundaries())
+        plan.validate(tuple(end - start for start, end in zip(boundaries, boundaries[1:])),
+                      self.cp_context.size, self.cp_context.rank)
+        config = plan.config
+        if (config.mode, config.block_size, config.zigzag_min_length, config.main_kv_comm, config.index_k_comm) != (
+                self.indexer_load_balance, self.indexer_balance_block_size, self.indexer_zigzag_min_length,
+                self.main_kv_comm, self.index_k_comm):
+            raise ValueError("Prepared CP batch configuration differs from the active communication context")
+        plan.for_ratio(self.compress_ratio)
+        plan.raw_route(self.sliding_window)
+        return replace(document, batch_plan=plan)
+
+    def indexer_runtime_options(self, document: CSA2DocumentInputs,
+                                shared_state: SharedCompressedAttentionState) -> dict:
+        """Pass bank ownership and per-call plans through the managed Indexer boundary."""
+        return {"source_key_plan": shared_state.index_key_plans.get(self.kv_source_layer_idx),
+                "owner_index_key": shared_state.owner_index_keys.get(self.kv_source_layer_idx),
+                "prepared_batch": document.batch_plan}
+
     def prepare_compression(self, document: CSA2DocumentInputs, embeddings: dict,
                             device: torch.device) -> tuple:
         """Plan owner blocks and explicitly complete block-start position metadata."""
@@ -315,7 +414,8 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
             packed = SharedCompressedPackedSequence(torch.tensor(boundaries), rank * local_length,
                                                      local_length, document.global_length)
         packed = packed.prepare(device, (self.compress_ratio,))
-        plan = document_compression_plan(boundaries, self.compress_ratio, local_length, size, rank)
+        plan = (document_compression_plan(boundaries, self.compress_ratio, local_length, size, rank)
+                if document.batch_plan is None else document.batch_plan.for_ratio(self.compress_ratio).compression)
         source_positions = embeddings["compress"]
         positions = packed.cached_compressed_positions(plan.ratio, source_positions)
         if positions is None:
@@ -361,9 +461,13 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
         context = self.cp_context
         boundaries = ((0, document.global_length) if document.packed is None
                       else document.packed.document_boundaries())
-        raw_route = sliding_window_route(boundaries, length, context.size, context.rank, self.sliding_window)
-        main_route = (document_prefix_route(boundaries, length, context.size, context.rank, self.compress_ratio)
-                      if self.compress_ratio and self.main_kv_comm == "all_to_all_v" else None)
+        if document.batch_plan is None:
+            raw_route = sliding_window_route(boundaries, length, context.size, context.rank, self.sliding_window)
+            main_route = (document_prefix_route(boundaries, length, context.size, context.rank, self.compress_ratio)
+                          if self.compress_ratio and self.main_kv_comm == "all_to_all_v" else None)
+        else:
+            raw_route = document.batch_plan.raw_route(self.sliding_window)
+            main_route = document.batch_plan.for_ratio(self.compress_ratio).main_route
         lengths = tuple(end - start for start, end in zip(boundaries, boundaries[1:]))
         cos, sin = embeddings["compress" if self.compress_ratio else "main"]
         raw = self._project_raw_kv(hidden_states, cos, sin)

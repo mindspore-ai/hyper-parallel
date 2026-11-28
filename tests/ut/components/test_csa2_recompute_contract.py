@@ -90,9 +90,10 @@ class _CountingState(SharedCompressedAttentionState):
         self.topk_count += int(published)
         return published
 
-    def publish_index_key(self, source_layer: int, value: torch.Tensor) -> bool:
+    def publish_index_key(self, source_layer: int, value: torch.Tensor, plan: Any = None,
+                          owner_key: torch.Tensor | None = None) -> bool:
         """Count one indexer-K publication."""
-        published = super().publish_index_key(source_layer, value)
+        published = super().publish_index_key(source_layer, value, plan, owner_key)
         self.index_key_count += int(published)
         return published
 
@@ -214,7 +215,8 @@ class _GatherCounter:
 class _GatherCSA2(CPCompressedSparseAttention2):
     """Use the counting gather for raw KV without creating a process group in UT."""
 
-    def exchange_raw(self, tensor, sequence_dim, route):
+    def exchange_raw(self, tensor: torch.Tensor, sequence_dim: int, route: Any) -> Any:
+        """Use the counting gather in place of raw-halo communication."""
         del route
         return self.launch_bank(tensor, sequence_dim)
 
