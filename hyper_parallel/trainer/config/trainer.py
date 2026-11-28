@@ -96,6 +96,7 @@ class TrainerConfig:
         builtin_registry.validate_selections(self.ops)
         if (
             self.compile.enabled
+            and not self.compile.selects_graph_compiler()
             and self.activation_checkpoint is not None
             and self.activation_checkpoint.mode != "off"
         ):
