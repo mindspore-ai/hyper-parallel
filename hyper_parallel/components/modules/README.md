@@ -30,7 +30,7 @@ The public [GroupedExperts family](moe/grouped_experts/README.md) selects local 
 See [Module Family](README.module_family.md) for legacy MXFP8 examples, rule semantics, and extension guidance.
 
 For attention replacement parameters, topology settings and framework-injected arguments, see
-[Attention YAML configuration](attention/readme.md). The
+[Attention YAML configuration](attention/README.MD). The
 [DeepSeek Sparse Attention guide](attention/deepseek_sparse_attention/readme.md) explains native `config=`
 construction, source-module replacement, and CP / TP support.
 

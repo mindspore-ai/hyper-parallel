@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""GQA Ulysses/KV-AllGather execution over shared, differentiable CP transport."""
+"""GQA Ulysses/KV-AllGather and Ring execution over the shared CP family."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import accumulate
@@ -26,6 +27,7 @@ import torch
 from hyper_parallel.components.functional.npu_fusion_attention import (
     PACKED_SEQUENCE_ARGUMENTS, resolve_packed_sequence_lengths,
 )
+from hyper_parallel.distributed.context_parallel.ring_attention import ring_attention
 from hyper_parallel.distributed.module_binding import ParallelModuleSpec
 from .grouped_query_attention import GQAInputs, GroupedQueryAttentionModule
 from .grouped_query_attention_family import validate_gqa_layout
@@ -130,21 +132,53 @@ class CPGQAOutputState:
     projection_state: Any
 
 
+@dataclass(frozen=True)
+class RingGQAPreparedInputs:
+    """Local projected Ring operands and global packed-document metadata."""
+
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    input_layout: str
+    document_lengths: tuple[int, ...] | None
+    causal: bool
+    output_state: CPGQAOutputState
+
+
+def _lengths_from_cumulative(values: Any) -> tuple[int, ...]:
+    """Convert global cumulative packed endpoints to document lengths."""
+    previous = 0
+    lengths = []
+    for endpoint in values:
+        length = int(endpoint) - previous
+        if length < 1:
+            raise ValueError("Ring GQA packed document endpoints must be strictly increasing")
+        lengths.append(length)
+        previous = int(endpoint)
+    return tuple(lengths)
+
+
 class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
-    """GQA CP member sharing transport across fixed projection representations.
+    """GQA CP member sharing scheduling across fixed projection representations.
 
     The default algorithm owns forward, projection math and FA. This member
-    schedules those projections around CP transfers and restores query ownership.
+    schedules those projections around Ulysses/AllGather transfers or Ring
+    attention, then restores query ownership.
     """
 
     def __init__(self, *, module: torch.nn.Module | None = None, config: Any = None,
                  module_fqn: str = "", context: Any = None,
-                 fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None) -> None:
+                 fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None,
+                 cp_algorithm: str = "ulysses", load_balance: str = "none",
+                 prune_documents: bool = True) -> None:
         """Keep CP scheduling options on the parallel member, outside local GQA math."""
         del module_fqn, context
         super().__init__(config=config, module=module, fuse_qkv=fuse_qkv)
         self.overlap = overlap
         self.ulysses_degree = ulysses_degree
+        self.cp_algorithm = cp_algorithm
+        self.load_balance = load_balance
+        self.prune_documents = prune_documents
 
     def parallel_module_spec(self) -> ParallelModuleSpec:
         """Request borrowed CP resources in addition to the shared TP boundary."""
@@ -164,6 +198,13 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
             raise ValueError("GQA CP requires a bound CPContext")
         self.cp_context = binding.cp_context
         degree = self.cp_context.size
+        if self.cp_algorithm == "ring":
+            if self.ulysses_degree not in (None, 1):
+                raise ValueError("Ring GQA currently requires ulysses_degree=1")
+            self.ulysses_degree = 1
+            self.ulysses_context, self.query_context = self.cp_context, self.cp_context
+            self.all_gather_degree = 1
+            return
         self.ulysses_degree = degree if self.ulysses_degree is None else self.ulysses_degree
         if self.ulysses_degree < 1 or degree % self.ulysses_degree:
             raise ValueError("GQA Ulysses degree must divide CP degree")
@@ -296,6 +337,10 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
         if q_lengths is not None and attention_mask is not None:
             raise ValueError("GQA CP packed lengths cannot be combined with an explicit mask")
         options = {name: value for name, value in kwargs.items() if name not in PACKED_SEQUENCE_ARGUMENTS}
+        if self.cp_algorithm == "ring":
+            return self._prepare_ring_inputs(
+                hidden_states, positions, attention_mask, q_lengths, options,
+            )
         if self.fuse_qkv:
             query, key, value, output_state = self.split_projection(hidden_states)
             query = self.normalize_position(query, self.q_norm, positions)
@@ -315,7 +360,65 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
             query, key, value, query_pending, key_pending, value_pending,
             attention_mask, q_lengths, options, output_state)
 
-    def exchange_attention(self, prepared: CPGQAPreparedInputs) -> GQAInputs:
+    def _prepare_ring_inputs(self, hidden_states: torch.Tensor, positions: Any,
+                             attention_mask: torch.Tensor | None, cumulative_lengths: Any,
+                             options: dict[str, Any]) -> RingGQAPreparedInputs:
+        """Project rank-local inputs while leaving sequence communication to Ring."""
+        if attention_mask is not None:
+            raise ValueError("Ring GQA does not support an explicit attention mask")
+        if self.training and self.attention_dropout != 0:
+            raise ValueError("Ring GQA requires attention dropout=0")
+        if self.sliding_window is not None:
+            raise ValueError("Ring GQA does not support sliding_window")
+        if (not isinstance(self.scaling, (int, float)) or isinstance(self.scaling, bool)
+                or not math.isclose(self.scaling, self.qk_head_dim ** -0.5, rel_tol=1e-12)):
+            raise ValueError("Ring GQA requires the default inverse-square-root attention scaling")
+        unsupported = ("sliding_window", "window_size", "softcap", "alibi_slopes", "attention_bias")
+        for name in unsupported:
+            if options.get(name) is not None:
+                raise ValueError(f"Ring GQA does not support {name}")
+        if options.get("use_cache", False):
+            raise ValueError("Ring GQA does not support a KV cache")
+        if options.get("output_attentions", False):
+            raise ValueError("Ring GQA does not return attention weights")
+        supported = {"is_causal", "use_cache", "output_attentions", "document_lengths"}
+        unknown = sorted(name for name, value in options.items() if name not in supported and value is not None)
+        if unknown:
+            raise ValueError(f"Ring GQA does not support attention options {unknown}")
+
+        causal = options.pop("is_causal", self.is_causal)
+        if not isinstance(causal, bool):
+            raise ValueError("Ring GQA is_causal must be bool")
+        options.pop("use_cache", None)
+        options.pop("output_attentions", None)
+        query, key, value, projection_state = self.project_qkv(hidden_states, positions)
+        batch, local_length = query.shape[:2]
+        lengths = None if cumulative_lengths is None else _lengths_from_cumulative(cumulative_lengths)
+        explicit_lengths = options.pop("document_lengths", None)
+        if explicit_lengths is not None:
+            explicit_lengths = tuple(explicit_lengths)
+            if (not explicit_lengths or any(type(length) is not int or length < 1 for length in explicit_lengths)):
+                raise ValueError("Ring GQA document_lengths must contain positive integers")
+            if lengths is not None and lengths != explicit_lengths:
+                raise ValueError("document_lengths conflicts with packed sequence metadata")
+            lengths = explicit_lengths
+        if lengths is not None:
+            if batch != 1:
+                raise ValueError("Ring GQA packed attention requires batch size one")
+            if sum(lengths) != local_length * self.cp_context.size:
+                raise ValueError("Ring GQA document lengths must sum to the global token count")
+            query, key, value = (tensor.squeeze(0).contiguous() for tensor in (query, key, value))
+            input_layout = "TND"
+        else:
+            input_layout = "BSND"
+        output_state = CPGQAOutputState((batch, local_length), None, projection_state)
+        return RingGQAPreparedInputs(
+            query, key, value, input_layout, lengths, causal, output_state,
+        )
+
+    def exchange_attention(
+        self, prepared: CPGQAPreparedInputs | RingGQAPreparedInputs,
+    ) -> GQAInputs | RingGQAPreparedInputs:
         """Complete this invocation's transfers and produce ready FA operands.
 
         Args:
@@ -325,12 +428,30 @@ class CPGroupedQueryAttentionModule(GroupedQueryAttentionModule):
         Returns:
             Ready BNSD inputs with local document coordinates and output state.
         """
+        if isinstance(prepared, RingGQAPreparedInputs):
+            return prepared
         query, key, value = self._finish_input_transfers(
             prepared.query, prepared.key, prepared.value,
             prepared.query_pending, prepared.key_pending, prepared.value_pending)
         return self._attention_operands(
             query, key, value, prepared.attention_mask, prepared.lengths,
             prepared.options, prepared.output_state)
+
+    def run_attention(
+        self, inputs: GQAInputs | RingGQAPreparedInputs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run either shared GQA attention or the selected Ring CP kernel."""
+        if isinstance(inputs, RingGQAPreparedInputs):
+            output = ring_attention(
+                inputs.query, inputs.key, inputs.value, self.cp_context.mesh,
+                causal=inputs.causal, input_layout=inputs.input_layout, overlap=self.overlap,
+                load_balance=self.load_balance, prune_documents=self.prune_documents,
+                document_lengths=inputs.document_lengths,
+            )
+            if inputs.input_layout == "TND":
+                output = output.unsqueeze(0)
+            return output, None
+        return super().run_attention(inputs)
 
     def restore_attention(self, output: torch.Tensor,
                           output_state: CPGQAOutputState) -> tuple[torch.Tensor, Any]:
