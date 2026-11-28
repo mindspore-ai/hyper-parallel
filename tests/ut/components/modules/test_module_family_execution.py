@@ -19,7 +19,7 @@ import torch
 
 from examples.torch.module_family.config import RMSNormConfig, SwiGLUMLPConfig, SharedExpertConfig
 from hyper_parallel.components.modules.common.rms_norm import RMSNorm, OffsetRMSNorm
-from hyper_parallel.components.modules.swiglu_mlp_family import SwiGLUMLP
+from hyper_parallel.components.modules.mlp import SwiGLUMLP
 from hyper_parallel.components.modules.moe.shared_expert import SharedExpert
 from tests.common.mark_utils import arg_mark
 

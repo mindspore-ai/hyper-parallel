@@ -1,5 +1,8 @@
 # Hyper-Parallel HSDP Refactor All-in-one Rules
 
+# Match nn.Linear.forward(input=...) so adopted LM heads preserve keyword calls.
+"hyper-parallel/hyper_parallel/components/modules/common/causal_lm_head.py" "redefined-builtin"
+
 # 1. Core Logic: hyper_parallel/core/fully_shard/
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "f-string-without-interpolation"
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "missing-function-docstring"

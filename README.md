@@ -47,6 +47,7 @@ HyperParallel provides distributed parallel acceleration for Ascend SuperPoDs. D
 
 ## 📣 Latest News
 
+- [Nov. 26, 2026]: [HyperParallel accelerates VeOmni training on Ascend NPUs](https://github.com/ByteDance-Seed/VeOmni)
 - [Oct. 15, 2026]: [DeepSeek-V4.1-Flash model support](docs/deepseek_v41_article/README.md)
 - [Oct. 9, 2026]: [moonshotai/Kimi-K2.6 model support](hyper_parallel/models/kimi_k26/README.md)
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B model support](examples/training_demo/README.md#full-pretrained-model)

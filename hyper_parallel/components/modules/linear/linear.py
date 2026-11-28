@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Canonical shell for low-precision Dense Linear."""
+"""Dense Linear replacement baseline and strategy-bound low-precision Linear."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import nn
@@ -21,6 +26,39 @@ from hyper_parallel.components.quantization.functional.base_linear_func import (
     LinearStrategy,
     _LinearFunction,
 )
+from hyper_parallel.models.replacement import module_replacement
+
+
+def _adopt_linear_parameters(target: nn.Linear, source: nn.Linear) -> None:
+    """Reuse source Linear parameters without temporary allocation."""
+    nn.Module.__init__(target)  # pylint: disable=non-parent-init-called,unnecessary-dunder-call
+    target.in_features = source.in_features
+    target.out_features = source.out_features
+    target.register_parameter("weight", source.weight)
+    target.register_parameter("bias", source.bias)
+
+
+@module_replacement
+class Linear(nn.Linear):
+    """Baseline Dense replacement using ordinary torch linear computation."""
+
+    def __init__(
+        self,
+        *,
+        module: nn.Linear,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Reuse parameters without allocating or initializing a second weight set.
+
+        Args:
+            module: Source Linear with loaded weight and optional bias.
+            module_fqn: Replacement path; unused by baseline computation.
+            context: Replacement context; unused by baseline computation.
+        """
+        del module_fqn, context
+        _adopt_linear_parameters(self, module)
+        self.train(module.training)
 
 
 class LowPrecisionLinear(nn.Linear):
@@ -37,7 +75,6 @@ class LowPrecisionLinear(nn.Linear):
         strategy: LinearStrategy,
     ) -> None:
         """Create a low-precision Linear with newly allocated Parameters."""
-
         self._validate_strategy(strategy)
         super().__init__(in_features, out_features, bias=bias)
         self.strategy = strategy
@@ -45,7 +82,6 @@ class LowPrecisionLinear(nn.Linear):
     @staticmethod
     def _validate_strategy(strategy: LinearStrategy) -> None:
         """Require a plain strategy so module registration stays unchanged."""
-
         if isinstance(strategy, nn.Module) or not isinstance(strategy, LinearStrategy):
             raise TypeError("strategy must be a non-Module LinearStrategy instance")
 
@@ -56,28 +92,30 @@ class LowPrecisionLinear(nn.Linear):
         *,
         strategy: LinearStrategy,
     ) -> "LowPrecisionLinear":
-        """Create a no-allocation shell retaining the source Parameters."""
+        """Create a shell retaining the source Parameters and training mode.
 
+        Args:
+            linear: Source Linear whose weight and optional bias are reused.
+            strategy: Low-precision compute strategy bound to the replacement.
+
+        Returns:
+            A new module sharing the source Parameters without reinitializing them.
+        """
         cls._validate_strategy(strategy)
         # object.__new__ is a static method; passing cls explicitly avoids the
         # allocation and initialization performed by nn.Linear.__init__.
         converted = cls.__new__(cls)  # pylint: disable=no-value-for-parameter
-        nn.Module.__init__(converted)  # pylint: disable=unnecessary-dunder-call
-        converted.in_features = linear.in_features
-        converted.out_features = linear.out_features
-        converted.register_parameter("weight", linear.weight)
-        converted.register_parameter("bias", linear.bias)
+        _adopt_linear_parameters(converted, linear)
         converted.strategy = strategy
         converted.training = linear.training
         return converted
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Apply the selected low-precision compute and high-precision bias."""
-
         output = _LinearFunction.apply(input, self.weight, self.strategy)
         if self.bias is not None:
             output = output + self.bias
         return output
 
 
-__all__ = ["LowPrecisionLinear"]
+__all__ = ["Linear", "LowPrecisionLinear"]

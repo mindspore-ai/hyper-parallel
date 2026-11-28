@@ -25,7 +25,7 @@ from torch.nn import functional
 
 from hyper_parallel.components.modules.common.spatial_merge_projector import SpatialMergeProjectorModule
 from hyper_parallel.components.modules.common.rms_norm import NativeRMSNormModule
-from hyper_parallel.components.modules.swiglu_mlp_family import W1W2SwiGLUMLPModule
+from hyper_parallel.components.modules.mlp import W1W2SwiGLUMLPModule
 
 
 def _vision_cos_sin(

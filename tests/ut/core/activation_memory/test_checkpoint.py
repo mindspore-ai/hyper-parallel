@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, call, patch, sentinel
 
 import torch
 
+from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.activation_memory.checkpoint import (
     CheckpointError,
@@ -139,15 +140,46 @@ class TestCheckpointHelpers(_CheckpointTestCase):
         device_module.get_rng_state.assert_called_once_with()
         device_module.set_rng_state.assert_called_once_with(sentinel.rng_state)
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
     def test_disabled_autocast_does_not_initialize_accelerator(self):
-        """Inactive accelerator autocast must not probe a device backend."""
+        """Feature: Checkpoint recomputation autocast context fast path.
+        Description: Build the recompute autocast context from a saved "disabled" state while the
+            ambient autocast state is also disabled.
+        Expectation: A null context is returned without entering torch.amp.autocast, so no device
+            backend setup is triggered.
+        """
         disabled = {"enabled": False, "dtype": torch.float16, "cache_enabled": True}
 
-        with patch.object(_checkpoint.torch.amp, "autocast") as autocast:
+        with patch.object(_checkpoint.torch, "is_autocast_enabled", return_value=False), \
+                patch.object(_checkpoint.torch.amp, "autocast") as autocast:
             context = _checkpoint._autocast_context("npu", disabled)
 
         self.assertIsInstance(context, contextlib.nullcontext)
         autocast.assert_not_called()
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_disabled_autocast_is_restored_inside_ambient_autocast(self):
+        """Feature: Checkpoint recomputation autocast state restoration.
+        Description: Build the recompute autocast context from a saved "disabled" state while the
+            ambient autocast state (the backward pass's own AMP region) is enabled.
+        Expectation: The replay explicitly enters autocast(enabled=False) with the saved options
+            instead of inheriting the ambient state, so recomputed tensors keep the forward dtype.
+        """
+        disabled = {"enabled": False, "dtype": torch.float16, "cache_enabled": True}
+        expected = contextlib.nullcontext()
+
+        with patch.object(_checkpoint.torch, "is_autocast_enabled", return_value=True), \
+                patch.object(_checkpoint.torch.amp, "autocast", return_value=expected) as autocast:
+            context = _checkpoint._autocast_context("cuda", disabled)
+
+        self.assertIs(context, expected)
+        autocast.assert_called_once_with(device_type="cuda", **disabled)
 
     def test_enabled_autocast_preserves_device_options(self):
         """Active accelerator autocast should pass through the captured options."""

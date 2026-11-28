@@ -49,6 +49,20 @@ high_availability:
 
 `enable` defaults to `false`. When `controller_ip` is set, `controller_port` defaults to `8000`. This mode requires the Controller on rank 0 to remain available during recovery.
 
+`high_availability.worker_recovery.mirror_metadata` defaults to `true`. Set it to `false` only when full
+replicas can also share RNG, data-loader/generator state, model buffers and module extra state. This skips
+per-step metadata communication, serialization and metadata H2D transfers. Local committed metadata remains
+as independent CPU snapshots; committed model buffers stay on their original device. Rollback reads these
+snapshots directly, and serialization/H2D occurs only when a repair header must be sent. During repair, the donor sends
+its own exact-step snapshot instead of a mirrored snapshot belonging to the failed rank. Parameters and
+optimizer tensors still come from the live donor. Replicated weights alone do not imply interchangeable
+training metadata; disabling this option with rank-specific data or RNG can change training results.
+
+Capture creates independent training/extra-state snapshots and transfers their ownership to the metadata
+bank without another deep copy. Decoded repair snapshots use the same ownership path. Metadata reads only
+create outer dictionaries and borrow the nested snapshot data read-only. Serialization does not require
+another copy; restore adapters isolate values at their load boundaries before handing them to mutable consumers.
+
 #### Controller Hosted by TaskD
 
 ```yaml

@@ -25,7 +25,7 @@ from hyper_parallel.components.quantization.functional.hifloat8_linear_func impo
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
 from hyper_parallel.components.quantization.functional.w4a8_gmm_func import W4A8GroupedLinear
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.modules.linear import LowPrecisionLinear
 from hyper_parallel.components.quantization.quantizers.hifloat8 import HiFloat8Quantizer
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 from hyper_parallel.components.quantization.tensor.mxfp8_tensor import MXFP8Tensor
@@ -181,7 +181,7 @@ class TestLowPrecisionRecovery(unittest.TestCase):
                         with torch.no_grad():
                             for name, tensor in donor_state.tensor_items():
                                 destination[name].copy_(tensor)
-                        target_state.restore_rank_state(rank_state["buffers"], rank_state["extra"])
+                        target_state.restore_model_state(rank_state["buffers"], rank_state["extra"])
                         self._step(donor, donor_optimizer, value)
                         self._step(target, target_optimizer, value)
                         destination = dict(target_state.tensor_items())

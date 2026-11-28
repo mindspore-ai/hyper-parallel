@@ -15,7 +15,7 @@
 """Megatron-aligned fp32 main-parameter optimizer composition."""
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -149,6 +149,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         self.fp32_from_float16_groups: list[list[nn.Parameter]] = []
         self.fp32_from_fp32_groups: list[list[nn.Parameter]] = []
         self.model_param_by_optimizer_param: dict[nn.Parameter, nn.Parameter] = {}
+        self.optimizer_param_by_model_param: dict[nn.Parameter, nn.Parameter] = {}
+        self._main_param_by_fqn: dict[str, nn.Parameter] = {}
+        if optimizer.parameter_views is not None:
+            return
         self._build_model_and_main_param_groups()
         self.optimizer_param_by_model_param = {
             model_param: optimizer_param
@@ -166,6 +170,26 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             parameter_names[model_param]: optimizer_param
             for optimizer_param, model_param in self.model_param_by_optimizer_param.items()
         }
+
+    def bind_parameter_layouts(self, layouts: Optional[dict]) -> None:
+        """Create main weights once from final local shards, preserving scheduler groups.
+
+        Args:
+            layouts: Final logical layouts and valid local shapes from the compiler.
+        """
+        views = self.optimizer.parameter_views
+        if views is None:
+            return
+        already_bound = views.bound
+        views.bind(self.optimizer, layouts, fp32_main_params=True)
+        if already_bound:
+            return
+        self.model_param_by_optimizer_param = self.optimizer.model_param_by_optimizer_param
+        self.optimizer_param_by_model_param = self.optimizer.optimizer_param_by_model_param
+        owned = [binding for binding in views.bindings if binding.owns_storage]
+        self.float16_groups.append([binding.local_view(binding.model.detach()) for binding in owned])
+        self.fp32_from_float16_groups.append([binding.optimizer for binding in owned])
+        self._main_param_by_fqn = {binding.model.model_name: binding.optimizer for binding in owned}
 
     def _build_model_and_main_param_groups(self) -> None:
         """Build Megatron-compatible model and main-parameter group views."""
@@ -263,7 +287,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def prepare_grads(self) -> None:
         """Make fp32 main gradients ready for AdamW/Muon."""
-        self._copy_model_grads_to_main_grads()
+        if self.optimizer.parameter_views is None:
+            self._copy_model_grads_to_main_grads()
+        else:
+            self.optimizer.parameter_views.prepare_grads()
 
     def step_with_ready_grads(self, closure: Any = None) -> Any:
         """Update main params, then copy them back to model params.
@@ -274,7 +301,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         Returns:
             The inner optimizer step result.
         """
-        loss = self.optimizer.step(closure=closure)
+        if self.optimizer.parameter_views is None:
+            loss = self.optimizer.step(closure=closure)
+        else:
+            loss = self.optimizer.step_with_ready_grads(closure=closure)
         self._copy_main_params_to_model_params()
         return loss
 
@@ -292,6 +322,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def reload_model_params(self) -> None:
         """Initialize main params from the current model parameter values."""
+        views = self.optimizer.parameter_views
+        if views is not None and not views.bound:
+            # Binding will create main weights from the loaded model shards.
+            return
         self._copy_model_params_to_main_params()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -301,6 +335,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             set_to_none: Whether inner gradients are reset to ``None``.
         """
         self.optimizer.zero_grad(set_to_none=set_to_none)
+        if self.optimizer.parameter_views is not None:
+            return
         for model_param in self.optimizer_param_by_model_param:
             model_param.grad = None
             model_param.main_grad = None

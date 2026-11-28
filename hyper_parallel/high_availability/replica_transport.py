@@ -15,18 +15,15 @@
 """Direct device tensor repair; only rank-owned metadata is mirrored during training."""
 
 import io
-import threading
-from collections import OrderedDict
 from datetime import timedelta
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.high_availability.recovery_state import clone_metadata
+from hyper_parallel.high_availability.recovery_state import local_tensor
 
 _TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
-_RETAINED_VERSIONS = 2
 _METADATA_TIMEOUT_SECONDS = 10
 
 
@@ -37,8 +34,9 @@ def serialize_metadata(value: Any) -> bytes:
     return stream.getvalue()
 
 
-def deserialize_metadata(payload: bytes) -> Any:
-    """Decode small metadata received from a trusted training peer."""
+def deserialize_metadata(encoded_metadata: torch.Tensor) -> Any:
+    """Decode a serialized byte tensor from a trusted peer into CPU metadata."""
+    payload = encoded_metadata.cpu().numpy().tobytes()
     return torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
 
 
@@ -48,86 +46,79 @@ def metadata_to_device(value: Any, device: torch.device) -> torch.Tensor:
 
 
 class DeviceMetadataBank:
-    """Mirror rank-specific device metadata and keep donor providers local until repair."""
+    """Retain one committed metadata and buffer snapshot per rank for the live weights."""
 
     def __init__(self, rank: int, device: torch.device) -> None:
-        """Bind this rank's device and allocate a bounded metadata version ring."""
-        self.rank, self.device = rank, device
-        self._rank_versions = {}
-        self._replica_versions = OrderedDict()
-        self._lock = threading.RLock()
+        """Keep local metadata unencoded alongside CPU buffer snapshots."""
+        self.rank = rank
+        self.device = device
+        self._rank_snapshots = {}
+        self._replica_snapshot = None
 
-    def put(self, step: int, metadata: Any, buffers: dict[str, torch.Tensor]) -> None:
-        """Separate local replica providers from mirrored rank state and device buffers.
+    def put_snapshot(self, step: int, rank_metadata: dict[str, Any], replica_state: dict[str, Any]) -> None:
+        """Take ownership of an independent snapshot without copying it again.
 
         Args:
             step: Committed training step represented by this snapshot.
-            metadata: Training snapshot including replica_state and module extra state.
-            buffers: Rank-owned buffer snapshots on the worker device.
+            rank_metadata: Independently captured or decoded rank metadata including CPU
+                buffer snapshots. The caller must not mutate snapshot values after this call.
+            replica_state: Independent same-step state shared by full replicas, no longer
+                mutated by the caller after this call.
         """
-        for value in buffers.values():
-            if value.device != self.device:
-                raise ValueError("recovery buffers must reside on the worker device")
-        state = metadata["state"]
-        with self._lock:
-            self._replica_versions[step] = clone_metadata(state["replica_state"])
-            self._replica_versions.move_to_end(step)
-            while len(self._replica_versions) > _RETAINED_VERSIONS:
-                self._replica_versions.popitem(last=False)
-        metadata = {**metadata, "state": {"rank_state": state["rank_state"]}}
-        self.install(self.rank, step, metadata_to_device(metadata, self.device), buffers)
+        self.store_rank_snapshot(self.rank, step, rank_metadata)
+        self._replica_snapshot = {"step": step, "state": replica_state}
 
-    def install(self, owner: int, step: int, payload: torch.Tensor, buffers: dict[str, torch.Tensor]) -> None:
-        """Install device buffers without retaining a CPU checkpoint."""
-        with self._lock:
-            slots = self._rank_versions.setdefault(owner, OrderedDict())
-            slots[step] = {"owner": owner, "step": step, "payload": payload, "buffers": buffers}
-            slots.move_to_end(step)
-            while len(slots) > _RETAINED_VERSIONS:
-                slots.popitem(last=False)
+    def store_rank_snapshot(
+        self,
+        owner: int,
+        step: int,
+        rank_metadata: dict[str, Any],
+    ) -> None:
+        """Replace rank metadata with owned metadata and CPU buffer snapshots."""
+        self._rank_snapshots[owner] = {
+            "step": step,
+            "rank_metadata": rank_metadata,
+        }
 
-    def get(self, owner: int, step: int) -> dict[str, Any]:
-        """Require exact target-rank metadata; a donor's own RNG is not interchangeable."""
-        with self._lock:
-            if step not in self._rank_versions.get(owner, {}):
-                raise RuntimeError(f"exact training metadata unavailable: owner={owner}, step={step}")
-            return self._rank_versions[owner][step]
+    def get_rank_metadata(self, owner: int, step: int) -> dict[str, Any]:
+        """Return rank metadata only when the stored snapshot matches the exact owner and step."""
+        rank_snapshot = self._rank_snapshots.get(owner)
+        if rank_snapshot is None or rank_snapshot["step"] != step:
+            raise RuntimeError(f"exact training metadata unavailable: owner={owner}, step={step}")
+        return rank_snapshot["rank_metadata"]
 
-    def tensors(self) -> list[torch.Tensor]:
-        """List retained device allocations for torch-npu safety recovery."""
-        with self._lock:
-            return [value for slots in self._rank_versions.values() for entry in slots.values()
-                    for value in [entry["payload"], *entry["buffers"].values()]]
-
-    def metadata(self, owner: int, step: int) -> dict[str, Any]:
-        """Combine target-rank state with the donor's exact-step replica providers.
+    def get_replica_state(self, step: int) -> dict[str, Any]:
+        """Return the local replica-provider snapshot for the exact committed step.
 
         Args:
-            owner: Logical rank whose rank-specific state is required.
-            step: Exact committed step required for every restored state component.
+            step: Exact committed step required for the replica providers.
 
         Returns:
-            Decoded rank state combined with the local replica-provider snapshot.
+            Read-only replica state. Restore adapters copy at load boundaries.
         """
-        entry = self.get(owner, step)
-        metadata = deserialize_metadata(entry["payload"].cpu().numpy().tobytes())
-        with self._lock:
-            if step not in self._replica_versions:
-                raise RuntimeError(f"exact replica provider metadata unavailable: step={step}")
-            metadata["state"]["replica_state"] = clone_metadata(self._replica_versions[step])
-        return metadata
+        if self._replica_snapshot is None or self._replica_snapshot["step"] != step:
+            raise RuntimeError(f"exact replica provider metadata unavailable: step={step}")
+        return self._replica_snapshot["state"]
 
 
 class ReplicaTransport:
     """Send the donor's live device model/main/moment tensors directly over HCCL."""
 
-    def __init__(self, group: Any, bank: DeviceMetadataBank, state: Any, device: torch.device) -> None:
+    def __init__(
+        self,
+        group: Any,
+        bank: DeviceMetadataBank,
+        state: Any,
+        device: torch.device,
+        mirror_metadata: bool = True,
+    ) -> None:
         """Bind the exact replica collective group and persistent live device state."""
         self.group = group
         self.metadata_bank = bank
         self.state = state
         self.device = device
         self.ranks = tuple(dist.get_process_group_ranks(group))
+        self._mirror_metadata = mirror_metadata
 
     @staticmethod
     def _wait(work: Any) -> None:
@@ -142,28 +133,35 @@ class ReplicaTransport:
         Args:
             step: Exact committed step whose rank metadata must be mirrored.
         """
-        entry = self.metadata_bank.get(self.metadata_bank.rank, step)
-        size = torch.tensor([entry["payload"].numel()], dtype=torch.int64, device=self.device)
+        if not self._mirror_metadata:
+            return
+        rank_metadata = self.metadata_bank.get_rank_metadata(self.metadata_bank.rank, step)
+        training_metadata = {name: value for name, value in rank_metadata.items() if name != "buffers"}
+        encoded_metadata = metadata_to_device(training_metadata, self.device)
+        size = torch.tensor([encoded_metadata.numel()], dtype=torch.int64, device=self.device)
         sizes = [torch.empty_like(size) for _ in self.ranks]
         self._wait(dist.all_gather(sizes, size, group=self.group, async_op=True))
         lengths = [int(value.item()) for value in sizes]
-        payload = entry["payload"]
-        if payload.numel() < max(lengths):
+        if encoded_metadata.numel() < max(lengths):
             padded = torch.empty(max(lengths), dtype=torch.uint8, device=self.device)
-            padded[:payload.numel()].copy_(payload)
-            padded[payload.numel():].zero_()
-            payload = padded
-        payloads = [torch.empty_like(payload) for _ in self.ranks]
-        self._wait(dist.all_gather(payloads, payload, group=self.group, async_op=True))
+            padded[:encoded_metadata.numel()].copy_(encoded_metadata)
+            padded[encoded_metadata.numel():].zero_()
+            encoded_metadata = padded
+        gathered_metadata = [torch.empty_like(encoded_metadata) for _ in self.ranks]
+        self._wait(dist.all_gather(gathered_metadata, encoded_metadata, group=self.group, async_op=True))
         buffers = [{} for _ in self.ranks]
-        for name, tensor in sorted(entry["buffers"].items()):
-            values = [torch.empty_like(tensor) for _ in self.ranks]
-            self._wait(dist.all_gather(values, tensor.contiguous(), group=self.group, async_op=True))
-            for saved, value in zip(buffers, values):
-                saved[name] = value
-        for owner, length, value, saved in zip(self.ranks, lengths, payloads, buffers):
+        for name, tensor in rank_metadata["buffers"].items():
+            communication_tensor = tensor.to(device=self.device).contiguous()
+            values = [torch.empty_like(communication_tensor) for _ in self.ranks]
+            self._wait(dist.all_gather(values, communication_tensor, group=self.group, async_op=True))
+            for owner, saved, value in zip(self.ranks, buffers, values):
+                if owner != self.metadata_bank.rank:
+                    saved[name] = value.cpu()
+        for owner, length, value, saved in zip(self.ranks, lengths, gathered_metadata, buffers):
             if owner != self.metadata_bank.rank:
-                self.metadata_bank.install(owner, step, value[:length], saved)
+                peer_metadata = deserialize_metadata(value[:length])
+                peer_metadata["buffers"] = saved
+                self.metadata_bank.store_rank_snapshot(owner, step, peer_metadata)
         self._wait(dist.barrier(group=self.group, async_op=True))
 
     def _send_tensor(self, tensor: torch.Tensor, destination: int, group: Any = None) -> None:
@@ -205,16 +203,28 @@ class ReplicaTransport:
         """
         if destination not in self.ranks or destination == self.metadata_bank.rank:
             raise ValueError("destination is not an equivalent device replica")
-        entry = self.metadata_bank.get(destination, step)
-        header = {"optimizer": self.state.metadata(), "training": self.metadata_bank.metadata(destination, step),
-                  "owner": destination, "step": step}
-        payload = metadata_to_device(header, self.device)
-        dist.send(torch.tensor([payload.numel()], dtype=torch.int64, device=self.device),
+        owner = destination if self._mirror_metadata else self.metadata_bank.rank
+        rank_metadata = self.metadata_bank.get_rank_metadata(owner, step)
+        training_metadata = {
+            "state": {
+                "rank_state": rank_metadata["rank_state"],
+                "replica_state": self.metadata_bank.get_replica_state(step),
+            },
+            "extra": rank_metadata["extra"],
+        }
+        header = {
+            "optimizer": self.state.metadata(),
+            "training": training_metadata,
+            "owner": destination,
+            "step": step
+        }
+        encoded_metadata = metadata_to_device(header, self.device)
+        dist.send(torch.tensor([encoded_metadata.numel()], dtype=torch.int64, device=self.device),
                   dst=destination, group=group)
-        self._send_tensor(payload, destination, group)
+        self._send_tensor(encoded_metadata, destination, group)
         for _, tensor in self.state.tensor_items():
             self._send_tensor(tensor, destination, group)
-        for _, tensor in sorted(entry["buffers"].items()):
+        for tensor in rank_metadata["buffers"].values():
             self._send_tensor(tensor, destination, group)
 
     def receive(self, source: int, step: int, group: Any = None) -> None:
@@ -231,15 +241,25 @@ class ReplicaTransport:
         dist.recv(length, src=source, group=group)
         if length.item() <= 0:
             raise RuntimeError("empty device repair header")
-        payload = torch.empty(int(length.item()), dtype=torch.uint8, device=self.device)
-        self._receive_tensor(payload, source, group)
-        header = deserialize_metadata(payload.cpu().numpy().tobytes())
+        encoded_metadata = torch.empty(int(length.item()), dtype=torch.uint8, device=self.device)
+        self._receive_tensor(encoded_metadata, source, group)
+        header = deserialize_metadata(encoded_metadata)
         if header["owner"] != self.metadata_bank.rank or header["step"] != step:
             raise RuntimeError("repair metadata belongs to another logical rank or step")
         self.state.prepare_receive(header["optimizer"])
         for _, tensor in self.state.tensor_items():
             self._receive_tensor(tensor, source, group)
-        buffers = {name: torch.empty_like(tensor) for name, tensor in self.state.buffers.items()}
-        for _, tensor in sorted(buffers.items()):
+        buffers = {
+            name: torch.empty_like(local_tensor(buffer), device="cpu")
+            for name, buffer in self.state.buffers.items()
+        }
+        for tensor in buffers.values():
             self._receive_tensor(tensor, source, group)
-        self.metadata_bank.put(step, header["training"], buffers)
+        training_metadata = header["training"]
+        training_state = training_metadata["state"]
+        rank_metadata = {
+            "rank_state": training_state["rank_state"],
+            "extra": training_metadata["extra"],
+            "buffers": buffers,
+        }
+        self.metadata_bank.put_snapshot(step, rank_metadata, training_state["replica_state"])

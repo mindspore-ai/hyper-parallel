@@ -23,6 +23,7 @@ import torch
 
 from hyper_multicore.modules.mega_gate import function as gate_function
 
+from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import (
     DeepseekV41MegaGate,
 )
@@ -30,27 +31,43 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
     _initialize_v41_owned_module,
 )
+from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
+from hyper_parallel.models.replacement import (
+    ModuleReplacementSpec,
+    apply_module_replacements,
+    compile_module_replacements,
+)
+from tests.common.mark_utils import arg_mark
 
 
-def _config(vision: bool, scoring: str = "sqrtsoftplus") -> SimpleNamespace:
+def _config(vision: bool, scoring: str = "sqrtsoftplus", initializer_range: float = 0.02) -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=128, num_local_experts=16, num_experts_per_tok=6,
         scoring_func=scoring, routed_scaling_factor=1.5, v41_vision_enabled=vision,
-        initializer_range=0.02, router_aux_loss_coef=0.1, router_bias_update_rate=0.01,
+        initializer_range=initializer_range, router_aux_loss_coef=0.1, router_bias_update_rate=0.01,
     )
 
 
 def _replace(router: DeepseekV41TopKRouter) -> DeepseekV41MegaGate:
-    return DeepseekV41MegaGate(
-        module=router, module_fqn="model.layers.0.mlp.gate", context={},
-    )
+    model = torch.nn.Module()
+    model.gate = router
+    plan = compile_module_replacements(model, [ModuleReplacementSpec(
+        match=("gate",), factory=DeepseekV41MegaGate,
+    )])
+    apply_module_replacements(model, plan)
+    return model.gate
 
 
 class TestMegaGateReplacement(unittest.TestCase):
     """Preserve model state and construction semantics across replacement."""
 
-    def test_replacement_preserves_router_state(self):
-        """Reuse source parameters without loading native code or changing RNG state."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_replacement_preserves_router_state(self) -> None:
+        """Feature: MegaGate replacement state adoption.
+
+        Description: Replace text and visual routers through the module replacement pipeline.
+        Expectation: Parameters, buffers, training state and RNG remain unchanged without native loading.
+        """
         for vision in (False, True):
             with self.subTest(vision=vision):
                 router = DeepseekV41TopKRouter(_config(vision)).eval()
@@ -70,24 +87,50 @@ class TestMegaGateReplacement(unittest.TestCase):
                 self.assertEqual(set(gate.state_dict()), set(router.state_dict()))
                 torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
 
-    def test_replacement_supports_meta_initialization(self):
-        """Materialize and initialize all parameters owned by a visual router."""
-        with torch.device("meta"):
-            gate = _replace(DeepseekV41TopKRouter(_config(vision=True)))
-        self.assertTrue(all(parameter.is_meta for parameter in gate.parameters()))
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_replacement_supports_meta_initialization(self) -> None:
+        """Feature: MegaGate meta initialization.
 
-        gate.to_empty(device="cpu")
-        with torch.no_grad():
-            _initialize_v41_owned_module(gate, 0.035)
+        Description: Replace and materialize text and visual routers with a configured initialization scale.
+        Expectation: Weights use the requested scale, biases are zero and transient statistics are rebuilt.
+        """
+        std = 0.035
+        for vision in (False, True):
+            with self.subTest(vision=vision):
+                with torch.device("meta"):
+                    gate = _replace(DeepseekV41TopKRouter(_config(vision, initializer_range=std)))
+                self.assertTrue(all(parameter.is_meta for parameter in gate.parameters()))
+                self.assertTrue(getattr(gate, "_hp_reset_after_materialization", False))
+                self.assertEqual(gate.initializer_range, std)
 
-        self.assertTrue(torch.isfinite(gate.weight).all())
-        self.assertGreater(gate.weight.std().item(), 0.02)
-        self.assertEqual(torch.count_nonzero(gate.bias).item(), 0)
-        self.assertEqual(torch.count_nonzero(gate.bias_vl).item(), 0)
-        torch.testing.assert_close(gate.tokens_per_expert, torch.zeros(2, 16, dtype=torch.long))
+                gate.to_empty(device="cpu")
+                # Leave sentinel values for the replacement's own reset to overwrite.
+                with torch.no_grad(), patch.object(gate, "initialize_weights", return_value=None, create=True):
+                    for parameter in gate.parameters():
+                        parameter.fill_(float("nan"))
+                    gate.tokens_per_expert.fill_(7)
+                    _initialize_model_weights(gate)
+                rebuild_materialized_state(gate, MaterializationContext(
+                    reason="random_init", device=torch.device("cpu"),
+                ))
 
-    def test_cpu_fallback_matches_router(self):
-        """Match the real router for every fallback score function and mask contract."""
+                self.assertTrue(torch.isfinite(gate.weight).all())
+                self.assertAlmostEqual(gate.weight.std().item(), std, delta=std * 0.1)
+                self.assertEqual(torch.count_nonzero(gate.bias).item(), 0)
+                if vision:
+                    self.assertEqual(torch.count_nonzero(gate.bias_vl).item(), 0)
+                else:
+                    self.assertIsNone(gate.bias_vl)
+                torch.testing.assert_close(gate.tokens_per_expert, torch.zeros(2, 16, dtype=torch.long))
+                self.assertNotIn("tokens_per_expert", gate.state_dict())
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_cpu_fallback_matches_router(self) -> None:
+        """Feature: MegaGate CPU fallback parity.
+
+        Description: Compare routing scores, masks, gradients and bias updates against the source router.
+        Expectation: All supported score functions preserve outputs, gradients and routing statistics.
+        """
         mask = torch.arange(14).reshape(2, 7).remainder(3) == 0
         token_mask = torch.arange(14).reshape(2, 7).remainder(5) != 0
         sequence_ids = torch.tensor([

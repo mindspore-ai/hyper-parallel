@@ -313,6 +313,8 @@ class Muon(BaseDistributedOptimizer):
             self._build_param_shard_metadata()
         if self.hsdp_replica_count is None:
             self.hsdp_replica_count = self._auto_deduce_replica_count()
+        # Retain the original cache if graph binding has to roll back.
+        self._split_sub_pg_cache = self._split_sub_pg_cache.copy()
         self._split_replicate_groups()
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
@@ -524,6 +526,53 @@ class Muon(BaseDistributedOptimizer):
             self.shard_assignments_by_group[group_idx] = shard_hsdp_assignments
             self.shard_params_by_group[group_idx] = shard_params
 
+    @staticmethod
+    def _update_muon_momentum_foreach(
+            grads: List[torch.Tensor],
+            bufs: List[torch.Tensor],
+            momentum1: float,
+            momentum2: float,
+            nesterov: bool,
+            mode: str,
+    ) -> List[torch.Tensor]:
+        """Apply the built-in momentum formula in homogeneous foreach regions."""
+        if mode not in ("vanilla", "legacy"):
+            raise ValueError(
+                "Muon._update_muon_momentum_mode must be 'vanilla' or 'legacy', "
+                f"got {mode!r}"
+            )
+
+        # NPU mixed-dtype foreach may round BF16 differently from homogeneous
+        # calls. Swap and HSDP can change list boundaries, so keep each foreach
+        # region homogeneous while preserving the original parameter order.
+        foreach_groups = defaultdict(list)
+        for index, (grad, buffer) in enumerate(zip(grads, bufs)):
+            key = (grad.device, grad.dtype, buffer.device, buffer.dtype)
+            foreach_groups[key].append(index)
+
+        local_us = list(grads)
+        # PyTorch exposes foreach operators only through underscore-prefixed APIs.
+        # pylint: disable=protected-access
+        for indices in foreach_groups.values():
+            grouped_grads = [grads[index] for index in indices]
+            grouped_bufs = [bufs[index] for index in indices]
+            if mode == "vanilla":
+                # Match vanilla Muon while folding Nesterov into one lerp.
+                update_momentum = momentum1 ** 2 if nesterov else momentum1
+                grouped_us = torch._foreach_lerp(grouped_grads, grouped_bufs, weight=update_momentum)
+                torch._foreach_lerp_(grouped_bufs, grouped_grads, weight=1 - momentum2)
+            else:
+                grouped_us = torch._foreach_add(grouped_grads, grouped_bufs, alpha=momentum1)
+                torch._foreach_mul_(grouped_bufs, momentum2)
+                torch._foreach_add_(grouped_bufs, grouped_grads)
+                if nesterov:
+                    torch._foreach_mul_(grouped_us, momentum1)
+                    torch._foreach_add_(grouped_us, grouped_grads)
+            for index, update in zip(indices, grouped_us):
+                local_us[index] = update
+        # pylint: enable=protected-access
+        return local_us
+
     def _update_muon_momentum(
             self,
             group: Dict[str, Any],
@@ -566,36 +615,19 @@ class Muon(BaseDistributedOptimizer):
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
-        if self._update_muon_momentum_mode == "vanilla":
-            # Match vanilla implementation in Muon paper & PyTorch implementation:
-            # m_for_update = (1 - momentum1) * grad + momentum1 * m_old
-            # m_new = (1 - momentum2) * grad + momentum2 * m_old
-            # Fold the Nesterov interpolation into one lerp with momentum1 squared.
-            # pylint: disable=protected-access
-            update_momentum = momentum1 ** 2 if group["nesterov"] else momentum1
-            local_us = torch._foreach_lerp(grads, bufs, weight=update_momentum)
-            torch._foreach_lerp_(bufs, grads, weight=1 - momentum2)
-        elif self._update_muon_momentum_mode == "legacy":
-            # Match muon_update_core():
-            # m_for_update = grad + momentum1 * m_old
-            # m_new = grad + momentum2 * m_old
-            # pylint: disable=protected-access
-            local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
+        local_us = self._update_muon_momentum_foreach(
+            grads,
+            bufs,
+            momentum1,
+            momentum2,
+            group["nesterov"],
+            self._update_muon_momentum_mode,
+        )
 
-            torch._foreach_mul_(bufs, momentum2)
-            torch._foreach_add_(bufs, grads)
-
-            if group["nesterov"]:
-                torch._foreach_mul_(local_us, momentum1)
-                torch._foreach_add_(local_us, grads)
-        else:
-            raise ValueError(
-                "Muon._update_muon_momentum_mode must be 'vanilla' or 'legacy', "
-                f"got {self._update_muon_momentum_mode!r}"
-            )
-
-        if local_us[0].dtype != torch.bfloat16:
-            local_us = [update.to(torch.bfloat16) for update in local_us]
+        local_us = [
+            update if update.dtype == torch.bfloat16 else update.to(torch.bfloat16)
+            for update in local_us
+        ]
 
         param_updates = dict(zip(valid_params, local_us))
         return param_updates

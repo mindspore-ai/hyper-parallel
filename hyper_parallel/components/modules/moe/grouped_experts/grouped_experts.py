@@ -31,7 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import Transpose, We
 from hyper_parallel.components.functional import grouped_matmul, swiglu as npu_swiglu
 from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
 from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
-from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation
+from hyper_parallel.components.modules.mlp import swiglu_activation
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
 

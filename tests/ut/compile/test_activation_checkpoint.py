@@ -58,10 +58,11 @@ from hyper_parallel.compile.tracer.graph_tracer import (
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
-from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.trainer.config.parallelism import (
     ActivationCheckpointConfig,
     FullCheckpointConfig,
+    FullExcludeRegionConfig,
+    SelectiveCheckpointConfig,
 )
 
 _DIST_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass.dist"
@@ -195,6 +196,30 @@ def _forward_policy(graph_module, name: str):
     return None
 
 
+def _forward_policies_under(graph_module, fqn: str) -> list:
+    """Return the recompute policies of forward nodes under module ``fqn``."""
+    policies = []
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function" or node.meta.get("autograd_backward", False):
+            continue
+        stack = [
+            value for value, _ in (node.meta.get("nn_module_stack") or {}).values()
+        ]
+        if any(value == fqn or value.startswith(f"{fqn}.") for value in stack):
+            policies.append(node.meta.get("recompute"))
+    return policies
+
+
+def _selective_config(module_paths) -> PassConfig:
+    """Build an eager-aligned selective config targeting whole block modules."""
+    return PassConfig(
+        ac_mode="selective",
+        ac_selective_recompute_modules=list(module_paths),
+        enable_overlap=False,
+        fsdp_enabled=False,
+    )
+
+
 def _eager_reference(model: nn.Module, x: torch.Tensor, y: torch.Tensor):
     """Compute the eager loss and gradients from a fresh copy of ``model``."""
     reference = copy.deepcopy(model)
@@ -281,23 +306,38 @@ class TestTagging(unittest.TestCase):
                         f"node {node.name} outside the blocks must not be tagged",
                     )
 
-    def test_selective_mode_saves_compute_intensive_ops(self):
-        """``selective`` saves the shared op set; the rest prefers recompute."""
-        config = PassConfig(
-            ac_mode="selective", enable_overlap=False, fsdp_enabled=False
-        )
+    def test_selective_mode_recomputes_only_declared_targets(self):
+        """``selective`` recomputes the declared block targets and saves the rest."""
+        config = _selective_config(["layers.0"])
         joint, _ = _run_ac(self.model, config)
         gm = joint.graph_module
 
-        self.assertEqual(
-            _forward_policy(gm, "addmm"),
-            CheckpointPolicy.MUST_SAVE,
-            "matmuls are in the shared must-save operator set",
+        inner = _forward_policies_under(gm, "layers.0.fc1")
+        self.assertTrue(inner, "the target block must contribute forward nodes")
+        self.assertTrue(
+            all(policy == CheckpointPolicy.MUST_RECOMPUTE for policy in inner),
+            "interior nodes of the target block must be recompute candidates",
         )
+        for fqn in ("layers.1.fc1", "layers.1.fc2", "head"):
+            policies = _forward_policies_under(gm, fqn)
+            self.assertTrue(
+                all(policy is None for policy in policies),
+                f"non-target {fqn} must stay saved",
+            )
+
+    def test_selective_targets_resolve_to_module_fqns(self):
+        """Layer-relative and model-root selective targets resolve to FQNs."""
+        config = PassConfig(
+            ac_mode="selective",
+            ac_selective_recompute_regions=[("fc1", [0, 1])],
+            ac_selective_recompute_modules=["head"],
+            enable_overlap=False,
+            fsdp_enabled=False,
+        )
+        scope = prepare_activation_checkpoint(self.model, config)
         self.assertEqual(
-            _forward_policy(gm, "relu"),
-            CheckpointPolicy.PREFER_RECOMPUTE,
-            "pointwise ops prefer recompute under selective",
+            scope.region_fqns,
+            frozenset({"layers.0.fc1", "layers.1.fc1", "head"}),
         )
 
     def test_rng_op_is_saved_and_not_duplicated(self):
@@ -515,11 +555,12 @@ class TestRemat(unittest.TestCase):
     def test_numerics_match_eager(self):
         """Full and selective both reproduce eager loss and gradients."""
         ref_loss, ref_grads = _eager_reference(self.model, self.x, self.y)
-        for mode in ("full", "selective"):
-            with self.subTest(ac_mode=mode):
-                config = PassConfig(
-                    ac_mode=mode, enable_overlap=False, fsdp_enabled=False
-                )
+        configs = (
+            self.config,
+            _selective_config(["layers.0", "layers.1"]),
+        )
+        for config in configs:
+            with self.subTest(ac_mode=config.ac_mode):
                 joint, model = _run_ac(self.model, config)
                 loss, grads, _ = run_traced_graph(
                     joint, model, {"x": self.x, "y": self.y}
@@ -549,10 +590,7 @@ class TestRemat(unittest.TestCase):
     def test_duplicates_are_backward_tagged_and_selective_is_subset(self):
         """Duplicates are backward-tagged; selective duplicates fewer than full."""
         full_joint, _ = _run_ac(self.model, self.config)
-        selective_config = PassConfig(
-            ac_mode="selective", enable_overlap=False, fsdp_enabled=False
-        )
-        selective_joint, _ = _run_ac(self.model, selective_config)
+        selective_joint, _ = _run_ac(self.model, _selective_config(["layers.0"]))
         duplicates = _duplicates(full_joint.graph_module)
 
         self.assertTrue(duplicates, "full mode must duplicate recompute nodes")
@@ -567,13 +605,14 @@ class TestRemat(unittest.TestCase):
         torch.manual_seed(8)
         x = torch.randn(4, 8)
         y = torch.randn(4, 8)
-        for mode in ("full", "selective"):
-            with self.subTest(ac_mode=mode):
+        configs = (
+            PassConfig(ac_mode="full", enable_overlap=False, fsdp_enabled=False),
+            _selective_config(["layers.0"]),
+        )
+        for config in configs:
+            with self.subTest(ac_mode=config.ac_mode):
                 model = _AliasModel()
                 ref_loss, ref_grads = _eager_reference(model, x, y)
-                config = PassConfig(
-                    ac_mode=mode, enable_overlap=False, fsdp_enabled=False
-                )
                 joint = _trace(model, x, y)
                 ActivationCheckpointPass().run(
                     joint.graph_module, config, model=model
@@ -591,8 +630,11 @@ class TestRemat(unittest.TestCase):
         Expectation: Full and selective recompute preserve the original result.
         Feature: Static-graph activation checkpointing with aliased mutations.
         """
-        for mode in ("full", "selective"):
-            with self.subTest(ac_mode=mode):
+        for config in (
+            PassConfig(ac_mode="full"),
+            _selective_config(["layers.0"]),
+        ):
+            with self.subTest(ac_mode=config.ac_mode):
                 graph = torch.fx.Graph()
                 value = graph.placeholder("value")
                 buffer = graph.call_function(torch.ops.aten.zeros_like.default, args=(value,))
@@ -609,11 +651,10 @@ class TestRemat(unittest.TestCase):
                 inputs = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
                 expected = module(inputs)
                 scope = _CheckpointScope(
-                    region_fqns=frozenset({"layers.0"}), unit_fqns=frozenset({"layers.0"})
+                    region_fqns=frozenset({"layers.0"}),
+                    unit_fqns=frozenset({"layers.0"}),
                 )
-                ActivationCheckpointPass().run(
-                    module, PassConfig(ac_mode=mode), ac_scope=scope
-                )
+                ActivationCheckpointPass().run(module, config, ac_scope=scope)
                 torch.testing.assert_close(module(inputs), expected, rtol=0, atol=0)
 
 
@@ -687,7 +728,7 @@ class TestEdgeCases(unittest.TestCase):
         cls.y = torch.randn(4, 8)
 
     def test_zero_layer_count_is_a_noop(self):
-        """Zero selected layers no-ops, with or without adapter regions."""
+        """Zero selected layers no-ops."""
         config = PassConfig(
             ac_mode="full",
             ac_layer_count=0,
@@ -705,6 +746,13 @@ class TestEdgeCases(unittest.TestCase):
         self.assertTrue(torch.allclose(loss, ref_loss, atol=1e-10))
         for grad, ref_grad in zip(grads, ref_grads):
             self.assertTrue(torch.allclose(grad, ref_grad, atol=1e-10))
+
+    def test_selective_model_target_without_block_marker(self):
+        """Model-root selective targets do not need transformer-block discovery."""
+        model = _Model()
+        del model.gradient_checkpointing
+        joint, _ = _run_ac(model, _selective_config(["head"]))
+        self.assertTrue(_duplicates(joint.graph_module))
 
     def test_second_run_does_not_duplicate_duplicates(self):
         """Rerunning the pass does not nest recompute copies."""
@@ -786,8 +834,14 @@ class TestPassConfigValidation(unittest.TestCase):
             {"ac_layer_count": -1},
             {"ac_layer_indices": []},
             {"ac_layer_indices": [1, 1]},
-            {"ac_region_source": "bogus"},
-            {"ac_mode": "full", "ac_region_source": "model_adapter_safe_regions"},
+            {"ac_mode": "selective"},
+            {"ac_mode": "selective", "ac_selective_recompute_regions": [("fc1", [])]},
+            {"ac_selective_recompute_modules": ["head"]},
+            {
+                "ac_mode": "selective",
+                "ac_layer_count": 1,
+                "ac_selective_recompute_modules": ["head"],
+            },
         )
         for kwargs in invalid:
             with self.subTest(**kwargs), self.assertRaises(ValueError):
@@ -797,32 +851,38 @@ class TestPassConfigValidation(unittest.TestCase):
 class TestTrainerConfigProjection(unittest.TestCase):
     """The dynamic ``ActivationCheckpointConfig`` projects onto ``PassConfig``.
 
-    The configs are duck-typed stand-ins instead of the real dataclasses: the
-    projection accepts ``Any`` by design, and importing the trainer config
-    package eagerly pulls in optional model dependencies the compile UT suite
-    does not need.
+    ``full`` is a real ``FullCheckpointConfig`` so the projection exercises the
+    ``recompute_layer`` -> ``recompute_layers`` normalization. The top-level
+    object stays duck-typed because ``ActivationCheckpointConfig`` validates
+    mode-specific sections (and rejects ``mode=selective`` without a selective
+    block) that these projection tests deliberately leave out.
     """
 
     @staticmethod
     def _ac_config(
         mode: Any = "off",
         *,
-        source: str = "default",
-        layer_count: Any = None,
-        layer_indices: Any = None,
+        recompute_layer: Any = None,
+        exclude_region: Any = None,
         swap_inputs: bool = False,
         allow_cache_entry_mutation: bool = False,
+        selective: Any = None,
     ) -> Any:
         """Build the ``ActivationCheckpointConfig`` field surface."""
+        full = (
+            None
+            if recompute_layer is None
+            else FullCheckpointConfig(
+                recompute_layer=list(recompute_layer),
+                exclude_region=exclude_region,
+            )
+        )
         return SimpleNamespace(
             mode=mode,
+            full=full,
+            selective=selective,
             swap_inputs=swap_inputs,
             allow_cache_entry_mutation=allow_cache_entry_mutation,
-            selection=SimpleNamespace(
-                source=source,
-                layer_count=layer_count,
-                layer_indices=layer_indices,
-            ),
         )
 
     @staticmethod
@@ -834,7 +894,7 @@ class TestTrainerConfigProjection(unittest.TestCase):
         )
 
     def test_mode_and_selectors_project(self):
-        """Mode, safe-region selectors, defaults, and the missing section."""
+        """Mode, full-layer selectors, defaults, and the missing section."""
         config = build_pass_config_from_trainer_config(
             self._trainer_config(self._ac_config())
         )
@@ -844,20 +904,34 @@ class TestTrainerConfigProjection(unittest.TestCase):
             self._trainer_config(
                 self._ac_config(
                     mode="selective",
-                    source="model_adapter_safe_regions",
-                    layer_count=2,
+                    selective=SelectiveCheckpointConfig(recompute={"fc1": [0, 1]}),
                 )
             )
         )
-        self.assertEqual((config.ac_mode, config.ac_layer_count), ("selective", 2))
-        self.assertEqual(config.ac_region_source, "model_adapter_safe_regions")
+        self.assertEqual((config.ac_mode, config.ac_layer_count), ("selective", None))
         self.assertIsNone(config.ac_layer_indices)
+        self.assertEqual(
+            config.ac_selective_recompute_regions,
+            [("fc1", [0, 1])],
+        )
+        self.assertIsNone(config.ac_selective_recompute_modules)
+
+        config = build_pass_config_from_trainer_config(
+            self._trainer_config(self._ac_config(mode="full", recompute_layer=[0, 2]))
+        )
+        self.assertEqual(config.ac_mode, "full")
+        self.assertIsNone(config.ac_layer_count)
+        self.assertEqual(config.ac_layer_indices, [0, 2])
+
+        config = build_pass_config_from_trainer_config(
+            self._trainer_config(self._ac_config(mode="full", recompute_layer=["1-3"]))
+        )
+        self.assertEqual(config.ac_layer_indices, [1, 2, 3])
 
         config = build_pass_config_from_trainer_config(
             self._trainer_config(self._ac_config(mode="full"))
         )
         self.assertEqual(config.ac_mode, "full")
-        self.assertEqual(config.ac_region_source, "default")
         self.assertIsNone(config.ac_layer_count)
         self.assertIsNone(config.ac_layer_indices)
 
@@ -867,6 +941,86 @@ class TestTrainerConfigProjection(unittest.TestCase):
             )
         )
         self.assertEqual(config.ac_mode, "off")
+
+    def test_full_raw_recompute_layer_projects(self):
+        """A duck-typed full config may expose only the raw integer selector."""
+        config = build_pass_config_from_trainer_config(
+            self._trainer_config(
+                SimpleNamespace(
+                    mode="full",
+                    full=SimpleNamespace(recompute_layer=[0, 2]),
+                )
+            )
+        )
+        self.assertEqual(config.ac_layer_indices, [0, 2])
+
+    def test_full_raw_recompute_layer_ranges_are_rejected(self):
+        """Unnormalized ranges must not silently degrade to all layers."""
+        config = SimpleNamespace(
+            mode="full",
+            full=SimpleNamespace(recompute_layer=["1-3"]),
+        )
+        with self.assertRaisesRegex(ValueError, "recompute_layers is normalized"):
+            build_pass_config_from_trainer_config(self._trainer_config(config))
+
+    def test_hybrid_mode_is_rejected(self):
+        """Graph mode has no ``hybrid`` equivalent and fails loudly."""
+        trainer_config = self._trainer_config(
+            self._ac_config(mode="hybrid", recompute_layer=[0])
+        )
+        with self.assertRaisesRegex(ValueError, "hybrid.*not supported"):
+            build_pass_config_from_trainer_config(trainer_config)
+
+    def test_selective_model_targets_project(self):
+        """Model-root selective recompute targets project as module paths."""
+        config = build_pass_config_from_trainer_config(
+            self._trainer_config(
+                self._ac_config(
+                    mode="selective",
+                    selective=SelectiveCheckpointConfig(recompute=["head"]),
+                )
+            )
+        )
+        self.assertEqual(config.ac_selective_recompute_regions, None)
+        self.assertEqual(config.ac_selective_recompute_modules, ["head"])
+
+    def test_selective_swap_warns_when_ignored(self):
+        """Selective swap targets are not supported in graph mode yet."""
+        selective = SelectiveCheckpointConfig(
+            recompute={"fc1": [0]},
+            swap={"fc2": [0]},
+        )
+        trainer_config = self._trainer_config(
+            self._ac_config(mode="selective", selective=selective)
+        )
+        with self.assertLogs("hyper_parallel.compile.pass_config", level="WARNING"):
+            config = build_pass_config_from_trainer_config(trainer_config)
+        self.assertEqual(config.ac_selective_recompute_regions, [("fc1", [0])])
+
+    def test_selective_swap_only_is_rejected(self):
+        """Graph mode cannot express a swap-only selective config yet."""
+        selective = SelectiveCheckpointConfig(swap={"fc2": [0]})
+        trainer_config = self._trainer_config(
+            self._ac_config(mode="selective", selective=selective)
+        )
+        with self.assertRaisesRegex(ValueError, "requires at least one recompute"):
+            build_pass_config_from_trainer_config(trainer_config)
+
+    def test_full_exclusions_warn_when_ignored(self):
+        """Full-mode exclusion regions are reported, not applied."""
+        exclude_region = FullExcludeRegionConfig(
+            save={"layers.0.fc1": [0]},
+        )
+        trainer_config = self._trainer_config(
+            self._ac_config(
+                mode="full",
+                recompute_layer=[0, 1],
+                exclude_region=exclude_region,
+            )
+        )
+        with self.assertLogs("hyper_parallel.compile.pass_config", level="WARNING"):
+            config = build_pass_config_from_trainer_config(trainer_config)
+        self.assertEqual((config.ac_mode, config.ac_layer_indices), ("full", [0, 1]))
 
     def test_swap_inputs_is_ignored_with_warning(self):
         """``swap_inputs`` has no graph-mode counterpart and warns."""
@@ -930,126 +1084,6 @@ class TestGraphCompilerEndToEnd(unittest.TestCase):
         for parameter, ref_grad in zip(model.parameters(), ref_grads):
             self.assertIsNotNone(parameter.grad)
             self.assertTrue(torch.allclose(parameter.grad, ref_grad, atol=1e-10))
-
-
-_ADAPTER_SPEC_PATH = (
-    "hyper_parallel.compile.passes.activation_checkpoint._adapter_recompute_spec"
-)
-
-
-class TestAdapterRegions(unittest.TestCase):
-    """Adapter ``RecomputePolicy`` regions match the eager semantics."""
-
-    @staticmethod
-    def _nodes_under(graph_module, fqn: str) -> list:
-        """Forward nodes whose module stack contains ``fqn``."""
-        nodes = []
-        for node in graph_module.graph.nodes:
-            if node.op != "call_function" or node.meta.get("autograd_backward"):
-                continue
-            stack = [
-                value for value, _ in (node.meta.get("nn_module_stack") or {}).values()
-            ]
-            if any(value == fqn or value.startswith(f"{fqn}.") for value in stack):
-                nodes.append(node)
-        return nodes
-
-    def test_full_default_upgrades_to_adapter_regions(self):
-        """``full`` with the default source applies the adapter regions and hook."""
-        model = _Model()
-        applied = []
-        spec = RecomputePolicy(
-            region_patterns=("layers.*",),
-            exclude_patterns=("layers.0.fc1",),
-            on_applied=applied.append,
-        )
-        with patch(_ADAPTER_SPEC_PATH, return_value=spec):
-            scope = prepare_activation_checkpoint(
-                model,
-                PassConfig(ac_mode="full", enable_overlap=False, fsdp_enabled=False),
-            )
-
-        self.assertEqual(scope.region_fqns, frozenset({"layers.0", "layers.1"}))
-        self.assertIn("layers.0.fc1", scope.exclude_fqns)
-        self.assertEqual(applied, [model], "on_applied must run once before tracing")
-
-    def test_excluded_region_stays_untagged(self):
-        """Nodes inside an adapter exclusion are never recompute candidates."""
-        model = _Model()
-        spec = RecomputePolicy(
-            region_patterns=("layers.*",),
-            exclude_patterns=("layers.0.fc1",),
-        )
-        with patch(_ADAPTER_SPEC_PATH, return_value=spec):
-            joint = _trace(model, torch.randn(4, 8), torch.randn(4, 8))
-            ActivationCheckpointPass().run(
-                joint.graph_module,
-                PassConfig(ac_mode="full", enable_overlap=False, fsdp_enabled=False),
-                model=model,
-            )
-
-        excluded = self._nodes_under(joint.graph_module, "layers.0.fc1")
-        inside = self._nodes_under(joint.graph_module, "layers.0.fc2")
-        self.assertTrue(excluded)
-        self.assertTrue(inside)
-        self.assertTrue(all("recompute" not in node.meta for node in excluded))
-        self.assertTrue(any("recompute" in node.meta for node in inside))
-
-    def test_explicit_safe_regions_without_adapter_raises(self):
-        """An explicitly requested adapter region must find a recompute policy."""
-        config = PassConfig(
-            ac_mode="full",
-            ac_region_source="model_adapter_safe_regions",
-            ac_layer_count=1,
-            enable_overlap=False,
-            fsdp_enabled=False,
-        )
-        with patch(_ADAPTER_SPEC_PATH, return_value=None):
-            with self.assertRaises(ValueError):
-                prepare_activation_checkpoint(_Model(), config)
-
-    def test_region_root_exclusion_raises(self):
-        """An exclusion that swallows a recompute region root is rejected."""
-        spec = RecomputePolicy(
-            region_patterns=("layers.*",),
-            exclude_patterns=("layers.0",),
-        )
-        with patch(_ADAPTER_SPEC_PATH, return_value=spec):
-            with self.assertRaises(ValueError):
-                prepare_activation_checkpoint(
-                    _Model(),
-                    PassConfig(
-                        ac_mode="full", enable_overlap=False, fsdp_enabled=False
-                    ),
-                )
-
-    def test_unmatched_exclude_patterns_raise(self):
-        """Pattern-based exclusions that match nothing are rejected."""
-        spec = RecomputePolicy(
-            region_patterns=("layers.*",),
-            exclude_patterns=("missing.*",),
-        )
-        with patch(_ADAPTER_SPEC_PATH, return_value=spec):
-            with self.assertRaises(ValueError):
-                prepare_activation_checkpoint(
-                    _Model(),
-                    PassConfig(
-                        ac_mode="full", enable_overlap=False, fsdp_enabled=False
-                    ),
-                )
-
-    def test_zero_layers_still_validate_explicit_regions(self):
-        """Zero selected layers do not bypass the adapter-region contract."""
-        config = PassConfig(
-            ac_mode="full",
-            ac_region_source="model_adapter_safe_regions",
-            ac_layer_count=0,
-            enable_overlap=False,
-            fsdp_enabled=False,
-        )
-        with patch(_ADAPTER_SPEC_PATH, return_value=None):
-            with self.assertRaises(ValueError):
-                prepare_activation_checkpoint(_Model(), config)
 
 
 class TestHOPSubgraphAttrs(unittest.TestCase):

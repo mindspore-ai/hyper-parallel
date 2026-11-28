@@ -56,7 +56,8 @@ def _sha_file(path: Path) -> str:
 
 
 def _asset_digest(state) -> str:
-    path = getattr(getattr(state.model, "config", None), "v41_engram_assets_path", None)
+    config = getattr(state.model, "config", None)
+    path = getattr(config, "engram_assets_path", getattr(config, "v41_engram_assets_path", None))
     return _sha_file(Path(path)) if path else ""
 
 

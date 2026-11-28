@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Transformers-compatible SwiGLU MLP with a fused Gate/Up projection."""
+"""SwiGLU MLP family with packed or separate logical projection layouts."""
 
 from __future__ import annotations
 
@@ -24,15 +24,12 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
 )
-
-from hyper_parallel.components.checkpoint import ConcatenateWithSections
-from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.modules.module_family import ModuleFamily, build_family, register_module_family
-from hyper_parallel.components.modules.family import SelectorSpec, VariantRule
 
 
 def _validate_mlp_config(config: Any) -> None:
@@ -126,6 +123,7 @@ class SwiGLUMLPModule(nn.Module):
     """Transformers-compatible SwiGLU MLP using one fused Gate/Up matmul."""
 
     @staticmethod
+
     def _source_projections(module: nn.Module) -> tuple[nn.Linear, nn.Linear, nn.Linear]:
         """Validate and return the source Gate, Up, and Down projections."""
         required = ("gate_proj", "up_proj", "down_proj")
@@ -138,6 +136,7 @@ class SwiGLUMLPModule(nn.Module):
         return projections
 
     @staticmethod
+
     def _validate_projection_contract(
         gate_proj: nn.Linear,
         up_proj: nn.Linear,
@@ -370,24 +369,85 @@ class W1W2SwiGLUMLPModule(nn.Module):
         return []
 
 
-@module_replacement
-def SwiGLUMLP(  # pylint: disable=invalid-name
-    *, config: Any = None, module: nn.Module | None = None,
-    module_fqn: str = "", context: Mapping[str, Any] | None = None, mesh: Any = None,
-    activation_dtype: str | None = None, swiglu_limit: float | None = None,
-    state_layout: str = "linear_fc",
-) -> nn.Module:
-    """Construct a tracked MLP from complete config or separate source projections."""
-    return build_family(SwiGLUMLP, config=config, module=module, module_fqn=module_fqn,
-                        context=context, mesh=mesh, activation_dtype=activation_dtype,
-                        swiglu_limit=swiglu_limit, state_layout=state_layout)
+class SeparateSwiGLUMLPModule(nn.Module):
+    """SwiGLU retaining separate logical matrices and source parameter identities.
+
+    Separate projections preserve optimizer matrix boundaries, tied parameters,
+    checkpoint keys and independently frozen projection parameters.
+    """
+
+    def __init__(
+        self, *, module: nn.Module | None = None, config: Any = None,
+        module_fqn: str = "", context: Mapping[str, Any] | None = None,
+        activation_dtype: str | None = None, swiglu_limit: float | None = None,
+    ) -> None:
+        """Build from complete config or validated separate source projections."""
+        super().__init__()
+        del module_fqn, context
+        if (module is None) == (config is None):
+            raise ValueError("provide exactly one of config or module")
+        source = module if module is not None else config
+        self.swiglu_limit, self.activation_dtype = _activation_settings(
+            source, limit=swiglu_limit, activation_dtype=activation_dtype)
+        self.config = config if module is None else getattr(module, "config", None)
+        activation = getattr(self.config, "hidden_act", getattr(self.config, "hidden_activation", None))
+        if activation is not None and activation not in ("silu", "swiglu"):
+            raise ValueError(f"SwiGLU requires a SiLU activation, but got {activation}")
+        if module is None:
+            _validate_mlp_config(config)
+            self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
+            self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.bias)
+            self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.bias)
+        else:
+            gate, up, down = SwiGLUMLPModule._source_projections(module)
+            # Independent projection freezing is valid without a packed Parameter.
+            if ((gate.in_features, gate.out_features, down.in_features, down.out_features)
+                    != (up.in_features, up.out_features, gate.out_features, gate.in_features)):
+                raise ValueError("SwiGLU projection shapes must describe one hidden/intermediate pair")
+            if len({(item.weight.device, item.weight.dtype) for item in (gate, up, down)}) != 1:
+                raise ValueError("SwiGLU projections must share device and dtype")
+            self.gate_proj, self.up_proj, self.down_proj = gate, up, down
+            if isinstance(getattr(module, "act_fn", None), nn.Module):
+                activation_type = type(module.act_fn)
+                hf_silu = (activation_type.__module__ == "transformers.activations"
+                           and activation_type.__name__ == "SiLUActivation")
+                if not isinstance(module.act_fn, nn.SiLU) and not hf_silu:
+                    raise ValueError("Registered SwiGLU activation must be a supported SiLU module")
+                self.act_fn = nn.SiLU()
+                self.act_fn.training = module.act_fn.training
+            self.training = module.training
+
+    def forward(self, hidden_states: torch.Tensor | None = None, *, x: torch.Tensor | None = None) -> torch.Tensor:
+        """Evaluate SwiGLU; ``x`` preserves HF MLP keyword calls."""
+        if (hidden_states is None) == (x is None):
+            raise ValueError("provide exactly one of hidden_states or x")
+        hidden_states = x if hidden_states is None else hidden_states
+        gate, up = self.gate_proj(hidden_states), self.up_proj(hidden_states)
+        if hasattr(self, "act_fn") and self.swiglu_limit <= 0 and self.activation_dtype == "input":
+            hidden = self.act_fn(gate) * up
+        else:
+            hidden = swiglu_activation(gate, up, limit=self.swiglu_limit, activation_dtype=self.activation_dtype)
+        return self.down_proj(hidden.to(hidden_states.dtype))
+
+    def reset_parameters(self) -> None:
+        """Initialize the three projections after meta materialization."""
+        for projection in (self.gate_proj, self.up_proj, self.down_proj):
+            projection.reset_parameters()
+
+    def make_transforms(self) -> list[WeightRenaming | WeightConverter]:
+        """Source checkpoint names and shapes already match this member."""
+        return []
 
 
-register_module_family(ModuleFamily(
-    name="swiglu_mlp", baseline=SwiGLUMLP,
-    variants={"local": "hyper_parallel.components.modules.swiglu_mlp_family.SwiGLUMLPModule",
-              "w1_w2": "hyper_parallel.components.modules.swiglu_mlp_family.W1W2SwiGLUMLPModule"},
-    selector_specs={"state_layout": SelectorSpec(str, "linear_fc")},
-    variant_rules=(VariantRule({"state_layout": "w1_w2", "parallel": False}, "w1_w2"),),
-    default_variant="local",
-))
+def parameter_sharding_rules() -> list[tuple[str, Any]]:
+    """Declare packed projection roles next to the family owning those names."""
+    # The planner imports family discovery; resolve its role type after discovery completes.
+    from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole  # pylint: disable=C0415
+    return [("linear_fc1.weight", ParamRole.FUSED_GATE_UP), ("linear_fc2.weight", ParamRole.ROWWISE)]
+__all__ = [
+    "SwiGLUMLPModule",
+    "W1W2SwiGLUMLPModule",
+    "SeparateSwiGLUMLPModule",
+    "local_swiglu",
+    "swiglu_activation",
+]

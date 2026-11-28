@@ -15,12 +15,28 @@
 """Empty / on-device weight initialization utilities."""
 # pylint: disable=C9006,C9007
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+import sys
+from typing import Optional
 
 import torch
 
 from hyper_parallel.core.dtensor._utils import init_on_device as _init_on_device
+
+
+def _get_npu_fill_state() -> bool:
+    """Read NPU's independent uninitialized-memory fill flag when ``torch_npu`` is loaded."""
+    torch_npu_c = getattr(sys.modules.get("torch_npu"), "_C", None)
+    getter = getattr(torch_npu_c, "_npu_get_fill_uninitialized_memory", None)
+    return bool(getter()) if callable(getter) else False
+
+
+def _get_npu_fill_setter() -> Optional[Callable[[bool], None]]:
+    """Return ``torch_npu._C._npu_set_fill_uninitialized_memory`` when ``torch_npu`` is loaded."""
+    torch_npu_c = getattr(sys.modules.get("torch_npu"), "_C", None)
+    setter = getattr(torch_npu_c, "_npu_set_fill_uninitialized_memory", None)
+    return setter if callable(setter) else None
 
 
 @contextmanager
@@ -53,12 +69,18 @@ def init_empty_weights(include_buffers: bool = False) -> Iterator[None]:
         The deterministic algorithm setting is unchanged.
     """
     fill_uninitialized_memory = torch.utils.deterministic.fill_uninitialized_memory
+    # torch_npu patches only the fill_uninitialized_memory setter while keeping its
+    # NPU-side fill flag False by default; preserve NPU's own flag across exit.
+    npu_fill_uninitialized_memory = _get_npu_fill_state()
     try:
         torch.utils.deterministic.fill_uninitialized_memory = False
         with _init_on_device(torch.device("meta"), include_buffers=include_buffers):
             yield
     finally:
         torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized_memory
+        npu_setter = _get_npu_fill_setter()
+        if npu_setter is not None:
+            npu_setter(npu_fill_uninitialized_memory)
 
 
 @contextmanager

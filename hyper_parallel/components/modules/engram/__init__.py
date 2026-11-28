@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public Engram contracts and legacy class exports."""
+"""Public Engram family, module and hash contracts."""
 from .engram_family import Engram
 from .engram import EngramModule
 from .ngram_hash_mapping import NgramHashMapping

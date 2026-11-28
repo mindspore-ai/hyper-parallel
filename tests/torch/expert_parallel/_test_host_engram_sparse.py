@@ -30,7 +30,7 @@ from hyper_parallel.components.modules.engram import EngramModule
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
-from hyper_parallel.models.deepseek_v41.adapter.optim.host_sparse import HostSparseOptimizerCoordinator
+from hyper_parallel.components.modules.engram.host_optimizer import HostSparseOptimizerCoordinator
 from hyper_parallel.models.external_state import CheckpointRuntime
 
 

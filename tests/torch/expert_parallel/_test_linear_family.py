@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.quantization.functional.linear_strategy_factory import build_linear_strategy
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.modules.linear import LowPrecisionLinear
 from hyper_parallel.components.quantization.ops.npu_mxfp8 import MXFP8NpuOps
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 from tests.common.linear_family import linear_config

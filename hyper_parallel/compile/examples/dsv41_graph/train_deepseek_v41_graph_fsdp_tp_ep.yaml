@@ -8,14 +8,21 @@ model:
   torch_dtype: float32
   attn_implementation: eager
   config_overrides:
-    _experts_implementation: batched_mm
-    router_aux_loss_coef: 0.0001
+    moe_aux_loss_coeff: 0.0001
     v41_indexer_loss_coeff: 0.001
     v41_candidate_source_layer_id: -1
 optimizer:
-  _target_: hyper_parallel.components.optim.builders.AdamW
+  _target_: hyper_parallel.components.optim.builders.Muon
+  fp32_main_params: false
+  muon_config:
+    muon_lr: 0.0001
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
   adamw_config:
-    lr: 0.0001
+    adamw_lr: 0.0001
     adamw_weight_decay: 0.0
 lr_scheduler:
   _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
@@ -42,6 +49,8 @@ accelerator:
 fsdp_config:
   dp_shard_size: 4
   edp_shard_size: 4
+activation_checkpoint:
+  mode: full
 compile:
   enabled: true
   use_joint_graph: true

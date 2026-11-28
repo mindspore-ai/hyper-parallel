@@ -45,7 +45,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.modules.common.rms_norm import RMSNormModule
 from hyper_parallel.components.modules.moe.shared_expert import SharedExpertModule
-from hyper_parallel.components.modules.swiglu_mlp_family import swiglu_activation
+from hyper_parallel.components.modules.mlp import swiglu_activation
 from hyper_parallel.components.modules.moe.router import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
@@ -266,6 +266,7 @@ class DeepseekV41TopKRouter(nn.Module):
         self.top_k = int(config.num_experts_per_tok)
         self.scoring_func = str(config.scoring_func)
         self.routed_scaling_factor = float(config.routed_scaling_factor)
+        self.initializer_range = float(getattr(config, "initializer_range", 0.02))
         self.aux_loss_coeff = float(getattr(config, "router_aux_loss_coef", 0.0))
         if not math.isfinite(self.aux_loss_coeff) or self.aux_loss_coeff < 0:
             raise ValueError("router_aux_loss_coef must be finite and nonnegative")

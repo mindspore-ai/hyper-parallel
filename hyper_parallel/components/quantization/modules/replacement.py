@@ -23,14 +23,12 @@ from typing import Any
 
 from torch import nn
 
+from hyper_parallel.components.modules.linear import LowPrecisionLinear
+from hyper_parallel.components.modules.linear.linear_family import replace_linear_with_policy
 from hyper_parallel.components.quantization.functional import build_low_precision_strategy
-from hyper_parallel.components.quantization.functional.linear_strategy_factory import (
-    build_linear_strategy,
-)
 from hyper_parallel.components.quantization.modules.grouped_experts import (
     GroupedExperts,
 )
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -57,25 +55,12 @@ def replace_linear(
 ) -> LowPrecisionLinear:
     """Replace one exact Dense Linear using its resolved low-precision policy."""
 
-    if type(module) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
-        raise TypeError(
-            f"{module_fqn!r} must be exact nn.Linear, got {type(module).__name__}"
-        )
-    if context.get("pp"):
-        raise NotImplementedError(
-            "Low-precision Linear training is not yet supported with pipeline parallelism."
-        )
-    try:
-        strategy = build_linear_strategy(
-            context.get("low_precision"),
-            in_features=module.in_features,
-            out_features=module.out_features,
-        )
-    except ValueError as error:
-        raise ValueError(
-            f"Low-precision Linear target {module_fqn!r} is invalid: {error}"
-        ) from error
-    return LowPrecisionLinear.from_linear(module, strategy=strategy)
+    return replace_linear_with_policy(
+        module=module,
+        module_fqn=module_fqn,
+        context=context,
+        scheme=context.get("low_precision"),
+    )
 
 
 @module_replacement

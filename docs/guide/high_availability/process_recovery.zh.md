@@ -50,6 +50,18 @@ high_availability:
 
 `enable` 默认关闭。指定 `controller_ip` 时，`controller_port` 默认是 `8000`。此部署模式要求 rank 0 上的 Controller 在恢复期间可用。
 
+`high_availability.worker_recovery.mirror_metadata` 默认是 `true`。只有完整副本之间的 RNG、数据加载器及
+generator 状态、模型 buffer 和 module extra state 也可以共用时，才可设置为 `false`。关闭后跳过每步元信息
+通信、序列化及元信息 H2D，本地元信息以独立 CPU 快照保留，模型 buffer 的提交快照仍保留在原 device。
+rollback 直接读取本地快照；只有 repair 实际发送恢复头时才序列化并搬到 NPU。
+repair 时发送供体自身目标提交步的快照，不再读取故障 rank 的镜像。参数及优化器
+张量仍从供体的实时持久状态获取。权重互为副本不代表训练元信息可共用；存在 rank 专属数据游标或 RNG 时关闭
+此选项，可能改变恢复后的训练结果。
+
+训练状态和 extra state 在捕获层生成独立快照，再将所有权移交给元信息容器，入库时不重复深拷贝。
+repair 解码得到的快照也走同一移交路径。读取元信息时只新建外层字典，内部快照数据按只读方式复用，
+序列化前不再复制；恢复适配器在调用可变状态的加载入口前执行必要的隔离复制。
+
 #### 由 TaskD 托管 Controller
 
 ```yaml

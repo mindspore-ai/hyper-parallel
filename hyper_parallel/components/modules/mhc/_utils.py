@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Validation shared by mHC implementations."""
+"""Validation and layout contracts shared by mHC implementations."""
 from __future__ import annotations
 
 from math import isfinite
 from typing import Any
 
 from torch import nn
+
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 
 
 def _required_attribute(module: nn.Module, name: str) -> Any:
@@ -77,3 +80,31 @@ def _validate_settings(num_stream: int, hidden_size: int | None = None, sinkhorn
             raise ValueError(f"{name} must be finite and positive")
     if not isinstance(use_gamma, bool):
         raise TypeError("use_gamma must be bool")
+
+
+def pipelined_mhc_sharding(*, module: nn.Module, module_fqn: str, member: Any,
+                           context: Any) -> ModuleShardingSpec:
+    """Own every coefficient matrix and keep token-local coefficient outputs aligned."""
+    del module_fqn, member
+    replicated = {axis: Replicate() for axis in context.mesh_dim_names if axis in context.axis_sizes}
+    tokens = dict(replicated)
+    if context.axis_sizes["cp"] > 1:
+        tokens["cp"] = Shard(1)
+    if context.axis_sizes["tp"] > 1 and context.sequence_parallel:
+        tokens["tp"] = Shard(1)
+    outputs = {name: dict(tokens) for name in ("pre", "post", "residual")}
+    return ModuleShardingSpec(
+        params={name: dict(replicated) for name, _ in module.named_parameters()},
+        in_src={"hidden_streams": dict(tokens)}, in_dst={"hidden_streams": dict(tokens)},
+        out_src=outputs, out_dst={name: dict(value) for name, value in outputs.items()},
+        out_names=("pre", "post", "residual"), is_boundary=True,
+    )
+
+
+def _validate_pipelined(*, config: Any, module: nn.Module | None, context: Any, member: Any) -> None:
+    """Reject fused execution without the matching shifted boundary protocol."""
+    del config, module, context
+    if member.selectors["use_fused_ops"] and not member.selectors["shifted"]:
+        raise ValueError("Native pipelined mHC requires shifted=True")
+    if member.selectors["use_fused_ops"] and any(member.axis_sizes[axis] > 1 for axis in ("tp", "cp")):
+        raise NotImplementedError("Native shifted mHC requires TP=CP=1 until its advance boundary is qualified")

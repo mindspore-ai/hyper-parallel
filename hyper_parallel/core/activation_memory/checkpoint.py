@@ -302,8 +302,18 @@ def _get_autocast_kwargs(device_type: str) -> Tuple[Optional[Dict[str, Any]], Di
 
 
 def _autocast_context(device_type: str, kwargs: Optional[Dict[str, Any]]) -> Any:
-    """Create an autocast context only when another thread enabled it."""
-    if kwargs is None or not kwargs.get("enabled", False):
+    """Recreate the autocast state recorded before the checkpointed forward.
+
+    A recorded ``enabled=False`` must be restored explicitly: recomputation may
+    run inside the backward pass's own autocast region (e.g. forward outside
+    AMP, backward under ``autocast(bf16)``), and a null context would let that
+    ambient state leak into the replay, changing recomputed tensor dtypes.
+    """
+    if kwargs is None:
+        return contextlib.nullcontext()
+    if not kwargs.get("enabled", False) and not torch.is_autocast_enabled(device_type):
+        # Saved and ambient state are both "disabled": entering autocast here
+        # would only trigger needless device backend setup.
         return contextlib.nullcontext()
     return torch.amp.autocast(device_type=device_type, **kwargs)
 
