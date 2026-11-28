@@ -38,10 +38,11 @@ class _PendingGradient(NamedTuple):
 class MemTrackerWrapper(nn.Module):
     """Check the previous layer's communication after this layer's backward hook."""
 
-    def __init__(self, module: nn.Module, enabled: bool = True) -> None:
+    def __init__(self, module: nn.Module, enabled: bool = True, *, comm_fusion: bool = False) -> None:
         super().__init__()
         self.module = module
         self.enabled = enabled
+        self.comm_fusion = comm_fusion
         self._next_layer = None
         self._pending = []
         self.release_history = []
@@ -89,24 +90,33 @@ class MemTrackerWrapper(nn.Module):
     def _capture_pending(self) -> None:
         """Record weak references and actual storage sizes before the next wait."""
         assert not self._pending
-        for hsdp_param in self.module.hsdp_scheduler.hsdp_state.hsdp_params:
-            param = hsdp_param.sharded_param
-            output = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
-            if output is None:
-                continue
-            source_grad = hsdp_param._grad  # pylint: disable=protected-access
-            input_storage = source_grad.untyped_storage() if source_grad is not None else None
-            output_storage = output.untyped_storage()
-            self._pending.append(_PendingGradient(
-                hsdp_param=weakref.ref(hsdp_param),
-                param=weakref.ref(param),
-                accumulated_grad=weakref.ref(param.grad) if param.grad is not None else None,
-                output=weakref.ref(output),
-                output_storage=StorageWeakRef(output_storage),
-                output_nbytes=output_storage.nbytes(),
-                input_storage=StorageWeakRef(input_storage) if input_storage is not None else None,
-                input_nbytes=input_storage.nbytes() if input_storage is not None else 0,
-            ))
+        state = self.module.hsdp_scheduler.hsdp_state
+        if self.comm_fusion:
+            # Per-parameter context stays empty until the next group's wait.
+            assert state.param_group.reduce_scatter_buckets
+            for bucket in state.param_group.reduce_scatter_buckets:
+                for param in bucket.hsdp_params:
+                    self._record(param, bucket.reduce_scatter_output, bucket.reduce_scatter_input)
+        else:
+            for param in state.hsdp_params:
+                output = param.reduce_scatter_comm_ctx.reduce_scatter_output
+                if output is not None:
+                    self._record(param, output, param._grad)  # pylint: disable=protected-access
+
+    def _record(self, hsdp_param, output: Tensor, source_grad: Optional[Tensor]) -> None:
+        param = hsdp_param.sharded_param
+        input_storage = source_grad.untyped_storage() if source_grad is not None else None
+        output_storage = output.untyped_storage()
+        self._pending.append(_PendingGradient(
+            hsdp_param=weakref.ref(hsdp_param),
+            param=weakref.ref(param),
+            accumulated_grad=weakref.ref(param.grad) if param.grad is not None else None,
+            output=weakref.ref(output),
+            output_storage=StorageWeakRef(output_storage),
+            output_nbytes=output_storage.nbytes(),
+            input_storage=StorageWeakRef(input_storage) if input_storage is not None else None,
+            input_nbytes=input_storage.nbytes() if input_storage is not None else 0,
+        ))
 
     @staticmethod
     def _remaining_storage_bytes(reference: StorageWeakRef) -> int:
@@ -131,20 +141,29 @@ class MemTrackerWrapper(nn.Module):
             if pending.input_storage is not None and pending.input_storage not in seen_inputs:
                 input_released += pending.input_nbytes - self._remaining_storage_bytes(pending.input_storage)
                 seen_inputs.add(pending.input_storage)
-            assert pending.output_storage not in seen_outputs
+            first_view = pending.output_storage not in seen_outputs
+            assert first_view or self.comm_fusion
             seen_outputs.add(pending.output_storage)
             if pending.accumulated_grad is None:
                 assert not pending.output_storage.expired()
                 if param.grad is None:
-                    assert hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output is pending.output()
+                    parked = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
+                    assert parked is not None
+                    if self.comm_fusion:
+                        assert StorageWeakRef(parked.untyped_storage()) == pending.output_storage
+                    else:
+                        assert parked is pending.output()
+                    del parked
                 else:
                     assert StorageWeakRef(param.grad._local_tensor.untyped_storage()) == pending.output_storage
-                output_retained += pending.output_nbytes
+                if first_view:
+                    output_retained += pending.output_nbytes
             else:
                 assert pending.accumulated_grad() is not None and param.grad is pending.accumulated_grad()
                 assert hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output is None
                 assert pending.output() is None and pending.output_storage.expired()
-                output_released += pending.output_nbytes
+                if first_view:
+                    output_released += pending.output_nbytes
                 self.checked_count += 1
         self.release_history.append((input_released, output_released, output_retained))
         self._pending.clear()
