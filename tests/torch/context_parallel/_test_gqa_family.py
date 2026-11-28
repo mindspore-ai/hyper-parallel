@@ -100,7 +100,7 @@ def _check_parameter_gradients(parallel, reference, mesh, tp, tp_rank):
         _close(parameter.grad, expected_grad)
 
 
-def _case(mesh, factory, degree, packed, device, *, tp=1, sp=False, padding=False, fuse_qkv=True):
+def _case(mesh, factory, degree, packed, device, *, tp=1, sp=False, padding=False, fuse_qkv=True, kv_heads=4):
     """Compare overlap off/on with the same representation and unpartitioned reference."""
     from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, Qwen3Config  # pylint: disable=C0415
     from transformers.models.qwen3_5.modeling_qwen3_5 import (  # pylint: disable=C0415
@@ -110,10 +110,11 @@ def _case(mesh, factory, degree, packed, device, *, tp=1, sp=False, padding=Fals
     cp = mesh["cp"].size()
     cp_rank, tp_rank = mesh["cp"].get_local_rank(), mesh["tp"].get_local_rank()
     gated = factory is GatedGroupedQueryAttention
-    config_type = Qwen3_5TextConfig if gated else Qwen3Config
-    attention_type = Qwen3_5Attention if gated else Qwen3Attention
+    config_type, attention_type = (
+        (Qwen3_5TextConfig, Qwen3_5Attention) if gated else (Qwen3Config, Qwen3Attention)
+    )
     config = config_type(hidden_size=128, intermediate_size=256, num_hidden_layers=1,
-                         num_attention_heads=8, num_key_value_heads=4, head_dim=16, attention_bias=True)
+                         num_attention_heads=8, num_key_value_heads=kv_heads, head_dim=16, attention_bias=True)
     for overlap in (False, True):
         torch.manual_seed(724)
         source = attention_type(config, 0).to(device=device, dtype=torch.bfloat16)
@@ -162,7 +163,7 @@ def _case(mesh, factory, degree, packed, device, *, tp=1, sp=False, padding=Fals
 
 def test_gqa_family_npu():
     """Feature: Family-owned GQA CP with packed boundaries and stable backward scheduling.
-    Description: Cover grouped/split/gated, U/AG/hybrid, B2, TP/SP and checkpointed accumulation on four cards.
+    Description: Cover grouped/split/gated, minimal KV replication, B2, packed, TP/SP and checkpointed accumulation.
     Expectation: Outputs, dX and all parameter gradients agree with the same unsharded representation.
     """
     import torch_npu  # pylint: disable=C0415,unused-import
@@ -172,14 +173,14 @@ def test_gqa_family_npu():
     dist.init_process_group("hccl", timeout=timedelta(seconds=180))
     try:
         mesh = init_device_mesh("npu", (4, 1), mesh_dim_names=("cp", "tp"))
-        for factory, degree, packed, fused in (
-            (GroupedQueryAttention, 4, False, True), (GroupedQueryAttention, 1, True, True),
-            (GroupedQueryAttention, 2, True, False), (GatedGroupedQueryAttention, 4, True, True),
+        for factory, degree, packed, fused, kv_heads in (
+            (GroupedQueryAttention, 4, False, True, 2), (GroupedQueryAttention, 1, True, True, 4),
+            (GroupedQueryAttention, 2, True, False, 1), (GatedGroupedQueryAttention, 4, True, True, 2),
         ):
-            _case(mesh, factory, degree, packed, device, fuse_qkv=fused)
+            _case(mesh, factory, degree, packed, device, fuse_qkv=fused, kv_heads=kv_heads)
         _case(mesh, GroupedQueryAttention, 1, False, device, padding=True)
         mesh = init_device_mesh("npu", (2, 2), mesh_dim_names=("cp", "tp"))
-        _case(mesh, GatedGroupedQueryAttention, 2, False, device, tp=2, sp=True)
+        _case(mesh, GatedGroupedQueryAttention, 2, False, device, tp=2, sp=True, kv_heads=2)
         _case(mesh, GroupedQueryAttention, 1, True, device, tp=2, sp=False, fuse_qkv=False)
     finally:
         dist.destroy_process_group()
