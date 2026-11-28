@@ -353,6 +353,25 @@ class TestGraphOptimizer(unittest.TestCase):
 
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
+    def test_fp32_adamw_identity_binding_consumes_main_grad(self):
+        """Feature: FP32 graph gradients.
+        Description: AdamW reuses an FP32 live parameter and reads its main_grad.
+        Expectation: AdamW updates the reused parameter.
+        """
+        model = nn.Linear(2, 1, bias=False)
+        nn.init.ones_(model.weight)
+        leaf = torch.optim.AdamW(model.parameters(), lr=0.1, weight_decay=0)
+        chain = ChainedOptimizer(model, {"adamw": leaf})
+        chain.defer_parameter_binding()
+        optimizer = Float16OptimizerWithFloat16Params(chain, model)
+        optimizer.bind_parameter_layouts(None)
+        self.assertIs(optimizer.optimizer_param_by_model_param[model.weight], model.weight)
+        model.weight.main_grad = torch.ones_like(model.weight)
+        optimizer.step()
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 0.9))
+
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_adam_fallback_keeps_padded_local_shape_with_fp32_main(self):
         """Feature: AdamW fallback.
 

@@ -43,6 +43,7 @@ from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     OffloadPolicy,
     SourceShardMetaInfo,
+    resolve_param_dtypes,
 )
 
 
@@ -665,16 +666,8 @@ class HSDPParamV2:
 
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
         """Initialize dtype attributes, applying source-parameter overrides before policy defaults."""
-        custom_dtypes = (mp_policy.custom_params or {}).get(self._src_parameter_id, {})
-        param_dtype = custom_dtypes.get("param_dtype", mp_policy.param_dtype)
-        reduce_dtype = custom_dtypes.get("reduce_dtype", mp_policy.reduce_dtype)
         self.orig_dtype = self.sharded_param.dtype
-        if reduce_dtype == param_dtype:
-            reduce_dtype = None
-        if param_dtype == self.orig_dtype:
-            param_dtype = None
-        self.param_dtype = param_dtype
-        self.reduce_dtype = reduce_dtype
+        self.param_dtype, self.reduce_dtype = resolve_param_dtypes(mp_policy, self._src_parameter_id, self.orig_dtype)
         self.apply_grad_on_fp32_main_grad = mp_policy.apply_grad_on_fp32_main_grad
 
     def init_unsharded_param_buffers(

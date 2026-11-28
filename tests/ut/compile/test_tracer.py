@@ -36,16 +36,20 @@ captures the joint graph; the patcher warning is suppressed during the trace.
 import os
 import unittest
 import warnings
+from copy import deepcopy
+from unittest.mock import patch
 
 
 import torch
-from torch import nn
+from torch import fx, nn
 
+from hyper_parallel.compile.mixed_precision import GraphMixedPrecision
 from hyper_parallel.compile.tracer.graph_tracer import (
     extract_module_state,
     run_traced_graph,
     trace_model_graph,
 )
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 
 
 class _LinearWithBuffer(nn.Module):
@@ -120,6 +124,59 @@ class TestTraceModelGraph(unittest.TestCase):
             torch.randn(2, 4),
         )
         self.assertEqual(joint.param_names, ["lin.weight", "lin.bias"])
+
+    def test_mixed_precision_dtypes_follow_state_order(self):
+        """Bind different compute dtypes to state slots and cast a frozen weight in the graph."""
+        model = nn.ModuleDict({
+            "frozen": nn.Linear(4, 4, bias=False),
+            "trainable": nn.Linear(4, 4, bias=False),
+        })
+        model["frozen"].requires_grad_(False)
+        model.register_buffer("buf", torch.zeros(4))
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            custom_params={model["trainable"].weight: {"param_dtype": torch.float16}},
+        )
+        precision = GraphMixedPrecision(model, policy, ())
+        inputs = {"x": torch.randn(2, 4)}
+
+        def train_fn(module, x):
+            """Compute each linear in its configured dtype."""
+            frozen = module["frozen"](x.bfloat16()).float()
+            trainable = module["trainable"](x.half()).float()
+            return (frozen + trainable + module.buf).sum()
+
+        reference = deepcopy(model)
+        reference["frozen"].to(torch.bfloat16)
+        reference["trainable"].to(torch.float16)
+        expected_loss = train_fn(reference, **inputs)
+        expected_grad, = torch.autograd.grad(expected_loss, tuple(reference["trainable"].parameters()))
+        for dynamic_dims in (None, {"x": [0]}):
+            with self.subTest(dynamic_dims=dynamic_dims):
+                joint = trace_model_graph(model, train_fn, inputs, dynamic_arg_dims=dynamic_dims,
+                                          mixed_precision=precision)
+                placeholders = joint.graph_module.graph.find_nodes(op="placeholder")
+                self.assertEqual(joint.state_fqns, ["frozen.weight", "trainable.weight", "buf"])
+                self.assertEqual([node.meta.get("fsdp_compute_dtype") for node in placeholders],
+                                 [torch.bfloat16, torch.float16, None, None])
+                self.assertEqual(placeholders[0].meta["val"].dtype, torch.float32)
+                loss, grads, _ = run_traced_graph(joint, model, inputs)
+                torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+                grad, = grads
+                torch.testing.assert_close(grad, expected_grad, rtol=0, atol=0)
+
+    def test_mixed_precision_rejects_missing_placeholder(self):
+        """Reject an incomplete traced input list before assigning compute dtypes."""
+        model = _LinearWithBuffer()
+        precision = GraphMixedPrecision(model, MixedPrecisionPolicy(param_dtype=torch.bfloat16), ())
+        graph = fx.Graph()
+        graph.output(graph.placeholder("weight"))
+        gm = fx.GraphModule(nn.Module(), graph)
+        with (
+            patch("hyper_parallel.compile.tracer.graph_tracer.make_fx", return_value=lambda *_: gm),
+            self.assertRaisesRegex(ValueError, "Expected 4 graph input placeholders, got 1"),
+        ):
+            trace_model_graph(model, lambda m, x: m(x).sum(), {"x": torch.ones(2, 4)}, mixed_precision=precision)
 
 
 class TestRunTracedGraph(unittest.TestCase):

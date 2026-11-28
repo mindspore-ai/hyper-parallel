@@ -217,6 +217,22 @@ class FSDP2Manager:
             claimed.update(parameters)
         return bindings
 
+    def mixed_precision_bindings(
+        self, model: ModuleClass, source_shard_info: SourceShardInfoByFQN | None,
+    ) -> tuple[fully_shard_utils.MixedPrecisionPolicy, tuple[ModuleClass, ...]]:
+        """Return the eager dtype policy and its module boundaries without installing hooks."""
+        metadata = _build_source_shard_info_by_param(self, model, source_shard_info)
+        units = self._find_wrap_modules(model, metadata)
+        modules = tuple(dict.fromkeys([model, *(unit.module for unit in units)]))
+        return self._resolve_model_precision_policy(model), modules
+
+    def _resolve_model_precision_policy(self, model: ModuleClass) -> fully_shard_utils.MixedPrecisionPolicy:
+        """Bind overrides before parameter identities can change."""
+        custom = None
+        if self.config.mix_precision.custom_params:
+            custom = self._resolve_custom_params(dict(model.named_parameters(remove_duplicate=False)))
+        return self._build_mixed_precision_policy(custom)
+
     def _resolve_custom_params(
         self, parameters_by_fqn: Mapping[str, ParameterClass]
     ) -> dict[ParameterClass, dict[str, Any]]:
@@ -826,10 +842,7 @@ class FSDP2Manager:
             source_shard_info,
         )
         replicate_params = self._resolve_replicate_params(model)
-        custom_params = None
-        if self.config.mix_precision.custom_params:
-            custom_params = self._resolve_custom_params(dict(model.named_parameters(remove_duplicate=False)))
-        self._build_mixed_precision_policy(custom_params)
+        self._resolve_model_precision_policy(model)
 
         wrap_modules = self._find_wrap_modules(model, metadata_by_parameter)
         owner_by_parameter = self._resolve_parameter_owners(model, wrap_modules)

@@ -46,11 +46,13 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.models.build_options import FSDP2Config, get_device_type
 from hyper_parallel.models.external_state import get_model_external_state
 
 from . import checkpoint_metadata, optimizer_state
 from .graph_parallel_plan import GraphParallelPlan
+from .mixed_precision import GraphMixedPrecision
 from .pass_config import (
     GradientReduction,
     PassConfig,
@@ -125,6 +127,7 @@ class GraphCompiler:
         self.model = model
         self.train_fn = train_fn
         self.parallel_plan = parallel_plan
+        self._explicit_pass_config = pass_config is not None
         self.pass_config = self._resolve_pass_config(
             pass_config=pass_config,
             trainer_config=trainer_config,
@@ -137,6 +140,8 @@ class GraphCompiler:
         self._expert_replicate_group_name: Optional[str] = None
         self._expert_replicate_degree: int = 1
         self._fsdp_config = getattr(trainer_config, 'fsdp_config', None)
+        self._fp32_main_params = getattr(getattr(trainer_config, "optimizer", None), "fp32_main_params", False)
+        self._mixed_precision: Optional[GraphMixedPrecision] = None
         self._parameter_meshes = {}
         self._parameter_groups = {}
         self._parameter_shapes = {}
@@ -312,6 +317,33 @@ class GraphCompiler:
                 "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
             )
 
+    def _build_mixed_precision(self) -> Optional[GraphMixedPrecision]:
+        """Reuse eager precision and reject combinations requiring a different sync schedule."""
+        config = self._fsdp_config
+        if not isinstance(config, FSDP2Config):
+            return None
+        precision = config.mix_precision
+        if not any((precision.param_dtype, precision.reduce_dtype, precision.output_dtype, precision.custom_params)):
+            return None
+        if not self.pass_config.fsdp_enabled:
+            # A one-rank trainer can apply the dtype policy without enabling FSDP passes.
+            if self._explicit_pass_config or (dist.is_initialized() and dist.get_world_size() > 1):
+                return None
+        mesh = self._mesh_context or MeshContext()
+        manager = FSDP2Manager(config, mesh, self._fp32_main_params)
+        policy, modules = manager.mixed_precision_bindings(self.model, self.source_shard_info)
+        mixed_precision = GraphMixedPrecision(self.model, policy, modules)
+        # Module I/O casts can still apply with the existing communication schedule.
+        if not mixed_precision.has_param_or_grad_casts:
+            return mixed_precision
+        if max(mesh.dp_replicate_size, self._expert_replicate_degree, mesh.tp_size, mesh.cp_size) > 1:
+            raise ValueError("Graph FSDP mixed precision requires one DP/EDP replica and TP=CP=1")
+        if self.pass_config.pp_enabled or not config.requires_grad_sync or config.replicate_params:
+            raise ValueError(
+                "Graph FSDP mixed precision does not support PP, deferred gradient sync or replicate_params"
+            )
+        return mixed_precision
+
     def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
@@ -342,11 +374,7 @@ class GraphCompiler:
         ):
             raise ValueError("Graph TP requires source_shard_info from the sharding plan")
 
-        if self.pass_config.fsdp_enabled and dist.is_initialized():
-            # Only build the FSDP mesh when distributed is actually up.
-            # ``FSDPPass`` early-returns when ``world_size == 1``, so a
-            # single-process run (no dist, or a single rank) compiles and
-            # runs as plain graph mode without sharding.
+        if self.pass_config.fsdp_enabled and dist.is_initialized() and dist.get_world_size() > 1:
             self._init_device_mesh(self._mesh_context)
 
         # Activation checkpointing must resolve its scope BEFORE tracing so
@@ -361,12 +389,15 @@ class GraphCompiler:
         self._parameter_shapes = {name: tuple(param.shape) for name, param in self.model.named_parameters()}
         self._layout_signature = None
 
+        self._mixed_precision = self._build_mixed_precision()
         trace_kwargs = {}
+        if self._mixed_precision is not None:
+            trace_kwargs["mixed_precision"] = self._mixed_precision
         if self.dynamic or self.dynamic_arg_dims is not None:
-            trace_kwargs = {
+            trace_kwargs.update({
                 "dynamic": self.dynamic,
                 "dynamic_arg_dims": self.dynamic_arg_dims,
-            }
+            })
         joint_graph = trace_model_graph(
             self.model, self.train_fn, inputs, **trace_kwargs
         )
@@ -1150,14 +1181,22 @@ class GraphCompiler:
                 f"refusing to assign gradients to avoid silent misalignment."
             )
 
+        precision = self._mixed_precision
+        use_main = precision is not None and precision.policy.apply_grad_on_fp32_main_grad
+        attribute = "main_grad" if use_main else "grad"
         for param, grad in zip(trainable, grads):
-            if param.grad is None:
+            if precision is not None and not use_main:
+                # Eager rounds each reduced microbatch before adding to storage-dtype .grad.
+                grad = grad.to(param.dtype)
+            accumulated = getattr(param, attribute, None)
+            if accumulated is None:
                 # Match eager's gradient layout so optimizer kernels see the
                 # parameter's strides rather than a backward matmul's view.
-                param.grad = torch.empty_like(param)
-                param.grad.copy_(grad)
+                accumulated = torch.empty_like(param, dtype=grad.dtype if use_main else param.dtype)
+                accumulated.copy_(grad)
+                setattr(param, attribute, accumulated)
             else:
-                param.grad += grad
+                accumulated.add_(grad)
 
     @staticmethod
     def _trainable_params_in_state_order(

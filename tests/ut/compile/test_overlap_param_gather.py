@@ -26,7 +26,7 @@ from torch.ops import _c10d_functional
 from hyper_parallel.compile.pass_config import PassConfig, build_pass_config_from_trainer_config
 from hyper_parallel.compile.passes.overlap import overlap_param_gather as prefetch_module
 from hyper_parallel.compile.passes.overlap.schedule import FsdpOverlapPass
-from hyper_parallel.compile.passes.parallel.fsdp_pass import _free_tensor_storage
+from hyper_parallel.compile.passes.parallel.fsdp_pass import _free_tensor_storage, _gather_input
 from hyper_parallel.models.build_options import CompileConfig
 from tests.ut.compile.test_fsdp_reshard import _ChunkedMLP, _MLP, _run_simulated, _trace_and_run
 
@@ -95,6 +95,23 @@ class TestPrefetchSchedule(unittest.TestCase):
         before = list(graph.graph.nodes)
         _run(graph)
         self.assertEqual(list(graph.graph.nodes), before)
+
+    def test_mixed_precision_shard_cast_moves_with_gather(self):
+        """Prefetch the shard cast with the AllGather that consumes it."""
+        module, launches, _, computes = _mlp_graph()
+        launch = launches[1]
+        shard = launch.args[0]
+        shard.meta["fsdp_compute_dtype"] = torch.bfloat16
+        with module.graph.inserting_before(launch):
+            cast = _gather_input(module.graph, shard)
+        launch.replace_input_with(shard, cast)
+
+        _run(module)
+
+        order = _positions(module)
+        self.assertLess(order[cast], order[launch])
+        self.assertLess(order[launch], order[computes[0]])
+        module.graph.lint()
 
     def test_disabled_overlap_does_not_mutate_graph(self):
         """The switch disables both prefetch and wait/view sinking."""
