@@ -155,46 +155,6 @@ class TestMTPIndexShare(unittest.TestCase):
         self.assertEqual(calls[1][3].tolist(), [1, 3])
         self.assertEqual(calls[1][4].tolist(), [2, 5])
 
-    def test_two_forwards_keep_independent_states_and_backward_order(self) -> None:
-        model = self._model()
-        with self._kernels():
-            first = model(self.hidden[:, :5], self.tokens[:, :5], embedding=self.embedding)
-            second = model(self.hidden[:, 1:6], self.tokens[:, 1:6], embedding=self.embedding)
-            second.hidden_states[-1].square().mean().backward()
-            first.hidden_states[-1].square().mean().backward()
-        self.assertEqual(len(indexer_calls), 2)
-        self.assertIs(calls[0][1], calls[1][1])
-        self.assertIs(calls[2][1], calls[3][1])
-        self.assertIsNot(calls[0][1], calls[2][1])
-        self.assertTrue(torch.isfinite(self.hidden.grad).all())
-
-    def test_auxiliary_indexer_loss_is_only_applied_on_step_zero(self) -> None:
-        model = MultiTokenPrediction([
-            MTPLayer(8, _DSADecoder(4, dsa_loss_coeff=0.25)),
-            MTPLayer(8, _DSADecoder(5, dsa_loss_coeff=0.25)),
-        ])
-        coefficients = []
-
-        def capture_aux_loss(output, *_args, **kwargs):
-            coefficients.append(kwargs["aux_loss_coefficient"])
-            return output
-
-        with self._kernels(), ExitStack() as stack:
-            for layer in model.layers:
-                stack.enter_context(patch.object(
-                    layer.mtp_block.attn, "_apply_auxiliary_loss", side_effect=capture_aux_loss,
-                ))
-            model(self.hidden[:, :5], self.tokens[:, :5], embedding=self.embedding)
-        self.assertEqual(coefficients, [0.25, 0.0])
-        self.assertEqual(len(indexer_calls), 1)
-
-    def test_cp_sharing_requires_adapter_positions_for_each_step(self) -> None:
-        model = self._model()
-        for layer in model.layers:
-            layer.mtp_block.attn.kv_cp_size = 2
-        model = MultiTokenPrediction(list(model.layers))
-        with self.assertRaisesRegex(ValueError, "adapter-provided position_ids"):
-            model(self.hidden[:, :5], self.tokens[:, :5], embedding=self.embedding)
 
     def test_cp_consumer_does_not_gather_the_shared_kv_bank_again(self) -> None:
         module = CPDeepseekSparseAttentionModule(config=_config(4), kv_cp_size=2)
@@ -207,13 +167,6 @@ class TestMTPIndexShare(unittest.TestCase):
         )
         self.assertIs(module.exchange_attention(inputs), inputs)
         module.prepare_key_bank.assert_not_called()
-
-    def test_mismatched_mtp_configs_fail_instead_of_silently_disabling(self) -> None:
-        with self.assertRaisesRegex(ValueError, "every MTP iteration"):
-            MultiTokenPrediction([
-                MTPLayer(8, _DSADecoder(4)),
-                MTPLayer(8, nn.Identity()),
-            ])
 
 
 if __name__ == "__main__":

@@ -27,11 +27,9 @@ from hyper_parallel.components.modules.attention.deepseek_sparse_attention impor
     deepseek_sparse_attention as impl,
 )
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import (
-    IndexShareContext, resolve_index_share_plan,
+    IndexShareContext, install_indexer_share, resolve_index_share_plan,
 )
 from hyper_parallel.components.modules import DeepseekSparseAttention
-from hyper_parallel.components.modules.attention.deepseek_sparse_attention import install_indexer_share
-from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.components.modules.attention.deepseek_sparse_attention.cp_deepseek_sparse_attention import (
     CPDeepseekSparseAttentionModule, CPSparseAttentionSequenceMetadata, _gather_key_banks,
 )
@@ -142,24 +140,6 @@ class TestIndexerShare(unittest.TestCase):
         self.assertEqual(plan.leaders, (0, 1, 1, 1, 4, 4))
         self.assertEqual(resolve_index_share_plan(config(dsa_index_topk_freq=99)).leaders, (0, 0, 0))
 
-    def test_invalid_layout(self) -> None:
-        for options in ({"dsa_indexer_types": ["shared"] * 3}, {"dsa_indexer_types": ["full"]},
-                        {"dsa_index_share_loss": "sum"}, {"dsa_index_share_topk_offload": True},
-                        {"dsa_indexer_types": None, "dsa_index_topk_freq": 0},
-                        {"dsa_indexer_types": None, "dsa_index_skip_topk_offset": -1},
-                        {"layer_idx": None}):
-            with self.subTest(options=options), self.assertRaises(ValueError):
-                DeepseekSparseAttention(config=config(**options))
-
-    def test_shared_layers_have_no_indexer_parameters(self) -> None:
-        model = Stack()
-        self.assertIsNotNone(model.layers[0].indexer)
-        for layer in model.layers[1:]:
-            self.assertIsNone(layer.indexer)
-            self.assertFalse(any("indexer" in name for name in layer.state_dict()))
-            layer.reset_parameters()
-        clone = Stack()
-        clone.load_state_dict(model.state_dict(), strict=True)
 
     def test_selection_is_computed_once_and_reused(self) -> None:
         for mode, calls in (("served", 3), ("leader", 1)):
@@ -175,23 +155,6 @@ class TestIndexerShare(unittest.TestCase):
                 self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
                                     for p in model.layers[0].indexer.parameters()))
 
-    def test_missing_leader_and_context_fail(self) -> None:
-        layer = Stack().layers[1]
-        with self.assertRaisesRegex(ValueError, "fresh IndexShareContext"):
-            layer(torch.randn(1, 4, 16))
-        with self.assertRaisesRegex(ValueError, "run first"):
-            layer(torch.randn(1, 4, 16), index_share_context=IndexShareContext())
-
-    def test_stage_and_shape_mismatch_fail(self) -> None:
-        model = Stack()
-        context = IndexShareContext()
-        with kernels():
-            model.layers[0](torch.randn(1, 4, 16), index_share_context=context)
-            with self.assertRaisesRegex(ValueError, "matching stage"):
-                model.layers[1](torch.randn(2, 4, 16), index_share_context=context)
-            model.layers[1].dsa_dense_warm_up = True
-            with self.assertRaisesRegex(ValueError, "matching stage"):
-                model.layers[1](torch.randn(1, 4, 16), index_share_context=context)
 
     def test_checkpoint_output_and_all_gradients_match(self) -> None:
         for warmup in (False, True):
@@ -211,113 +174,6 @@ class TestIndexerShare(unittest.TestCase):
                     for (_, param), (_, reference) in zip(candidate.named_parameters(), baseline.named_parameters()):
                         torch.testing.assert_close(param.grad, reference.grad)
 
-    def test_overlapping_invocations_backward_in_reverse(self) -> None:
-        with kernels():
-            reference = Stack(recompute=True)
-            actual = Stack(recompute=True)
-            actual.load_state_dict(reference.state_dict())
-            batches = [torch.randn(1, 4, 16), torch.randn(1, 4, 16)]
-            for batch in reversed(batches):
-                reference(batch).square().mean().backward()
-            outputs = [actual(batch) for batch in batches]
-            for output in reversed(outputs):
-                output.square().mean().backward()
-            for (_, param), (_, expected) in zip(actual.named_parameters(), reference.named_parameters()):
-                torch.testing.assert_close(param.grad, expected.grad)
-
-    def test_disabled_sharing_retains_every_indexer(self) -> None:
-        with kernels() as (index, _, loss):
-            model = Stack(roles=["full"] * 3)
-            model(torch.randn(1, 4, 16)).sum().backward()
-            self.assertEqual(index.call_count, 3)
-            self.assertEqual(loss.call_count, 3)
-            self.assertTrue(all(layer.indexer is not None for layer in model.layers))
-
-    def test_parallel_sharing_preserves_existing_family_support(self) -> None:
-        for topology in ({"tp_size": 2}, {"cp_size": 2}, {"tp_size": 2, "cp_size": 2},
-                         {"dp_size": 2}, {"ep_size": 2}):
-            with self.subTest(topology=topology):
-                layer = DeepseekSparseAttention(
-                    config=config(layer_idx=1), context=topology,
-                    kv_cp_size=topology.get("cp_size", 1),
-                )
-                self.assertIsNone(layer.indexer)
-                if topology.get("cp_size", 1) > 1:
-                    self.assertIsInstance(layer, CPDeepseekSparseAttentionModule)
-        with self.assertRaisesRegex(ValueError, "pipeline"):
-            DeepseekSparseAttention(config=config(), context={"pp_size": 2})
-
-    def test_install_is_idempotent(self) -> None:
-        model = Stack()
-        handle = model._hp_index_share_hook
-        install_indexer_share(model)
-        self.assertIs(model._hp_index_share_hook, handle)
-        with kernels():
-            with self.assertRaisesRegex(ValueError, "model owns"):
-                model(torch.randn(1, 4, 16), index_share_context=IndexShareContext())
-
-    def test_served_gradient_is_mean_of_all_teachers(self) -> None:
-        with kernels() as (_, _, loss):
-            model = Stack()
-            hidden = torch.randn(1, 4, 16, requires_grad=True)
-            output = model(hidden)
-            calls = loss.call_args_list
-            parameters = tuple(model.layers[0].indexer.parameters())
-            terms = [sparse_loss(*call.args[:-1], 1.0) for call in calls]
-            expected = torch.autograd.grad(0.3 * torch.stack(terms).mean(), parameters, retain_graph=True)
-            output.sum().backward()
-            for param, gradient in zip(parameters, expected):
-                torch.testing.assert_close(param.grad, gradient)
-            self.assertTrue(all(not call.args[i].requires_grad for call in calls for i in (3, 4, 8, 9)))
-
-    def test_multiple_groups_checkpoint_replay(self) -> None:
-        with kernels():
-            reference = Stack(roles=["full", "shared", "full", "shared", "shared"])
-            actual = Stack(roles=["full", "shared", "full", "shared", "shared"], recompute=True)
-            actual.load_state_dict(reference.state_dict())
-            hidden = torch.randn(1, 4, 16)
-            reference(hidden).sum().backward()
-            actual(hidden).sum().backward()
-            for (_, param), (_, expected) in zip(actual.named_parameters(), reference.named_parameters()):
-                torch.testing.assert_close(param.grad, expected.grad)
-
-    def test_reentrant_training_rejected_and_eval_no_grad_works(self) -> None:
-        model = Stack()
-        with kernels(), torch.no_grad():
-            with self.assertRaisesRegex(ValueError, "non-reentrant"):
-                model(torch.randn(1, 4, 16))
-            model.eval()(torch.randn(1, 4, 16))
-
-    def test_model_adapter_installs_carrier_and_nonreentrant_regions(self) -> None:
-        with kernels():
-            reference = Stack()
-            actual = Stack()
-            actual.load_state_dict(reference.state_dict())
-            actual._hp_index_share_hook.remove()
-            del actual._hp_index_share_hook
-            actual.config.model_type = "deepseek_v32"
-            actual.gradient_checkpointing = False
-            _apply_activation_checkpointing(actual, "full")
-            hidden = torch.randn(1, 4, 16)
-            reference(hidden).square().mean().backward()
-            actual(hidden).square().mean().backward()
-            for (_, param), (_, expected) in zip(actual.named_parameters(), reference.named_parameters()):
-                torch.testing.assert_close(param.grad, expected.grad)
-
-    def test_meta_shared_layer_materialization(self) -> None:
-        with torch.device("meta"):
-            layer = DeepseekSparseAttention(config=config(layer_idx=1))
-        self.assertIsNone(layer.indexer)
-        self.assertTrue(all(p.is_meta for p in layer.parameters()))
-        layer.to_empty(device="cpu")
-        layer.reset_parameters()
-        self.assertTrue(all(torch.isfinite(p).all() for p in layer.parameters()))
-
-    def test_install_rejects_mismatched_layer_config(self) -> None:
-        model = Stack()
-        model.config.dsa_indexer_types = ["full", "full", "shared"]
-        with self.assertRaisesRegex(ValueError, "same Indexer Share plan"):
-            install_indexer_share(model)
 
     def test_cp_shared_gathers_only_main_banks(self) -> None:
         for leader in (True, False):

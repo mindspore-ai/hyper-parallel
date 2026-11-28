@@ -135,6 +135,8 @@ def install_indexer_share(model: nn.Module) -> None:
             module for module in layer.modules()
             if hasattr(module, "index_share_plan")
         ]
+        if not attentions:
+            raise ValueError("Indexer sharing requires DeepseekSparseAttention in every decoder layer")
         if any(module.index_share_plan != plan for module in attentions):
             raise ValueError("Decoder attention layers must use the same Indexer Share plan as the model config")
     if getattr(decoder, "_hp_index_share_hook", None) is None:

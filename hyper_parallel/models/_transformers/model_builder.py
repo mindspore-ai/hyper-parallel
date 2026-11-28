@@ -466,6 +466,19 @@ def _apply_materialization_adapter(model: nn.Module) -> None:
         raise TypeError("ModelAdapterSpec.materialization must mutate the model and return None")
 
 
+def _apply_runtime_setup_adapter(model: nn.Module) -> None:
+    """Let a family adapter install runtime coordination on the final module tree."""
+    adapter_spec = resolve_model_adapter(model)
+    provider = getattr(adapter_spec, "runtime_setup", None)
+    if provider is None:
+        return
+    if not callable(provider):
+        raise TypeError("ModelAdapterSpec.runtime_setup must be callable")
+    result = provider(model)  # pylint: disable=not-callable
+    if result is not None:
+        raise TypeError("ModelAdapterSpec.runtime_setup must mutate the model and return None")
+
+
 def _apply_activation_features(
     model: nn.Module,
     activation_checkpoint: Optional[Any],
@@ -709,8 +722,9 @@ def apply_model_infrastructure(
 ) -> nn.Module:
     """Apply sharding, activation wrappers, FSDP2, initialization and compilation.
 
-    The execution order is: parallel layout -> activation wrappers -> FSDP2 ->
-    materialization/loading -> model_init_dtype conversion -> per-layer compile.
+    The execution order is: module replacements -> adapter runtime setup ->
+    parallel layout -> activation wrappers -> FSDP2 -> materialization/loading ->
+    model_init_dtype conversion -> per-layer compile.
     Placement validation keeps the DTensor placement path and skips compile;
     FSDP2 consumes DTensor parameter layouts in both modes.
 
@@ -759,6 +773,7 @@ def apply_model_infrastructure(
     model, weights_mapping = _maybe_apply_module_replacements(
         model, distributed_setup, low_precision_config, load_base_model,
     )
+    _apply_runtime_setup_adapter(model)
     if is_meta_device:
         _apply_materialization_adapter(model)
 
