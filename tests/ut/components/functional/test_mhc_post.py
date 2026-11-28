@@ -16,10 +16,12 @@
 
 import sys
 import unittest
+import warnings
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from hyper_parallel.components.functional.mhc_post import mhc_post
 
@@ -42,8 +44,8 @@ class TestMhcPost(unittest.TestCase):
             post coefficients in the operator order, and return the flattened
             mixed streams.
         """
-        block_output = torch.randn(B, S, C)
-        residual = torch.randn(B, S, N * C)
+        block_output = torch.randn(B, S, C, dtype=torch.bfloat16)
+        residual = torch.randn(B, S, N * C, dtype=torch.bfloat16)
         h_post = torch.randn(B, S, N)
         h_res = torch.randn(B, S, N, N)
         mixed = torch.randn(B, S, N, C)
@@ -79,6 +81,57 @@ class TestMhcPost(unittest.TestCase):
         )
         torch.testing.assert_close(result, expected.flatten(2))
 
+    def test_fp32_npu_uses_formula_and_warns(self):
+        """
+        Feature: FP32 NPU MHC post.
+        Description: Invoke the CANN and Omni selections with FP32 NPU inputs.
+        Expectation: Emit a runtime warning, evaluate the tensor formula, and bypass fused dispatch.
+        """
+        inputs = (
+            torch.randn(B, S, C, dtype=torch.float32),
+            torch.randn(B, S, N * C, dtype=torch.float32),
+            torch.randn(B, S, N, dtype=torch.float32),
+            torch.randn(B, S, N, N, dtype=torch.float32),
+        )
+        expected = mhc_post(*inputs, N)
+
+        for backend in ("cann", "omni"):
+            with self.subTest(backend=backend):
+                with patch("hyper_parallel.components.functional.mhc_post._MhcPost.apply") as fused, \
+                        _fake_npu_device(), warnings.catch_warnings(record=True) as emitted:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    actual = mhc_post(*inputs, N, backend=backend)
+
+                fused.assert_not_called()
+                self.assertEqual(len(emitted), 1)
+                self.assertIs(emitted[0].category, RuntimeWarning)
+                self.assertIn("FP32 NPU inputs", str(emitted[0].message))
+                torch.testing.assert_close(actual, expected)
+
+    def test_fake_joint_graph_replays_forward_and_backward(self):
+        """
+        Feature: MHC joint graph replay.
+        Description: Capture forward and backward with FakeTensor inputs on CPU.
+        Expectation: Replay the captured graph with matching output and all input gradients.
+        """
+        inputs = (
+            torch.randn(B, S, C, requires_grad=True),
+            torch.randn(B, S, N * C, requires_grad=True),
+            torch.randn(B, S, N, requires_grad=True),
+            torch.randn(B, S, N, N, requires_grad=True),
+        )
+
+        def _joint(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Return the mixed streams and gradients of their sum."""
+            result = mhc_post(*args, N)
+            return (result, *torch.autograd.grad(result.sum(), args))
+
+        expected = _joint(*inputs)
+        graph = make_fx(_joint, tracing_mode="fake")(*inputs)
+        actual = graph(*inputs)
+        for value, reference in zip(actual, expected):
+            torch.testing.assert_close(value, reference)
+
     def test_omni_backend_is_deprecated(self):
         """
         Feature: Legacy omni MHC post backend.
@@ -86,8 +139,8 @@ class TestMhcPost(unittest.TestCase):
         Expectation: Log a deprecation warning and run the legacy post operator
             through torch.ops.custom.
         """
-        block_output = torch.randn(B, S, C)
-        residual = torch.randn(B, S, N * C)
+        block_output = torch.randn(B, S, C, dtype=torch.bfloat16)
+        residual = torch.randn(B, S, N * C, dtype=torch.bfloat16)
         h_post = torch.randn(B, S, N)
         h_res = torch.randn(B, S, N, N)
         mixed = torch.randn(B, S, N, C)

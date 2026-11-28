@@ -1,7 +1,7 @@
 # DeepSeek V4.1 Graph Training
 
 This example runs native `TextTrainer` / `GraphCompiler` training on eight Ascend
-NPUs with **FSDP4 + TP2/SP + EP2** (expert EDP4), FP32, sequence length 2304,
+NPUs with **FSDP4 + TP2/SP + EP2** (expert EDP4), BF16, sequence length 2304,
 micro batch size 1, global batch size 8, and 30 Muon optimizer steps. Full
 recomputation, dataset packing,
 DSA Compressor, and Indexer are enabled; CP and PP are disabled.
@@ -14,6 +14,8 @@ randomly initializes weights; pretrained checkpoints must be supplied separately
 ## Resources and Launch
 
 Install the project and its compatible PyTorch, torch_npu, and CANN/HCCL dependencies.
+BF16 eager and graph execution require a CANN installation that provides the
+`aclnnMhcPost` and `aclnnMhcPostBackward` operators.
 Run the following commands from the repository root and check that the import
 points to this checkout:
 

@@ -15,6 +15,7 @@
 """Manifold hyper-connection post-processing functions."""
 
 from typing import Any, Tuple
+import warnings
 
 import torch
 
@@ -86,9 +87,10 @@ def mhc_post(
         num_stream: Number of residual streams.
         backend: ``"cann"`` (default) calls the differentiable CANN
             ops-transformer ``mhc_post`` operator and requires fp16/bf16
-            ``x``/``residual`` with fp32 ``h_post``/``h_res``; the legacy
-            ``"omni"`` backend is deprecated. CPU execution keeps the eager
-            fallback.
+            ``x``/``residual`` with fp32 ``h_post``/``h_res``. Graph capture
+            requires a CANN wrapper that uses the PyTorch dispatcher. CPU and
+            FP32 NPU inputs use the tensor formula. The legacy ``"omni"``
+            backend is deprecated.
 
     Returns:
         Flattened mixed residual streams.
@@ -97,7 +99,14 @@ def mhc_post(
         raise ValueError(f"backend must be 'cann' or 'omni', got {backend!r}")
     x_shape = x.size()
     residual = residual.reshape(x_shape[0], x_shape[1], num_stream, -1)
-    if x.device.type == "npu":
+    is_npu = x.device.type == "npu"
+    if is_npu and x.dtype == torch.float32:
+        warnings.warn(
+            "Fused mHC post does not support FP32 NPU inputs; using the PyTorch tensor formula.",
+            RuntimeWarning,
+            stacklevel=1,
+        )
+    elif is_npu:
         # Load only the selected optional backend so either can be used independently.
         # pylint: disable=import-outside-toplevel
         if backend == "cann":
