@@ -274,8 +274,8 @@ def _tensor_size(key: str, chunks: list[ChunkStorageMetadata]) -> tuple[int, ...
         tuple[int, ...]: The smallest size that holds every chunk.
 
     Raises:
-        ValueError: If the chunks differ in number of dimensions, or hold more or fewer elements
-            than that size does: a file of the checkpoint is missing, or two chunks overlap.
+        ValueError: If the chunks differ in number of dimensions, overlap, or hold more or fewer
+            elements than that size does: a file of the checkpoint is missing, or two chunks overlap.
     """
     ndim = len(chunks[0].sizes)
     if any(len(chunk.sizes) != ndim for chunk in chunks):
@@ -287,6 +287,20 @@ def _tensor_size(key: str, chunks: list[ChunkStorageMetadata]) -> tuple[int, ...
             f"The chunks of tensor {key!r} hold {held} elements between them, where a tensor of size "
             f"{size} has {prod(size)}: a file of the checkpoint is missing, or two chunks overlap."
         )
+    occupied: list[ChunkStorageMetadata] = []
+    for chunk in chunks:
+        if prod(chunk.sizes) == 0:
+            continue
+        for previous in occupied:
+            if all(
+                max(chunk.offsets[dim], previous.offsets[dim])
+                < min(chunk.offsets[dim] + chunk.sizes[dim], previous.offsets[dim] + previous.sizes[dim])
+                for dim in range(ndim)
+            ):
+                raise ValueError(
+                    f"The chunks of tensor {key!r} at offsets {previous.offsets} and {chunk.offsets} overlap."
+                )
+        occupied.append(chunk)
     return size
 
 

@@ -259,6 +259,30 @@ class TestRegionTensor(unittest.TestCase):
             with self.subTest(label), self.assertRaises(UnsupportedRegionOp):
                 case()
 
+    def test_flatten_block_limit_checked_before_expansion(self):
+        """
+        Feature: RegionTensor block limit before allocation.
+        Description: Flatten a transposed tensor needing five blocks with a limit of four.
+        Expectation: UnsupportedRegionOp before any child block is constructed.
+        """
+        region = RegionTensor.leaf("w", (2, 5), torch.float32).transpose(0, 1)
+        with patch("hyper_parallel.components.checkpoint.region_tensor.MAX_BLOCKS", 4):
+            with patch("hyper_parallel.components.checkpoint.region_tensor._restrict") as restrict:
+                with self.assertRaises(UnsupportedRegionOp):
+                    region.flatten()
+                restrict.assert_not_called()
+
+    def test_flatten_at_block_limit_matches_torch(self):
+        """
+        Feature: RegionTensor block limit boundary.
+        Description: Flatten a transposed tensor needing exactly four blocks with a limit of four.
+        Expectation: The conversion succeeds and its values match torch.
+        """
+        region, real = _pair("w", (2, 4))
+        with patch("hyper_parallel.components.checkpoint.region_tensor.MAX_BLOCKS", 4):
+            flattened = region.transpose(0, 1).flatten()
+        self._assert_matches(flattened, real.transpose(0, 1).flatten(), {"w": real}, "flatten at block limit")
+
     def test_region_cut_into_too_many_blocks_is_refused(self):
         """
         Feature: RegionTensor block limit.

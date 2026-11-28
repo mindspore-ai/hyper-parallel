@@ -32,6 +32,9 @@
 # The maintainers of hyper_parallel/compile.
 /hyper_parallel/compile/ @kisnwangg @yu-chen-code
 
+# The maintainers of hyper_parallel/components.
+hyper_parallel/components/checkpoint @zhangbuxue @xiaoyuxing-010818
+
 # The maintainers of tests.
 /tests/ @liuchongming74
 /tests/ut/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
