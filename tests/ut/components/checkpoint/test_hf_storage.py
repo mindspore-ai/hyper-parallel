@@ -382,6 +382,37 @@ class TestTorchShardedSafetensorsReader(unittest.TestCase):
                     TorchShardedSafetensorsReader(checkpoint_dir).load_metadata()
                 self.assertIn("'w'", str(ctx.exception), f"tensor 'w' not named in: {ctx.exception}")
 
+    def test_overlap_balanced_by_gap_is_rejected(self):
+        """
+        Feature: TorchShardedSafetensorsReader.load_metadata coverage check.
+        Description: Save three shards whose overlap and gap have equal volume, in one and two dimensions.
+        Expectation: ValueError naming the tensor and overlap despite the matching total element count.
+        """
+        for shape, offsets in (
+            ((2,), ((0,), (1,), (4,))),
+            ((2, 2), ((0, 0), (0, 1), (0, 4))),
+        ):
+            with self.subTest(shape=shape):
+                checkpoint_dir = _temporary_directory(self)
+                for index, offset in enumerate(offsets):
+                    _save(checkpoint_dir / f"shard-{index}.safetensors", {"w": torch.zeros(shape)},
+                          {"w": list(offset)})
+                with self.assertRaisesRegex(ValueError, "tensor 'w'.*overlap"):
+                    TorchShardedSafetensorsReader(checkpoint_dir).load_metadata()
+
+    def test_adjacent_and_empty_shards_are_accepted(self):
+        """
+        Feature: TorchShardedSafetensorsReader.load_metadata overlap boundaries.
+        Description: Tile a 2x4 tensor along columns and include an empty shard within another shard.
+        Expectation: Adjacent shards and zero-volume shards are accepted.
+        """
+        checkpoint_dir = _temporary_directory(self)
+        for index, (shape, offset) in enumerate((((2, 2), [0, 0]), ((2, 2), [0, 2]), ((0, 2), [1, 0]))):
+            _save(checkpoint_dir / f"shard-{index}.safetensors", {"w": torch.zeros(shape)}, {"w": offset})
+        metadata = TorchShardedSafetensorsReader(checkpoint_dir).load_metadata()
+        size = metadata.state_dict_metadata["w"].size
+        self.assertEqual(size, (2, 4), f"tensor shape mismatch: expected=(2, 4), got={size}")
+
     def test_inconsistent_shards_are_rejected(self):
         """
         Feature: TorchShardedSafetensorsReader.load_metadata consistency checks.

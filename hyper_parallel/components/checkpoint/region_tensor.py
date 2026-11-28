@@ -208,11 +208,11 @@ def _merge_axes(blocks: Sequence[RegionBlock], start: int, sizes: Sequence[int])
             )
             if not (whole and in_step):
                 origin = block.offsets[start + first]
+                _check_count(len(merged) + len(pending) + block.lengths[start + first])
                 pending.extend(
                     _restrict(block, start + first, origin + index, 1)
                     for index in range(block.lengths[start + first])
                 )
-                _check_count(len(merged) + len(pending))
                 continue
             length = block.lengths[start + first] * strides[first]
         offset = sum(index * stride for index, stride in zip(block.offsets[start:stop], strides))
