@@ -65,12 +65,31 @@ optimizer:
 class TestConfigOverrides(unittest.TestCase):
     """``--a.b=c`` overrides applied to a resolved trainer config."""
 
-    def _parse(self, *overrides: str):
+    def _parse(self, *overrides: str, extra_yaml: str = ""):
         """Write the sample YAML into a temporary directory and parse it."""
         with tempfile.TemporaryDirectory() as tmpdir:
             yaml_path = Path(tmpdir) / "train.yaml"
-            yaml_path.write_text(_SAMPLE_YAML.format(module=__name__), encoding="utf-8")
+            yaml_path.write_text(_SAMPLE_YAML.format(module=__name__) + extra_yaml, encoding="utf-8")
             return parse_training_args([str(yaml_path), *overrides])
+
+    def test_logging_level_defaults_and_overrides(self) -> None:
+        """Resolve the default level, the YAML setting, and a CLI override."""
+        training_yaml = "training:\n  logging_level: WARNING\n"
+        for expected, extra_yaml, overrides in (
+            ("INFO", "", ()),
+            ("WARNING", training_yaml, ()),
+            ("DEBUG", training_yaml, ("--training.logging_level=DEBUG",)),
+        ):
+            with self.subTest(expected=expected):
+                level = self._parse(*overrides, extra_yaml=extra_yaml).training.logging_level
+                self.assertEqual(level, expected, f"Expected logging level {expected}, got {level}")
+
+    def test_invalid_logging_level_is_rejected(self) -> None:
+        """Report the field path for an invalid level in YAML or on the CLI."""
+        with self.assertRaisesRegex(ConfigResolutionError, r"training\.logging_level"):
+            self._parse(extra_yaml="training:\n  logging_level: VERBOSE\n")
+        with self.assertRaisesRegex(ConfigResolutionError, r"training\.logging_level"):
+            self._parse("--training.logging_level=VERBOSE")
 
     def test_worker_recovery_defaults_and_overrides(self) -> None:
         """Resolve the nested recovery switch and Controller endpoint overrides."""

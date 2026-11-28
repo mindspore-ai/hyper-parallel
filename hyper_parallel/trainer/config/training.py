@@ -54,6 +54,7 @@ class TrainingConfig:
     attention over the real sequence boundaries.
     """
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
+    logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
 
 @dataclass

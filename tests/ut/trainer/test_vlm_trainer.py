@@ -81,7 +81,7 @@ class TestVLMTrainer(unittest.TestCase):
             for aux in (1.0, 3.0)
         ])
 
-        with patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log:
+        with self.assertLogs("hyper_parallel.trainer.callbacks.logging_callback", level="INFO") as log:
             result = trainer.train_step(iter(range(2)))
 
         metrics = getattr(trainer.base, "step_env_metrics")
@@ -89,8 +89,8 @@ class TestVLMTrainer(unittest.TestCase):
         observed = {name: metrics[name] for name in expected}
         self.assertEqual(observed, expected, f"expected step metrics={expected}, got={observed}")
         self.assertEqual(result["loss"], 1.0, f"expected backward loss sum=1.0, got={result['loss']}")
-        log.assert_called_once()
-        message = log.call_args.args[1]
+        self.assertEqual(len(log.records), 1, f"Expected one step log, got {log.output}")
+        message = log.records[0].getMessage()
         self.assertIn("training/router_aux_loss=2", message.split(), f"expected terminal AUX=2, got={message}")
 
     def test_micro_steps_release_images_before_fetching_next_batch(self) -> None:

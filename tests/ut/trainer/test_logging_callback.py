@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for cadence-controlled router auxiliary-loss logging."""
 
+import logging
 import subprocess
 import sys
 from textwrap import dedent
@@ -25,12 +26,19 @@ import torch
 
 from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
 from hyper_parallel.trainer.callbacks.logging_callback import LoggingCallback
+from hyper_parallel.trainer.runtime.logging import create_logger, setup_logging
 from hyper_parallel.trainer.state import TrainerState
 from tests.common.mark_utils import arg_mark
 
 
 class TestLoggingCallback(unittest.TestCase):
     """Verify router metrics use the normal rank, cadence and terminal output path."""
+
+    def setUp(self) -> None:
+        """Start each callback test at the default Trainer logging level."""
+        trainer_logger = logging.getLogger("hyper_parallel.trainer")
+        self.addCleanup(trainer_logger.setLevel, trainer_logger.level)
+        trainer_logger.setLevel(logging.INFO)
 
     @staticmethod
     def _trainer(monitor=None, logging_steps: int = 2, rank: int = 0) -> SimpleNamespace:
@@ -178,3 +186,20 @@ class TestLoggingCallback(unittest.TestCase):
         trainer.tqdm_callback.write.assert_called_once()
         self.assertIn("training/router_aux_loss=1.25", trainer.tqdm_callback.write.call_args.args[0])
         log.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_warning_level_filters_trainer_loggers_and_tqdm_metrics(self) -> None:
+        """Apply the Trainer threshold to formatted loggers and the active tqdm writer."""
+        name = "hyper_parallel.trainer.test_logging_callback"
+        with patch.object(logging.getLogger(name), "addHandler"):
+            trainer_logger = create_logger(name)
+        trainer = self._trainer()
+        trainer.tqdm_callback = SimpleNamespace(write=Mock(return_value=True))
+        callback = LoggingCallback(trainer)
+
+        with patch.object(logging, "basicConfig"):
+            setup_logging("WARNING")
+        level = trainer_logger.getEffectiveLevel()
+        self.assertEqual(level, logging.WARNING, f"Expected logging level {logging.WARNING}, got {level}")
+        callback.on_step_end(TrainerState(global_step=2), loss=2.5, loss_dict={}, grad_norm=1.0)
+        trainer.tqdm_callback.write.assert_not_called()
