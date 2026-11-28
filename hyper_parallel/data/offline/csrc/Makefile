@@ -25,7 +25,7 @@ OUTPUT = ../$(LIBRARY_NAME)$(LIBRARY_EXTENSION)
 
 all: $(OUTPUT)
 
-$(OUTPUT): indexed_helpers.cpp
+$(OUTPUT): helpers.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:

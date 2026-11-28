@@ -85,7 +85,7 @@ activation_checkpoint:
 
 dataset:
   data_config:
-    seq_length: 4096
+    max_seq_len: 4096
 
 optimizer:
   _target_: hyper_parallel.components.optim.Muon

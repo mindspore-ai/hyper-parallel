@@ -30,8 +30,8 @@ from numpy.random import RandomState
 
 from hyper_parallel.data.constants import IGNORE_INDEX, PAD_TOKEN_ID
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
-from hyper_parallel.data.indexed.indexed_data_reader import ArrowDataReader, IndexedDataReader
+from hyper_parallel.data.offline.data_config import GPTDatasetConfig
+from hyper_parallel.data.offline.data_reader import ArrowDataReader, IndexedDataReader
 
 logger = get_dataset_logger(__name__)
 
@@ -98,14 +98,21 @@ class _IndexedPretrainDataset(ABC):
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
+                self.config.inter_document_masking,
             )
         )
         self._cached_ltor_fields = None
 
         # Handle pad token id provided by the tokenizer.
         try:
-            pad_token_id = self.config.tokenizer.pad
-            self._pad_token_id = PAD_TOKEN_ID if pad_token_id is None else int(pad_token_id)
+            pad_token_id = getattr(self.config.tokenizer, "pad_token_id", None)
+
+            if pad_token_id is None:
+                pad_token_id = self.config.tokenizer.pad
+
+            self._pad_token_id = (
+                PAD_TOKEN_ID if pad_token_id is None or callable(pad_token_id) else int(pad_token_id)
+            )
         except (AttributeError, NotImplementedError):
             self._pad_token_id = PAD_TOKEN_ID
 
@@ -124,7 +131,7 @@ class _IndexedPretrainDataset(ABC):
                 except (AttributeError, NotImplementedError):
                     pass
 
-        if not self.config.mock and self._pad_token_id in special_token_ids:
+        if self._pad_token_id in special_token_ids:
             if self.config.allow_ambiguous_pad_tokens:
                 logger.warning(
                     "The tokenizer PAD ID collides with another special token ID; matching tokens will also be "
@@ -159,19 +166,32 @@ class _IndexedPretrainDataset(ABC):
             self,
             tokens: np.ndarray,
             labels: np.ndarray,
+            document_boundaries: np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         """Build LTR masks and position IDs when explicitly enabled."""
+
         if not self.config.create_ltor_fields:
-            ltor_fields = {}
-            return ltor_fields
 
-        if not self._ltor_fields_cacheable or self._cached_ltor_fields is None:
-            attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(tokens, self.config)
-            if self._ltor_fields_cacheable:
-                self._cached_ltor_fields = (attention_mask, loss_mask, position_ids)
+            return {}
+
+        # Final document-specific masks and positions may differ even for
+        # samples with the same token length, so they cannot share this cache.
+        cacheable = self._ltor_fields_cacheable and document_boundaries is None
+        cached_fields = self._cached_ltor_fields if cacheable else None
+
+        if cached_fields is not None:
+            fields = cached_fields
+
+        elif document_boundaries is not None:
+            fields = _get_ltor_masks_and_position_ids_from_boundaries(tokens, self.config, document_boundaries)
+
         else:
-            attention_mask, loss_mask, position_ids = self._cached_ltor_fields
+            fields = _get_ltor_masks_and_position_ids_from_eod(tokens, self.config)
 
+        if cacheable and cached_fields is None:
+            self._cached_ltor_fields = fields
+
+        attention_mask, loss_mask, position_ids = fields
         loss_mask = loss_mask.copy()
         loss_mask[labels == self._pad_token_id] = 0.0
         ltor_fields = {
@@ -276,10 +296,16 @@ class _MockDataset(_IndexedPretrainDataset):
 class MockGPTDataset(_MockDataset):
     """Generate deterministic, fixed-length mock GPT samples."""
 
+    def _finalize(self) -> None:
+        """Require the EOD token inserted into each generated sample."""
+
+        if getattr(self.config.tokenizer, "eod", None) is None:
+            raise ValueError("MockGPTDataset requires a tokenizer with an EOD token ID")
+
     def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Generate a deterministic mock sample for one split and index."""
         token = 1
-        pad = 2
+        pad = self._pad_token_id
         eod = self.config.tokenizer.eod
 
         if index >= self.num_samples:
@@ -292,14 +318,17 @@ class MockGPTDataset(_MockDataset):
         sample_tokens = np.zeros(length) + token
         sample_pads = np.zeros(self.config.sequence_length - length - 1) + pad
         sample = np.int64(np.concatenate([[length], sample_tokens, [eod], sample_pads]))
-        tokens = sample[:-1]
-        labels = sample[1:]
+        tokens = sample[:-1].copy()
+        labels = sample[1:].copy()
+        ltor_fields = self._build_ltor_fields(tokens, labels)
+        tokens[tokens == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         raw_sample = {
             "input_ids": tokens,
             "labels": labels,
         }
-        raw_sample.update(self._build_ltor_fields(tokens, labels))
+        raw_sample.update(ltor_fields)
 
         return raw_sample
 
@@ -307,11 +336,26 @@ class MockGPTDataset(_MockDataset):
 class GPTDataset(_IndexedPretrainDataset):
     """Build fixed-length GPT samples from an indexed token stream."""
 
+    @staticmethod
+    def validate_config(config: GPTDatasetConfig) -> None:
+        """Require an EOD token ID when document boundaries come from tokens.
+
+        Args:
+            config: Indexed GPT Dataset configuration.
+
+        Raises:
+            ValueError: If EOD-based boundaries are selected without an EOD token ID.
+        """
+
+        if not config.inter_document_masking and getattr(config.tokenizer, "eod", None) is None:
+            raise ValueError("GPTDataset requires an EOD token ID when inter_document_masking=False")
+
     def _finalize(self) -> None:
         """Build the document, sample, and shuffle indices for the token stream."""
         if self.dataset is None or self.indices is None:
             raise ValueError("GPTDataset requires a low-level Dataset and split indices")
 
+        self.validate_config(self.config)
         self.document_index, self.sample_index, self.shuffle_index = self._build_document_sample_shuffle_indices()
 
     def _plan_epochs(self, num_tokens_per_epoch: int) -> tuple[int, bool, int]:
@@ -400,7 +444,7 @@ class GPTDataset(_IndexedPretrainDataset):
 
         # Convert the shuffled token stream into fixed-length sample boundaries in C++.
         # Keep the optional C++ extension out of the pre-packed MindRecord path.
-        from hyper_parallel.data.indexed.indexed_helpers import build_sample_index  # pylint: disable=C0415
+        from hyper_parallel.data.offline.helpers import build_sample_index  # pylint: disable=C0415
 
         sample_index = build_sample_index(
             self.dataset.sequence_lengths,
@@ -451,7 +495,7 @@ class GPTDataset(_IndexedPretrainDataset):
 
     def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Read, shift, and mask one shuffled GPT sample."""
-        text, _, _ = self._query_document_sample_shuffle_indices(index)
+        text, _, document_lengths = self._query_document_sample_shuffle_indices(index)
 
         if self.config.add_extra_token_to_sequence:
             tokens = text[:-1].copy()
@@ -461,11 +505,33 @@ class GPTDataset(_IndexedPretrainDataset):
             labels = np.roll(text, shift=-1)
             labels[-1] = self._pad_token_id
 
-        ltor_fields = self._build_ltor_fields(tokens, labels)
+        document_boundaries = None
+        if self.config.inter_document_masking:
+            document_lengths = [length for length in document_lengths if length > 0]
+
+            # The extra token produces the shifted labels. Subtract it if it was
+            # read from the last document part so cu_seq_lens indexes the input
+            # tokens. An extra token supplied by padding is outside document_lengths.
+            if self.config.add_extra_token_to_sequence and sum(document_lengths) > tokens.size:
+                document_lengths[-1] -= 1
+                if document_lengths[-1] == 0:
+                    document_lengths.pop()
+
+            # Fold sample padding into the last document so cu_seq_lens[-1]
+            # equals the input sequence length.
+            shortfall = tokens.size - sum(document_lengths)
+            if shortfall > 0:
+                if document_lengths:
+                    document_lengths[-1] += shortfall
+                else:
+                    document_lengths.append(shortfall)
+            document_boundaries = np.cumsum([0] + document_lengths, dtype=np.int32)
+
+        ltor_fields = self._build_ltor_fields(tokens, labels, document_boundaries)
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         if np.any(tokens < 0) or np.any(tokens >= len(self.config.tokenizer)):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
@@ -476,12 +542,20 @@ class GPTDataset(_IndexedPretrainDataset):
         }
         raw_sample.update(ltor_fields)
 
+        if document_boundaries is not None:
+            # Pad cu_seq_lens to a fixed length so default_collate can stack
+            # samples with different numbers of documents. The boundary resolver
+            # strips trailing entries that repeat the sequence length.
+            boundaries = np.full(tokens.size + 1, tokens.size, dtype=np.int32)
+            boundaries[:document_boundaries.size] = document_boundaries
+            raw_sample["cu_seq_lens"] = boundaries
+
         return raw_sample
 
     def _query_document_sample_shuffle_indices(
         self,
         index: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, list[int]]:
         """Get the text (token ids) and document ids for a given index
 
         Args:
@@ -625,13 +699,13 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
             labels = np.roll(text, shift=-1)
             labels[-1] = self._pad_token_id
 
-        if np.any(tokens < 0) or np.any(tokens >= self.config.tokenizer.vocab_size):
+        if np.any(tokens < 0) or np.any(tokens >= len(self.config.tokenizer)):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
 
         ltor_fields = self._build_ltor_fields(tokens, labels)
 
         tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = IGNORE_INDEX
 
         raw_sample = {
             "input_ids": tokens,
@@ -642,11 +716,11 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
         return raw_sample
 
 
-def _get_ltor_masks_and_position_ids(
+def _get_ltor_masks_and_position_ids_from_eod(
     tokens: np.ndarray,
     config: GPTDatasetConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build causal attention, loss, and position arrays for one token sequence.
+    """Build LTR fields by locating EOD tokens in the input sequence.
 
     Args:
         tokens: Token IDs for one fixed-length Indexed sample.
@@ -656,40 +730,65 @@ def _get_ltor_masks_and_position_ids(
         Attention mask, loss mask, and position IDs.
     """
     seq_length = tokens.size
-    eod_token = config.tokenizer.eod
+    eod_token = getattr(config.tokenizer, "eod", None)
     attention_mask = np.tril(np.ones((seq_length, seq_length)))[None, :, :]
 
     # Loss mask.
     loss_mask = np.ones(seq_length, dtype=np.float32)
-    if config.eod_mask_loss:
+    if config.eod_mask_loss and eod_token is not None:
         loss_mask[tokens == eod_token] = 0.0
 
     # Position ids.
     position_ids = np.arange(seq_length, dtype=np.int64)
-    # We need to clone as the ids will be modified based on batch index.
-    if config.reset_position_ids:
-        position_ids = position_ids.copy()
-
-    if config.reset_position_ids or config.reset_attention_mask:
-        # Find indices where EOD token is.
-        eod_indices = position_ids[tokens == eod_token]
-        # Detach indices from positions if going to modify positions.
-        if config.reset_position_ids:
-            eod_indices = eod_indices.copy()
-
-        # Loop through EOD indices:
+    if (config.reset_position_ids or config.reset_attention_mask) and eod_token is not None:
+        next_indices = np.flatnonzero(tokens == eod_token) + 1
         prev_index = 0
-        for eod_index in eod_indices:
-            next_index = int(eod_index) + 1
-            # Mask attention loss.
+
+        for next_index in next_indices:
+            next_index = int(next_index)
+
             if config.reset_attention_mask:
                 attention_mask[0, next_index:, :next_index] = 0
-            # Reset positions.
+
             if config.reset_position_ids:
                 position_ids[next_index:] -= next_index - prev_index
                 prev_index = next_index
 
     # Convert attention mask to binary:
+    attention_mask = attention_mask < 0.5
+
+    return attention_mask, loss_mask, position_ids
+
+
+def _get_ltor_masks_and_position_ids_from_boundaries(
+    tokens: np.ndarray,
+    config: GPTDatasetConfig,
+    document_boundaries: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build document-isolated LTR fields for Indexed packing without EOD tokens.
+
+    Args:
+        tokens: Token IDs for one fixed-length Indexed sample.
+        config: Indexed Dataset runtime-field configuration.
+        document_boundaries: Leading-zero input boundaries built from Indexed lengths.
+
+    Returns:
+        Attention mask, loss mask, and positions reset within each document.
+    """
+    seq_length = tokens.size
+    attention_mask = np.tril(np.ones((seq_length, seq_length)))[None, :, :]
+    loss_mask = np.ones(seq_length, dtype=np.float32)
+    eod_token = getattr(config.tokenizer, "eod", None)
+
+    if config.eod_mask_loss and eod_token is not None:
+        loss_mask[tokens == eod_token] = 0.0
+
+    # Reset position IDs per document.
+    position_ids = np.empty(seq_length, dtype=np.int64)
+    for start, end in zip(document_boundaries[:-1], document_boundaries[1:]):
+        attention_mask[0, start:end, :start] = 0
+        position_ids[start:end] = np.arange(end - start, dtype=np.int64)
+
     attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids

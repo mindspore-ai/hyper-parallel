@@ -14,6 +14,8 @@
 # ============================================================================
 """Select and combine samples for multimodal packing."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -48,14 +50,19 @@ class FirstFitPackingSelector(PackingSelector):
     """Select candidates in source order until the token budget is full."""
 
     def get_sample_cost(self, sample: Mapping[str, Any]) -> int:
-        """Read standard packing metadata or derive cost from encoded input IDs."""
+        """Use packing metadata without undercounting already encoded tokens."""
         sample_cost = sample.get("packing_length")
+
         if sample_cost is None:
             sample_cost = self._get_input_length(sample)
 
         resolved_cost = int(sample_cost)
+
         if resolved_cost <= 0:
             raise ValueError("Packing sample cost must be positive")
+
+        if sample.get("packing_length") is not None and sample.get("input_ids") is not None:
+            resolved_cost = max(resolved_cost, self._get_input_length(sample))
 
         return resolved_cost
 
@@ -65,6 +72,7 @@ class FirstFitPackingSelector(PackingSelector):
             token_budget: int,
     ) -> Sequence[int]:
         """Select the next ordered first-fit group from the candidate buffer."""
+
         if not samples:
             raise ValueError("Packing candidate buffer is empty")
 
@@ -72,7 +80,8 @@ class FirstFitPackingSelector(PackingSelector):
         selected_cost = 0
         for sample_index, sample in enumerate(samples):
             sample_cost = self.get_sample_cost(sample)
-            sample_fits = selected_cost == 0 or selected_cost + sample_cost <= token_budget
+            sample_fits = selected_cost + sample_cost <= token_budget
+
             if sample_fits:
                 selected_indices.append(sample_index)
                 selected_cost += sample_cost
@@ -188,8 +197,10 @@ class SamplePacker:
                 packed_starts.append(token_starts + sequence_offset)
 
             input_ids = sample.get("input_ids")
+
             if input_ids is None:
                 raise ValueError(f"Packing {field!r} requires input_ids in every sample")
+
             sequence_offset += int(torch.as_tensor(input_ids).shape[-1])
 
         if not packed_starts:
@@ -203,27 +214,36 @@ class SamplePacker:
             samples: Sequence[Mapping[str, Any]],
     ) -> torch.Tensor:
         """Build cumulative text boundaries for packed attention isolation."""
-        sequence_lengths = []
+        cumulative_lengths = [0]
         input_ids_reference = None
         for sample in samples:
             if "input_ids" not in sample:
                 raise ValueError("Every packed sample must contain input_ids")
 
             input_ids = sample["input_ids"]
+
             if input_ids_reference is None and isinstance(input_ids, torch.Tensor):
                 input_ids_reference = input_ids
+
             input_shape = getattr(input_ids, "shape", None)
+
             if input_shape is not None:
                 sequence_length = int(input_shape[-1])
             else:
                 sequence_length = len(input_ids)
+
             if sequence_length <= 0:
                 raise ValueError("Packed samples must contain at least one token")
-            sequence_lengths.append(sequence_length)
 
-        cumulative_lengths = [0]
-        for sequence_length in sequence_lengths:
-            cumulative_lengths.append(cumulative_lengths[-1] + sequence_length)
+            sample_boundaries = sample.get("cu_seq_lens")
+            local_boundaries = ([0, sequence_length] if sample_boundaries is None
+                                else torch.as_tensor(sample_boundaries).reshape(-1).tolist())
+
+            if not local_boundaries or local_boundaries[0] != 0 or local_boundaries[-1] != sequence_length:
+                raise ValueError("Sample cu_seq_lens must cover the complete input_ids")
+
+            sequence_offset = cumulative_lengths[-1]
+            cumulative_lengths.extend(sequence_offset + boundary for boundary in local_boundaries[1:])
 
         if input_ids_reference is None:
             sequence_boundaries = torch.tensor(cumulative_lengths, dtype=torch.int32)
@@ -232,6 +252,7 @@ class SamplePacker:
                 cumulative_lengths,
                 dtype=torch.int32,
             )
+
         return sequence_boundaries
 
 

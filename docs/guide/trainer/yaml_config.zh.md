@@ -2,6 +2,13 @@
 
 [English](yaml_config.md) | **简体中文**
 
+Dataset 的 Online/Offline 配置、必填项和数据片段见
+[Dataset 使用方法](../../../hyper_parallel/data/README.zh.md#10-配置示例)。其中专门说明了
+`max_seq_len`、`micro_batch_size`、packing 上限、固定/动态 padding 与 CP/TP 对齐的关系。
+Online 训练使用 `epochs/max_steps`；Offline 使用 `train_iters/train_samples`，二者不能混用。
+Dataset 最小模板只列必选项；默认值、可选覆盖项以及 Trainer 注入项在使用说明中分开列出。
+原始数据制作 `.bin/.idx` 的命令行参数见 [Offline 制作指南](../data/offline_preparation_guide.zh.md)。
+
 HyperParallel 模型训练按 [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 的字段定义解析 YAML。字段名决定 YAML 可以包含哪些配置项，字段类型决定对应的值如何解析。解析完成后得到 `TrainerConfig` 对象，随后通过 CLI dotted overrides 更新配置字段。
 
 ```python
@@ -159,6 +166,9 @@ CLI override 在 YAML 已经解析为 `TrainerConfig` 后执行，使用 `--fiel
 --optimizer.adamw_config.adamw_lr=2.0e-5
 --profiler.enable=true
 ```
+
+上面的 `train_iters` 用于 Offline。Online 使用 `--training.epochs=2 --training.max_steps=100`，
+表示两轮、每轮 100 个 optimizer steps；基础 YAML 也须使用 Online 的训练计划。
 
 Value 先由 `yaml.safe_load()` 解析，再按照目标节点的类型转换：
 

@@ -77,7 +77,7 @@ class SyntheticTextDataset(Dataset):
 def build_dataset(
     *,
     vocab_size: int,
-    seq_length: int,
+    data_config: dict[str, Any],
     num_samples: int,
     seed: int = 42,
     mesh_context: Any = None,
@@ -90,7 +90,7 @@ def build_dataset(
 
     Args:
         vocab_size: Vocabulary size for the synthetic tokens.
-        seq_length: Sequence length of every synthetic sample.
+        data_config: Required max_seq_len for every synthetic sample.
         num_samples: Number of synthetic samples.
         seed: Base seed for deterministic sampling.
         mesh_context: Trainer mesh (unused; injection point).
@@ -105,7 +105,7 @@ def build_dataset(
     del mesh_context, training_config, transform, tokenizer, kwargs
     return SyntheticTextDataset(
         vocab_size=vocab_size,
-        seq_length=seq_length,
+        seq_length=data_config["max_seq_len"],
         num_samples=num_samples,
         seed=seed,
     )

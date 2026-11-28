@@ -66,21 +66,19 @@ activation_checkpoint:
 dataset:
   _target_: hyper_parallel.compile.examples.simple_model.data.build_dataset
   vocab_size: 128256
-  seq_length: 128
+  data_config:
+    max_seq_len: 128
   num_samples: 512
   seed: 42
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   sampler_type: single
-  data_sharding: false
-  drop_last: true
-  num_workers: 0
-  pin_memory: false
   collate_fn:
     _target_: hyper_parallel.compile.examples.simple_model.data.build_collate_fn
   get_batch:
     _target_: hyper_parallel.compile.examples.simple_model.data.build_get_batch
+    source_type: offline
 
 checkpoint:
   save_ckpt: false

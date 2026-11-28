@@ -26,6 +26,9 @@ class TrainingConfig:
 
     train_iters: Optional[int] = None
     train_samples: Optional[int] = None
+    epochs: Optional[int] = None
+    max_steps: Optional[int] = None
+    """Online optimizer-step limit per epoch; used together with ``epochs``."""
     lr_scheduler_iters: Optional[int] = None
     eval_iters: int = 0
 
@@ -54,6 +57,21 @@ class TrainingConfig:
     attention over the real sequence boundaries.
     """
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
+
+    def __post_init__(self) -> None:
+        """Keep explicit epoch plans separate from legacy global run limits."""
+
+        if self.epochs is None and self.max_steps is None:
+            return
+
+        for name in ("epochs", "max_steps"):
+            value = getattr(self, name)
+
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"training.{name} must be a positive integer; configure epochs and max_steps together")
+
+        if self.train_iters is not None or self.train_samples is not None:
+            raise ValueError("training.epochs/max_steps cannot be combined with train_iters/train_samples")
 
 
 @dataclass

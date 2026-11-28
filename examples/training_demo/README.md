@@ -44,6 +44,78 @@ Both launchers automatically generate small deterministic local datasets when
 the expected files are absent. This process does not access or download an
 external dataset.
 
+## Epoch and step limits
+
+Offline and Online configurations normalize into the same three Trainer values:
+`train_iters` (total optimizer steps), `train_steps` (optimizer steps per epoch),
+and `train_epochs` (number of epochs). All step counts below refer to optimizer
+updates, not gradient-accumulation micro-batches.
+`dataloader.get_batch.source_type` selects which configuration is required;
+the presence of `epochs` does not select the data mode.
+
+Offline keeps its existing total-run controls. Set either `train_iters` or
+`train_samples`; leave `epochs` and `max_steps` unset:
+
+```yaml
+training:
+  global_batch_size: 16
+  train_iters: 100
+  # Alternatively, replace train_iters with train_samples: 1600.
+dataloader:
+  get_batch:
+    source_type: offline
+```
+
+Online uses `epochs` and `max_steps` together. Keep `train_iters` and
+`train_samples` unset:
+
+```yaml
+training:
+  global_batch_size: 16
+  epochs: 2
+  max_steps: 100
+dataloader:
+  get_batch:
+    source_type: online
+dataset:
+  data_config:
+    repeat: true
+```
+
+These snippets show the run-limit fields; retain the Dataset/DataLoader targets
+and other required fields from the chosen recipe.
+
+| Internal value | Offline | Online |
+| --- | --- | --- |
+| `train_iters` | `train_iters`, or `train_samples // global_batch_size` | `epochs * max_steps` |
+| `train_steps` | `len(train_dataloader) // num_micro_batches` | `max_steps` |
+| `train_epochs` | `(train_iters + train_steps - 1) // train_steps` | Same calculation; equals configured `epochs` |
+
+Both modes use the same epoch loop, bounded by `train_steps` and the remaining
+total steps. For example, an Offline budget of ten steps with capacity for four
+updates per epoch runs **4, 4, 2** updates. Online with `epochs: 3` and
+`max_steps: 4` runs **4, 4, 4** updates. Resume starts at the saved epoch and
+global step. The startup log prints all three normalized values.
+
+Offline Dataset construction and total-run semantics remain unchanged;
+`epochs/max_steps` is unsupported for Offline. Partial sample/accumulation groups
+are excluded by the integer divisions above, matching the existing behavior.
+
+Online training defaults `dataset.data_config.repeat` to `true` and runs `max_steps`
+updates per epoch; explicit `false` is unsupported with `epochs/max_steps`.
+Its Mapping Dataset indexes all valid source records;
+raw-document counts are independent of the packed-sequence budget. Exhausted
+rank-local loaders restart before the next model micro-step, so differing
+packing ratios do not expose rank-local EOF to training collectives. Empty
+passes raise an error. Native loader state and the source-pass counter are
+checkpointed separately from the logical training epoch.
+
+Online requires `epochs/max_steps`; a legacy Online recipe must replace its
+`train_iters: N` with `epochs: 1` and `max_steps: N`.
+Online Mapping lengths always reflect the natural sources.
+Online `epochs/max_steps` requires native loaders. Existing non-Online
+`load_balance` configurations retain their total-run plan.
+
 ## Run
 
 Pass a local Qwen3-30B-A3B Hugging Face directory containing `config.json` and

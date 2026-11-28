@@ -9,7 +9,8 @@ model:
   force_hf: true
 
 training:
-  train_iters: 10
+  epochs: 1
+  max_steps: 10
   global_batch_size: 8
   micro_batch_size: 1
   backend: hccl
@@ -47,10 +48,10 @@ dataset:
     local_files_only: true
   data_transform:
     _target_: hyper_parallel.data.omni.AutoProcessorTransform
-    max_seq_len: 512
   _target_: hyper_parallel.data.omni.build_online_omni_mapping_dataset
   data_path: /path/to/vlm/data.json
-  data_config: {}
+  data_config:
+    max_seq_len: 512
 
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
@@ -59,15 +60,7 @@ dataloader:
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
   sampler_type: single
-  token_budget: 128
   min_buffered_samples: 1
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW

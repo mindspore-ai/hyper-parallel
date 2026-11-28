@@ -21,7 +21,8 @@ model:
   force_hf: true
 
 training:
-  train_iters: 3
+  epochs: 1
+  max_steps: 3
   train_samples: null
   global_batch_size: 1
   micro_batch_size: 1
@@ -88,8 +89,8 @@ dataset:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 4096
   data_config:
+    max_seq_len: 4096
     config_name: wikitext-2-raw-v1
     cache_dir: null
     labels_are_shifted: true
@@ -108,13 +109,6 @@ dataloader:
     source_type: online
     attention_mode: dense
   sampler_type: single
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
 
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW

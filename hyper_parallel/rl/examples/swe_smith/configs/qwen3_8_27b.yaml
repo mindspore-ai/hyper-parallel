@@ -15,9 +15,6 @@ data:
   max_prompt_length: 4096
   max_train_samples: null
   shuffle: false
-  num_workers: 0
-  prefetch_factor: null
-  pin_memory: true
 rollout:
   engine: vllm
   num_return_sequences: 2

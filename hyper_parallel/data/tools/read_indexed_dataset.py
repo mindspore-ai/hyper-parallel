@@ -21,6 +21,8 @@ python -m hyper_parallel.data.tools.read_indexed_dataset \
   --num-samples 5
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 from collections.abc import Sequence
@@ -28,7 +30,7 @@ from collections.abc import Sequence
 from transformers import AutoTokenizer
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
+from hyper_parallel.data.offline.data_reader import IndexedDataReader
 
 logger = get_dataset_logger(__name__)
 

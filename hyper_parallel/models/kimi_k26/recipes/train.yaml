@@ -31,7 +31,8 @@ model:
   freeze_patterns: ["model.vision_tower*"]
 
 training:
-  train_iters: 6
+  epochs: 1
+  max_steps: 6
   train_samples: null
   eval_iters: 0
 
@@ -163,7 +164,6 @@ dataset:
     # Eager (padding) Kimi transform: encodes one sample and pads it to max_seq_len,
     # which is the shape the fixed-sample throughput arms below measure.
     _target_: hyper_parallel.models.kimi_k26.adapter.data.transform_fn.build_kimi_omni_transform
-    max_seq_len: 8192
     # ARM H: align the image budget with MindSpeed-MM. Their kimi_k3 config sets
     # image_max_pixels: 262144 (=512*512) and resizes by sqrt(max_px/(w*h)) before
     # the processor; a 1024x1024 image then becomes 512x512 -> grid [1,38,38] ->
@@ -176,6 +176,7 @@ dataset:
   # --dataset.data_path 覆盖。
   data_path: ./kimi_k26_demo_data/data.json
   data_config:
+    max_seq_len: 8192
     # Random/mock dataset for throughput testing: keep every record. The filter has to
     # transform the whole dataset during construction (per rank), which is prohibitive
     # for 10240 records x 10 images; off, construction is O(1).
@@ -194,13 +195,6 @@ dataloader:
     # ChunkedCausalLMLoss 需要的预移位目标（本配方 loss_fn 用 chunk loss）。
     _target_: hyper_parallel.data.batching.OmniParallelBatch
   sampler_type: single
-  data_rearrange_map: null
-  data_sharding: false
-  drop_last: true
-  use_background_prefetcher: false
-  num_workers: 8
-  pin_memory: true
-  prefetch_factor: 2
 
 optimizer:
   _target_: hyper_parallel.components.optim.builders.AdamW
