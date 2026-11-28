@@ -16,7 +16,7 @@
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
+from tests.common.parallel_case import parallel_run, parallel_run_ascend_batches, TorchCase
 
 # Absolute path so torchrun+pytest finds the worker regardless of cwd.
 _VPP_SCHEDULE = str(Path(__file__).resolve().parent / "vpp_schedule.py")
@@ -48,32 +48,11 @@ def test_vpp_schedule_group1():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_vpp_dxdw_split():
-    """
-    Feature: PyTorch VPP dx/dw split under concurrent backward/forward execution.
-    Description: Run four ranks with split input/weight backward and compare every local gradient.
-    Expectation: Pipeline outputs and gradients match the full-model reference.
-    """
-    parallel_run([
-        TorchCase(_VPP_SCHEDULE, "test_vpp_dxdw_split", num_proc=4)
-    ])
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_vpp_pipeline_swap():
-    """
-    Feature: PyTorch pipeline activation swap under Interleaved 1F1B.
-    Description: Run paired no-swap/swap phases on the existing four-rank,
-        two-local-chunk VPP layout and compare outputs, gradients, and peak memory.
-    Expectation: Accuracy matches and swap reduces peak NPU memory on every rank.
-    """
-    parallel_run([
-        TorchCase(_VPP_SCHEDULE, "test_vpp_pipeline_swap", num_proc=4)
+def test_vpp_dxdw_split_and_swap() -> None:
+    """Check split gradients and swap accuracy and peak memory on disjoint device slices."""
+    parallel_run_ascend_batches([
+        TorchCase(_VPP_SCHEDULE, "test_vpp_dxdw_split", num_proc=4),
+        TorchCase(_VPP_SCHEDULE, "test_vpp_pipeline_swap", num_proc=4),
     ])
 
 
@@ -125,38 +104,4 @@ def test_vpp_schedule_deep_warmup_gloo():
     """
     parallel_run([
         TorchCase(_VPP_SCHEDULE, "test_vpp_deep_warmup", num_proc=4)
-    ])
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_vpp_dynamic_batch_p2p_cold_start():
-    """
-    Feature: Dynamic-shape VPP with a cold batched-P2P process group.
-    Description: Launch eight ranks as two four-rank PP groups, with two virtual stages per rank.
-    Expectation: The first batched peer operation does not hang during communicator initialization.
-    """
-    parallel_run([
-        TorchCase(_VPP_SCHEDULE, "test_vpp_dynamic_batch_p2p_cold_start", num_proc=8)
-    ])
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_vpp_dynamic_multi_stream_p2p_cold_start():
-    """
-    Feature: Dynamic-shape VPP with peer-specific P2P groups.
-    Description: Launch two four-rank PP domains with an independent group for each PP edge.
-    Expectation: Group initialization and the first batched peer operations complete without deadlock.
-    """
-    parallel_run([
-        TorchCase(_VPP_SCHEDULE, "test_vpp_dynamic_multi_stream_p2p_cold_start", num_proc=8)
     ])

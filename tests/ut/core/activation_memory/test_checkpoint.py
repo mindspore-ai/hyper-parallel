@@ -18,9 +18,12 @@
 # pylint: disable=wrong-import-position,protected-access
 import contextlib
 import importlib
+import inspect
 import unittest
+from typing import Callable
 from unittest.mock import MagicMock, call, patch, sentinel
 
+import pytest
 import torch
 
 from tests.common.mark_utils import arg_mark
@@ -30,6 +33,7 @@ from hyper_parallel.core.activation_memory.checkpoint import (
     checkpoint,
     clear_recompute_session,
     recompute_handle,
+    recompute_handle_collector_ctx,
     recompute_session_ctx,
 )
 
@@ -56,6 +60,19 @@ class _TensorWithDeviceType(torch.Tensor):
     def get_device(self) -> int:
         """Return the synthetic device index."""
         return self.device_index
+
+
+def _make_tail_recording_function(
+    function: Callable[..., torch.Tensor], tail_calls: list[None]
+) -> Callable[..., torch.Tensor]:
+    """Wrap a test function and record each completed invocation."""
+    def wrapped(*args: torch.Tensor) -> torch.Tensor:
+        """Run the wrapped function and append one tail-call marker."""
+        result = function(*args)
+        tail_calls.append(None)
+        return result
+
+    return wrapped
 
 
 class _CheckpointTestCase(unittest.TestCase):
@@ -101,19 +118,22 @@ class TestCheckpointHelpers(_CheckpointTestCase):
 
     def test_infer_device_type_uses_default_for_cpu_inputs(self):
         """CPU-only nested inputs should use Torch's configured default device type."""
-        inputs = {"tensor": torch.ones(2), "nested": [torch.zeros(1)]}
-
-        with patch.object(_checkpoint.DefaultDeviceType, "get_device_type", return_value="xla"):
-            device_type = _checkpoint._infer_device_type(inputs)
-
-        self.assertEqual(device_type, "xla")
+        cases = (
+            ("xla", {"tensor": torch.ones(2), "nested": [torch.zeros(1)]}),
+            ("npu", torch.ones(1)),
+        )
+        for expected, inputs in cases:
+            with self.subTest(device_type=expected), patch.object(
+                _checkpoint.DefaultDeviceType, "get_device_type", return_value=expected
+            ):
+                self.assertEqual(_checkpoint._infer_device_type(inputs), expected)
 
     def test_infer_device_type_warns_and_prefers_cuda(self):
         """Mixed non-CPU device types should warn and prefer CUDA."""
         cuda_tensor = _TensorWithDeviceType("cuda")
         xla_tensor = _TensorWithDeviceType("xla")
 
-        with self.assertWarnsRegex(UserWarning, "multiple non-CPU device types"):
+        with pytest.warns(UserWarning, match="multiple non-CPU device types"):
             device_type = _checkpoint._infer_device_type({"xla": xla_tensor}, cuda_tensor)
 
         self.assertEqual(device_type, "cuda")
@@ -375,6 +395,93 @@ class TestCheckpointValidation(_CheckpointTestCase):
                 checkpoint(lambda: sentinel.result)
 
 
+class TestEagerCheckpoint(_CheckpointTestCase):
+    """Exercise eager checkpoint control flow with real CPU autograd."""
+
+    def test_function_keyword_arguments_are_forwarded(self) -> None:
+        """Non-checkpoint control kwargs should be passed to the wrapped function."""
+        input_tensor = torch.randn(4, requires_grad=True)
+
+        output = checkpoint(lambda x, scale: x.sin() * scale, input_tensor, scale=3.0)
+        output.sum().backward()
+
+        self.assertTrue(torch.allclose(output, input_tensor.sin() * 3.0))
+
+    def test_early_stop_controls_tail_execution(self) -> None:
+        """early_stop should stop before side effects after the last saved tensor."""
+        for early_stop, expected_tail_calls in ((True, 1), (False, 2)):
+            with self.subTest(early_stop=early_stop):
+                tail_calls = []
+
+                function = _make_tail_recording_function(
+                    lambda input_tensor: input_tensor.sin().cos(), tail_calls
+                )
+
+                input_tensor = torch.randn(4, requires_grad=True)
+                checkpoint(function, input_tensor, early_stop=early_stop).sum().backward()
+
+                self.assertEqual(len(tail_calls), expected_tail_calls)
+
+    def test_native_early_stop_context_does_not_override_keyword(self) -> None:
+        """The eager implementation should use only Hyper's explicit keyword."""
+        tail_calls = []
+
+        def function(input_tensor):
+            output = input_tensor.sin().cos()
+            tail_calls.append(None)
+            return output
+
+        input_tensor = torch.randn(4, requires_grad=True)
+        with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+            checkpoint(function, input_tensor, early_stop=True).sum().backward()
+
+        self.assertEqual(len(tail_calls), 1)
+
+    def test_forward_and_recompute_contexts_are_used(self) -> None:
+        """The two contexts should surround their corresponding executions."""
+        events = []
+
+        @contextlib.contextmanager
+        def record(name):
+            events.append(f"enter:{name}")
+            try:
+                yield
+            finally:
+                events.append(f"exit:{name}")
+
+        def context_fn():
+            return record("forward"), record("recompute")
+
+        input_tensor = torch.randn(4, requires_grad=True)
+        checkpoint(lambda x: x.sin(), input_tensor, context_fn=context_fn).sum().backward()
+
+        self.assertEqual(
+            events,
+            ["enter:forward", "exit:forward", "enter:recompute", "exit:recompute"],
+        )
+
+    def test_no_grad_execution_does_not_create_handle(self) -> None:
+        """A checkpoint outside autograd should behave as a direct function call."""
+        with recompute_handle_collector_ctx() as handles:
+            with torch.no_grad():
+                output = checkpoint(lambda x: x.sin(), torch.ones(4))
+
+        self.assertTrue(torch.equal(output, torch.ones(4).sin()))
+        self.assertEqual(handles, [])
+
+    def test_failed_forward_does_not_leave_handle(self) -> None:
+        """A failed checkpoint invocation should be removed from its collector."""
+        def function(input_tensor):
+            del input_tensor
+            raise RuntimeError("forward failed")
+
+        with recompute_handle_collector_ctx() as handles:
+            with self.assertRaisesRegex(RuntimeError, "forward failed"):
+                checkpoint(function, torch.ones(1, requires_grad=True))
+
+        self.assertEqual(handles, [])
+
+
 class TestRecomputeSessions(_CheckpointTestCase):
     """Unit tests for recomputation session validation."""
 
@@ -391,14 +498,270 @@ class TestRecomputeSessions(_CheckpointTestCase):
         """Session APIs should reject invalid handles, null IDs, unhashable IDs, and retention flags."""
         with self.assertRaisesRegex(ValueError, "handle must be produced"):
             recompute_handle(object(), "session")
+        session_parameter = inspect.signature(recompute_session_ctx).parameters["session_id"]
+        self.assertIs(session_parameter.default, inspect.Parameter.empty)
         with self.assertRaisesRegex(ValueError, "session_id must not be None"):
             clear_recompute_session(None)
+        with self.assertRaisesRegex(ValueError, "session_id must not be None"):
+            with recompute_session_ctx(None):
+                self.fail("A null session should not be entered.")
         with self.assertRaisesRegex(ValueError, "session_id must be hashable"):
             with recompute_session_ctx([]):
                 self.fail("An unhashable session should not be entered.")
         with self.assertRaisesRegex(ValueError, "retain_on_unpack must be bool"):
             with recompute_session_ctx("session", retain_on_unpack=1):
                 self.fail("An invalid retention policy should not be entered.")
+
+
+    def test_repeated_sessions_keep_iterations_isolated(self) -> None:
+        """Repeated iterations should not reuse frames or tensors from earlier sessions."""
+        weight = torch.randn(4, 4, requires_grad=True)
+        calls = []
+
+        def function(current_input, current_weight):
+            calls.append(None)
+            return torch.nn.functional.gelu(current_input @ current_weight)
+
+        for step in range(3):
+            input_tensor = torch.randn(4, 4, requires_grad=True)
+            reference_input = input_tensor.detach().clone().requires_grad_()
+            reference_weight = weight.detach().clone().requires_grad_()
+            reference_output = torch.nn.functional.gelu(reference_input @ reference_weight)
+            expected_dx, expected_dw = torch.autograd.grad(
+                reference_output.sum(),
+                (reference_input, reference_weight),
+            )
+            with recompute_handle_collector_ctx() as handles:
+                output = checkpoint(function, input_tensor, weight)
+
+            session_id = ("iteration", step, id(output))
+            try:
+                recompute_handle(handles[0], session_id)
+                with recompute_session_ctx(session_id, retain_on_unpack=True):
+                    actual_dx = torch.autograd.grad(output.sum(), input_tensor, retain_graph=True)[0]
+                with recompute_session_ctx(session_id, retain_on_unpack=False):
+                    actual_dw = torch.autograd.grad(output.sum(), weight)[0]
+            finally:
+                clear_recompute_session(session_id)
+            clear_recompute_session(session_id)
+
+            self.assertTrue(torch.allclose(actual_dx, expected_dx))
+            self.assertTrue(torch.allclose(actual_dw, expected_dw))
+            self.assertEqual(len(calls), (step + 1) * 2)
+
+    def test_partial_and_failed_sessions_can_be_cleared_and_reused(self) -> None:
+        """Early-stop, partial consumption, and failed prefire should leave reusable frames."""
+        for early_stop, expected_tail_calls in ((True, 1), (False, 3)):
+            with self.subTest(early_stop=early_stop):
+                input_tensor = torch.randn(4, 4, requires_grad=True)
+                weight = torch.randn(4, 4, requires_grad=True)
+                reference_input = input_tensor.detach().clone().requires_grad_()
+                reference_weight = weight.detach().clone().requires_grad_()
+                reference_output = torch.nn.functional.gelu(reference_input @ reference_weight)
+                expected_dx, expected_dw = torch.autograd.grad(
+                    reference_output.sum(),
+                    (reference_input, reference_weight),
+                )
+                tail_calls = []
+
+                function = _make_tail_recording_function(
+                    lambda current_input, current_weight: torch.nn.functional.gelu(current_input @ current_weight),
+                    tail_calls,
+                )
+
+                with recompute_handle_collector_ctx() as handles:
+                    output = checkpoint(function, input_tensor, weight, early_stop=early_stop)
+
+                session_id = ("partial", early_stop, id(output))
+                try:
+                    recompute_handle(handles[0], session_id)
+                    with recompute_session_ctx(session_id, retain_on_unpack=True):
+                        actual_dx = torch.autograd.grad(output.sum(), input_tensor, retain_graph=True)[0]
+                finally:
+                    clear_recompute_session(session_id)
+
+                actual_dw = torch.autograd.grad(output.sum(), weight)[0]
+                self.assertEqual(len(tail_calls), expected_tail_calls)
+                self.assertTrue(torch.allclose(actual_dx, expected_dx))
+                self.assertTrue(torch.allclose(actual_dw, expected_dw))
+
+        input_tensor = torch.randn(4, requires_grad=True)
+        should_fail = True
+        calls = []
+
+        def failing_function(value):
+            calls.append(None)
+            result = value.sin().cos()
+            if should_fail and len(calls) > 1:
+                raise RuntimeError("expected recomputation failure")
+            return result
+
+        with recompute_handle_collector_ctx() as handles:
+            output = checkpoint(failing_function, input_tensor, early_stop=False)
+
+        failed_session_id = ("failed", id(output))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "expected recomputation failure"):
+                recompute_handle(handles[0], failed_session_id)
+        finally:
+            clear_recompute_session(failed_session_id)
+
+        should_fail = False
+        recovered_session_id = ("recovered", id(output))
+        try:
+            recompute_handle(handles[0], recovered_session_id)
+            with recompute_session_ctx(recovered_session_id, retain_on_unpack=False):
+                actual_grad = torch.autograd.grad(output.sum(), input_tensor)[0]
+        finally:
+            clear_recompute_session(recovered_session_id)
+
+        reference_input = input_tensor.detach().clone().requires_grad_()
+        expected_grad = torch.autograd.grad(reference_input.sin().cos().sum(), reference_input)[0]
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(torch.allclose(actual_grad, expected_grad))
+
+    def test_prefired_session_survives_contextvar_loss(self) -> None:
+        """A worker without the caller ContextVar should still find prefired tensors."""
+        calls = []
+        input_tensor = torch.randn(4, 4, requires_grad=True)
+        weight = torch.randn(4, 4, requires_grad=True)
+
+        def function(x, w):
+            calls.append(None)
+            return torch.nn.functional.gelu(x @ w)
+
+        with recompute_handle_collector_ctx() as handles:
+            output = checkpoint(function, input_tensor, weight)
+
+        session_id = "worker-context-loss"
+        try:
+            recompute_handle(handles[0], session_id)
+            with recompute_session_ctx(session_id, retain_on_unpack=True):
+                token = _checkpoint._RECOMPUTE_SESSION.set(None)
+                try:
+                    torch.autograd.grad(output.sum(), input_tensor, retain_graph=True)
+                finally:
+                    _checkpoint._RECOMPUTE_SESSION.reset(token)
+            with recompute_session_ctx(session_id, retain_on_unpack=False):
+                token = _checkpoint._RECOMPUTE_SESSION.set(None)
+                try:
+                    torch.autograd.grad(output.sum(), weight)
+                finally:
+                    _checkpoint._RECOMPUTE_SESSION.reset(token)
+        finally:
+            clear_recompute_session(session_id)
+
+        self.assertEqual(len(calls), 2)
+
+    def test_scheduled_nested_checkpoint_raises(self) -> None:
+        """Scheduled recomputation should reject nested checkpoint regions explicitly."""
+        input_tensor = torch.randn(4, requires_grad=True)
+
+        def inner(value):
+            return value.sin()
+
+        def outer(value):
+            return checkpoint(inner, value).cos()
+
+        with recompute_handle_collector_ctx() as handles:
+            checkpoint(outer, input_tensor)
+
+        session_id = "nested-prefire"
+        try:
+            with self.assertRaisesRegex(CheckpointError, "Nested checkpoint is not supported"):
+                recompute_handle(handles[0], session_id)
+        finally:
+            clear_recompute_session(session_id)
+
+        self.assertEqual(len(handles), 2)
+
+    def test_clear_session_is_idempotent(self) -> None:
+        """A retained session can be cleared repeatedly in cleanup paths."""
+        input_tensor = torch.randn(4, requires_grad=True)
+        with recompute_handle_collector_ctx() as handles:
+            checkpoint(lambda x: x.sin(), input_tensor)
+
+        session_id = "clear-twice"
+        recompute_handle(handles[0], session_id)
+        clear_recompute_session(session_id)
+        clear_recompute_session(session_id)
+
+    def test_unpack_outside_backward_uses_temporary_graph_key(self) -> None:
+        """An eager saved-tensor access outside backward should recompute successfully."""
+        input_tensor = torch.randn(4, requires_grad=True)
+        output = checkpoint(lambda value: value.sin(), input_tensor)
+
+        saved_input = output.grad_fn._saved_self  # pylint: disable=W0212
+
+        self.assertTrue(torch.equal(saved_input, input_tensor))
+
+    def test_incomplete_forward_ignores_extra_save_only_without_early_stop(self) -> None:
+        """Only a full recomputation may run ahead of an incomplete original forward."""
+        input_tensor = torch.randn(4, requires_grad=True)
+        early_stop_frame = _checkpoint._CheckpointFrame(lambda: None, True, None)
+        with self.assertRaises(CheckpointError):
+            with _checkpoint._create_recomputation_hooks(early_stop_frame, "early-stop"):
+                input_tensor.sin()
+
+        full_recompute_frame = _checkpoint._CheckpointFrame(lambda: None, False, None)
+        with _checkpoint._create_recomputation_hooks(full_recompute_frame, "full-recompute"):
+            input_tensor.sin()
+        self.assertTrue(full_recompute_frame.ignore_saved_mismatch)
+
+    def test_recompute_metadata_mismatch_raises(self) -> None:
+        """Default determinism checks should detect changed recompute tensor metadata."""
+        recomputing = False
+
+        @contextlib.contextmanager
+        def recompute_context():
+            nonlocal recomputing
+            recomputing = True
+            try:
+                yield
+            finally:
+                recomputing = False
+
+        def function(input_tensor):
+            value = input_tensor.half() if recomputing else input_tensor
+            return value.sin()
+
+        input_tensor = torch.randn(4, requires_grad=True)
+        output = checkpoint(
+            function,
+            input_tensor,
+            context_fn=lambda: (contextlib.nullcontext(), recompute_context()),
+        )
+
+        with self.assertRaises(CheckpointError):
+            output.sum().backward()
+
+    def test_none_determinism_check_allows_metadata_change(self) -> None:
+        """The none mode should keep count checks while skipping tensor metadata checks."""
+        recomputing = False
+
+        @contextlib.contextmanager
+        def recompute_context():
+            nonlocal recomputing
+            recomputing = True
+            try:
+                yield
+            finally:
+                recomputing = False
+
+        def function(input_tensor):
+            value = input_tensor.half() if recomputing else input_tensor
+            return value.sin()
+
+        input_tensor = torch.randn(4, requires_grad=True)
+        output = checkpoint(
+            function,
+            input_tensor,
+            context_fn=lambda: (contextlib.nullcontext(), recompute_context()),
+            determinism_check="none",
+        )
+
+        output.sum().backward()
+
 
 if __name__ == "__main__":
     unittest.main()

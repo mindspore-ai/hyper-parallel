@@ -13,24 +13,19 @@
 # limitations under the License.
 # ============================================================================
 """Tests for init_empty_weights -> fully_shard -> init weight consistency."""
+from pathlib import Path
 
+from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
 
-_TEST_INIT_WEIGHTS = "_test_init_weights.py"
+_TEST_INIT_WEIGHTS = str(Path(__file__).resolve().with_name("_test_init_weights.py"))
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_init_weights_group1():
-    """
-    Feature: parallel run case in init_weights
-    Description:
-        1.test_init_weights_consistency
-        2.test_init_weights_with_randn_like
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_INIT_WEIGHTS, "test_init_weights_consistency", 12350, 2),
-        TorchCase(_TEST_INIT_WEIGHTS, "test_init_weights_with_randn_like", 12351, 2),
-        TorchCase(_TEST_INIT_WEIGHTS, "test_replicate_init_weights_consistency", 12352, 2),
-    ])
+def test_init_weights_group1() -> None:
+    """Verify seeded, randn_like, and replicated initialization on two NPUs."""
+    torchrun_case(_TEST_INIT_WEIGHTS, (
+        "test_init_weights_consistency",
+        "test_init_weights_with_randn_like",
+        "test_replicate_init_weights_consistency",
+    ), num_proc=2, timeout=420)

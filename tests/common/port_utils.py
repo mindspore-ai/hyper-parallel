@@ -13,9 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Port allocation utilities for distributed test cases."""
-import fcntl
 import os
 import tempfile
+
+try:
+    import fcntl
+except ImportError:
+    # CPU tests can inspect the launcher on systems without POSIX port locking.
+    fcntl = None
 
 
 def allocate_port() -> int:
@@ -29,6 +34,8 @@ def allocate_port() -> int:
     Returns:
         A TCP port number guaranteed unique among all current callers.
     """
+    if fcntl is None:
+        raise OSError("Distributed ST port allocation requires POSIX file locking")
     counter_path = os.path.join(tempfile.gettempdir(), f"hp_port_counter_{os.getuid()}")
     port_base = 10000
     port_range = 20000

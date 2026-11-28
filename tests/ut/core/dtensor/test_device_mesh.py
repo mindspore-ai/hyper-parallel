@@ -14,7 +14,6 @@
 # ============================================================================
 """Coverage supplement tests for hyper_parallel.core.dtensor.device_mesh."""
 
-import os
 
 
 import unittest
@@ -26,6 +25,7 @@ import torch
 from hyper_parallel.core.dtensor.device_mesh import (
     DeviceMesh,
     _MeshEnv,
+    _mesh_resources,
     _DEVICE_MESH_MAP,
     _normalize_backend_value,
     _normalize_backend_override,
@@ -47,6 +47,7 @@ def _setup_mock_platform(platform_mock):
 
     def _split_group_side_effect(split_ranks, parent_pg=None, timeout=None, pg_options=None, group_desc=None):
         """ split group side effect."""
+        del parent_pg, timeout, pg_options, group_desc
         for sr in split_ranks:
             key = str(tuple(sorted(sr)))
             EXISTING_COMM_GROUPS[key] = mock_group
@@ -92,7 +93,7 @@ class TestMeshEnv(unittest.TestCase):
     def test_empty_stack_raises(self):
         """Test empty stack raises."""
         env = _MeshEnv()
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "(?i)device mesh"):
             env.get_current_mesh()
 
     def test_push_pop(self):
@@ -102,7 +103,7 @@ class TestMeshEnv(unittest.TestCase):
         env.mesh_stack.append(sentinel)
         self.assertIs(env.get_current_mesh(), sentinel)
         env.mesh_stack.pop()
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "(?i)device mesh"):
             env.get_current_mesh()
 
 
@@ -156,23 +157,28 @@ class TestDeviceMeshContextManager(_MockedDeviceMeshTestCase):
     def test_enter_exit(self):
         """Test enter exit."""
         dm = DeviceMesh("npu", [0, 1], mesh_dim_names=("dp",), _init_backend=False)
-        from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
         initial_len = len(_mesh_resources.mesh_stack)
         with dm:
             self.assertEqual(len(_mesh_resources.mesh_stack), initial_len + 1)
             self.assertIs(_mesh_resources.get_current_mesh(), dm)
         self.assertEqual(len(_mesh_resources.mesh_stack), initial_len)
 
-    def test_nested_with(self):
-        """Test nested with."""
-        dm1 = DeviceMesh("npu", [0, 1], mesh_dim_names=("dp",), _init_backend=False)
-        dm2 = DeviceMesh("npu", [0, 1], mesh_dim_names=("tp",), _init_backend=False)
-        from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
-        with dm1:
-            self.assertIs(_mesh_resources.get_current_mesh(), dm1)
-            with dm2:
-                self.assertIs(_mesh_resources.get_current_mesh(), dm2)
-            self.assertIs(_mesh_resources.get_current_mesh(), dm1)
+    def test_nested_with(self) -> None:
+        """Exiting a 2-D inner mesh restores the 1-D outer mesh and stack depth."""
+        outer = DeviceMesh("npu", [0, 1], mesh_dim_names=("tp",), _init_backend=False)
+        inner = DeviceMesh("npu", [[0], [1]], mesh_dim_names=("outer", "inner"), _init_backend=False)
+        with patch.object(_mesh_resources, "mesh_stack", []) as stack:
+            with self.assertRaisesRegex(RuntimeError, "(?i)device mesh"):
+                _mesh_resources.get_current_mesh()
+            with outer:
+                self.assertIs(_mesh_resources.get_current_mesh(), outer)
+                self.assertEqual(len(stack), 1)
+                with inner:
+                    self.assertIs(_mesh_resources.get_current_mesh(), inner)
+                    self.assertEqual(len(stack), 2)
+                self.assertIs(_mesh_resources.get_current_mesh(), outer)
+                self.assertEqual(len(stack), 1)
+            self.assertEqual(len(stack), 0)
 
 
 # ===========================================================================

@@ -13,6 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """test HSDPParamV2"""
+from pathlib import Path
+
+from pytest import MonkeyPatch
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 from tests.common.distributed_launcher import torchrun_case
@@ -293,16 +297,11 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor_gloo():
-    """
-    Feature: HSDPParamV2.
-    Description: Test reordered unified mesh remaps shard/replicate dims and unsharded group construction.
-    Expectation: assertion pass.
-    """
-    master_port = 12361
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor"
-    torchrun_case(file_name, case_name, master_port)
+def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor_gloo(monkeypatch: MonkeyPatch) -> None:
+    """Check the full reordered mesh and close its eight-rank Gloo world cleanly."""
+    monkeypatch.setenv("HYPER_PARALLEL_TEST_DEVICE_TYPE", "cpu")
+    worker = str(Path(__file__).with_name("_hsdp_param_gloo.py").resolve())
+    torchrun_case(worker, "test_reordered_mesh_gloo_lifecycle", num_proc=8, timeout=420)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")

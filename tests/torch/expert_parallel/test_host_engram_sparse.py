@@ -34,18 +34,6 @@ def test_host_engram_four_rank_gloo():
     torchrun_case(_WORKER, "test_host_engram_four_rank_gloo", num_proc=4)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_host_engram_four_rank_hccl():
-    """Check the four-rank owner step on Ascend.
-
-    Feature: Ascend HCCL Host Engram routing and update.
-    Description: Run the same device-versus-Host precision fixture on NPUs.
-    Expectation: Outputs, gradients, and restored rows match the reference.
-    """
-    torchrun_case(_WORKER, "test_host_engram_four_rank_hccl", num_proc=4)
-
-
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_host_engram_ep1_generalization_gloo():

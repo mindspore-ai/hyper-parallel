@@ -25,25 +25,87 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
+import time
+from contextlib import suppress
 from typing import Optional
+
+import psutil
 
 from tests.common.port_utils import allocate_port
 
 
 def torchrun_case(
     file_name: str,
-    case_name: str,
+    case_name: str | tuple[str, ...],
     master_port: Optional[int] = None,
     num_proc: int = 8,
+    *,
+    timeout: Optional[float] = None,
 ) -> None:
     """Spawn *num_proc* workers via ``python -m torch.distributed.run``.
 
-    Uses :data:`sys.executable` so conda/env interpreters work when ``torchrun``
-    is not on ``PATH``.
+    Pass a tuple of pytest selectors to run cases from the same file in one
+    worker session. Uses :data:`sys.executable` from the active environment.
     """
-    env = os.environ.copy()
     abs_file = os.path.abspath(file_name)
+    case_names = (case_name,) if isinstance(case_name, str) else case_name
+    _run_node_ids([f"{abs_file}::{name}" for name in case_names], file_name, master_port, num_proc, timeout)
+
+
+def torchrun_cases(node_ids: list[str], num_proc: int, *, timeout: Optional[float] = None) -> None:
+    """Run pytest node IDs from several worker files in one distributed session."""
+    if not node_ids:
+        raise ValueError("torchrun_cases requires at least one pytest node ID")
+    file_name = node_ids[0].split("::", 1)[0]
+    _run_node_ids(node_ids, file_name, None, num_proc, timeout)
+
+
+def _stop_worker_tree(job: psutil.Popen) -> list[int]:
+    """Terminate only this launcher's descendants, including ranks with independent sessions."""
+    family = [job]
+    with suppress(psutil.NoSuchProcess):
+        family.extend(job.children(recursive=True))
+    for process in family:
+        with suppress(psutil.NoSuchProcess):
+            process.terminate()
+    _, alive = psutil.wait_procs(family, timeout=5)
+    for process in alive:
+        with suppress(psutil.NoSuchProcess):
+            process.kill()
+    _, remaining = psutil.wait_procs(alive, timeout=5)
+    return [process.pid for process in remaining]
+
+
+def _run_with_deadline(cmd: list[str], env: dict[str, str], remaining: float) -> subprocess.CompletedProcess:
+    """Bound an elastic job without an implicit unbounded wait during timeout cleanup."""
+    with tempfile.TemporaryFile() as log:
+        job = psutil.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            status = job.wait(timeout=max(0, remaining))
+        except psutil.TimeoutExpired as exc:
+            survivors = _stop_worker_tree(job)
+            size = log.seek(0, os.SEEK_END)
+            log.seek(max(0, size - 16000))
+            tail = log.read().decode("utf-8", errors="replace")
+            raise AssertionError(f"Distributed test timed out: {cmd}; remaining PIDs: {survivors}\n{tail}") from exc
+        log.seek(0)
+        output = log.read().decode("utf-8", errors="replace") if status else ""
+    return subprocess.CompletedProcess(cmd, status, output, "")
+
+
+def _run_node_ids(
+    node_ids: list[str], file_name: str, master_port: Optional[int], num_proc: int, timeout: Optional[float] = None,
+) -> None:
+    """Launch the worker session and collect per-rank diagnostics."""
+    if not node_ids:
+        raise ValueError("torchrun_case requires at least one pytest selector")
+    env = os.environ.copy()
+    log_name = node_ids[0].split("::", 1)[1]
+    if len(node_ids) > 1:
+        log_name = f"{log_name}_and_{len(node_ids) - 1}_more"
     max_attempts = 3
+    deadline = None if timeout is None else time.monotonic() + timeout
     for attempt in range(max_attempts):
         if master_port is None or attempt > 0:
             master_port = allocate_port()
@@ -52,7 +114,7 @@ def torchrun_case(
             "-m",
             "torch.distributed.run",
             f"--nproc-per-node={num_proc}",
-            f"--log-dir=./logs/{file_name}/{case_name}",
+            f"--log-dir=./logs/{file_name}/{log_name}",
             # Keep rank logs and return worker tracebacks with failed CI output.
             "-t",
             "3",
@@ -61,13 +123,17 @@ def torchrun_case(
             "-m",
             "pytest",
             "-s",
-            f"{abs_file}::{case_name}",
+            *(["-v"] if deadline is not None else []),
+            *node_ids,
         ]
         # Native runtime logs can contain bytes outside UTF-8; keep their diagnostics
         # without turning a successful worker exit into a decoding failure.
-        result = subprocess.run(
-            cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
-        )
+        if deadline is None:
+            result = subprocess.run(
+                cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+            )
+        else:
+            result = _run_with_deadline(cmd, env, deadline - time.monotonic())
         if result.returncode == 0:
             return
         combined = result.stdout + result.stderr

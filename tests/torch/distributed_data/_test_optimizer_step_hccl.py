@@ -151,6 +151,9 @@ def _check_next_epoch(loader: DistributedDataLoader, expected: list[int], device
     # Inspect internal queues and ownership to verify prefetch lifetime invariants.
     # pylint: disable=protected-access
     worker = loader._worker
+    assert (worker is not loader._source) == loader._data_plane.is_member, (
+        "Each participating data-plane rank must own an independent producer"
+    )
     copy_stream = loader._device_prefetch._copy_stream if loader._device_prefetch is not None else None
     if worker is not loader._source:
         assert worker._process.is_alive(), "Producer exited at epoch exhaustion"
@@ -189,26 +192,42 @@ def _check_legacy_complete_step(device: torch.device, metadata_mode: bool) -> No
     assert actual == expected, f"Legacy complete-step replay differs: {actual} vs {expected}"
 
 
-@pytest.mark.parametrize("metadata_mode", (False, True), ids=("online", "metadata"))
-def test_optimizer_step_loading_hccl(metadata_mode: bool) -> None:
-    """Overlap window data preparation with compute and independent HCCL collectives.
+_ONLINE_BROADCAST = ("hccl", False, True)
+_LOCAL_PLAN = ("hccl", False, False)
+_METADATA = ("hccl", True, True)
+_GLOO = ("gloo", False, True)
 
-    Args:
-        metadata_mode: Whether the sampler reads precomputed metadata.
-    """
+
+# Preserve each source's original cold start and share the slower HCCL trials across both worlds.
+@pytest.mark.parametrize("windows,legacy_metadata", [
+    pytest.param((
+        (1, 1, (_GLOO, _ONLINE_BROADCAST)),
+        (3, 1, (_ONLINE_BROADCAST, _LOCAL_PLAN)),
+        (5, 2, (_LOCAL_PLAN, _ONLINE_BROADCAST)),
+        (3, 0, (_GLOO, _ONLINE_BROADCAST)),
+        (3, 2, (_GLOO, _ONLINE_BROADCAST)),
+    ), False, id="online"),
+    pytest.param((
+        (3, 0, (_METADATA, _LOCAL_PLAN)),
+        (3, 2, (_METADATA, _LOCAL_PLAN)),
+        (1, 1, (_METADATA, _LOCAL_PLAN)),
+        (3, 1, (_METADATA, _GLOO)),
+        (5, 2, (_METADATA, _GLOO)),
+    ), True, id="metadata"),
+])
+def test_optimizer_step_loading_hccl(
+        windows: tuple[tuple[int, int, tuple[tuple[str, bool, bool], ...]], ...], legacy_metadata: bool,
+) -> None:
+    """Exercise every window/mode pair with fresh producers for training and checkpoint replay."""
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     torch.npu.set_device(device)
     dist.init_process_group("hccl", timeout=timedelta(seconds=90))
     try:
-        # Cover steps shorter than, equal to and longer than the three-batch host window.
-        if metadata_mode:
-            cases = ((3, 0, "hccl", True), (3, 2, "hccl", True))
-        else:
-            cases = ((1, 1, "gloo", True), (3, 1, "hccl", True), (5, 2, "hccl", False))
-        for accumulation, device_depth, backend, broadcast_plan in cases:
-            with torch.npu.stream(torch.npu.Stream(device=device)):
-                _run_case(device, backend, metadata_mode, broadcast_plan, accumulation, device_depth)
-        _check_legacy_complete_step(device, metadata_mode)
+        for accumulation, device_depth, modes in windows:
+            for backend, metadata_mode, broadcast_plan in modes:
+                with torch.npu.stream(torch.npu.Stream(device=device)):
+                    _run_case(device, backend, metadata_mode, broadcast_plan, accumulation, device_depth)
+        _check_legacy_complete_step(device, legacy_metadata)
         dist.barrier()
     finally:
         torch.npu.synchronize()

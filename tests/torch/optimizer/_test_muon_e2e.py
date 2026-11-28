@@ -22,9 +22,11 @@ single-card view and asserted against a plain single-card reference trajectory
 computed in the same worker.
 """
 # pylint: disable=W0611,C0413,C0412,W0613,W0612
+from collections.abc import Callable
 import os
 
 import numpy as np
+import pytest
 import torch
 import torch_npu
 import torch.distributed as dist
@@ -229,13 +231,16 @@ def _snapshot_step(model, muon_optimizer, adamw_optimizer):
     params = {}
     momentum = {}
     exp_avg = {}
+    exp_avg_sq = {}
     for name, param in model.named_parameters():
         params[name] = param.detach().clone()
         if param.ndim >= 2:
             momentum[name] = muon_optimizer.state[param]["momentum_buffer"].detach().clone()
         else:
-            exp_avg[name] = adamw_optimizer.state[param]["exp_avg"].detach().clone()
-    return {"params": params, "momentum": momentum, "exp_avg": exp_avg}
+            state = adamw_optimizer.state[param]
+            exp_avg[name] = state["exp_avg"].detach().clone()
+            exp_avg_sq[name] = state["exp_avg_sq"].detach().clone()
+    return {"params": params, "momentum": momentum, "exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}
 
 
 def _run_reference_trajectory():
@@ -279,79 +284,62 @@ def _assert_matches_reference(model, optimizer, reference):
                         f"step {step} momentum {name}", _STATE_RTOL, _STATE_ATOL,
                     )
                 else:
-                    _assert_close(
-                        ref_snapshot["exp_avg"][name],
-                        _logical_optimizer_state(adamw_optimizer.state[param]["exp_avg"], param),
-                        f"step {step} exp_avg {name}", _STATE_RTOL, _STATE_ATOL,
-                    )
+                    for moment in ("exp_avg", "exp_avg_sq"):
+                        _assert_close(
+                            ref_snapshot[moment][name],
+                            _logical_optimizer_state(adamw_optimizer.state[param][moment], param),
+                            f"step {step} {moment} {name}", _STATE_RTOL, _STATE_ATOL,
+                        )
         finally:
             muon_optimizer.cleanup_synced_state()
 
 
-def _run_sharding_parity_case(shard_model_fn, muon_overrides=None):
-    """Shared driver: reference trajectory vs one sharded scenario, asserted per step."""
+@pytest.fixture(scope="module", name="reference_trajectory")
+def _reference_trajectory() -> list[dict[str, dict[str, torch.Tensor]]]:
+    """Compute the single-card reference once for every sharding layout."""
     init_dist()
-    reference = _run_reference_trajectory()
-    model = shard_model_fn(_build_model())
-    optimizer = _make_optimizer(model, **(muon_overrides or {}))
-    _assert_matches_reference(model, optimizer, reference)
+    world_size = dist.get_world_size()
+    assert world_size == 8, f"Muon Level0 parity needs eight ranks, got {world_size}"
+    return _run_reference_trajectory()
 
 
-def _shard_full_8p(model):
-    """Shard every parameter on a flat 8-card mesh."""
+def _shard_full(model):
+    """Shard every parameter on a flat eight-card mesh."""
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     return fully_shard(model, mesh=mesh, reshard_after_forward=True, mp_policy=MixedPrecisionPolicy())
 
 
-def _shard_hybrid_2x4(model):
-    """Shard on a (replicate=2, shard=4) mesh so Muon dedups NS compute across replicas."""
+def _shard_hybrid(model):
+    """Shard across four cards per replica for Muon replica deduplication."""
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("replicate", "shard"))
     return fully_shard(model, mesh=mesh, reshard_after_forward=True, mp_policy=MixedPrecisionPolicy())
 
 
 def _shard_mixed_meshes(model):
-    """Different sharding rules per module: attention on 8 cards, experts on (2, 4), rest replicated."""
-    mesh_dp8 = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    mesh_2x4 = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("replicate", "shard"))
-    model.attn = fully_shard(model.attn, mesh=mesh_dp8, reshard_after_forward=True,
+    """Shard attention across eight cards and experts across a 2 x 4 mesh."""
+    mesh_dp = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh_hsdp = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("replicate", "shard"))
+    model.attn = fully_shard(model.attn, mesh=mesh_dp, reshard_after_forward=True,
                              mp_policy=MixedPrecisionPolicy())
-    model.moe = fully_shard(model.moe, mesh=mesh_2x4, reshard_after_forward=True,
+    model.moe = fully_shard(model.moe, mesh=mesh_hsdp, reshard_after_forward=True,
                             mp_policy=MixedPrecisionPolicy())
     return model
 
 
-def test_muon_e2e_full_shard_8p():
-    """
-    Feature: Muon e2e precision self-consistency under full sharding.
-    Description:
-        All weights (embedding, attention, router, 3D experts) sharded on an 8-card mesh,
-        norm weights sharded for AdamW. Identical logical weights/grads/states as the
-        single-card reference; gather and assert after each of the 10 steps.
-    Expectation: Every step matches the single-card reference within tolerance.
-    """
-    _run_sharding_parity_case(_shard_full_8p)
-
-
-def test_muon_e2e_hybrid_shard_replicate_8p():
-    """
-    Feature: Muon e2e precision self-consistency under hybrid sharding with replica dedup.
-    Description:
-        Params sharded on a (replicate=2, shard=4) mesh with hsdp_replica_count=2, so NS
-        compute is split across replica peers and broadcast back.
-    Expectation: Every step matches the single-card reference within tolerance.
-    """
-    _run_sharding_parity_case(_shard_hybrid_2x4, {"hsdp_replica_count": 2})
-
-
-def test_muon_e2e_mixed_mesh_per_module_8p():
-    """
-    Feature: Muon e2e precision self-consistency with mixed sharding rules in one model.
-    Description:
-        Attention weights sharded on 8 cards, expert weights sharded on a (2, 4) mesh,
-        embedding and norm weights replicated: multiple HSDP comm groups in one optimizer.
-    Expectation: Every step matches the single-card reference within tolerance.
-    """
-    _run_sharding_parity_case(_shard_mixed_meshes)
+@pytest.mark.parametrize(("shard_model", "muon_overrides"), [
+    pytest.param(_shard_full, {}, id="full"),
+    pytest.param(_shard_hybrid, {"hsdp_replica_count": 2}, id="hybrid-replica-dedup"),
+    pytest.param(_shard_mixed_meshes, {}, id="mixed"),
+])
+def test_muon_e2e_sharding_parity(
+    reference_trajectory: list[dict[str, dict[str, torch.Tensor]]],
+    shard_model: Callable[[nn.Module], nn.Module],
+    muon_overrides: dict[str, int],
+) -> None:
+    """Compare every weight and optimizer state against the reference for ten steps."""
+    model = shard_model(_build_model())
+    optimizer = _make_optimizer(model, **muon_overrides)
+    _assert_matches_reference(model, optimizer, reference_trajectory)
 
 
 def test_muon_e2e_forward_backward_smoke_8p():
