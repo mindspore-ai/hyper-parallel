@@ -32,6 +32,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from rl.agentic.core.gateway_transport import (
+    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES, read_gateway_body,
+)
 from rl.tool_protocol.protocol import inspect_tool_response
 
 logger = logging.getLogger(__name__)
@@ -149,12 +152,19 @@ class _Session:
 class _State:
     """Own registered gateway sessions and captured completion events."""
     def __init__(
-        self, backend_url: str, model_name: str, request_timeout: float
+        self, backend_url: str, model_name: str, request_timeout: float,
+        max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         """Initialize independent DeepSeek protocol and per-session trace storage."""
         self.backend_url = backend_url.rstrip("/")
         self.model_name = model_name
         self.request_timeout = request_timeout
+        for limit in (max_request_bytes, max_response_bytes):
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("Gateway byte limits must be positive integers")
+        self.max_request_bytes = max_request_bytes
+        self.max_response_bytes = max_response_bytes
         self.protocol = DeepSeekChatProtocol()
         self.lock = threading.RLock()
         self.sessions: dict[str, _Session] = {}
@@ -422,9 +432,11 @@ class _Handler(BaseHTTPRequestHandler):
             with urllib.request.urlopen(
                 request, timeout=self.server.state.request_timeout
             ) as response:
-                body = response.read()
+                body = read_gateway_body(response, self.server.state.max_response_bytes)
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
+            with error:
+                body = read_gateway_body(error, self.server.state.max_response_bytes)
+                detail = body.decode("utf-8", errors="replace")
             raise RuntimeError(
                 f"vLLM chat completion failed with HTTP {error.code}: {detail}"
             ) from error
@@ -453,7 +465,7 @@ class _Handler(BaseHTTPRequestHandler):
         if length <= 0:
             raise ValueError("Request body must be non-empty")
         try:
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(read_gateway_body(self.rfile, self.server.state.max_request_bytes, length))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("Request body must be valid JSON") from error
         if not isinstance(body, dict):
@@ -504,6 +516,8 @@ class DeepSeekGateway:
         backend_url: str,
         model_name: str,
         request_timeout: float,
+        max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         """Initialize an unstarted DeepSeek gateway."""
         if not host:
@@ -511,7 +525,7 @@ class DeepSeekGateway:
         if not 0 <= port < 65536:
             raise ValueError("DeepSeek gateway port must be in [0, 65535]")
         self._server = _GatewayServer(
-            (host, port), _State(backend_url, model_name, request_timeout)
+            (host, port), _State(backend_url, model_name, request_timeout, max_request_bytes, max_response_bytes)
         )
         self._thread: threading.Thread | None = None
 

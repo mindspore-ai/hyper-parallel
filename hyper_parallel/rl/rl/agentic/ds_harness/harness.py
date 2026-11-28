@@ -27,7 +27,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 from urllib.parse import urlparse
 
 from rl.agentic.core.program_runner import (
@@ -43,7 +43,7 @@ from rl.agentic.core.types import RewardResult
 from rl.agentic.ds_harness.gateway import DeepSeekGateway
 from rl.data.contracts import PromptRecord, Trajectory
 DEFAULT_DEEPSEEK_HARNESS_VERSION = "0.1.1rc1"
-RewardCallable = Callable[[str, PromptRecord], float | RewardResult]
+RewardCallable = Callable[[str, PromptRecord], Union[float, RewardResult]]
 _MAX_GENERATION_PREFIX_REWRITE = 16
 
 
@@ -133,8 +133,9 @@ def _http_json(
     url: str,
     payload: Mapping[str, Any] | None,
     timeout: float,
+    *, max_response_bytes: int | None = None,
 ) -> dict[str, Any]:
-    return request_gateway_json("DeepSeek", method, url, payload, timeout)
+    return request_gateway_json("DeepSeek", method, url, payload, timeout, max_response_bytes=max_response_bytes)
 
 
 def _json_value(value: Any) -> Any:
@@ -154,7 +155,10 @@ class DeepSeekRuntime(HarnessRuntime):
 
     def __init__(self, engine: Any, config: Mapping[str, Any]) -> None:
         """Bind the independent runtime to the existing shared rollout engine."""
-        super().__init__(engine, config, DeepSeekGateway, "DeepSeek", 8300, "/v1")
+        super().__init__(engine, config, DeepSeekGateway, "DeepSeek", 8300, "/v1", gateway_options={
+            "max_request_bytes": int(config.get("max_request_bytes", 8 * 1024 * 1024)),
+            "max_response_bytes": int(config.get("max_response_bytes", 32 * 1024 * 1024)),
+        })
 
 
 class DeepSeekAgentProgram:
@@ -187,6 +191,8 @@ class DeepSeekAgentProgram:
             session_id
         )
         timeout = float(self.config.get("request_timeout", 600.0))
+        request_options = ({"max_response_bytes": int(self.config["max_response_bytes"])}
+                           if "max_response_bytes" in self.config else {})
         registered = False
         try:
             await asyncio.to_thread(
@@ -200,7 +206,7 @@ class DeepSeekAgentProgram:
                     "max_completions": int(self.config["max_turns"]),
                     "generation": self._generation_settings(),
                 },
-                timeout,
+                timeout, **request_options,
             )
             registered = True
             started = time.perf_counter()
@@ -216,7 +222,7 @@ class DeepSeekAgentProgram:
                 "GET",
                 f"{self.admin_url}/internal/sessions/{session_id}",
                 None,
-                timeout,
+                timeout, **request_options,
             )
             reward_result = self._score_capture(final_answer, finish_reason, captured)
             return build_harness_call_trajectories(
@@ -257,7 +263,7 @@ class DeepSeekAgentProgram:
                     "DELETE",
                     f"{self.admin_url}/internal/sessions/{session_id}",
                     None,
-                    timeout,
+                    timeout, **request_options,
                 )
 
     def _score_capture(
