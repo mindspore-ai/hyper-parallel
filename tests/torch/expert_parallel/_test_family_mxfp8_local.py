@@ -181,8 +181,8 @@ def _bf16_local(experts, x, counts):
     """Plain reference with identical expert token groups and BF16 boundaries."""
     outputs = []
     for block, w1, w2 in zip(x.split(counts), experts.gate_up_proj, experts.down_proj):
-        gate, up = (block @ w1).chunk(2, -1)
-        outputs.append((F.silu(gate) * up) @ w2)
+        gate, up = (block @ w1.T).chunk(2, -1)
+        outputs.append((F.silu(gate) * up) @ w2.T)
     return torch.cat(outputs)
 
 def _check_local_case(expert, baseline, counts, frozen, device):

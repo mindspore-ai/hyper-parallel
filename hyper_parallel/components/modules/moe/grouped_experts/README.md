@@ -507,8 +507,8 @@ HF 的 `top_k_index/top_k_weights` 与当前内部 `topk_ids/topk_weights` 位�
 DeepSeek-V3.2 的两份配方、Qwen3.6 的文本/图文及两种 CP 配方均改为直接选择新族，并去掉旧父层 EP 方法替换。
 DeepSeek-V3 的 MLA 配方也加入普通专家族；原 router 和共享专家继续由 HF 父层执行。
 父 MoE 布局由 planner 和默认模板统一推导，各模型 spec 不再注册相同的父层 provider。
-旧类通过 `hyper_parallel.components.modules.grouped_experts.GroupedExperts` 显式访问；
-其低精选择、量化工厂和 MegaMoe 路径保留。公共 `components.modules.GroupedExperts` 统一选择新专家族。
+低精与高精度专家族统一通过公共 `hyper_parallel.components.modules.GroupedExperts` 访问，
+复用同一套 `[E,2I,H]/[E,H,I]` 规范权重布局与 local/EP/MoonEP 传输，仅在 `compute_experts` 阶段绑定低精量化策略；MegaMoe 路径保留。
 
 ### 配置和 forward 关键字匹配
 

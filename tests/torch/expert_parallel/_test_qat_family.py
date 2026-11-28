@@ -42,7 +42,7 @@ def _run(fake, block_size, weight_format):
     expert = model.mlp.experts
     actual_weights = (expert.gate_up_proj, expert.down_proj)
     reference_weights = nn.ParameterList([
-        nn.Parameter(p.detach().transpose(-2, -1).contiguous()) for p in actual_weights
+        nn.Parameter(p.detach().clone()) for p in actual_weights
     ])
     policy = config.training.low_precision.resolve_dtype_scheme("experts")
     strategy = build_low_precision_strategy(policy, tile_shapes=tuple(tuple(p.shape) for p in reference_weights))
@@ -78,11 +78,11 @@ def _run(fake, block_size, weight_format):
         expected_loss.backward()
         torch.testing.assert_close(actual_input.grad, expected_input.grad, rtol=0, atol=0)
         for actual_weight, expected_weight in zip(actual_weights, reference_weights):
-            torch.testing.assert_close(actual_weight.grad, expected_weight.grad.transpose(-2, -1), rtol=0, atol=0)
+            torch.testing.assert_close(actual_weight.grad, expected_weight.grad, rtol=0, atol=0)
         optimizer.step()
         reference_optimizer.step()
         for actual_weight, expected_weight in zip(actual_weights, reference_weights):
-            torch.testing.assert_close(actual_weight, expected_weight.transpose(-2, -1), rtol=0, atol=0)
+            torch.testing.assert_close(actual_weight, expected_weight, rtol=0, atol=0)
         assert torch.isfinite(loss)
         losses.append(loss.item())
     assert all(not torch.equal(a, b) for a, b in zip(initial, actual_weights))

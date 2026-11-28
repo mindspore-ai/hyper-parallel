@@ -27,7 +27,7 @@ from hyper_parallel.components.quantization.functional.base_linear_func import _
 from hyper_parallel.components.quantization.functional.hifloat8_linear_func import HiFloat8LinearStrategy
 from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import HiFloat8GroupedLinear
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import hifloat8_matmul
-from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.quantization.modules import GroupedExperts
 
 
 class IdentityOps:

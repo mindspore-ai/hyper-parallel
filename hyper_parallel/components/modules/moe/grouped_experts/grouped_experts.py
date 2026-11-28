@@ -28,12 +28,36 @@ from torch.nn import functional as F
 from transformers.activations import SiLUActivation
 
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
-from hyper_parallel.components.functional import grouped_matmul
-from hyper_parallel.components.functional import swiglu as npu_swiglu
-from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
-from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
 from hyper_parallel.components.modules.mlp import swiglu_activation
 from hyper_parallel.core.dtensor.dtensor import DTensor
+
+
+def grouped_matmul(*args: Any, **kwargs: Any) -> Tensor:
+    """Lazily load the NPU grouped-matmul operator only when executed."""
+    # pylint: disable-next=import-outside-toplevel
+    from hyper_parallel.components.functional.grouped_matmul import grouped_matmul as operator
+    return operator(*args, **kwargs)
+
+
+def npu_swiglu(*args: Any, **kwargs: Any) -> Tensor:
+    """Lazily load the NPU fused SwiGLU operator only when executed."""
+    # pylint: disable-next=import-outside-toplevel
+    from hyper_parallel.components.functional.swiglu import swiglu as operator
+    return operator(*args, **kwargs)
+
+
+def moe_token_permute(tokens: Tensor, indices: Tensor) -> tuple[Tensor, Tensor]:
+    """Lazily load the NPU token-permutation operator only when executed."""
+    # pylint: disable-next=import-outside-toplevel
+    from hyper_parallel.components.functional.moe_token_permute import moe_token_permute as operator
+    return operator(tokens, indices)
+
+
+def moe_token_unpermute(values: Tensor, indices: Tensor, probs: Tensor | None = None) -> Tensor:
+    """Lazily load the NPU token-unpermutation operator only when executed."""
+    # pylint: disable-next=import-outside-toplevel
+    from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute as operator
+    return operator(values, indices, probs)
 
 
 def _normalize_swiglu_limit(limit: Any) -> float | None:
@@ -403,8 +427,13 @@ class GroupedExpertsModule(nn.Module):
         # The kernel uses input-major projections while checkpoints store linear weights.
         gate_up, down = gate_up.transpose(-2, -1), down.transpose(-2, -1)
         # Empty ranks avoid unsupported empty GMM calls while retaining gradients to both weights.
-        fc1 = (grouped_matmul(hidden, gate_up, group_list=group_list)  # pylint: disable=not-callable
-               if hidden.shape[0] else hidden @ gate_up[0])
+        is_empty = (
+            not torch.compiler.is_compiling()
+            and isinstance(hidden.shape[0], int)
+            and hidden.shape[0] == 0
+        )
+        fc1 = (hidden @ gate_up[0]
+               if is_empty else grouped_matmul(hidden, gate_up, group_list=group_list))  # pylint: disable=not-callable
         if (self.config.swiglu_limit is not None or self.config.activation is not None
                 or self.config.activation_dtype != "input"):
             activated = self.apply_activation(*fc1.chunk(2, dim=-1), hidden.dtype)
@@ -414,8 +443,8 @@ class GroupedExpertsModule(nn.Module):
             if routing_weights is None:
                 raise ValueError("before_fc2 requires differentiable slot routing weights")
             activated = (activated * routing_weights.unsqueeze(-1)).to(activated.dtype)
-        return (grouped_matmul(activated, down, group_list=group_list)  # pylint: disable=not-callable
-                if hidden.shape[0] else activated @ down[0])
+        return (activated @ down[0]
+                if is_empty else grouped_matmul(activated, down, group_list=group_list))  # pylint: disable=not-callable
 
     def combine(
         self, values: Tensor, send_splits: list[int] | None, recv_splits: list[int] | None, recv_inverse: Tensor | None,

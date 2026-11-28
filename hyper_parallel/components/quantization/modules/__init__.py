@@ -17,10 +17,22 @@
 import importlib
 from typing import TYPE_CHECKING, Any
 
-from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
-
 if TYPE_CHECKING:
     from hyper_parallel.components.modules.linear.linear import LowPrecisionLinear
+    from hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts import (
+        LowPrecisionGroupedExperts as GroupedExperts,
+    )
+
+_EXPORT_TO_ATTR = {
+    "GroupedExperts": (
+        "hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts",
+        "LowPrecisionGroupedExperts",
+    ),
+    "LowPrecisionLinear": (
+        "hyper_parallel.components.modules.linear.linear",
+        "LowPrecisionLinear",
+    ),
+}
 
 __all__ = [
     "GroupedExperts",
@@ -29,10 +41,11 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
-    """Defer the Linear compatibility export to avoid a cycle with its canonical package."""
-    if name != "LowPrecisionLinear":
+    """Lazily resolve canonical low-precision module implementations."""
+    target = _EXPORT_TO_ATTR.get(name)
+    if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    linear_module = importlib.import_module("hyper_parallel.components.modules.linear.linear")
-    value = getattr(linear_module, name)
+    module_path, attr_name = target
+    value = getattr(importlib.import_module(module_path), attr_name)
     globals()[name] = value
     return value
