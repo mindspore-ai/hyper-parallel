@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>@TITLE@</title>
+<style>
+:root{color:#17243a;background:#f2f5fa;--line:#d9e3f0;--blue:#245bb6}
+*{box-sizing:border-box}body{margin:0;font:15px/1.55 system-ui,"Noto Sans CJK SC",sans-serif}
+main{max-width:1310px;margin:auto;padding:28px 20px 75px}section,header{background:white;border:1px solid var(--line);padding:22px 25px;margin-bottom:18px;border-radius:9px}
+h1,h2,p{margin:0 0 10px}h1{font-size:clamp(25px,4vw,39px)}h2{font-size:22px}a{color:#17448d}
+.sub{color:#485d78}.summary{display:grid;gap:10px;grid-template-columns:repeat(4,1fr);margin:14px 0}
+.summary div{border-top:3px solid var(--c);background:#f5f8fd;padding:8px 12px;display:grid;gap:2px}.summary b{font-size:25px;color:var(--c);font-variant-numeric:tabular-nums}.summary span{font-size:13px}
+.stack{display:flex;overflow:hidden;border-radius:5px;height:16px}
+.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}
+input,button{border:1px solid #a7bbd5;border-radius:4px;background:white;padding:6px 9px;font:inherit;color:#17243a}
+input{max-width:100%}button{cursor:pointer}button:hover{background:#e8f1ff}
+.plot-box{position:relative}.selection{display:none;position:absolute;top:28px;height:282px;background:#245bb633;pointer-events:none;border-inline:1px solid #245bb6}
+canvas{width:100%;height:337px;border:1px solid var(--line);display:block;touch-action:pan-y;cursor:crosshair}
+#hover{min-height:51px;margin:8px 0 0;color:#254977;font-size:13px;overflow-wrap:anywhere}
+.table-wrap{overflow:auto;max-height:680px;border:1px solid var(--line)}table{border-collapse:collapse;width:100%;min-width:810px;font-size:13px;font-variant-numeric:tabular-nums}
+thead{position:sticky;top:0;background:#244c91;color:white}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:right}th:first-child,td:first-child{text-align:left}tbody tr:nth-child(even){background:#f6f9fe}
+.spotlight{padding:9px 12px;background:#eff5ff;border-left:3px solid #4d77bd;color:#243f66}
+.step-figures{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;margin:16px 0}
+.step-figures figure{margin:0;padding:13px;border:1px solid var(--line);border-radius:7px}
+.step-figures h3{font-size:17px;margin:0 0 8px}
+.step-figures img{display:block;width:100%;max-width:440px;margin:auto;height:auto}
+.step-figures .flow-view img{max-width:760px}
+.flow-view h4{font-size:16px;margin:16px 0 8px}
+.flow-view h5{font-size:14px;margin:0 0 4px;color:#314964}
+.flow-zooms{display:grid;gap:12px}
+.flow-zooms>div{border-top:1px solid var(--line);padding-top:9px}
+.step-figures figcaption{color:#485d78;font-size:13px;margin-top:7px;overflow-wrap:anywhere}
+.figure-result{background:#edf4fe;border-left:3px solid #245bb6;padding:8px 10px}
+.figure-guide{font-size:13px;color:#485d78;margin:0 0 7px}
+.step-key{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px}
+.step-key span::before{content:"";display:inline-block;width:10px;height:10px;margin-right:4px;background:var(--swatch);border-radius:2px}
+.figure-tasks{font-size:13px;margin-top:10px;color:#314964}.figure-tasks summary{cursor:pointer;font-weight:600}
+.figure-tasks ol{padding-left:24px;margin:6px 0 0}.figure-tasks li{padding:6px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.figure-tasks li span{display:block;color:#485d78}
+#operator-count,#range{color:#485d78;font-size:13px}
+@media(max-width:740px){main{padding:12px 8px}section,header{padding:15px 10px}.summary{grid-template-columns:repeat(2,1fr)}.step-figures{grid-template-columns:1fr}.step-figures figure{padding:10px}}
+</style>
+<main>
+<header><h1>@TITLE@</h1><p class="sub">@SCOPE@</p><p><a href="#coverage">时间覆盖</a>　<a href="#timeline">逐算子时间线</a>　<a href="#ranking">算子利用率</a>　<a href="#method">采样说明</a></p></header>
+<section id="coverage"><h2>采样窗口时间分布</h2><p>@STATS@</p><div class="summary">@COVERAGE@</div><div class="stack" aria-hidden="true">@STACK@</div><p class="sub" style="margin:12px 0 0">有计数器读数的任务加权均值 · @UTILIZATION@</p></section>
+<section id="timeline"><h2>逐任务时间线及 MAC／Vector 读数</h2>
+<p class="sub">展示所选输入的采样任务；rank、设备和步范围以报告说明为准。下方交互时间线支持<b>按钮/滚轮放大缩小</b>、<b>前移/后移</b>、<b>拖选区间放大</b>、<b>Shift+拖动平移</b>、悬停详情及按算子名筛选；放大后各条形自动标注算子名。</p>
+@FIGURES@
+<div class="toolbar"><button id="begin" title="快捷键 0">回到全窗</button><button id="zoom-in" title="快捷键 +">放大 (+)</button><button id="zoom-out" title="快捷键 -">缩小 (-)</button><button id="earlier" title="快捷键 ←">前移 (←)</button><button id="later" title="快捷键 →">后移 (→)</button><button id="jump-fwd">定位典型前向层</button><button id="jump-bwd">定位典型反向层</button><label>筛选 <input id="filter" type="search" placeholder="例如 SparseFlashMlaGrad"></label><span id="range">载入时间线…</span></div><p class="sub" id="selection-coverage"></p>
+<div class="plot-box"><canvas id="plot" aria-label="设备逐任务时间线"></canvas><div class="selection" id="selection" aria-hidden="true"></div></div><p id="hover" aria-live="polite"></p></section>
+<section id="ranking"><h2>算子利用率与耗时</h2><p class="sub">按算子类型聚合。点击算子名定位其耗时最长的一次调用。点击列名排序。AICore 占比的分母为全部任务的 AICore 累计时间。</p>@ATTENTION@
+<div class="toolbar"><label>筛选表格 <input id="search" type="search" placeholder="算子类型"></label><span id="operator-count"></span></div>
+<div class="table-wrap"><table><thead><tr id="columns"></tr></thead><tbody id="operators"></tbody></table></div></section>
+<section id="method"><h2>采样和统计说明</h2>
+<p>MAC / Vector 是采样算子计数器读数，不是模型 MFU。灰色 Free/其余时间不代表设备完全空闲。自动层窗为锚点启发式估计，锚点不足时回退到全采样窗，需结合模型标记核对。SVG 最多展示七条主要泳道，统计仍包含所有任务；无 PMU 读数时标为 N/A，不填零。</p>
+<p>采样步号标注为 @STEPS@。@REFERENCE@</p>
+<p>存在 <code>step_trace_time.csv</code> 时，顶部时间占比采用该文件；否则按输入任务区间的并集计算。纯计算从计算覆盖时间扣除重叠。通信掩盖率用重叠时间除以通信总时间。逐任务条形来自所选 CSV 或数据库导出，横轴以首个任务为零点。</p>
+<p>通信流绘制标为 <code>COMMUNICATION</code> 或类型以 hcom/hccl 开头的事件。AI_CPU 轨保留其执行记录，部分是集合通信配套任务。跨流算子累计耗时可超过整步墙钟。MAC、Cube、MTE2 和 Vector 分别用有读数的对应核心时间加权，空白表示对应读数缺失。时间线使用采样任务及核类别，层号只有在有明确标记时才归属。局部覆盖根据 Cube／Vector 和 COMMUNICATION 事件求并集，未归入这两类的时间显示为「其余」，可能包含 AI_CPU 活动。</p></section>
+</main>
+<script id="payload" type="application/octet-stream">@DATA@</script>
+<script>
+(async function(){
+  const q=id=>document.getElementById(id);
+  const raw=Uint8Array.from(atob(q("payload").textContent.trim()),c=>c.charCodeAt(0));
+  const {ops,tasks,table,span}=await new Response(new Blob([raw]).stream().pipeThrough(new DecompressionStream("gzip"))).json();
+  const canvas=q("plot"), ctx=canvas.getContext("2d"), H=337, L=126, ys=[48,83,118,153,188];
+  const color=["#2563eb","#d97706","#dc2626","#7c3aed","#94a3b8"];
+  const lane=["Cube / 混合 (蓝)","Vector (黄)","HCCL 通信 (红)","AI_CPU (紫)","其他 (灰)"];
+  let lo=0,hi=span,selected=null,tableCol=2,desc=true,filterText="",drag=null,visible=[];
+  const endPrefix=[];
+  tasks.forEach(([start,duration],i)=>{endPrefix[i]=Math.max(i ? endPrefix[i-1] : 0,start+duration)});
+  const compute=[], communication=[];
+  function addInterval(list,start,end){
+    const last=list.at(-1);
+    if(last&&start<=last[1])last[1]=Math.max(last[1],end);
+    else list.push([start,end]);
+  }
+  for(const [start,duration,id] of tasks){
+    const group=ops[id][3];
+    if(group<2)addInterval(compute,start,start+duration);
+    if(group===2)addInterval(communication,start,start+duration);
+  }
+  const overlap=[];
+  for(let a=0,b=0;a<compute.length&&b<communication.length;){
+    const left=Math.max(compute[a][0],communication[b][0]);
+    const right=Math.min(compute[a][1],communication[b][1]);
+    if(left<right)overlap.push([left,right]);
+    if(compute[a][1]<=communication[b][1])a++;else b++;
+  }
+  function covered(intervals){
+    let length=0;
+    for(const [start,end] of intervals){
+      if(start>=hi)break;
+      if(end>lo)length+=Math.min(hi,end)-Math.max(lo,start);
+    }
+    return length;
+  }
+  function windowCoverage(){
+    const c=covered(compute),m=covered(communication),o=covered(overlap),width=hi-lo;
+    const pct=v=>(Math.max(0,v)/width*100).toFixed(1)+"%";
+    q("selection-coverage").textContent=width>=span-.01
+      ? "完整采样窗口的覆盖见上方。局部放大后会按设备计算与通信任务重算覆盖。"
+      : `所选窗口 · 纯计算 ${pct(c-o)} / 纯通信 ${pct(m-o)} / 重叠 ${pct(o)} / 其余 ${pct(width-c-m+o)}`;
+  }
+  function firstIndex(values,value){
+    let a=0,b=values.length;
+    while(a<b){const i=(a+b)>>>1;if(values[i]<value)a=i+1;else b=i}
+    return a;
+  }
+  function ms(us){return (us/1000).toLocaleString("en-US",{maximumFractionDigits:3})}
+  function draw(){
+    const w=canvas.clientWidth,scale=devicePixelRatio,plotW=w-L-12;
+    canvas.width=w*scale;canvas.height=H*scale;ctx.scale(scale,scale);
+    ctx.font="12px system-ui";ctx.fillStyle="#485d78";
+    const x=t=>L+(t-lo)*plotW/(hi-lo);
+    for(let i=0;i<5;i++){ctx.fillText(lane[i],6,ys[i]+4);ctx.fillStyle="#eef3fa";ctx.fillRect(L,ys[i]-9,plotW,18);ctx.fillStyle="#485d78"}
+    const tickCount=w<600?2:5;
+    for(let i=0;i<=tickCount;i++){
+      const t=lo+(hi-lo)*i/tickCount;
+      ctx.fillStyle="#485d78";ctx.textAlign=i===0?"left":i===tickCount?"right":"center";
+      ctx.fillText(ms(t)+(i===tickCount?" ms":""),x(t),22);
+    }
+    ctx.textAlign="left";
+    const uTop=215, uBot=315, uH=uBot-uTop;
+    ctx.fillStyle="#f5f8fd";ctx.fillRect(L,uTop,plotW,uH);
+    ctx.strokeStyle="#dce5f2";ctx.lineWidth=1;
+    for(const pct of [0,50,100]){
+      const gy=uBot-pct*uH/100;
+      ctx.beginPath();ctx.moveTo(L,gy);ctx.lineTo(L+plotW,gy);ctx.stroke();
+      ctx.fillStyle="#64748b";ctx.textAlign="right";ctx.fillText(pct+"%",L-6,gy+3.5);
+    }
+    ctx.textAlign="left";
+    ctx.fillStyle="#16a34a";ctx.fillText("MAC % (绿)",6,uTop+16);
+    ctx.fillStyle="#92400e";ctx.fillText("Vec % (棕)",6,uTop+34);
+    ctx.fillStyle="#485d78";
+    ctx.save();ctx.beginPath();ctx.rect(L,27,plotW,310);ctx.clip();
+    visible=[];
+    const stepPts=[[],[]];
+    for(let i=firstIndex(endPrefix,lo);i<tasks.length&&tasks[i][0]<hi;i++){
+      const a=tasks[i], [start,duration,id]=a, kind=ops[id], group=kind[3];
+      if(start+duration<lo||filterText&&!kind[0].toLowerCase().includes(filterText)&&!kind[1].toLowerCase().includes(filterText))continue;
+      const left=x(start),right=Math.max(left+1,x(start+duration)),width=right-left;
+      ctx.fillStyle=color[group];ctx.fillRect(left,ys[group]-7,width,14);
+      if(width>=34){
+        ctx.save();ctx.beginPath();ctx.rect(left+2,ys[group]-7,width-4,14);ctx.clip();
+        ctx.fillStyle="#ffffff";ctx.font="600 10px system-ui";ctx.fillText(kind[0],left+4,ys[group]+3.5);
+        ctx.restore();ctx.font="12px system-ui";
+      }
+      if(selected===i){ctx.strokeStyle="#152033";ctx.lineWidth=2;ctx.strokeRect(left,ys[group]-9,width,18)}
+      for(let k=0;k<2;k++){const p=a[4+k];if(p!==null){const yy=uBot-Math.max(0,Math.min(100,p))*uH/100;stepPts[k].push([left,right,yy])}}
+      visible.push([i,left,right,ys[group]]);
+    }
+    const lineColors=["#16a34a","#92400e"];
+    for(let k=0;k<2;k++){
+      const pts=stepPts[k];if(!pts.length)continue;
+      ctx.strokeStyle=lineColors[k];ctx.lineWidth=1.6;ctx.beginPath();
+      let prevX=pts[0][0];
+      ctx.moveTo(prevX,uBot);
+      for(const [l,r,yy] of pts){
+        if(l>prevX+1.5){ctx.lineTo(prevX,uBot);ctx.lineTo(l,uBot);}
+        ctx.lineTo(l,yy);ctx.lineTo(r,yy);
+        prevX=r;
+      }
+      ctx.lineTo(prevX,uBot);ctx.stroke();
+    }
+    ctx.restore();q("range").textContent=`${ms(lo)}–${ms(hi)} ms · ${visible.length.toLocaleString()} 条任务`;
+  }
+  function limit(start,width){width=Math.max(20,Math.min(span,width));lo=Math.max(0,Math.min(start,span-width));hi=Math.min(span,lo+width);draw();windowCoverage()}
+  function zoomAt(factor,anchorRatio=0.5){const cur=hi-lo,nw=Math.max(20,Math.min(span,cur*factor)),anchor=lo+cur*anchorRatio;limit(anchor-nw*anchorRatio,nw)}
+  function info(i){const a=tasks[i],[kind,name,core]=ops[a[2]],pct=v=>v===null?"—":v+"%";q("hover").textContent=`${kind} · ${name} · ${core} · Stream ${a[3]} · 开始 ${ms(a[0])} ms · 耗时 ${a[1]} μs · Cube ${pct(a[6])} / MAC ${pct(a[4])} / Vector ${pct(a[5])}`}
+  let pan=null;
+  canvas.addEventListener("pointerdown",e=>{
+    if(e.offsetX<L||e.offsetX>canvas.clientWidth-12)return;
+    if(e.button===1||(e.button===0&&e.shiftKey)){pan=[e.offsetX,lo,hi-lo];canvas.setPointerCapture(e.pointerId);e.preventDefault();return;}
+    if(e.button!==0)return;
+    drag=[e.offsetX,e.offsetX];canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener("pointermove",e=>{
+    if(pan){
+      const plotW=Math.max(1,canvas.clientWidth-L-12),dx=e.offsetX-pan[0];
+      limit(pan[1]-dx*pan[2]/plotW,pan[2]);return;
+    }
+    if(drag){
+      drag[1]=Math.max(L,Math.min(canvas.clientWidth-12,e.offsetX));
+      const box=q("selection");box.style.display="block";box.style.left=Math.min(...drag)+"px";box.style.width=Math.abs(drag[0]-drag[1])+"px";return;
+    }
+    const match=visible.findLast(([,a,b,y])=>e.offsetX>=a-1&&e.offsetX<=b+1&&Math.abs(e.offsetY-y)<9);
+    if(match)info(match[0]);
+  });
+  canvas.addEventListener("pointerup",e=>{
+    if(pan){pan=null;return;}
+    if(!drag)return;
+    const [a,b]=drag;drag=null;q("selection").style.display="none";
+    if(Math.abs(a-b)>7){const w=canvas.clientWidth-L-12,t=x=>lo+(Math.max(L,Math.min(L+w,x))-L)*(hi-lo)/w;const left=t(Math.min(a,b)),right=t(Math.max(a,b));if(right>left){limit(left,Math.max(20,right-left));return}}
+    draw();
+  });
+  canvas.addEventListener("pointercancel",()=>{drag=null;pan=null;q("selection").style.display="none"});
+  canvas.addEventListener("wheel",e=>{
+    if(e.offsetX<L||e.offsetX>canvas.clientWidth-12)return;
+    e.preventDefault();
+    const plotW=Math.max(1,canvas.clientWidth-L-12),ratio=Math.max(0,Math.min(1,(e.offsetX-L)/plotW));
+    zoomAt(e.deltaY<0?0.65:1/0.65,ratio);
+  },{passive:false});
+  q("begin").onclick=()=>limit(0,span);
+  q("zoom-in").onclick=()=>zoomAt(0.5,0.5);
+  q("zoom-out").onclick=()=>zoomAt(2.0,0.5);
+  q("earlier").onclick=()=>limit(lo-(hi-lo)*.4,hi-lo);
+  q("later").onclick=()=>limit(lo+(hi-lo)*.4,hi-lo);
+  function jumpLayer(opType){
+    const hits=[];for(let i=0;i<tasks.length;i++)if(ops[tasks[i][2]][0]===opType)hits.push(i);
+    if(!hits.length)return;
+    const k=Math.min(opType==="SparseFlashMla"?20:10,Math.floor(hits.length/2));
+    const t0=tasks[hits[k]][0], t1=k+1<hits.length?tasks[hits[k+1]][0]:t0+100000;
+    selected=hits[k];limit(t0-2000,Math.max(20000,(t1-t0)+4000));info(hits[k]);
+  }
+  q("jump-fwd").onclick=()=>jumpLayer("SparseFlashMla");
+  q("jump-bwd").onclick=()=>jumpLayer("SparseFlashMlaGrad");
+  window.addEventListener("keydown",e=>{
+    if(e.target&&/INPUT|TEXTAREA/.test(e.target.tagName))return;
+    if(e.key==="="||e.key==="+"){zoomAt(0.5,0.5);e.preventDefault();}
+    else if(e.key==="-"){zoomAt(2.0,0.5);e.preventDefault();}
+    else if(e.key==="ArrowLeft"){limit(lo-(hi-lo)*.4,hi-lo);e.preventDefault();}
+    else if(e.key==="ArrowRight"){limit(lo+(hi-lo)*.4,hi-lo);e.preventDefault();}
+    else if(e.key==="0"){limit(0,span);e.preventDefault();}
+  });
+  q("filter").oninput=e=>{filterText=e.target.value.toLowerCase().trim();draw()};
+  const title=["算子","调用次数","累计耗时 ms","AICore ms","Cube %","MAC %","Vector %","MTE2 %","AICore 占比"];
+  title.forEach((v,i)=>{const th=document.createElement("th");th.scope="col";const btn=document.createElement("button");
+    btn.textContent=v;btn.onclick=()=>{desc=tableCol!==i||!desc;tableCol=i;renderTable()};th.append(btn);q("columns").append(th)});
+  function renderTable(){
+    const text=q("search").value.toLowerCase(), rows=table.filter(r=>r[0].toLowerCase().includes(text));
+    rows.sort((a,b)=>{const x=a[tableCol],y=b[tableCol];if(x===null)return y===null?0:1;if(y===null)return -1;
+      return (desc?-1:1)*(typeof x==="string"?x.localeCompare(y):x-y)});
+    const body=q("operators");body.replaceChildren();
+    for(const r of rows){const tr=document.createElement("tr");r.forEach((v,i)=>{
+      const td=document.createElement("td");
+      if(i===0){const b=document.createElement("button");b.textContent=v;b.onclick=()=>{
+        let pick=-1;for(let j=0;j<tasks.length;j++)if(ops[tasks[j][2]][0]===v&&(pick<0||tasks[j][1]>tasks[pick][1]))pick=j;
+        if(pick<0)return;filterText="";q("filter").value="";selected=pick;const a=tasks[pick],margin=Math.max(500,a[1]*2);
+        limit(a[0]-margin,Math.min(span,a[1]+2*margin));info(pick);q("timeline").scrollIntoView();};td.append(b)}
+      else td.textContent=v===null?"—":v.toLocaleString("en-US",{maximumFractionDigits:2});
+      tr.append(td);
+    });body.append(tr)}
+    q("operator-count").textContent=`${rows.length} 种算子`;
+  }
+  q("search").oninput=renderTable;new ResizeObserver(draw).observe(canvas);renderTable();draw();windowCoverage();
+})().catch(err=>{document.getElementById("range").textContent="时间线载入失败："+err.message});
+</script>
+</html>

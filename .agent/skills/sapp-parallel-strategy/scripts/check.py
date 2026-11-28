@@ -99,6 +99,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if not (args.family or args.yaml):
         parser.error("give --family, or --yaml with the asker's trainer yaml")
+    ask.select_cluster(args)
     args.recompute = []  # the check prices no layout
     repo = ask.repo_root()
     notes: List[str] = []

@@ -125,4 +125,5 @@ layers_per_device = L / pp
 | Parameter offload (CPU) | ~param_size freed | CPU-GPU transfer, PCIe bound |
 | Activation swap (CPU) | ~activation_size freed | Prefetch scheduling, PCIe bound |
 
-**Priority order** (short sequence): FSDP → activation checkpoint → activation swap (A3/950DT) → TP → PP → optimizer/param offload
+**Priority order** (short sequence): FSDP → activation checkpoint → activation swap
+(when measured host-device bandwidth and prefetching permit) → TP → PP → optimizer/param offload

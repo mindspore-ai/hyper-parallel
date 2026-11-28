@@ -20,7 +20,7 @@ Start → Estimate memory (model states + activations)
  │   ├─ Step 2: + Activation checkpoint (recomputation)
  │   │   └─ Fits? → Done (FSDP + DP + recompute)
  │   │
- │   ├─ Step 3: + Activation swap (A3 / 950DT with high bandwidth)
+ │   ├─ Step 3: + Activation swap (when measured host-device bandwidth supports it)
  │   │   └─ Fits? → Done (FSDP + DP + recompute + swap)
  │   │
  │   ├─ Step 4: + TP (intra-node, shard params & activations)
@@ -160,7 +160,7 @@ Apply memory optimizations in this order (each adds overhead, so stop as soon as
 ```
 1. FSDP (shard model states)         — low overhead, once-per-step comm
 2. Activation checkpoint (recompute) — ~33% recompute cost, large mem savings
-3. Activation swap (A3/950DT)        — needs high PCIe/die bandwidth, prefetch scheduling
+3. Activation swap                  — validate host-device bandwidth and prefetch scheduling
 4. TP (tensor parallel)              — per-layer AllReduce, must be intra-node
 5. PP (pipeline parallel)            — pipeline bubble overhead
 6. Optimizer/param offload (CPU)     — PCIe bound, last resort
@@ -193,9 +193,8 @@ estimated_memory_per_device <= device_memory × 0.9  # 10% safety margin
 tp_size <= devices_per_node
 
 # CP bandwidth reality:
-#   On 8-die nodes: tp already occupies most/all intra-node slots,
-#   so cp > 1 almost always requires cross-node communication.
-#   Only 16-die nodes (A3/950DT) can fit both tp and cp intra-node.
+#   Use the job-visible device count and actual TP/CP rank placement.
+#   TP x CP must fit within the node's available logical devices to stay local.
 cp_intra = devices_per_node / tp_size        # max CP that stays intra-node
 # If cp > cp_intra → effective_bw = bw_inter (not bw_intra)
 # For GQA/MLA this is acceptable (low KV volume); for MHA it's costly.
@@ -225,7 +224,7 @@ FSDP level2 + DP=N + recompute  # if activations tight
 FSDP level2 + DP=N + recompute                    # try FSDP-only first
 FSDP level2 + TP=8 + DP=N/8 + recompute           # add TP if still OOM
 FSDP level2 + TP=8 + PP=2 + DP=N/16 + recompute   # add PP for very large
-# A3/950DT: can add activation swap before resorting to TP
+# Consider activation swap before TP when host-device bandwidth and prefetching permit it
 ```
 
 ### Very Large Model (100B+), 256+ Devices
@@ -233,7 +232,9 @@ FSDP level2 + TP=8 + PP=2 + DP=N/16 + recompute   # add PP for very large
 ```
 FSDP level2 + TP=8 + PP=4 + DP=N/32 + recompute
 FSDP level3 + TP=8 + PP=8 + DP=N/64 + recompute   # level3 if needed
-# A3/950DT: FSDP level2 + TP=16 + PP=4 + swap + recompute
+# A3(64超节点, 8 dies/node): FSDP level2 + TP=8 + PP=4 + swap + recompute
+# A3(384超节点, 16 dies/node): consider node-local TP up to 16; validate its communication cost
+# Other hardware: choose TP/PP from confirmed device mapping, memory, and effective bandwidth
 ```
 
 ## Common Strategy Templates (Long Sequence)

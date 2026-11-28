@@ -4,12 +4,14 @@ Load with `SKILL.md` when collecting inputs or formatting the final report.
 
 ## How to invoke (examples)
 
+Replace hardware placeholders with the current job's confirmed allocation.
+Counts refer to logical training devices, not physical multi-die cards.
+
 ```bash
-/parallel-strategy-analyzer Analyze strategy for a 70B LLaMA model on 64 Ascend A2 NPUs
-/parallel-strategy-analyzer 13B model, 8× A100 80GB, sequence length 8192, batch size 512
-/parallel-strategy-analyzer Mixtral 8x7B on 32 H100, seq_len 4096
-/parallel-strategy-analyzer Currently using DP=8 for 7B on 16 GPUs, OOM at seq_len=32768
-/parallel-strategy-analyzer Compare DP=4,TP=8,PP=2 vs DP=8,TP=8,PP=1 for LLaMA-70B on 64 A100s
+/parallel-strategy-analyzer Analyze <model> on <device_count> <device_type> devices, <memory_per_device_gb> GB each
+/parallel-strategy-analyzer <model>, <device_count> <device_type>, <memory_per_device_gb> GB each, seq_len=<seq_len>, batch_size=<batch_size>
+/parallel-strategy-analyzer <model>, <current_strategy>, <device_count> <device_type>, <memory_per_device_gb> GB each, OOM at seq_len=<seq_len>
+/parallel-strategy-analyzer Compare <candidate_1> vs <candidate_2> for <model> on <device_count> <device_type>, <memory_per_device_gb> GB each
 ```
 
 ## Required inputs
@@ -17,8 +19,8 @@ Load with `SKILL.md` when collecting inputs or formatting the final report.
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | Model size | Parameter count or name | 70B, LLaMA-2-70B |
-| Device count | Total devices | 64 |
-| Device type | Hardware | Ascend A2/A3/950DT, A100 80GB, H100 |
+| Device count | Total logical devices allocated to the job | `<device_count>` |
+| Device type | User-specified hardware and deployment configuration | `<device_type>` |
 
 ## Optional inputs (improves accuracy)
 
@@ -33,6 +35,12 @@ Load with `SKILL.md` when collecting inputs or formatting the final report.
 | Framework | Backend | PyTorch |
 
 Known models (LLaMA, GPT, Mixtral, …) auto-fill from `known-models.md`.
+
+For hardware outside the reference configurations, collect job-visible devices
+per node, device mapping, per-device memory and effective communication bandwidth
+as described in [the hardware collection procedure](known-hardware.md).
+Record the source and units; request missing inputs before calculations that
+depend on them. A device name alone does not determine the deployment topology.
 
 ## Output sections (required)
 

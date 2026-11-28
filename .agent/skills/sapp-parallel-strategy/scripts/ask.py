@@ -16,7 +16,7 @@
 
 Run from the HyperParallel checkout whose ND should answer, with the Python that has its dependencies:
 
-    python .agent/skills/sapp-parallel-strategy/scripts/ask.py --family qwen3_5_moe --cluster a3 \\
+    python .agent/skills/sapp-parallel-strategy/scripts/ask.py --family qwen3_5_moe --cluster a3_64 \\
         --layers 8 --seq 8192 --global-batch 64 --micro-batch 1 --dies 64 --recompute full \\
         --request "the request, in the asker's words"
 
@@ -256,6 +256,8 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
                         help="template name, for example qwen3_5_moe; with --yaml it only picks the status line")
     parser.add_argument("--yaml", default=None, help="the asker's trainer yaml, instead of the family's template")
     parser.add_argument("--cluster", default="a3", help="cluster key in calibration/clusters.json")
+    parser.add_argument("--cards-per-node", type=int, choices=(4, 8), default=None,
+                        help="queried physical A3 cards per node (two dies/card), not logical device count")
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--seq", type=int, default=None, help="tokens a sequence")
     parser.add_argument("--global-batch", dest="global_batch", type=int, default=None, help="sequences a step")
@@ -276,13 +278,38 @@ def _arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if not (args.family or args.yaml):
         parser.error("give --family, or --yaml with the asker's trainer yaml")
+    select_cluster(args)
     return args
+
+
+def select_cluster(args: argparse.Namespace) -> None:
+    """Resolve A3 from confirmed physical cards; label the post-inquiry default."""
+    cards = getattr(args, "cards_per_node", None)
+    if cards is not None and (not isinstance(cards, int) or isinstance(cards, bool) or cards not in (4, 8)):
+        raise ValueError("A3 physical cards_per_node must be 4 or 8")
+    if args.cluster == "a3":
+        if cards is None:
+            args.cluster = "a3_384"
+            args.hardware_selection = "assumed 8 physical cards/node; inventory not supplied"
+            sys.stderr.write("A3 specification unspecified: assuming a3_384 (8 cards, 16 dies/node). "
+                             "Query target-node physical cards or ask the user before relying on this default.\n")
+        else:
+            args.cluster = "a3_64" if cards == 4 else "a3_384"
+            args.hardware_selection = f"physical card count supplied: {cards}/node"
+    elif args.cluster in ("a3_64", "a3_384"):
+        expected = 4 if args.cluster == "a3_64" else 8
+        if cards is not None and cards != expected:
+            raise ValueError(f"{args.cluster} requires {expected} physical cards/node, got {cards}")
+        args.hardware_selection = f"explicit specification: {args.cluster} ({expected} physical cards/node)"
+    elif cards is not None:
+        raise ValueError("--cards-per-node selects an A3 specification; use an A3 cluster key")
 
 
 def cluster_record(name: str, trust: Dict[str, Any], budget: Optional[str]) -> Dict[str, Any]:
     """The cluster's record: its ratios only where the trust record says they hold for this family, its budget."""
     clusters = json.loads((SKILL / "calibration" / "clusters.json").read_text(encoding="utf-8"))
-    record = dict(clusters.get(name, {}))
+    resolved = "a3_384" if name == "a3" else name
+    record = dict(clusters.get(resolved, {}))
     calibrated = bool(trust.get("calibrated")) and bool(record.get("ratios"))
     record["ratios"] = SKILL / "calibration" / record["ratios"] if calibrated else None
     record["budget"] = budget or record.get("budget")
@@ -298,7 +325,8 @@ def run_folder(args: argparse.Namespace, repo: Path, doc: Dict[str, Any]) -> Pat
     run.mkdir(parents=True, exist_ok=False)
     (run / "run.yaml").write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
     (run / "request.md").write_text(args.request + "\n", encoding="utf-8")
-    asked = {"family": args.family, "cluster": args.cluster, "yaml": args.yaml}
+    asked = {"family": args.family, "cluster": args.cluster, "yaml": args.yaml,
+             "hardware_selection": getattr(args, "hardware_selection", None)}
     (run / "ask.json").write_text(json.dumps(asked, indent=2) + "\n", encoding="utf-8")
     return run
 

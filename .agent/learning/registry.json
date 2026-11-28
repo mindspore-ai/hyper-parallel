@@ -1,0 +1,442 @@
+{
+  "schema": "hp-rsi-experience/v1",
+  "lessons": {
+    "packed-attention-work-accounting": {
+      "title": "Audit causal pairs and distinguish capacity from speedup",
+      "claim": "Freeze the headline FLOPs convention, provide causal-pair sensitivity, and compare effective token throughput across workload changes. Use equal-work controls for end-to-end implementation gains.",
+      "fingerprint": "5e1875a5af26de048e2fbe3775966be4f2e16cc229de81deca08d6da1ea88e77",
+      "owner": "mfu-riser",
+      "form": "acceptance procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/mfu-riser/references/acceptance.md"
+      ],
+      "evidence_sha256": [
+        "05e2cb771f5de6ef4c6c7c21f03cd9106d8a0d55125048d1b73fd6104b33f217",
+        "1d23b5d131b6e08822c0069682ec42df12ab1bd80de27f3e690ed27266ce6936",
+        "5025bbba9952914dbaa3b3af6ad1a36d6c9b64f67608fc60765e94bbcb8308e4",
+        "6d3321c54764eb44b79978ea4382cc7e902b20bda3f0bd80abfeb60d77c7a028",
+        "7facca6f2b8217aa576cc0752103dc7681f2cafbd2d4bb67a69527c048f56370",
+        "9bfd87070fce835a75a547d58bf678428dd13229f612c4345b65f5c5c7a2e61b",
+        "a4990c9fcef459c7556b5de67bc500545af48b4e9132b331f78c9d355e9530fc",
+        "b13ffd473ffbebbc17cbd387f80c58cfa6651ca457e23fafecb73ba5962f9590",
+        "bf55ec0a38fdab2240d875e1f07da9f4c32effd405ac92263d129805826c7a9c",
+        "c697cce2a104f7097b98092ec4361ad43b9a04c0a570cda304269f47a67c2c04",
+        "cb2f4d674061665bfb74570dfd297702e94c52a3c31d34213bba5ff66b1e9ddd",
+        "d077e2bb77c0519658c7d5fd8a7a7e286acd9934a5a07abde8fe53c5ed2c1d33",
+        "df6c80a063886ef878fbd962c30fd2bcc550958b9e292441afc26b325247a4dd",
+        "fc36fde184edd6ed798f4140c544d25c7b634d9662b3d1b583aae80df95d10f3"
+      ],
+      "revision": 3
+    },
+    "staged-shell-launcher-preflight": {
+      "title": "Check staged shell launchers and their recipe imports on the target OS",
+      "claim": "Run launcher positive controls and the existing configuration validator before reserving devices. Verify overridden target origins and digest their resolved sources.",
+      "fingerprint": "eb7953aaaf471070db5b38d718f213f25b73567372741f7420e321564eb9f877",
+      "owner": "hf-model-integration",
+      "form": "launcher and recipe validation procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/hf-model-integration/references/bringup-field-checklist.md"
+      ],
+      "evidence_sha256": [
+        "0103162aeae651691df555f8e00b7830cadeddf6828ae4922c2b2fd35e4b3c0f",
+        "58da2da980b69406ffd8aec53c1742cf711015e443d7dc0752c2574cc7011dda"
+      ],
+      "revision": 2
+    },
+    "active-device-process-admission": {
+      "title": "Verify device occupancy at admission and throughout the measured interval",
+      "claim": "Check device process rows independently of the HBM threshold and verify exclusive occupancy over the sampled interval when a post-launch collision is detected.",
+      "fingerprint": "f46d922c0bc15f20ff19e2a99d36e1b824b400214dee0c51ee7b7bf72a359896",
+      "owner": "hf-model-integration",
+      "form": "benchmark occupancy provenance procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/hf-model-integration/references/bringup-field-checklist.md"
+      ],
+      "evidence_sha256": [
+        "795b0f5686f88a679d6a8b9a96285fb537bb4051556a00eddfaca09cd95ffb25",
+        "db50182c038e1d0edddba459a72258d31154f030c5466d23869d252960ca0172"
+      ],
+      "revision": 2
+    },
+    "batch-small-independent-attention-windows": {
+      "title": "Batch independent attention windows when launch fan-out dominates",
+      "claim": "Reduce launch fan-out with shape-compatible batched attention while preserving the mask, scale, and gradients per window.",
+      "fingerprint": "e2e1a35991cf921569c5fe954e377b05e0a645e423727c0b0c9923423210bc97",
+      "owner": "perf-playbook",
+      "form": "bottleneck procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/feature-scenarios.md"
+      ],
+      "evidence_sha256": [
+        "a4990c9fcef459c7556b5de67bc500545af48b4e9132b331f78c9d355e9530fc",
+        "df6c80a063886ef878fbd962c30fd2bcc550958b9e292441afc26b325247a4dd"
+      ],
+      "revision": 1
+    },
+    "target-step-time-budget": {
+      "title": "Size a fixed-workload MFU target using timing and matched hardware counters",
+      "claim": "Calculate the fixed-workload step-time deficit and, with matched hardware counters, project the covered HFU required if executed FLOPs per useful FLOP stay constant. Use this evidence to prioritize exposed time or extra execution.",
+      "fingerprint": "926a09cf6881fddc772fc7276aae3129d56d450137a20322b3a93c4486334430",
+      "owner": "mfu-riser",
+      "form": "status fields, planning procedure and regression tests",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/mfu-riser/references/contracts.md",
+        ".agent/skills/mfu-riser/references/planner.md",
+        ".agent/skills/mfu-riser/scripts/mfu_riser.py",
+        ".agent/skills/mfu-riser/scripts/plan_accumulation.py",
+        ".agent/skills/mfu-riser/scripts/riser_contract.py",
+        "tests/ut/tools/test_mfu_riser.py",
+        "tests/ut/tools/test_mfu_riser_counter_window.py",
+        "tests/ut/tools/test_plan_accumulation.py"
+      ],
+      "evidence_sha256": [
+        "1244da55ef0acd926313fdec3deca98149450b8fcee9cfbe0b6c063e0bac4495",
+        "140a8caa8435c6b97659f3ccdb0c1a1530ffda06ef7e7e4bb29a876afc20fcdc",
+        "1b826c38beacb697a6e60c866595e8d32940671ebb6d9e3b923d35a341b67107",
+        "32344c65a552159c88e7576435d971136ddfb47b529758aa961e998a51897641",
+        "88e0292d24d771a472502eb0d5e954d89e9db35e7c397fdb01a2ea3b72e93d0a",
+        "b070dbcfe09524adda41f68a200c7f4ce5ac796b8cdf4bfe3a808a10a46505db",
+        "b8e299e6909078306bd4ff369db102353436953250525e0e194aaefbe4f45ccd",
+        "c5a7b2eb284291a704cbc37a6b9dec1314b0fde582b96c767e1ca02acc8a21dd",
+        "f43856412084df0b6591a2b4348755d2555f9fbcee6dc6d78af7f448a926725d"
+      ],
+      "revision": 3
+    },
+    "causal-mask-materialization": {
+      "title": "Check dense causal mask materialization and backend dispatch",
+      "claim": "Use a paired real-shape probe to compare implicit causal dispatch against explicit masking before attempting a kernel rewrite.",
+      "fingerprint": "e9bf94078341b7de1c5047d1fdff16c130e171203900ad8512d3a85b1aa0e045",
+      "owner": "perf-playbook",
+      "form": "bottleneck procedure and numerical requirements",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/mfu-riser/references/acceptance.md",
+        ".agent/skills/perf-playbook/references/feature-scenarios.md"
+      ],
+      "evidence_sha256": [
+        "094425416ed00f6b8395b73021edeb2507251b041011a7294c8fb1be3419fc8e",
+        "4fa68a565465061166c58d80fd0acbb954f8e783f710c1d2368bbda1708826ba",
+        "504c20b1f77dc8c3660cf02e55fbc879b439ea7b2d3a01fb6b937a68ee79d794",
+        "e39d8e90706a86b22506e3ed86eb79e8934bfebfc670ac514d53429f18e4f085"
+      ],
+      "revision": 1
+    },
+    "selective-checkpoint-memory-tradeoff": {
+      "title": "Measure saved training time per incremental GiB of live memory",
+      "claim": "Use a device timeline to target selective operator output retention. Verify path engagement and rank candidates by unprofiled step savings per incremental GiB after numerical acceptance.",
+      "fingerprint": "d2c749f9ef229b90f1ddbc3e818957dcf793368a7b07b7d8a1f7b3f9e6084cb0",
+      "owner": "perf-playbook",
+      "form": "activation checkpointing procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/acceptance-learning.md"
+      ],
+      "evidence_sha256": [
+        "286c49097db16011913e3c27bb57cb7fe8fdfbaaf7fd7e1e90e179f452cc4955",
+        "39c4895ad3fa8fd7e50ee5d2a6feb4fb44e44a1643c1e05907d8ab552f08ce7b",
+        "68dc5d018bb491d308948e0f491da38dd1d3f4820ba5db87aceb075e2aa4eabd",
+        "71d46cb1e0f66de94552d1bb51a0a1af3a88fac4b6c593b04c193665ca0f067d",
+        "9b12b37c9111ec3fc5cfbeaa5f321277ebea68f2ec04792b624fce921e26c29d",
+        "9ef859c8d1abc3d0e260a3130bd144b68ca9085cf3424ab71892cf3b950b8cd7",
+        "b0bf0135d9ccc0920fc976d2d196f4a383110fb3c705f97358ddf009f60bf8a8",
+        "eafdbb47e4413d10f14fa9c9db7c7a07914951323b8139fee558c5ced390dba1",
+        "f164d68668584fdaef9ccc21dd2670b284491b3e5630ca34d7ed743e583b42be"
+      ],
+      "revision": 2
+    },
+    "chunk-vocabulary-loss-for-memory-headroom": {
+      "title": "Reduce vocabulary loss workspace and validate the resulting capacity",
+      "claim": "Retain the full head GEMM, compare scaled logits gradients at the actual dtype and shape, and account for overlapping buffers after optimizer state initialization.",
+      "fingerprint": "4aca90c0afb51fa71b2d0251d11f57a7ab30ba3006425df853f4756a5c8c34aa",
+      "owner": "perf-playbook",
+      "form": "head workspace diagnosis and logits gradient preflight",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/feature-scenarios.md"
+      ],
+      "evidence_sha256": [
+        "272fb5aea3b4e778ee90f370a6075d5edbff3447830b1509aaaed35073aa721d",
+        "3b18c86f010913674127e764c0e7f4ea930a50dab3d7b7746cf5069fd018b815",
+        "5cc52aa895ef0a8372f50f232cbd3727e00884e763517c7c7a02b417aae512ad",
+        "5cdfa22d3ad866f5b6cc0b2c8c9d4eecff0d1f68cd62fab24c1836bf3eb84dbc",
+        "6d6c61c7a3e8c97e1c080567380614222ab3cd3ebc357012276cd0856c64e026",
+        "94aac43cadc56f7b79bd4e2e3f1dc2fd48bb98d7c507daf7f36a496fae585eec",
+        "a4cf59806b075ce91914029f8c03db4d1d3122fffdcd1a26f8c9597ee8d7645e",
+        "afb9ce69f84ea1076b6bbb69458b7dcc62b3f853571c142272a1d0e435c65620",
+        "c82f697ce5dc9c2a5dab55d54c18496a97acaf0c74a74486d764fca86b859558",
+        "db15f7c5107cda4bd248d5fdd7efb5e200bd0112c865c98974795f1e63a053a7",
+        "ebaa78fd0115f54d1ce3504b815cea66ae75cb4fdf7508c0e16d7f06ba6ee299",
+        "ef4eacb567da9e6460d047fab7c4659bee7e366d705087d6d59a46d330ebaa90",
+        "fe265dae2ae9f7559ebf8b4beef2ae2ba3fe7713e53b6acd1bcba36561889a97"
+      ],
+      "revision": 4
+    },
+    "estimate-microbatch-accumulation-scaling": {
+      "title": "Use a measured accumulation model with held-out validation",
+      "claim": "Use matched one- and two-microbatch measurements to estimate amortized update costs. Validate calibration on independent accumulation counts before extrapolating and compare modeled MFU with its target step-time budget under fixed per-microbatch work.",
+      "fingerprint": "905cde93f9144b18b0836b17a2835c5d610c32ed88f1ffdfb79463f127447c2d",
+      "owner": "mfu-riser",
+      "form": "offline planning command, candidate workflow, and regressions",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/mfu-riser/SKILL.md",
+        ".agent/skills/mfu-riser/references/planner.md",
+        ".agent/skills/mfu-riser/scripts/plan_accumulation.py",
+        "tests/ut/tools/test_plan_accumulation.py"
+      ],
+      "evidence_sha256": [
+        "1244da55ef0acd926313fdec3deca98149450b8fcee9cfbe0b6c063e0bac4495",
+        "140a8caa8435c6b97659f3ccdb0c1a1530ffda06ef7e7e4bb29a876afc20fcdc",
+        "1b826c38beacb697a6e60c866595e8d32940671ebb6d9e3b923d35a341b67107",
+        "54e643e6012642d22545bdf1cfd5291b92c832196be7b8768e41a6ac3a08b3e2",
+        "60e5af753bf68d2a0a53a9cd9d4a9b2fea66e00afd66a7ac02f6c1a445d89694",
+        "b82cea8fc6e296176b497210ddbdad2ffe1beb33f5dd6104b0853870187088ee",
+        "b9ddb1dfbffc399a14639c9cf26e0678388322ca995207bc715adae3c8d0bf19",
+        "e1701e5034443e1276d6503244462e5b2bd789b370a69600c250d9f17f63c43b"
+      ],
+      "revision": 2
+    },
+    "vocabulary-memory-capacity-checks": {
+      "title": "Measure peak migration after vocabulary memory optimization",
+      "claim": "Retest replay at fixed physical shape and record the first failing allocation after reducing vocabulary memory.",
+      "fingerprint": "e9293ab7e3047ae25e6d24cc4a47d506e4610f5fe760b525e4cdae1e0474ffbf",
+      "owner": "perf-playbook",
+      "form": "extension to the memory-bottleneck tuning procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/feature-scenarios.md"
+      ],
+      "evidence_sha256": [
+        "04a2fe141e821c3a01615a6fe1f4e81d479a061fbce601d29f71e83c63092f07",
+        "16e8d95485dba79ff351cb349d801fa73657d464f11166dd62da69b3be99295a",
+        "23f274b62340106ea44d42a1b75d88f5f03e64d34896b62d053a9791f904002a",
+        "2946477a1a8352bceac69129c02750771987caf0e951f1ea777efd5420ae171c",
+        "6a078d2b4f24dbd5f3613d50dfa8de896d4c9c9ffc091beff17211cb39951aac",
+        "6f6e6892db9863a86176d9f1cd36bd61bc422ed0107fbcb2a4a895e88a2e31fa",
+        "974492284b27ac6c12d090b5c9bec14bb03a5ab7a95575a6085934b77822c510",
+        "9ab23d57c07230a5bd9288af5a0db562e33b60d2156fd9a84bad8b40a378014b",
+        "a6b62b3188092719632e576ffd16e4ebe6234b6a124ab37d09c872c494a85f89",
+        "b162babe4cd8ecaf84119cfbfcae9bceac548707829ac75794e5f3e937df39ea",
+        "c951612cfbb403a9f620efcd4908b266eace570e6221230146d6f97756ddddcc",
+        "cb4fbb699110dd5392ab49994cdd2bbaaa059fdc3f5311f7343563ab59b93787",
+        "d0d458749ee5ae17fdcf43fe782a7c4e66a12143a7f7c7b7d77ef487ccb6841f",
+        "e11e92b58a5115ab547b4ebb8ae0d99d26f348ff8460f7df50fa4a4d483b9e62",
+        "ec76eced97ac1d3eb1e3e7a0b9f7ace3f14e6eb4f43ddc1ecd3f3ec0ec9b224b",
+        "ef0a6344cf39f9fbaa630f16c2ac7a7fd3cfb73762ae32d13c50c5190b3934aa"
+      ],
+      "revision": 1
+    },
+    "guarded-complete-update-hfu": {
+      "title": "Verify complete-update hardware counter windows",
+      "claim": "Recover native arithmetic exports when possible, validate distinct physical cores for each declared device and engine, and bind the counters to rank boundary receipts and a matched unprofiled window before reporting complete-update HFU.",
+      "fingerprint": "f50a58363461dc6d4e523a3f01e525a5c0bf81dab7d88fa0c16740cc02c72992",
+      "owner": "perf-playbook",
+      "form": "profiling extractor, recovery procedure and regression tests",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/hierarchical-performance-diagnosis.md",
+        ".agent/skills/profiling/SKILL.md",
+        ".agent/skills/profiling/scripts/arithmetic_counters.py",
+        "tests/ut/tools/test_arithmetic_counters.py"
+      ],
+      "evidence_sha256": [
+        "13236ae2f460686a560d793177d7231fcfdad9e8d4096d9c11660f86d02880a9",
+        "1941de40bed11c4b5750eade490e201973f4774105644a09aa9d06e0860057fd",
+        "1fc97313f4250e7801fc0db3eb6df1ce9482b875ec6074cebbb7ddf628ace57e",
+        "2c740e9f0402e86565250fdd0f77d9b7ba6fbbef58a572f68a52262c792d79aa",
+        "c222fb8caf62495306a29acf61cbd81e8d094dc9243ccf6ffa085158af7bef3e",
+        "c6705f594b1f7855ff097244207309106cb8e9014981aeda925e9b724d925be8",
+        "c9b105858afdbacf5f50754a349d5dc6ccab74e97f029ece57592fde60ef9600",
+        "f8432095420f27c052796a8d8c09df1023883f01d912effe97eb815f669ade6f"
+      ],
+      "revision": 2
+    },
+    "operator-backend-preflight": {
+      "title": "Qualify fused backend, normalization and replacement state contracts",
+      "claim": "Register custom operators before runtime initialization and preserve source parameter, buffer and precision contracts when installing a fused training replacement. Validate the registry and identities in addition to serialized keys.",
+      "fingerprint": "49f5cbef11b670f3e9f07a89f0cf5da123ba3958a90dc2974375e18e1ccf6cc4",
+      "owner": "perf-playbook",
+      "form": "fused backend, state and numerical preflight procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/fusion-methodology.md"
+      ],
+      "evidence_sha256": [
+        "048fdb8d46d63aad030aedda299fd5414f64782f0b39a2ba07518690af043269",
+        "0e037d11d1648666e26d664dff616688a6ac8e79b0e5c0ad974e4ff75b8f8009",
+        "3bd4e594610f8eabe91a8f63504efdba59297ecbb5840eaebe3c95aac87623bf",
+        "4b8cc1292796ab327bc0c888f6792142691f1aeb8759d8ab2d657b32b427725e",
+        "5af95e70d1e9b1c84370ae5589a561ca0a9aa9169888edda4af798ccdd30368a",
+        "6e33d65aad00d1900b75c714f710bd1b8cfcf1ac460bd517b1d3173b27db59fa",
+        "725f857c5e8e8a614ee6529ce7419a2818eab0a6b813c8e6b94884bc7a60b02d",
+        "c7c752f0db2b44f680d7f80c5e02c39d66084b7431caa9bd0da3d62d42fe2e7f",
+        "f07b484f58f572e816ab4e37d24cd4b9f4c097efd0a4c9ac8c8c80491555a505",
+        "f44f684e237917f8b9f6b692c0d57b78b69fc6dcbd4a7d0ce715382e32fe1a8e",
+        "f5a86415cc5c59155a6d8c9888c01c380b2a6677a46930c4be145992f81d8bcb"
+      ],
+      "revision": 2
+    },
+    "fixed-row-capacity-preflight": {
+      "title": "Preflight materialized rows for fixed-shape capacity trials",
+      "claim": "Exercise the real tokenization and collation path at the target shape before scheduling a fixed-row capacity trial.",
+      "fingerprint": "7c14aa0e205db19a872f6775eafd0dc169f01b21cf3d257048e492126323cb2b",
+      "owner": "perf-playbook",
+      "form": "capacity planning preflight procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/mfu-targets.md"
+      ],
+      "evidence_sha256": [
+        "3a5f42ea7c68c0f25c6a0bf214b101881d802adb81ee6f6ab856b1287218be89",
+        "5b7196dfac8d7e0da81fa0239a960d58c8616b196535d752ef419add54203322",
+        "6a3adf4149015d38f6b78bcc336909e5fd853caaa388e8d4db31821c951a449e",
+        "d8f54e5556287ea1af27153a28af7705a3536f19692dc992aaa02baf2ab2f60a"
+      ],
+      "revision": 1
+    },
+    "data-parallel-trajectory-digests": {
+      "title": "Bound input fingerprint communication in trajectory validation",
+      "claim": "Hash complete logical input fields at their owning data-parallel ranks and gather component digests with canonical rank coverage.",
+      "fingerprint": "30face4b52cc6f0ea11de8b797b6c5146ceb1ed339eb5987ae97afaf6419f79b",
+      "owner": "perf-playbook",
+      "form": "trajectory verification procedure for the updated Trainer recorder",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/training-rsi.md"
+      ],
+      "evidence_sha256": [
+        "08cd565e84f33b2c51f9de878810f26414c39d8ffd92976352fda6a9c926875e",
+        "37a6b93a523b32a8b8152a69483e008c7603cd2f23e92ca9052b642288284efc",
+        "596254a4efae08c89a5dadac7abbe8aa500f736bfd67ce83ad5be5a56d8fb1ea",
+        "c615d8b30a7af5a56a8b15cb974f47647acd80765fc09d0ca806c9c9b488d27e",
+        "f9edc707370ff802ac6d1c7e28f0256c9d3d351336f2d67a4ab88765e9d6f349"
+      ],
+      "revision": 1
+    },
+    "capacity-utilization-throughput-tradeoff": {
+      "title": "Audit utilization and token throughput across context lengths",
+      "claim": "Use useful FLOPs per effective token to explain opposing MFU and throughput changes in capacity sweeps. Base fixed-work speedups on matched model work.",
+      "fingerprint": "01b7de49be4efbd63a20a48d4cf820f9b6ce722743d779b67db2c4676f2074c6",
+      "owner": "perf-playbook",
+      "form": "capacity comparison procedure in the utilization guide",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/mfu-targets.md"
+      ],
+      "evidence_sha256": [
+        "0bffb643aefc788f05bbf2c1c0bf83933e42f0afe340b820d020f67d985b37ed",
+        "5adfea9064bfa940315f58554f869f360b13184d098039a6a060ca02fb6d0071",
+        "6d903d39225f6f7fe1df0e72d9ab127a32855e949ca01a98d6116becd515d6f7",
+        "8157215a1b468a1ba2297e8574a7a349ff2cb5ed9307ff57656bf6826ad905ad",
+        "c7fe8a348e062d57cf489567e345066dd09959c4969002709fad319ae425eeee",
+        "f96f24eb58502673566e9ae46010fa4b33d39a6c5b480c6aa9ac7d454e6fb656"
+      ],
+      "revision": 1
+    },
+    "sharded-optimizer-owner-placement": {
+      "title": "Audit sharded matrix optimizer work by owner and batch",
+      "claim": "Evaluate owner placement and communication copies before changing Newton–Schulz arithmetic. Validate directed exchange on the supported layout and the complete training step.",
+      "fingerprint": "f8f8665b5c0f6ad73c67477a0ae03d5abd98f62c7ae198f4aedb5d065ec0a61b",
+      "owner": "perf-playbook",
+      "form": "optimizer ownership diagnosis and collective mapping procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/optimizer-overhead.md"
+      ],
+      "evidence_sha256": [
+        "076136015399c2e5f27bcd8ad191dc06b0ddb87daa42db991ecd83c89f1dcb7c",
+        "0fa5e4563f06730a6cb15ac298d866c2233e7ece1f87e4face7520de1e87ecba",
+        "2139928498b6237eb3ea5bf3ab74ea1685737174bb0a97e08d2055816f5ff1db",
+        "257510a4900f48a682803ef9f09082925ee81b51897609eb7376131b47cc52bb",
+        "8dc16f45ca25b6e9611a838c66aa4cd711738427f2de405455ee722c7613df30",
+        "a03f3477d333e2708a1c5946a2a3e9423590cb4957f66929b740ae9438e8a0e5",
+        "a067f6870cb0b9b210901bff301717bafad748585d2401616d1070ea0b3b27a8",
+        "bb7e246d33e6729db8b9cc14fc3fb70002988b0e8a498404ff5332c74cb72359"
+      ],
+      "revision": 1
+    },
+    "native-gemm-task-correlation": {
+      "title": "Attribute native compute and Host wait intervals",
+      "claim": "Recover unique task geometry from correlated device records and verify Host wait savings in a matched end-to-end benchmark.",
+      "fingerprint": "08890530ea8189c371b0ddc288c6db31d1e3c82442bb0b8f13c10334c2ef2bff",
+      "owner": "profiling",
+      "form": "native task attribution and Host wait accounting procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/profiling/SKILL.md",
+        ".agent/skills/profiling/references/breakdown-dimensions.md",
+        ".agent/skills/profiling/scripts/gemm_throughput.py",
+        "tests/ut/tools/test_profiling_breakdown.py"
+      ],
+      "evidence_sha256": [
+        "10363450341dec6d22c642dc51606ed30ebd2c4f032388ef274ba99291348cd4",
+        "338b8179789f5257fe57df534e39df7ab9804683abb39cfd96f5c19b0ab77322",
+        "55da9633829de27fadcde122b407483e3af128cf4cbd108889f6282fe5b9b684",
+        "65d1d137e189fb4e070ff6da1e7a08572b5dc51eb9c78551d5a72cf0e691b7ad",
+        "7ba07938aeeb93dd9e82bbd19460e1fb48d93387530d78c4a450b24aaf18885b",
+        "cbd168402d8b37a5835c13b7243318f1af23a5cbff7832b5f99de5a92673413c",
+        "d79de1c201190f8f081b5a70853f147ee98408aa8a79e135f84624ea6ae1d890"
+      ],
+      "revision": 3
+    },
+    "signed-permutation-backward": {
+      "title": "Remove redundant backward copies for signed permutations",
+      "claim": "Map view-related device copies to their source layout. For a signed permutation of disjoint channels, compare its explicit adjoint with slice backward at the real training strides and validate the full trajectory.",
+      "fingerprint": "88176405e2d10e3b7fde959f69d18903a3f288ff72fc723e64f445229a3a806e",
+      "owner": "perf-playbook",
+      "form": "layout-aware training operator procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/fusion-methodology.md"
+      ],
+      "evidence_sha256": [
+        "4555306d658b430a7aa1dc06aa29feb9a4cb82a11f393ace479a8849a0bfd06d",
+        "513a83cc09383f01b6ea024ee2d5b701e3a5f012364a24067992f75d9fe655ae",
+        "71ef7b91514cfbd4fd04fd4d107a9463b87965cb269f6feeb11327883d1267b0",
+        "9ac34a89c5ea513bd0a39171d38ddd0a6a5b9ab461a1ebd92e8258f8fafbe11c",
+        "9d7743b4ba65f02d51b57f49ff386cbcc1226153b7fe1815f9ff9c00b320f56f",
+        "d86a7b8b1a5e1f372fa05e6c6fa5184b550a53f5cb6b55c4b9c5cfd0504a529a",
+        "ec704a907375522179b338e707f27e73a5646d151c6ced9842cca36b212165e6",
+        "efa2005f4b174f18b49997697a8feefdec5165cd4a18d32c999ae36d847f6106"
+      ],
+      "revision": 1
+    },
+    "measured-shape-and-collective-regimes": {
+      "title": "Calibrate training shapes and collective payload regimes",
+      "claim": "Measure attained device rates and actual operator shapes before ranking kernel changes. Verify each collective payload definition and compare exclusive intervals before scoring coalescing.",
+      "fingerprint": "ef37704bff6629c129e58811003d4e47e08460435ae4e2de6c71b77c68a402aa",
+      "owner": "perf-playbook",
+      "form": "hardware-efficiency diagnostic procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/perf-playbook/references/hierarchical-performance-diagnosis.md"
+      ],
+      "evidence_sha256": [
+        "721649fbdddec3251d600f60dd402c13920db794c952d1b4c22c3350161c5104",
+        "c1929c867eb36f188cac645afe24f20089e7f0f8f8a1515cf7c0e4d3f2aee0aa",
+        "dff219ee95f59fd5bb9d80e46f8384ff1622a1e1516441009b0890a7cb5c6bc3"
+      ],
+      "revision": 1
+    },
+    "logical-slice-numerical-diagnosis": {
+      "title": "Localize numerical errors within the logical tensor layout",
+      "claim": "Report slice-level extreme and percentile errors with logical coordinates, and absolute error near zero, under the existing numerical policy.",
+      "fingerprint": "b506dc02c0d470da6b0664b912fd27b521501342e92f3531ceb87adfd8d63c69",
+      "owner": "precision",
+      "form": "targeted numerical diagnosis procedure",
+      "qualification": "validated",
+      "files": [
+        ".agent/skills/precision/references/align-flow.md"
+      ],
+      "evidence_sha256": [
+        "dc0584fc8f818e8db67f1f8c5a9b7a8763247e7e895248a7ef651802aca86138"
+      ],
+      "revision": 1
+    }
+  }
+}
