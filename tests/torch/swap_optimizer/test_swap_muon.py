@@ -66,6 +66,38 @@ def test_swap_muon_4():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_swap_muon_overlap_2p():
+    """Run Muon communication overlap with both swap transfer modes.
+
+    Feature: Muon shard communication overlap under optimizer-state swap.
+    Description: Run the same multi-group two-rank trajectory with per-tensor
+        and packed momentum transfers.
+    Expectation: Both transfer modes enter Muon's overlap stages and match the
+        serial parameter and momentum trajectory.
+    """
+    parallel_run([
+        TorchCase(SWAP_MUON, "test_swap_muon_overlap_2p", None, 2),
+        TorchCase(SWAP_MUON, "test_swap_muon_packed_overlap_2p", None, 2),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_swap_muon_hsdp_overlap_4p():
+    """Run Muon HSDP overlap with both swap transfer modes.
+
+    Feature: Muon HSDP communication overlap under optimizer-state swap.
+    Description: Run per-tensor and packed momentum transfers on a
+        replicate-by-shard four-rank mesh.
+    Expectation: Replica broadcasts, overlap stages, host state and serial
+        numerical parity are preserved in both transfer modes.
+    """
+    parallel_run([
+        TorchCase(SWAP_MUON, "test_swap_muon_hsdp_overlap_4p", None, 4),
+        TorchCase(SWAP_MUON, "test_swap_muon_hsdp_packed_overlap_4p", None, 4),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_swap_muon_hsdp_checkpoint_8p():
     """
     Feature: HSDP checkpoint lifecycle for swap Muon.
