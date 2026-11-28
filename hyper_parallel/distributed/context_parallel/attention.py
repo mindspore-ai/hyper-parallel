@@ -335,3 +335,42 @@ def _cp_offset_causal_mask(q_len: int, kv_len: int, lo: int,
     i = torch.arange(q_len, device=device).view(-1, 1)
     j = torch.arange(kv_len, device=device).view(1, -1)
     return (j <= (lo + i)).to(dtype)
+
+
+def build_cp_attention_mask(
+        attention_mask: Optional[torch.Tensor],
+        *,
+        q_len: int,
+        kv_len: int,
+        query_offset: int,
+        device: Any,
+) -> torch.Tensor:
+    """Build the ``(B, 1, q_len, kv_len)`` CP offset causal + padding mask.
+
+    ``attention_mask`` is the 2D ``[B, S]`` padding mask covering the complete
+    (unsharded) sequence; it is required — a padding-free fallback would let
+    query rows attend pad tokens that the all-gather brings in from every rank.
+    """
+    if attention_mask is None:
+        raise ValueError(
+            "Decoder CP input sharding requires a 2D attention_mask covering "
+            "the complete sequence (the K/V all-gather exposes every rank's pad "
+            "tokens, so the padding must be masked explicitly)"
+        )
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            "Decoder CP input sharding expects a 2D [batch, seq] attention "
+            f"mask, got shape {tuple(attention_mask.shape)}"
+        )
+    if attention_mask.shape[-1] != kv_len:
+        raise ValueError(
+            "Decoder CP input sharding expects the attention mask to cover "
+            f"the complete sequence: mask length={attention_mask.shape[-1]}, "
+            f"sequence length={kv_len}"
+        )
+    allowed = _cp_offset_causal_mask(q_len, kv_len, query_offset, device)
+    allowed = allowed.view(1, 1, q_len, kv_len)
+    padding = attention_mask.to(device=device, dtype=torch.bool).view(
+        attention_mask.shape[0], 1, 1, kv_len
+    )
+    return allowed & padding

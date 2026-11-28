@@ -42,6 +42,11 @@ plan_overrides:
 普通 YAML 无需设置 `fuse_qkv`，默认融合 QKV。
 现有 Qwen3-MoE 配方显式设置 U=1，因此只增大 cp_size 会选择 KV AG。
 
+已有源模块的 Q/K/V 通过同一套 checkpoint 转换接管已加载权重；meta 构造仍等待 checkpoint 加载。
+Q/K Norm 保留直接 scale 或 offset scale 的来源约定，也保留子模块各自的 train/eval 状态。
+`use_fused_ops` 默认 true，控制公共 Norm/RoPE；CPU 的 dense 参考使用 eager/SDPA，
+支持 padding、因果和滑动窗口。CPU 参考不是 packed/NPU 训练路径的替代。
+
 ## 混合 CP 与通算掩盖
 
 Ulysses 在 U 张卡之间用 AllToAll 将序列分片转换为头分片；KV AllGather 再沿 A 维补齐 KV 序列，

@@ -113,7 +113,7 @@ plan_overrides:
     replace:
       kind: method
       implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.qwen3_5_linear_attention_decoder_wrapper
+        _target_: hyper_parallel.distributed.context_parallel.wrappers.packed_linear_decoder_wrapper
 ```
 
 纯 Ulysses 将 mixer 的 `ulysses_degree` 设为 `null`，卷积通过 `conv_backend` 显式选择。
@@ -236,7 +236,7 @@ plan_overrides:
     replace:
       kind: method
       implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.qwen3_5_packed_model_wrapper
+        _target_: hyper_parallel.distributed.context_parallel.wrappers.packed_linear_model_wrapper
 ```
 
 该适配只在显式收到 `packed_sequence_info` 时让 HF 使用两类 attention 的空 mask 映射，

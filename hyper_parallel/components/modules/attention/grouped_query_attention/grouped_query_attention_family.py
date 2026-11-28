@@ -45,6 +45,8 @@ def validate_gqa_family(*, config: Any, module: nn.Module | None, context: Any, 
     # Declarative replacement requests omit defaults, unlike a direct Python factory call.
     if not isinstance(member.arguments.get("overlap", False), bool):
         raise TypeError("GQA overlap must be boolean")
+    if not isinstance(member.arguments.get("use_fused_ops", True), bool):
+        raise TypeError("GQA use_fused_ops must be boolean")
     _validate_gqa_degrees(config, member)
 
 
@@ -109,7 +111,6 @@ def validate_gqa_layout(*, module: nn.Module, sharding: Any, context: Any) -> No
     validate_tp_boundary(sharding, expected, name="GQA")
 
 
-
 def gqa_local_parallel_spec(*, module: nn.Module, member: Any) -> ParallelModuleSpec:
     """Retain final layout validation without binding resources to standalone math."""
     del module, member
@@ -119,17 +120,19 @@ def gqa_local_parallel_spec(*, module: nn.Module, member: Any) -> ParallelModule
 def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     fuse_qkv: bool = True, overlap: bool = False, ulysses_degree: int | None = None,
+    use_fused_ops: bool = True,
 ) -> nn.Module:
     """Build standalone math; the family retains CP options and owns parallel layouts."""
     del module_fqn, context, overlap, ulysses_degree
-    return GroupedQueryAttentionModule(config=config, module=module, fuse_qkv=fuse_qkv)
+    return GroupedQueryAttentionModule(config=config, module=module, fuse_qkv=fuse_qkv,
+                                       use_fused_ops=use_fused_ops)
 
 
 @module_replacement
 def GroupedQueryAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, fuse_qkv: bool = True,
-    overlap: bool = False, ulysses_degree: int | None = None,
+    overlap: bool = False, ulysses_degree: int | None = None, use_fused_ops: bool = True,
 ) -> nn.Module:
     """Build one GQA family with fixed projections and independent CP scheduling.
 
@@ -140,6 +143,7 @@ def GroupedQueryAttention(  # pylint: disable=invalid-name
         context: Logical parallel configuration, independent of concrete process groups.
         mesh: Existing job mesh, borrowed by the shared execution binder.
         fuse_qkv: Use grouped linear_qkv (True) or independent Q/K/V Parameters (False); fixed at construction.
+        use_fused_ops: Fuse source RMSNorm and RoPE; attention keeps the common NPU kernel.
         overlap: Submit ready Q/K/V transfers before independent projection stages.
         ulysses_degree: Head-parallel CP factor; 1 selects KV AG, None selects pure Ulysses.
 
@@ -148,7 +152,7 @@ def GroupedQueryAttention(  # pylint: disable=invalid-name
     """
     return build_family(GroupedQueryAttention, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, fuse_qkv=fuse_qkv,
-                        overlap=overlap, ulysses_degree=ulysses_degree)
+                        overlap=overlap, ulysses_degree=ulysses_degree, use_fused_ops=use_fused_ops)
 
 
 register_module_family(ModuleFamily(

@@ -27,7 +27,9 @@ from torch import nn
 from hyper_parallel.components.checkpoint import InterleaveQKV
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 from hyper_parallel.components.functional import apply_rotary_pos_emb_single, npu_fusion_attention_forward
-from hyper_parallel.components.modules.common.rms_norm import RMSNorm
+from hyper_parallel.components.functional.npu_fusion_attention import PACKED_SEQUENCE_ARGUMENTS
+from hyper_parallel.components.functional.torch_attention import torch_attention
+from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm, _hf_scale_kind
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -48,7 +50,8 @@ def _projections_can_fuse(projections: tuple[nn.Linear, ...]) -> bool:
     )
 
 
-def apply_gqa_position(tensor: torch.Tensor, positions: Any, interleaved: bool) -> torch.Tensor:
+def apply_gqa_position(tensor: torch.Tensor, positions: Any, interleaved: bool,
+                       use_fused_ops: bool = True) -> torch.Tensor:
     """Rotate one BSND branch, retaining the source half-band/interleaved convention."""
     if positions is None:
         return tensor
@@ -66,7 +69,7 @@ def apply_gqa_position(tensor: torch.Tensor, positions: Any, interleaved: bool) 
         cos, sin = (part[..., :rotary_dim // 2].repeat_interleave(2, dim=-1) for part in (cos, sin))
     cos, sin = (part.expand(tensor.shape[0], -1, -1).transpose(0, 1) for part in (cos, sin))
     result = apply_rotary_pos_emb_single(tensor.transpose(0, 1), cos, sin,
-                                       rotary_interleaved=interleaved, use_fused_rotary_pos_emb=True)
+                                       rotary_interleaved=interleaved, use_fused_rotary_pos_emb=use_fused_ops)
     result = result.transpose(0, 1)
     if interleaved:
         rotary, tail = result.split((rotary_dim, result.shape[-1] - rotary_dim), dim=-1)
@@ -136,7 +139,9 @@ class GroupedQueryAttentionModule(nn.Module):
         if isinstance(self.attention_dropout, nn.Dropout):
             self.attention_dropout = self.attention_dropout.p
         self.is_causal = getattr(module, "is_causal", True)
-        self.sliding_window = getattr(module, "sliding_window", getattr(config, "sliding_window", None))
+        self.sliding_window = getattr(module, "sliding_window", None)
+        if not isinstance(module, nn.Module):
+            self.sliding_window = getattr(config, "sliding_window", None)
         self.rotary_interleaved = getattr(
             module,
             "rotary_interleaved",
@@ -208,6 +213,7 @@ class GroupedQueryAttentionModule(nn.Module):
             device=source_qkv.weight.device,
             dtype=source_qkv.weight.dtype,
         )
+        self.linear_qkv.training = source_qkv.training
         self.linear_qkv.weight.requires_grad_(source_qkv.weight.requires_grad)
         if self.linear_qkv.bias is not None:
             self.linear_qkv.bias.requires_grad_(source_qkv.bias.requires_grad)
@@ -221,32 +227,39 @@ class GroupedQueryAttentionModule(nn.Module):
             setattr(self, name, getattr(module, name))
         for name in ("q_norm", "k_norm"):
             norm = getattr(module, name, None)
-            # The former three-projection Qwen path used fused direct-scale RMSNorm.
-            # Retain that kernel as a real child Module so FSDP hooks are not bypassed.
+            # Keep normalization as a child so FSDP hooks run for either kernel policy.
             if norm is not None and hasattr(norm, "variance_epsilon"):
                 if set(dict(norm.named_parameters())) != {"weight"}:
                     raise ValueError("GQA direct-scale RMSNorm requires only a weight parameter")
-                norm = RMSNorm(module=norm, use_fused_ops=True)
+                norm_family = OffsetRMSNorm if _hf_scale_kind(norm) == "offset" else RMSNorm
+                norm = norm_family(module=norm, use_fused_ops=self.use_fused_ops)
             setattr(self, name, norm)
 
     def __init__(self, *, config: Any = None, module: nn.Module | None = None,
-                 fuse_qkv: bool = True) -> None:
+                 fuse_qkv: bool = True, use_fused_ops: bool = True) -> None:
         """Build fixed QKV parameters from configuration or a supported source.
 
         Args:
             config: Native dimensions and math options; exclusive with module.
             module: Source attention providing weights and checkpoint conversion metadata.
             fuse_qkv: Use grouped linear_qkv rows or independent Q/K/V children.
+            use_fused_ops: Use fused source RMSNorm and rotary kernels when available.
         """
         super().__init__()
         if not isinstance(fuse_qkv, bool):
             raise TypeError("GQA fuse_qkv must be boolean")
         self.fuse_qkv = fuse_qkv
+        if not isinstance(use_fused_ops, bool):
+            raise TypeError("GQA use_fused_ops must be boolean")
+        self.use_fused_ops = use_fused_ops
         if (config is None) == (module is None):
             raise ValueError("GroupedQueryAttention requires exactly one of config or module")
         self._config_initialization = module is None or getattr(module, "_config_initialization", False)
         self.attention_interface = npu_fusion_attention_forward
         self.config = config if module is None else module.config
+        self.torch_attention_implementation = (
+            "eager" if getattr(self.config, "_attn_implementation", None) == "eager" else "sdpa"
+        )
         source = config if module is None else module
         self.layer_idx = getattr(source, "layer_idx", getattr(source, "layer_number", None))
         self._initialize_dimensions(module)
@@ -254,28 +267,48 @@ class GroupedQueryAttentionModule(nn.Module):
             self._initialize_config(config)
             return
         if isinstance(module, GroupedQueryAttentionModule):
-            if self.fuse_qkv != module.fuse_qkv:
-                raise ValueError("GQA promotion cannot change the fused/split parameter representation")
-            if hasattr(self, "gated_qkv_group_width") != hasattr(module, "gated_qkv_group_width"):
-                raise ValueError("GQA promotion cannot add or remove query gate parameters")
-            # Promotion happens before sharding: retain weights, FQNs and conversion provenance.
-            for name in ("_source_is_fused", "_source_projection_names"):
-                setattr(self, name, getattr(module, name, None))
-            # Preserve registration order and aliases as well as parameter names.
-            for name, child in module.named_modules(remove_duplicate=False):
-                if name and "." not in name:
-                    self.add_module(name, child)
-            for name in ("q_norm", "k_norm"):
-                if not hasattr(self, name):
-                    setattr(self, name, getattr(module, name, None))
-            self._initialize_attention_options(module)
-            self.train(module.training)
+            self._adopt_family_member(module)
             return
         self._initialize_attention_options(module)
         source_qkv, source_projection_names = self._source_qkv(module)
         self._source_projection_names = source_projection_names
         self._initialize_projections(module, source_qkv)
-        self.train(module.training)
+        self._copy_eager_source_projection(module)
+        self.training = module.training
+
+    def _adopt_family_member(self, module: nn.Module) -> None:
+        """Preserve parameter identity and source math when topology selects another family member."""
+        if self.fuse_qkv != module.fuse_qkv:
+            raise ValueError("GQA promotion cannot change the fused/split parameter representation")
+        if self.use_fused_ops != module.use_fused_ops:
+            raise ValueError("GQA promotion cannot change the Norm/RoPE kernel policy")
+        if hasattr(self, "gated_qkv_group_width") != hasattr(module, "gated_qkv_group_width"):
+            raise ValueError("GQA promotion cannot add or remove query gate parameters")
+        # Promotion happens before sharding: retain weights, FQNs and conversion provenance.
+        for name in ("_source_is_fused", "_source_projection_names"):
+            setattr(self, name, getattr(module, name, None))
+        # Preserve registration order and aliases as well as parameter names.
+        for name, child in module.named_modules(remove_duplicate=False):
+            if name and "." not in name:
+                self.add_module(name, child)
+        for name in ("q_norm", "k_norm"):
+            if not hasattr(self, name):
+                setattr(self, name, getattr(module, name, None))
+        self._initialize_attention_options(module)
+        self.training = module.training
+
+    def _copy_eager_source_projection(self, module: nn.Module) -> None:
+        """Use the same declared conversion for eager adoption and checkpoint loading."""
+        if not self.fuse_qkv or self.linear_qkv.weight.is_meta:
+            return
+        source = dict(module.named_parameters())
+        with torch.no_grad():
+            for converter in self.make_transforms():
+                values = {name: source[name] for name in converter.source_patterns}
+                for operation in converter.operations:
+                    values = operation.convert(values, converter.source_patterns, converter.target_patterns)
+                for name, value in values.items():
+                    self.get_parameter(name).copy_(value)
 
     def _initialize_config(self, config: Any) -> None:
         """Create native projections and optional direct-scale Q/K RMSNorm."""
@@ -296,11 +329,13 @@ class GroupedQueryAttentionModule(nn.Module):
         # Norm presence is an algorithm choice, not something inferred from model_type
         # or rms_norm_eps. Native gamma is direct scale; source Norms keep their own convention.
         self.q_norm = (
-            RMSNorm(config=SimpleNamespace(hidden_size=self.qk_head_dim, eps=eps), use_fused_ops=True).to(dtype=dtype)
+            RMSNorm(config=SimpleNamespace(hidden_size=self.qk_head_dim, eps=eps),
+                    use_fused_ops=self.use_fused_ops).to(dtype=dtype)
             if qk_norm else None
         )
         self.k_norm = (
-            RMSNorm(config=SimpleNamespace(hidden_size=self.qk_head_dim, eps=eps), use_fused_ops=True).to(dtype=dtype)
+            RMSNorm(config=SimpleNamespace(hidden_size=self.qk_head_dim, eps=eps),
+                    use_fused_ops=self.use_fused_ops).to(dtype=dtype)
             if qk_norm else None
         )
 
@@ -357,7 +392,7 @@ class GroupedQueryAttentionModule(nn.Module):
         """Apply per-head Norm and position math through ordinary child-module calls."""
         if norm is not None:
             tensor = norm(tensor)
-        return apply_gqa_position(tensor, positions, self.rotary_interleaved)
+        return apply_gqa_position(tensor, positions, self.rotary_interleaved, self.use_fused_ops)
 
     def project_query(self, hidden_states: torch.Tensor, positions: Any) -> torch.Tensor:
         """Compute a query from the independent projection representation.
@@ -371,6 +406,10 @@ class GroupedQueryAttentionModule(nn.Module):
         """
         query = self.q_proj(hidden_states).view(*hidden_states.shape[:-1], self.num_heads, self.qk_head_dim)
         return self.normalize_position(query, self.q_norm, positions)
+
+    def project_query_state(self, hidden_states: torch.Tensor, positions: Any) -> tuple[torch.Tensor, Any]:
+        """Return the independent query and optional token-local algorithm state."""
+        return self.project_query(hidden_states, positions), None
 
     def project_key(self, hidden_states: torch.Tensor, positions: Any) -> torch.Tensor:
         """Compute a key from the independent projection representation.
@@ -408,10 +447,10 @@ class GroupedQueryAttentionModule(nn.Module):
             use one GEMM; independent parameters keep their ordinary child calls.
         """
         if not self.fuse_qkv:
-            query = self.project_query(hidden_states, positions)
+            query, output_state = self.project_query_state(hidden_states, positions)
             key = self.project_key(hidden_states, positions)
             value = self.project_value(hidden_states)
-            return query, key, value, None
+            return query, key, value, output_state
         query, key, value, output_state = self.split_projection(hidden_states)
         query = self.normalize_position(query, self.q_norm, positions)
         key = self.normalize_position(key, self.k_norm, positions)
@@ -481,9 +520,30 @@ class GroupedQueryAttentionModule(nn.Module):
         """
         options = dict(inputs.options)
         options.setdefault("sliding_window", self.sliding_window)
+        if (self.torch_attention_implementation == "eager" or inputs.query.device.type != "npu") and (
+            self.attention_interface is npu_fusion_attention_forward
+        ):
+            return self._run_torch_attention(inputs, options), None
         return self.attention_interface(
             self, inputs.query, inputs.key, inputs.value, inputs.attention_mask,
             dropout=self.attention_dropout if self.training else 0.0, scaling=self.scaling, **options)
+
+    def _run_torch_attention(self, inputs: GQAInputs, options: dict[str, Any]) -> torch.Tensor:
+        """Preserve explicit eager math or use portable SDPA for ordinary sequences.
+
+        Packed document boundaries require a dedicated implementation; rejecting
+        them prevents accidental cross-document attention on these devices.
+        """
+        if any(options.get(name) is not None for name in PACKED_SEQUENCE_ARGUMENTS):
+            raise ValueError("Torch GQA SDPA does not support packed document metadata")
+        return torch_attention(inputs.query, inputs.key, inputs.value, inputs.attention_mask,
+                               is_causal=options.get(
+                                   "is_causal", self.is_causal and (inputs.attention_mask is None
+                                                                   or inputs.attention_mask.ndim == 2)
+                               ), scaling=self.scaling,
+                               dropout=self.attention_dropout if self.training else 0.0,
+                               sliding_window=options.get("sliding_window", self.sliding_window),
+                               implementation=self.torch_attention_implementation)
 
     def restore_attention(self, output: torch.Tensor, output_state: Any) -> tuple[torch.Tensor, Any]:
         """Preserve local query ownership and return algorithm-only output state.

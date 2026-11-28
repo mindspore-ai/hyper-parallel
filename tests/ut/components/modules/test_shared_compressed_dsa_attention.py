@@ -192,6 +192,11 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         default = CompressedSparseAttention2(module=_source(True))
         self.assertFalse(default.use_fused_ops)
         self.assertFalse(default.indexer.use_fused)
+        with self.assertRaisesRegex(ValueError, "replace_indexer=True"):
+            attention_impl.CompressedSparseAttention2Module(
+                module=default, replace_indexer=False, use_fused_ops=True)
+        with self.assertRaisesRegex(ValueError, "norm_cast_order"):
+            CompressedSparseAttention2(module=_source(), norm_cast_order="unknown")
         for value in ("false", "true", "auto", None, 0, 1):
             with self.subTest(invalid=value), self.assertRaisesRegex(TypeError, "use_fused_ops"):
                 CompressedSparseAttention2(module=_source(), use_fused_ops=value)

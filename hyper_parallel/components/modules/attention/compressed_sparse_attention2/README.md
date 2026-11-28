@@ -64,6 +64,11 @@ Its reference member preserves FP32 normalization, the cast before scale multipl
 and the existing scale Parameter. The V4.1 initializer restores these scales to one after
 meta materialization. Adopting a source attention preserves its existing child modules.
 
+`norm_cast_order` defaults to `null`, preserving the existing policy. Direct construction
+may explicitly select `before_weight` or `after_weight`; adopting an initialized source
+cannot silently change its normalization rounding. Changing a parallel Indexer's fusion
+policy is rejected rather than dropping its parallel behavior.
+
 CSA2 `use_fused_ops` controls Indexer, attention and KL, independently of normalization.
 To select fused normalization explicitly, add an RMSNorm replacement, for example:
 

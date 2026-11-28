@@ -407,15 +407,18 @@ def test_native_and_generated_closures_preserve_calls_and_cleanup(
         events.append(("mask",))
         return kwargs
 
-    def _hybrid(callback, q, k, v, kwargs, _mesh, ulysses_degree):
+    def _hybrid(callback, q, k, v, kwargs, mesh, ulysses_degree):
+        del mesh
         events.append(("hybrid", ulysses_degree))
         return callback(q + ulysses_degree, k, v, kwargs)
 
-    def _head_tail(callback, q, k, v, kwargs, _mesh, **_options):
+    def _head_tail(callback, q, k, v, kwargs, mesh, **_options):
+        del mesh
         events.append(("head_tail",))
         return callback(q + 5, k, v, kwargs)
 
-    def _gather(k, v, axis, _mesh):
+    def _gather(k, v, axis, mesh):
+        del mesh
         events.append(("gather", axis))
         return k + 4, v + 6
 
@@ -838,7 +841,7 @@ class Host(Base):
 
 def test_native_packed_decoder_lowering_runs_at_cp1(tmp_path):
     """The actual Qwen packed branch must work without CP or an inherited forward."""
-    target = "hyper_parallel.models.qwen3_5.adapter.linear_attention_decoder.qwen3_5_linear_attention_decoder_wrapper"
+    target = "hyper_parallel.distributed.context_parallel.wrappers.packed_linear_decoder_wrapper"
     patches = build_strategy_patches(
         (SourceObservation(match=("layer",), inner_wrapper_target=target),),
         boundary_classes={"layer": "Layer"},
@@ -2041,7 +2044,9 @@ def test_explicit_replacements_preserve_partial_layers_aliases_and_initializatio
         for module in layers.children():
             module.weight.detach().fill_(7)
 
-    class Wrapped(nn.Module):
+    class Wrapped(nn.Module):  # pylint: disable=abstract-method
+        """Constructor-only probe for parameter adoption and aliases."""
+
         def __init__(self, *, module, module_fqn, mode):
             super().__init__()
             self.weight = module.weight

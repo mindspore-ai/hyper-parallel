@@ -31,11 +31,9 @@ def _load_replacements():
 
 
 def _load_context_parallel():
-    """Return the model-owned packed decoder call adapter."""
-    from hyper_parallel.models.qwen3_5.adapter import (  # pylint: disable=C0415
-        linear_attention_decoder,
-    )
-    return linear_attention_decoder
+    """Return the shared packed metadata adapters."""
+    from hyper_parallel.distributed.context_parallel import wrappers  # pylint: disable=C0415
+    return wrappers
 
 
 def _load_loss():

@@ -99,7 +99,7 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         for cp_size, expected_type in ((1, DeepseekSparseAttentionModule), (2, CPDeepseekSparseAttentionModule)):
             with self.subTest(cp_size=cp_size):
                 module = DeepseekSparseAttention(
-                    config=_config(), context={"cp_size": cp_size}, kv_cp_size=cp_size,
+                    config=_config(), context={"cp_size": cp_size},
                 )
 
                 self.assertIs(type(module), expected_type)
@@ -115,7 +115,7 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         Expectation: Both paths retain the documented KV transport and overlap defaults.
         """
         expected = {
-            "kv_cp_size": 1, "kv_cp_strategy": "allgather", "cp_comm_overlap": False,
+            "kv_cp_size": None, "kv_cp_strategy": "allgather", "cp_comm_overlap": False,
         }
         for deferred in (False, True):
             with self.subTest(deferred=deferred):
@@ -180,7 +180,7 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         Description: Pass mismatched CP degrees, invalid KV sizes and removed options.
         Expectation: Unsupported requests fail during construction or deferred preparation.
         """
-        for cp_size, options in ((2, {}), (1, {"kv_cp_size": 2}), (4, {"kv_cp_size": 2})):
+        for cp_size, options in ((1, {"kv_cp_size": 2}), (4, {"kv_cp_size": 2})):
             for deferred in (False, True):
                 with self.subTest(cp_size=cp_size, options=options, deferred=deferred), self.assertRaises(ValueError):
                     if deferred:
@@ -211,6 +211,9 @@ class TestDeepseekSparseAttention(unittest.TestCase):
         """
         module = CPDeepseekSparseAttentionModule(config=_config(), kv_cp_size=2)
         context = Mock(size=4, mesh=object())
+        automatic = CPDeepseekSparseAttentionModule(config=_config())
+        automatic.bind_parallel(ParallelBinding(mesh_binding=Mock(), cp_context=context))
+        self.assertEqual(automatic.kv_cp_size, 4)
         with self.assertRaises(ValueError):
             module.bind_parallel(ParallelBinding(mesh_binding=Mock(), cp_context=context))
 

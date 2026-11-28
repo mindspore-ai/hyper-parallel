@@ -48,7 +48,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
     _commit_forward_rewrite,
 )
 from hyper_parallel.distributed.context_parallel.attention import (
-    _cp_offset_causal_mask,
+    build_cp_attention_mask,
 )
 from hyper_parallel.models.kimi_k26.adapter import KIMI_MODEL_TYPES
 
@@ -68,45 +68,6 @@ def _resolve_language_model(model: nn.Module) -> nn.Module:
             "Kimi-K2.6 CP input sharding requires model.model.language_model"
         )
     return language_model
-
-
-def build_cp_attention_mask(
-        attention_mask: torch.Tensor | None,
-        *,
-        q_len: int,
-        kv_len: int,
-        query_offset: int,
-        device: Any,
-) -> torch.Tensor:
-    """Build the ``(B, 1, q_len, kv_len)`` CP offset causal + padding mask.
-
-    ``attention_mask`` is the 2D ``[B, S]`` padding mask covering the complete
-    (unsharded) sequence; it is required — a padding-free fallback would let
-    query rows attend pad tokens that the all-gather brings in from every rank.
-    """
-    if attention_mask is None:
-        raise ValueError(
-            "Kimi-K2.6 CP input sharding requires a 2D attention_mask covering "
-            "the complete sequence (the K/V all-gather exposes every rank's pad "
-            "tokens, so the padding must be masked explicitly)"
-        )
-    if attention_mask.ndim != 2:
-        raise ValueError(
-            "Kimi-K2.6 CP input sharding expects a 2D [batch, seq] attention "
-            f"mask, got shape {tuple(attention_mask.shape)}"
-        )
-    if attention_mask.shape[-1] != kv_len:
-        raise ValueError(
-            "Kimi-K2.6 CP input sharding expects the attention mask to cover "
-            f"the complete sequence: mask length={attention_mask.shape[-1]}, "
-            f"sequence length={kv_len}"
-        )
-    allowed = _cp_offset_causal_mask(q_len, kv_len, query_offset, device)
-    allowed = allowed.view(1, 1, q_len, kv_len)
-    padding = attention_mask.to(device=device, dtype=torch.bool).view(
-        attention_mask.shape[0], 1, 1, kv_len
-    )
-    return allowed & padding
 
 
 def bind_context_parallel(model: nn.Module, mesh_context: Any) -> None:
