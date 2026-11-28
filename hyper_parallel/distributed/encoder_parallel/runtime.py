@@ -51,6 +51,12 @@ from hyper_parallel.distributed.encoder_parallel.planning import (
     build_destinations,
     build_segments,
 )
+from hyper_parallel.distributed.encoder_parallel.projector_dispatch import (
+    EncoderProjectorPlan,
+    build_projector_plan,
+    project_spatial_blocks,
+    route_projected_rows,
+)
 
 
 def _invalid_head_count(count: Any) -> bool:
@@ -128,9 +134,18 @@ class EncoderParallelPlan:
     destinations: dict[int, tuple[int, ...]]
     local_segments: tuple[EncoderSegment, ...]
     k_fsdp_max: int
+    projector_plan: EncoderProjectorPlan | None = None
+    decoder_layouts: dict[int, DecoderSequenceLayout] | None = None
 
     def _gather_features(self, hidden: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """All-gather each local segment and trim dummy padding."""
+        if self.runtime.config.packed_attention:
+            full = differentiable_variable_all_gather(
+                hidden, output_splits=[hidden.shape[0]] * self.runtime.config.encoder_cp_size,
+                group=self.runtime.encoder_cp_mesh.get_group(),
+            ) if self.runtime.config.encoder_cp_size > 1 else hidden
+            lengths = tuple(item.sequence_length for item in self.buckets[self.runtime.encoder_dp_rank])
+            return tuple(full[:sum(lengths)].split(lengths)) if lengths else (full,)
         gathered = []
         offset = 0
         for segment in self.local_segments:
@@ -143,35 +158,47 @@ class EncoderParallelPlan:
             gathered.append(full if segment.is_dummy else full[:segment.item.sequence_length])
         return tuple(gathered)
 
-    def _execute_local(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs
-                       ) -> tuple[tuple[EncoderFeature, ...], torch.Tensor, torch.Tensor]:
-        """Run the local ViT pass and build routed feature records."""
+    def _encode_local(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs) -> torch.Tensor:
+        """Run one local ViT pass with its matching sequence plan."""
         bridge = self.runtime.bridge
         context = EncoderAttentionContext(
             self.local_segments,
             self.runtime.encoder_cp_mesh,
             bridge.head_counts,
             self.runtime.expected,
+            packed_sequence_lengths=(
+                tuple(item.sequence_length for item in self.buckets[self.runtime.encoder_dp_rank])
+                or (self.runtime.config.encoder_cp_size,)
+            ) if self.runtime.config.packed_attention else None,
+            overlap=self.runtime.config.overlap,
         )
         with activate_encoder_attention(context):
             hidden = bridge.encode_local(image_inputs, self.local_segments)
         context.assert_exactly_once()
+        return hidden
+
+    def _execute_local(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs
+                       ) -> tuple[tuple[EncoderFeature, ...], torch.Tensor, torch.Tensor]:
+        """Run the local ViT pass and build routed feature records."""
+        bridge = self.runtime.bridge
+        hidden = self._encode_local(image_inputs)
         full_features = self._gather_features(hidden)
         records = []
         anchors = [feature.sum() * 0.0 for feature in full_features]
         prototype = None
+        items = self.buckets[self.runtime.encoder_dp_rank]
         for slot in range(self.k_fsdp_max):
-            segment = self.local_segments[slot] if slot < len(self.local_segments) else None
-            real = segment is not None and not segment.is_dummy and self.runtime.encoder_cp_rank == 0
+            item = items[slot] if slot < len(items) else None
+            real = item is not None and self.runtime.encoder_cp_rank == 0
             if real:
-                feature = bridge.project(full_features[slot], segment.item)
-                if feature.ndim != 2 or feature.shape[0] != segment.item.output_rows:
+                feature = bridge.project(full_features[slot], item)
+                if feature.ndim != 2 or feature.shape[0] != item.output_rows:
                     raise ValueError(
                         "aligner output does not match planned rows; "
-                        f"item_id={segment.item.item_id}; actual_shape={tuple(feature.shape)}; "
-                        f"expected_rows={segment.item.output_rows}"
+                        f"item_id={item.item_id}; actual_shape={tuple(feature.shape)}; "
+                        f"expected_rows={item.output_rows}"
                     )
-                records.append((segment.item, feature))
+                records.append((item, feature))
             else:
                 feature = bridge.project(hidden, None)
                 anchors.append(feature.sum() * 0.0)
@@ -180,6 +207,22 @@ class EncoderParallelPlan:
             raise RuntimeError("active plan must have an aligner slot")
         anchor = torch.stack(anchors).sum() if anchors else prototype.sum() * 0.0
         return tuple(records), prototype, anchor
+
+    def _execute_sharded_projector(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs
+                                   ) -> tuple[list[EncoderFeature], torch.Tensor]:
+        """Project independently owned spatial blocks, then route only needed rows."""
+        if self.projector_plan is None or self.decoder_layouts is None:
+            raise RuntimeError("sharded projector requires a complete input and output plan")
+        runtime = self.runtime
+        hidden = self._encode_local(image_inputs)
+        blocks = self.projector_plan.dispatch_blocks(hidden, runtime.encoder_cp_mesh)
+        projected, anchor = project_spatial_blocks(self.projector_plan, blocks, hidden, runtime.bridge)
+        records, route_anchor = route_projected_rows(
+            projected, buckets=self.buckets, layouts=self.decoder_layouts,
+            parent_rank=runtime.parent_rank, encoder_cp_size=runtime.config.encoder_cp_size,
+            mesh=runtime.parent_mesh, bridge=runtime.bridge,
+        )
+        return records, anchor + route_anchor
 
     def encode_and_route(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs
                          ) -> tuple[list[EncoderFeature], torch.Tensor | None]:
@@ -193,6 +236,8 @@ class EncoderParallelPlan:
         """
         if not self.active:
             return [], None
+        if self.runtime.config.projector_mode != "leader":
+            return self._execute_sharded_projector(image_inputs)
         records, prototype, local_anchor = self._execute_local(image_inputs)
         mode = self.runtime.feature_exchange_mode
         exchange_mesh = self.runtime.tp_mesh if mode in (
@@ -219,6 +264,14 @@ class EncoderParallelRuntime:
         self.model = model
         self.spec = spec
         self.bridge = spec.bind(model)
+        required = []
+        if config.projector_mode != "leader":
+            required.extend(("projector_patch_count", "projector_input_indices", "project_blocks", "feature_interval"))
+        if config.balance_cost == "encoder_flops":
+            required.append("estimate_work_cost")
+        missing = [name for name in required if not hasattr(self.bridge, name)]
+        if missing:
+            raise ValueError(f"encoder bridge does not support requested execution options: missing={missing}")
         validate_encoder_execution_options(
             {**execution_options, "loss_parallel": mesh_context.loss_parallel}, self.bridge,
         )
@@ -289,7 +342,9 @@ class EncoderParallelRuntime:
         if dist.is_initialized() and self.global_mesh.size() > 1:
             dist.all_reduce(marker, op=dist.ReduceOp.MAX, group=self.global_mesh.get_group())
         active = bool(marker.item())
-        buckets = assign_lpt(items, self.encoder_dp_size, self.config.encoder_cp_size)
+        costs = (self.bridge.estimate_work_cost(items, self.config.encoder_cp_size)
+                 if self.config.balance_cost == "encoder_flops" else None)
+        buckets = assign_lpt(items, self.encoder_dp_size, self.config.encoder_cp_size, costs=costs)
         layouts = {rank: DecoderSequenceLayout.build(mesh_context=self.mesh_context,
                                                      cp_local_length=layout.cp_local_length,
                                                      cp_rank=rank // self.mesh_context.tp_size,
@@ -297,16 +352,29 @@ class EncoderParallelRuntime:
                    for rank in range(self.mesh_context.cp_size * self.mesh_context.tp_size)}
         destinations = build_destinations(items, layouts)
         segments = build_segments(buckets[self.encoder_dp_rank], self.encoder_cp_rank,
-                                  self.config.encoder_cp_size)
-        slot_count = torch.tensor(len(buckets[self.encoder_dp_rank]), device=marker.device)
-        if dist.is_initialized() and self.global_mesh.size() > 1:
-            dist.all_reduce(slot_count, op=dist.ReduceOp.MAX, group=self.global_mesh.get_group())
+                                  self.config.encoder_cp_size, packed=self.config.packed_attention)
+        k_fsdp_max = self._projector_call_count(buckets, marker.device)
+        projector_plan = build_projector_plan(
+            buckets[self.encoder_dp_rank], self.encoder_cp_rank, self.config.encoder_cp_size,
+            packed=self.config.packed_attention, bridge=self.bridge,
+        ) if self.config.projector_mode != "leader" else None
         return EncoderParallelPlan(
             runtime=self,
             active=active, decoder_layout=layout, buckets=buckets,
             destinations=destinations, local_segments=segments,
-            k_fsdp_max=max(1, int(slot_count.item())),
+            k_fsdp_max=k_fsdp_max,
+            projector_plan=projector_plan, decoder_layouts=layouts,
         )
+
+    def _projector_call_count(self, buckets: tuple[tuple[EncoderWorkItem, ...], ...],
+                              device: torch.device) -> int:
+        """Align leader-mode projector calls across the FSDP domain."""
+        if self.config.projector_mode != "leader":
+            return 1
+        slot_count = torch.tensor(len(buckets[self.encoder_dp_rank]), device=device)
+        if dist.is_initialized() and self.global_mesh.size() > 1:
+            dist.all_reduce(slot_count, op=dist.ReduceOp.MAX, group=self.global_mesh.get_group())
+        return max(1, int(slot_count.item()))
 
 
 def build_encoder_parallel_runtime(*, config: EncoderParallelConfig, mesh_context: Any,

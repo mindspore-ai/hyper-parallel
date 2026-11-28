@@ -29,8 +29,8 @@ from torch.nn import functional as F
 from hyper_parallel.distributed.context_parallel.collectives import (
     AsyncCPCollective, async_ulysses_seq_to_head_launch,
 )
-from hyper_parallel.components.modules.attention.multi_latent_attention.cp_mla_backward_overlap import (
-    MLAExpandedInputA2AState, _InputA2ALaunch, launch_input_a2a,
+from hyper_parallel.distributed.context_parallel.ulysses_overlap import (
+    UlyssesQKVA2AState, launch_input_a2a,
 )
 
 
@@ -115,7 +115,7 @@ class _GatedExpandedInputA2AWait(torch.autograd.Function):
     """Release gate backward only after the attention input gradients are sent."""
 
     @staticmethod
-    def forward(ctx: Any, gate: torch.Tensor, state: MLAExpandedInputA2AState,
+    def forward(ctx: Any, gate: torch.Tensor, state: UlyssesQKVA2AState,
                 gate_state: GatedMLAInputState) -> tuple:
         """Consume Q/K/V after native gate compute, keeping its gradient edge.
 
@@ -154,7 +154,7 @@ class _GatedExpandedInputA2AWait(torch.autograd.Function):
 
 
 def finish_gated_expanded_inputs(
-    query: torch.Tensor, state: MLAExpandedInputA2AState, gate_state: GatedMLAInputState,
+    query: torch.Tensor, state: UlyssesQKVA2AState, gate_state: GatedMLAInputState,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Cover the last Q A2A with the model-owned native gate projection.
 
@@ -166,8 +166,9 @@ def finish_gated_expanded_inputs(
     Returns:
         Completed attention inputs in head-local layout; gate is saved in gate_state.
     """
-    launch_input = _InputA2ALaunch.apply if gate_state.defer_gate_gradient else launch_input_a2a
-    gate_input = launch_input(query, gate_state.hidden, state.query)
+    gate_input = launch_input_a2a(
+        query, gate_state.hidden, state.query, overlap_backward=gate_state.defer_gate_gradient,
+    )
     gate = gate_state.project(gate_input)
     if gate_state.defer_gate_gradient:
         return _GatedExpandedInputA2AWait.apply(gate, state, gate_state)

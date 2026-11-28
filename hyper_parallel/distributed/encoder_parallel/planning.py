@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import lcm
+from math import isfinite, lcm
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -113,36 +113,44 @@ class DecoderSequenceLayout:
 
 
 def assign_lpt(items: Sequence[EncoderWorkItem], encoder_dp_size: int,
-               encoder_cp_size: int) -> tuple[tuple[EncoderWorkItem, ...], ...]:
+               encoder_cp_size: int, *, costs: Mapping[int, float] | None = None
+               ) -> tuple[tuple[EncoderWorkItem, ...], ...]:
     """Assign image work by stable largest-processing-time-first scheduling.
 
     Args:
         items: Images with valid patch counts and stable IDs.
         encoder_dp_size: Number of visual work buckets.
         encoder_cp_size: Sequence-sharding degree of each bucket.
+        costs: Optional model-owned cost per image ID. None retains patch-square scheduling.
     """
     if encoder_dp_size < 1 or encoder_cp_size < 1:
         raise ValueError("encoder DP and CP sizes must be positive")
     buckets: list[list[EncoderWorkItem]] = [[] for _ in range(encoder_dp_size)]
     loads = [0] * encoder_dp_size
-    for item in sorted(items, key=lambda value: (-value.sequence_length ** 2, value.batch_index, value.item_id)):
+    weights = {item.item_id: item.sequence_length ** 2 if costs is None else costs[item.item_id] for item in items}
+    if any(not isfinite(value) or value <= 0 for value in weights.values()):
+        raise ValueError("encoder work costs must be finite and positive")
+    for item in sorted(items, key=lambda value: (-weights[value.item_id], value.batch_index, value.item_id)):
         bucket = min(range(encoder_dp_size), key=lambda rank: (loads[rank], rank))
         buckets[bucket].append(item)
-        loads[bucket] += item.sequence_length ** 2 // encoder_cp_size
+        loads[bucket] += weights[item.item_id] // encoder_cp_size if costs is None else weights[item.item_id]
     return tuple(tuple(bucket) for bucket in buckets)
 
 
 def build_segments(items: Sequence[EncoderWorkItem], encoder_cp_rank: int,
-                   encoder_cp_size: int) -> tuple[EncoderSegment, ...]:
+                   encoder_cp_size: int, *, packed: bool = False) -> tuple[EncoderSegment, ...]:
     """Build equal-size padded sequence shards for one Encoder-CP rank.
 
     Args:
         items: Images assigned to this Encoder-DP bucket.
         encoder_cp_rank: Sequence-shard coordinate within the bucket.
         encoder_cp_size: Number of shards per image.
+        packed: Split the concatenated image sequence with only one tail pad.
     """
     if not 0 <= encoder_cp_rank < encoder_cp_size:
         raise ValueError("invalid encoder CP rank")
+    if packed:
+        return _build_packed_segments(items, encoder_cp_rank, encoder_cp_size)
     segments = []
     offset = 0
     for item in items:
@@ -155,6 +163,27 @@ def build_segments(items: Sequence[EncoderWorkItem], encoder_cp_rank: int,
         offset += local_length
     if not segments:
         segments.append(EncoderSegment(None, 0, 1, 1, 0))
+    return tuple(segments)
+
+
+def _build_packed_segments(items: Sequence[EncoderWorkItem], rank: int, size: int) -> tuple[EncoderSegment, ...]:
+    """Intersect each image with one equal shard of the concatenated bucket."""
+    if any(item.sequence_length < 1 for item in items):
+        raise ValueError("image patch count must be positive")
+    total = sum(item.sequence_length for item in items)
+    shard = max(1, (total + size - 1) // size)
+    left, right = rank * shard, (rank + 1) * shard
+    segments = []
+    image_start = offset = 0
+    for item in items:
+        start, stop = max(left, image_start), min(right, image_start + item.sequence_length)
+        if start < stop:
+            length = stop - start
+            segments.append(EncoderSegment(item, start - image_start, length, length, offset))
+            offset += length
+        image_start += item.sequence_length
+    if offset < shard:
+        segments.append(EncoderSegment(None, 0, 0, shard - offset, offset))
     return tuple(segments)
 
 

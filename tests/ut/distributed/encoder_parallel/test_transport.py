@@ -62,6 +62,14 @@ class TestEncoderTransport(unittest.TestCase):
         }
         self.items = self.bridge.parse_images(self.batch)
 
+    def test_model_owned_work_estimate(self) -> None:
+        """Feature: model-specific ViT work estimates for optional LPT scheduling.
+
+        Description: Estimate two actual parsed images using the small native vision tower.
+        Expectation: Costs include its QKV/output and SwiGLU work, divided across Encoder-CP.
+        """
+        self.assertEqual(self.bridge.estimate_work_cost(self.items, 2), {0: 7200.0, 1: 2688.0})
+
     def _runtime(self, cp_size: int = 2, tp_size: int = 1) -> SimpleNamespace:
         """Provide pure planning geometry and a recorded finalize operation."""
         return SimpleNamespace(

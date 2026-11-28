@@ -97,6 +97,18 @@ _FULL_MODEL_MODE = "full"
 _VALIDATION_CROP_MODE = "validation_crop"
 
 
+def _unpack_encoder_features(
+        routed_records: list[tuple[Any, torch.Tensor]],
+) -> tuple[list[tuple[int, int, int, int, torch.Tensor]], list[int]]:
+    """Translate encoder routing records to model image spans and row offsets."""
+    image_records = [
+        (item.batch_index, item.decoder_token_start, *item.metadata["llm_hw"], feature)
+        for item, feature in routed_records
+    ]
+    row_starts = [getattr(item, "feature_row_start", 0) for item, _ in routed_records]
+    return image_records, row_starts
+
+
 def _resolve_v41_model_mode(config: Any) -> str:
     """Resolve and validate the explicit full-versus-crop construction mode."""
     model_mode = getattr(config, "v41_model_mode", _FULL_MODEL_MODE)
@@ -833,10 +845,12 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             token_types: torch.Tensor,
             image_records: list[tuple[int, int, int, int, torch.Tensor]],
             image_sequence_start: int,
+            feature_row_starts: list[int] | None = None,
     ) -> torch.Tensor:
-        """Apply the official type-based image insertion to local CP token spans."""
+        """Insert full or contiguous partial image records into local CP token spans."""
         merged = input_embeddings.clone()
         local_end = image_sequence_start + merged.shape[1]
+        image_anchors = []
         for image_index, (batch_index, token_start, llm_height, llm_width, image_features) in enumerate(image_records):
             if not 0 <= batch_index < merged.shape[0]:
                 raise ValueError(f"image_batch_indices[{image_index}] is outside the batch")
@@ -869,13 +883,21 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                 image_offsets = torch.arange(feature_start, feature_stop, device=token_types.device)
                 image_offsets = image_offsets[local_types == IMAGE]
                 feature_indices = image_offsets - 1 - (image_offsets - 1) // (llm_width + 1)
-                local_span[local_types == IMAGE] = image_features[feature_indices].to(merged.dtype)
+                row_start = 0 if feature_row_starts is None else feature_row_starts[image_index]
+                if row_start == 0 and image_features.shape[0] == llm_height * llm_width:
+                    local_span[local_types == IMAGE] = image_features[feature_indices].to(merged.dtype)
+                else:
+                    selected = (feature_indices >= row_start) & (feature_indices < row_start + image_features.shape[0])
+                    positions = torch.nonzero(local_types == IMAGE, as_tuple=False).flatten()[selected]
+                    local_span[positions] = image_features[feature_indices[selected] - row_start].to(merged.dtype)
             # Keep every vision parameter in the graph even when this CP rank
             # owns none of an image's token types.
             image_grad_anchor = (
                 image_features.sum() + self.image_start.sum() + self.image_end.sum() + self.image_newline.sum()
             )
-            merged = merged + image_grad_anchor.to(merged.dtype) * 0.0
+            image_anchors.append(image_grad_anchor.to(merged.dtype) * 0.0)
+        if image_anchors:
+            merged = merged + torch.stack(image_anchors).sum()
         return merged
 
     def _collect_image_records(
@@ -930,6 +952,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             encoder_parallel_inputs: Any | None = None,
     ) -> torch.Tensor:
         """Encode images and merge only records owned by this decoder rank."""
+        feature_row_starts = None
         if encoder_parallel_plan is None:
             image_records = self._collect_image_records(
                 token_types, image_inputs["pixel_values"], image_inputs["image_patch_offsets"],
@@ -941,10 +964,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             routed_records, vision_grad_anchor = encoder_parallel_plan.encode_and_route(
                 image_inputs if encoder_parallel_inputs is None else encoder_parallel_inputs,
             )
-            image_records = [
-                (item.batch_index, item.decoder_token_start, *item.metadata["llm_hw"], feature)
-                for item, feature in routed_records
-            ]
+            image_records, feature_row_starts = _unpack_encoder_features(routed_records)
         if token_types is not None and token_types.shape != input_ids.shape:
             raise ValueError("token_types must have the same shape as input_ids")
         if inputs_embeds is None:
@@ -968,6 +988,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         if image_records:
             inputs_embeds = self._merge_image_embeddings(
                 inputs_embeds, merge_token_types, image_records, merge_start,
+                feature_row_starts=feature_row_starts,
             )
         if encoder_parallel_plan is not None and encoder_parallel_plan.active:
             anchor = (vision_grad_anchor + self.image_start.sum() + self.image_end.sum()

@@ -120,13 +120,53 @@ class TestEncoderPlanning(unittest.TestCase):
         """Feature: Encoder-CP configuration validation.
 
         Description: Reject invalid degrees and removed single-choice settings.
-        Expectation: Only enabled and encoder_cp_size remain public inputs.
+        Expectation: Invalid CP degrees and removed option names remain rejected.
         """
         for size in (0, True):
-            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "encoder_cp_size must be a positive integer"):
+            with self.subTest(size=size), self.assertRaisesRegex(
+                    ValueError, "encoder_cp_size must be a positive integer"):
                 EncoderParallelConfig(encoder_cp_size=size)
         for name, value in (("mode", "sequence_sharded"),
                             ("balance_by", "attention_flops"),
+                            ("combine_qkv_comm", True),
                             ("validate_metadata", True)):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unknown encoder_parallel keys"):
                 EncoderParallelConfig.from_mapping({name: value})
+
+    def test_optional_encoder_cost_assignment(self):
+        """Feature: opt-in linear and quadratic image work estimates.
+
+        Description: Assign a heterogeneous batch with both policies and validate costs.
+        Expectation: Default ownership is retained; explicit costs reduce patch imbalance.
+        """
+        lengths = (1426, 864, 1610, 1426, 1296, 1426, 1426, 2070)
+        items = tuple(EncoderWorkItem(i, 0, length, 1, i, 1, 0, length, {})
+                      for i, length in enumerate(lengths))
+        costs = {item.item_id: item.sequence_length ** 2 + 6272 * item.sequence_length for item in items}
+        original = assign_lpt(items, 2, 2)
+        balanced = assign_lpt(items, 2, 2, costs=costs)
+        self.assertEqual(tuple(tuple(item.item_id for item in bucket) for bucket in original),
+                         ((7, 3, 6), (2, 0, 5, 4, 1)))
+        self.assertEqual(tuple(tuple(item.item_id for item in bucket) for bucket in balanced),
+                         ((7, 3, 6, 1), (2, 0, 5, 4)))
+        self.assertEqual(EncoderParallelConfig().balance_cost, "attention")
+        self.assertEqual(EncoderParallelConfig.from_mapping({"balance_cost": "encoder_flops"}).balance_cost,
+                         "encoder_flops")
+        with self.assertRaisesRegex(ValueError, "balance_cost must be"):
+            EncoderParallelConfig(balance_cost="invalid")
+        for invalid in (0, float("inf"), float("nan")):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "finite and positive"):
+                assign_lpt(items, 2, 2, costs={**costs, 0: invalid})
+
+    def test_overlap_requires_packed_attention(self):
+        """Feature: optional encoder input communication overlap.
+
+        Description: Parse the supported switch and reject ambiguous configurations.
+        Expectation: Overlap is off by default and only accepts packed boolean requests.
+        """
+        self.assertFalse(EncoderParallelConfig().overlap)
+        self.assertTrue(EncoderParallelConfig.from_mapping({"packed_attention": True, "overlap": True}).overlap)
+        with self.assertRaisesRegex(ValueError, "requires packed_attention=True"):
+            EncoderParallelConfig(overlap=True)
+        with self.assertRaisesRegex(ValueError, "overlap must be a boolean"):
+            EncoderParallelConfig(packed_attention=True, overlap="true")

@@ -25,6 +25,7 @@ from torch.nn import functional
 
 from hyper_parallel.components.modules.common.spatial_merge_projector import SpatialMergeProjectorModule
 from hyper_parallel.components.modules.common.rms_norm import NativeRMSNormModule
+from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
 from hyper_parallel.components.modules.mlp import W1W2SwiGLUMLPModule
 
 
@@ -69,11 +70,6 @@ def _npu_vision_attention(
         value: torch.Tensor,
 ) -> torch.Tensor:
     """Run bidirectional fused attention on canonical BNSD tensors."""
-    # The NPU extension is optional for CPU/GPU vision and checkpoint tests.
-    from hyper_parallel.components.functional.npu_fusion_attention import (  # pylint: disable=C0415
-        npu_fusion_attention_forward,
-    )
-
     output, _ = npu_fusion_attention_forward(
         module, query, key, value, attention_mask=None,
         dropout=0.0, scaling=query.shape[-1] ** -0.5,
@@ -116,6 +112,25 @@ def _vision_attention(
         query, key, value, is_causal=False,
     )
     return output.squeeze(0).transpose(0, 1)
+
+
+def _vision_packed_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
+                             value: torch.Tensor, lengths: tuple[int, ...]) -> torch.Tensor:
+    """Attend independent image sequences in one native TND call."""
+    if query.device.type == "npu":
+        ends = [0]
+        for length in lengths:
+            ends.append(ends[-1] + length)
+        output, _ = npu_fusion_attention_forward(
+            module, query.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0), attention_mask=None,
+            dropout=0.0, scaling=query.shape[-1] ** -0.5, is_causal=False,
+            sparse_mode=0, pre_tokens=2147483647, next_tokens=2147483647,
+            cu_seqlens_q=ends, cu_seqlens_kv=ends,
+        )
+        return output.squeeze(0)
+    return torch.cat([_vision_attention(module, q, k, v) for q, k, v in
+                      zip(query.split(lengths), key.split(lengths), value.split(lengths))], dim=0)
 
 
 class DeepseekV41VisionRMSNorm(NativeRMSNormModule):

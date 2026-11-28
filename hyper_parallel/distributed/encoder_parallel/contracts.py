@@ -36,6 +36,7 @@ class EncoderWorkItem:
     payload_start: int
     payload_stop: int
     metadata: Mapping[str, Any]
+    feature_row_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,11 @@ class EncoderParallelAdapterSpec:
     ``bind(model)`` returns an object with ``input_fields``, ``head_counts``,
     ``validate_training``, ``parse_images``, ``pack_payload``, ``payload_field``,
     ``empty_payload_shape``, ``encode_local`` and ``project``.
+    Sharded spatial projection additionally requires ``projector_patch_count``,
+    ``projector_input_indices``, ``project_blocks`` and ``feature_interval``.
+    ``balance_cost=encoder_flops`` requires ``estimate_work_cost(items, encoder_cp_size)``
+    returning a positive finite cost per image ID.
+    Default execution does not require these extensions.
     The runtime uses these operations without inspecting model-specific state.
     Module replacement is selected separately by recipe ``replace_module``.
     """

@@ -16,14 +16,23 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional
 
+from hyper_parallel.distributed.context_parallel.ulysses_overlap import (
+    UlyssesQKVA2AState,
+    UlyssesInputA2AState,
+    finish_qkv_inputs,
+    launch_input_a2a,
+)
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.distributed.context_parallel import ulysses_head_to_seq, ulysses_seq_to_head
 from hyper_parallel.distributed.encoder_parallel.attention import (
+    EncoderAttentionContext,
     current_encoder_attention_context,
     encoder_attention_checkpoint_contexts,
 )
@@ -38,6 +47,7 @@ from hyper_parallel.models.deepseek_v41.vision import (
     _apply_vision_rotary,
     _vision_attention,
     _vision_cos_sin,
+    _vision_packed_attention,
 )
 from hyper_parallel.models.replacement import module_replacement
 
@@ -46,6 +56,19 @@ _IMAGE_FIELDS = (
     "pixel_values", "image_patch_offsets", "image_vit_grid_hw", "image_llm_grid_hw",
     "image_batch_indices", "image_token_starts",
 )
+
+
+@lru_cache(maxsize=64)
+def _spatial_projector_indices(height: int, width: int, ratio: int) -> torch.Tensor:
+    """Cache CPU spatial block indices; callers must not mutate the returned table."""
+    output_height = (height + ratio - 1) // ratio
+    output_width = (width + ratio - 1) // ratio
+    rows = torch.arange(output_height * output_width, dtype=torch.int64, device="cpu").unsqueeze(1)
+    offsets = torch.arange(ratio * ratio, dtype=torch.int64, device="cpu").unsqueeze(0)
+    patch_row = rows.div(output_width, rounding_mode="floor") * ratio + offsets.div(ratio, rounding_mode="floor")
+    patch_col = rows.remainder(output_width) * ratio + offsets.remainder(ratio)
+    indices = patch_row * width + patch_col
+    return indices.masked_fill((patch_row >= height) | (patch_col >= width), -1)
 
 
 def _bundle_shapes_valid(pixels: torch.Tensor, offsets: torch.Tensor,
@@ -204,6 +227,23 @@ class DeepseekV41VisionBridge:
             raise ValueError(f"pixel_values patches must have shape {self.empty_payload_shape}")
         return items
 
+    def estimate_work_cost(self, items: Sequence[EncoderWorkItem], encoder_cp_size: int) -> dict[int, float]:
+        """Estimate ViT matrix FLOPs, without calibrated timing or projector costs.
+
+        Args:
+            items: Images to assign to Encoder-DP buckets.
+            encoder_cp_size: Common sequence-sharding degree of those buckets.
+
+        Returns:
+            Costs including attention, QKV/output projection, and SwiGLU.
+        """
+        width = self.vision.hidden_size
+        linear = sum(8 * width * width + 6 * width * block.mlp.w2.in_features
+                     for block in self.vision.blocks)
+        quadratic = 4 * len(self.vision.blocks) * width
+        return {item.item_id: (quadratic * item.sequence_length ** 2 + linear * item.sequence_length)
+                / encoder_cp_size for item in items}
+
     def pack_payload(self, batch: Mapping[str, Any], segments: Sequence[EncoderSegment],
                      *, device: torch.device | str = "cpu") -> torch.Tensor:
         """Copy only the selected patch intervals and zero padding into one buffer.
@@ -300,6 +340,89 @@ class DeepseekV41VisionBridge:
             height, width = item.metadata["vit_hw"]
         return self.aligner(hidden, height, width)
 
+    @property
+    def projector_patch_count(self) -> int:
+        """Number of spatial patches contributing to each independent output row."""
+        return self.aligner.downsample_ratio ** 2
+
+    def projector_input_indices(self, item: EncoderWorkItem, start: int, stop: int) -> torch.Tensor:
+        """Map output rows to raster patch indices; -1 denotes spatial padding.
+
+        Args:
+            item: Image geometry for the spatial merge.
+            start: First requested output row within the image.
+            stop: Exclusive end of the requested output rows.
+        """
+        height, width = item.metadata["vit_hw"]
+        ratio = self.aligner.downsample_ratio
+        return _spatial_projector_indices(height, width, ratio)[start:stop]
+
+    def project_blocks(self, blocks: torch.Tensor) -> torch.Tensor:
+        """Project packed spatial blocks through the original aligner module.
+
+        Args:
+            blocks: Spatial patches in [output_rows, patches_per_block, channels] order.
+        """
+        merged = blocks.transpose(1, 2).reshape(blocks.shape[0], self.aligner.w1.in_features)
+        return self.aligner(merged, input_is_merged=True)
+
+    @staticmethod
+    def feature_interval(item: EncoderWorkItem, token_start: int, token_stop: int) -> tuple[int, int]:
+        """Count IMAGE rows preceding the local text interval, excluding markers.
+
+        Args:
+            item: Image token span and spatial output geometry.
+            token_start: First token owned by this decoder rank.
+            token_stop: Exclusive end of the decoder token interval.
+        """
+        height, width = item.metadata["llm_hw"]
+        result = []
+        for token in (token_start, token_stop):
+            offset = min(max(token - item.decoder_token_start - 1, 0), height * (width + 1))
+            full_rows, remainder = divmod(offset, width + 1)
+            result.append(full_rows * width + min(remainder, width))
+        return tuple(result)
+
+
+def _exchange_encoder_qkv(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                          context: EncoderAttentionContext) -> tuple[torch.Tensor, ...]:
+    """Exchange three equal-shaped inputs together while retaining contiguous TND views."""
+    if context.cp_mesh.size() == 1:
+        return query, key, value
+    packed = torch.stack((query, key, value), dim=0)
+    return ulysses_seq_to_head(packed, seq_dim=1, head_dim=2, cp_mesh=context.cp_mesh).unbind(0)
+
+
+class _EncoderQKVLinear(nn.Linear):
+    """Keep split projections inside the original FSDP-managed module boundary."""
+
+    def __init__(self, source: nn.Linear) -> None:
+        """Retain the checkpoint keys and parameter identities of a QKV Linear."""
+        nn.Module.__init__(self)
+        self.in_features, self.out_features = source.in_features, source.out_features
+        self.weight, self.bias = source.weight, source.bias
+        self.train(source.training)
+
+    def forward(self, tensor: torch.Tensor, *, context: EncoderAttentionContext | None = None,
+                heads: int = 0, cosine: torch.Tensor | None = None,
+                sine: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Project V/K/Q in order, pairing each input transfer with its inverse."""
+        if context is None:
+            return functional.linear(tensor, self.weight, self.bias)
+        count, width = tensor.shape[0], self.out_features // 3
+        dim = width // heads
+        query_weight, key_weight, value_weight = self.weight.chunk(3, dim=0)
+        query_bias, key_bias, value_bias = self.bias.chunk(3, dim=0) if self.bias is not None else (None,) * 3
+        state = UlyssesQKVA2AState(*(UlyssesInputA2AState(context.cp_mesh) for _ in range(3)))
+        value = functional.linear(tensor, value_weight, value_bias).view(1, count, heads, dim)
+        key_input = launch_input_a2a(value, tensor, state.value, overlap_backward=True)
+        key = functional.linear(key_input, key_weight, key_bias).view(count, heads, dim)
+        key = _apply_vision_rotary(key, cosine, sine).unsqueeze(0)
+        query_input = launch_input_a2a(key, key_input, state.key, overlap_backward=True)
+        query = functional.linear(query_input, query_weight, query_bias).view(count, heads, dim)
+        query = _apply_vision_rotary(query, cosine, sine).unsqueeze(0)
+        return tuple(value.squeeze(0) for value in finish_qkv_inputs(query, state, overlap_backward=True))
+
 
 class DeepseekV41EncoderParallelAttention(DeepseekV41VisionAttention):
     """Structure-preserving attention with an active segmented Ulysses path."""
@@ -314,7 +437,7 @@ class DeepseekV41EncoderParallelAttention(DeepseekV41VisionAttention):
             module_fqn: Final path used by execution diagnostics.
         """
         result = cls(source.num_attention_heads * source.head_dim, source.num_attention_heads)
-        result.wqkv = source.wqkv
+        result.wqkv = _EncoderQKVLinear(source.wqkv)
         result.wo = source.wo
         result.module_fqn = module_fqn
         result.train(source.training)
@@ -334,6 +457,17 @@ class DeepseekV41EncoderParallelAttention(DeepseekV41VisionAttention):
             return super().forward(hidden_states, cosine, sine)
         context.record(self.module_fqn)
         count = hidden_states.shape[0]
+        if context.overlap and context.cp_mesh.size() > 1:
+            if context.packed_sequence_lengths is None:
+                raise ValueError("encoder_parallel.overlap requires packed attention")
+            context.validate_runtime_head_counts(
+                module_fqn=self.module_fqn, query_heads=self.num_attention_heads,
+                key_heads=self.num_attention_heads, value_heads=self.num_attention_heads,
+            )
+            query, key, value = self.wqkv(
+                hidden_states, context=context, heads=self.num_attention_heads, cosine=cosine, sine=sine,
+            )
+            return self._packed_output(query, key, value, context, count)
         query, key, value = (tensor.view(count, self.num_attention_heads, self.head_dim)
                              for tensor in self.wqkv(hidden_states).chunk(3, dim=-1))
         query = _apply_vision_rotary(query, cosine, sine)
@@ -342,18 +476,30 @@ class DeepseekV41EncoderParallelAttention(DeepseekV41VisionAttention):
             module_fqn=self.module_fqn, query_heads=query.shape[1],
             key_heads=key.shape[1], value_heads=value.shape[1],
         )
+        if context.packed_sequence_lengths is not None:
+            q, k, v = _exchange_encoder_qkv(query, key, value, context)
+            return self._packed_output(q, k, v, context, count)
         outputs = []
         for segment in context.segments:
             start = segment.packed_offset
             stop = start + segment.local_padded_length
-            q = ulysses_seq_to_head(query[start:stop], seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
-            k = ulysses_seq_to_head(key[start:stop], seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
-            v = ulysses_seq_to_head(value[start:stop], seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
+            q, k, v = _exchange_encoder_qkv(query[start:stop], key[start:stop], value[start:stop], context)
             global_length = segment.local_padded_length * context.cp_mesh.size()
             key_length = global_length if segment.is_dummy else segment.item.sequence_length
             attended = _vision_attention(self, q, k, v, key_length=key_length)
             outputs.append(ulysses_head_to_seq(attended, seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh))
         return self.wo(torch.cat(outputs, dim=0).reshape(count, -1))
+
+    def _packed_output(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                       context: EncoderAttentionContext, count: int) -> torch.Tensor:
+        """Run image-isolated attention on completed inputs and return local rows."""
+        valid = sum(context.packed_sequence_lengths)
+        attended = _vision_packed_attention(self, query[:valid], key[:valid], value[:valid],
+                                            context.packed_sequence_lengths)
+        if query.shape[0] != valid:
+            attended = functional.pad(attended, (0, 0, 0, 0, 0, query.shape[0] - valid))
+        output = ulysses_head_to_seq(attended, seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
+        return self.wo(output.reshape(count, -1))
 
 
 @module_replacement

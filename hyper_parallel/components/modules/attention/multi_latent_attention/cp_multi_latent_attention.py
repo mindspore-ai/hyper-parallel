@@ -26,9 +26,10 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules.attention.multi_latent_attention.cp_mla_backward_overlap import (
-    CPMLAKVLinear, CPMLAOutputLinear, MLAOutputProjectionState, MLAExpandedInputA2AState, MLAInputA2AState,
-    _InputA2ALaunch, _LatentInputA2AWait,
-    finish_expanded_inputs, launch_input_a2a,
+    CPMLAKVLinear, CPMLAOutputLinear, MLAOutputProjectionState, _LatentInputA2AWait,
+)
+from hyper_parallel.distributed.context_parallel.ulysses_overlap import (
+    UlyssesInputA2AState, UlyssesQKVA2AState, finish_qkv_inputs, launch_input_a2a,
 )
 from hyper_parallel.components.modules.attention.multi_latent_attention.multi_latent_attention import (
     MLAInputs, MLALatentInputs, MultiLatentAttentionModule, apply_mla_rope as _apply_mla_rope,
@@ -698,20 +699,23 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
     def _prepare_expanded_ulysses_inputs(self, state, positions, key_rope, input_gate,
                                          overlap_input_backward, rotary_fn):
         """Prepare expanded Q/K/V in V/K/Q order and attach the selected adjoints."""
-        launch_input = _InputA2ALaunch.apply if overlap_input_backward else launch_input_a2a
-        input_a2a = MLAExpandedInputA2AState(
-            query=MLAInputA2AState(self.ulysses_mesh),
-            key=MLAInputA2AState(self.ulysses_mesh),
-            value=MLAInputA2AState(self.ulysses_mesh),
+        input_a2a = UlyssesQKVA2AState(
+            query=UlyssesInputA2AState(self.ulysses_mesh),
+            key=UlyssesInputA2AState(self.ulysses_mesh),
+            value=UlyssesInputA2AState(self.ulysses_mesh),
         )
         # V needs no positional transform: it is ready as soon as KV up-projection
         # is split. Shared-K positional math was already applied by the caller.
         key_nope, value = self.project_key_value_parts(state.kv_latent, heads=self.cp_plan.local_heads)
         # Keep K assembly inside V's communication window.
-        key_nope = launch_input(value, key_nope, input_a2a.value)
+        key_nope = launch_input_a2a(
+            value, key_nope, input_a2a.value, overlap_backward=overlap_input_backward,
+        )
         key = self.assemble_key(key_nope, key_rope)
         # K is complete; Q projection and its model-defined rotation can cover it.
-        query_latent = launch_input(key, state.query_latent, input_a2a.key)
+        query_latent = launch_input_a2a(
+            key, state.query_latent, input_a2a.key, overlap_backward=overlap_input_backward,
+        )
         query = self.project_query(
             query_latent, positions, heads=self.cp_plan.local_heads, rotary_fn=rotary_fn,
         ).transpose(1, 2)
@@ -730,7 +734,7 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         """
         if input_gate is not None:
             raise ValueError("Ordinary MLA cannot consume a gated input dependency")
-        return finish_expanded_inputs(query, transfers, overlap_backward)
+        return finish_qkv_inputs(query, transfers, overlap_backward)
 
     def _prepare_latent_ulysses_inputs(self, state, positions, key_rope, rotary_fn):
         """Prepare latent Ulysses inputs and pair their Q/KV backward dependencies."""
@@ -744,9 +748,9 @@ class CPMultiLatentAttentionModule(MultiLatentAttentionModule):
         # via kv_input. Keep this numeric buffer off the default gradient path.
         with torch.no_grad():
             gathered = kv_all_gather_handle.wait()
-        query_a2a = MLAInputA2AState(self.ulysses_mesh)
+        query_a2a = UlyssesInputA2AState(self.ulysses_mesh)
         # Same payload value, with Q's inverse A2A bracketing its KV backward.
-        kv_input = _InputA2ALaunch.apply(query, payload, query_a2a)
+        kv_input = launch_input_a2a(query, payload, query_a2a, overlap_backward=True)
         heads = self.cp_plan.compute_heads
         start = self.head_rank * heads
         projected, shared_key = self.kv_b_proj(
